@@ -14,11 +14,10 @@
 #include "logx_internal.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <string>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <vector>
 
 namespace logx {
@@ -162,13 +161,15 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
             // 缓存指向文件不存在或被截;扩展到全保留文件扫描
             std::string best = scan_dir_for_target(inst);
             if (!best.empty()) sr = scan_append_target(inst, best);
+            else return r;  // 目录里也没有任何文件:全新启动(非截断)
         }
     } else {
         std::string best = scan_dir_for_target(inst);
         if (!best.empty()) sr = scan_append_target(inst, best);
+        else return r;  // 全新启动:无任何日志文件
     }
     if (!sr.ok) {
-        r.file_truncated = true;  // 信任 header 重刷 staging
+        r.file_truncated = true;  // 文件存在但打不开:IO 错误,信任 header 重刷
         return r;
     }
     r.S_file = sr.seqno;
@@ -242,18 +243,27 @@ void run_recovery(Instance* inst) {
                    "blocks written but header not committed; trusting file seqno");
     } else if (seqno_file < S_hdr) {
         // 文件尾损坏:截到最后有效块,丢失打点
-        if (truncated) {
-            emit_event(inst, LOGX_EV_RECOVERY, -1, "appended file tail truncated");
-            inst->truncated_blocks.fetch_add(S_hdr - seqno_file);
-        }
         f_target = F;
         seqno_next = S_hdr;
     }
 
-    // 截断后:续写首块 seqno = max(S_hdr, S_file) + 2(防 nonce 重用)
-    uint32_t resume_seqno = (truncated || (seqno_file != S_hdr && seqno_file < S_hdr))
-        ? std::max(S_hdr, seqno_file) + 2
-        : std::max(S_hdr, seqno_file) + 1;
+    // 文件尾被截断:无论 S_file 与 S_hdr 大小关系都打点(丢失 ≥ 1 块;
+    // S_file == S_hdr 时也可能发生——文件里恰好只有已提交块 + 半块尾巴)。
+    if (truncated) {
+        emit_event(inst, LOGX_EV_RECOVERY, -1, "appended file tail truncated");
+        inst->truncated_blocks.fetch_add(std::max<uint32_t>(1u, S_hdr - seqno_file));
+    }
+
+    // 续写首块 seqno:无任何已落盘块(全新启动/重建后无文件)保持 0,
+    // 第一块从 1 开始;截断后 +2 防 nonce 重用;常规续写 +1。
+    uint32_t resume_seqno;
+    if (seqno_file == 0 && S_hdr == 0 && !truncated) {
+        resume_seqno = 0;
+    } else if (truncated || (seqno_file != S_hdr && seqno_file < S_hdr)) {
+        resume_seqno = std::max(S_hdr, seqno_file) + 2;
+    } else {
+        resume_seqno = std::max(S_hdr, seqno_file) + 1;
+    }
 
     // 4) 环形扫描 staging(在 [F, total) 一维连续视图里;简化:取 [F, F + pending_bytes))
     // 由于 raw 在环上可能跨回绕,先把 staging 物理拷出成"以 F 为起点的连续视图"。

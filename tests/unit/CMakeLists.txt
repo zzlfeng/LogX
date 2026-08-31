@@ -18,11 +18,14 @@ target_link_libraries(logx_unit_tests
     logx_core
     GTest::gtest
     GTest::gtest_main
-    pthread
 )
+if(NOT WIN32)
+    target_link_libraries(logx_unit_tests PRIVATE pthread)
+endif()
 target_include_directories(logx_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/../core/include
 )
+add_test(NAME logx_unit_tests COMMAND logx_unit_tests)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(logx_unit_tests PRIVATE -Wall -Wextra)
 endif()

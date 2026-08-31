@@ -102,22 +102,24 @@ TEST(Split, TornTailNotClosedAsValidBlock) {
 
 TEST(Flush, BlocksEncodeAndFileWrite_Roundtrip) {
     // 写一个块到磁盘,然后读取并校验 header+CRC。
-    std::string dir = std::string("/tmp/logx_flush_") +
-                      std::to_string(::getpid()) + "_" +
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_tmp_") +
+                      std::to_string(pal.pid()) + "_" +
                       std::to_string(rand());
-    ::mkdir(dir.c_str(), 0755);
+    pal.file_mkdirs(dir.c_str());
     std::string path = dir + "/20260831.log";
 
     Instance inst{};
     inst.log_dir = dir;
-    inst.pal = &default_pal();
+    inst.pal = &pal;
     inst.compress_algo = kAlgoNone;
     inst.encrypt_enable = false;
     inst.kid = 1;
 
     uint8_t salt[8] = {1,2,3,4,5,6,7,8};
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int fd = pal.file_open(path.c_str(), true, false);
     ASSERT_GE(fd, 0);
+    ASSERT_EQ(pal.file_truncate(fd, 0), 0);  // O_TRUNC 语义
     uint8_t hdr[32] = {};
     put_u32_le(hdr, kMagicFile);
     hdr[4] = 1; hdr[5] = 0;
@@ -125,7 +127,7 @@ TEST(Flush, BlocksEncodeAndFileWrite_Roundtrip) {
     put_u16(hdr + 10, 1);
     std::memcpy(hdr + 12, salt, 8);
     put_u32_le(hdr + 28, crc32_update(0, hdr, 28));
-    ASSERT_EQ(::write(fd, hdr, 32), 32);
+    ASSERT_EQ(pal.file_write(fd, hdr, 32), 32);
 
     // 写一个块
     auto rec = make_entry(100);
@@ -134,18 +136,18 @@ TEST(Flush, BlocksEncodeAndFileWrite_Roundtrip) {
                                            /*seqno=*/1, /*flag=*/0, salt, nullptr);
     EXPECT_TRUE(wr.ok);
     EXPECT_EQ(wr.start_offset, 32u);
-    ::close(fd);
+    pal.file_close(fd);
 
     // 再打开,从 32 开始读 34B 头
-    fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    fd = pal.file_open(path.c_str(), false, false);
     uint8_t bhdr[34];
-    EXPECT_EQ(::pread(fd, bhdr, 34, 32), 34);
+    EXPECT_EQ(pal.file_pread(fd, bhdr, 34, 32), 34);
     EXPECT_EQ(get_u32(bhdr), kMagicBlock);
     EXPECT_EQ(get_u32(bhdr + 6), 1u);  // seqno
     EXPECT_EQ(get_u32(bhdr + 10), static_cast<uint32_t>(rec.size()));  // raw_len
-    ::close(fd);
+    pal.file_close(fd);
 
     // 清理
-    ::unlink(path.c_str());
-    ::rmdir(dir.c_str());
+    pal.file_unlink(path.c_str());
+    pal.file_rmdir(dir.c_str());
 }

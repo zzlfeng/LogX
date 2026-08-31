@@ -11,10 +11,7 @@
 #include <gtest/gtest.h>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <string>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <vector>
 
 using namespace logx;
@@ -29,29 +26,24 @@ protected:
     std::string staging_path_;
     std::string log_dir_;
     void SetUp() override {
-        staging_path_ = std::string("/tmp/logx_recovery_staging_") +
-                        std::to_string(::getpid()) + "_" +
+        Pal& pal = default_pal();
+        staging_path_ = std::string("logx_test_tmp_") +
+                        std::to_string(pal.pid()) + "_" +
                         std::to_string(rand()) + ".bin";
-        log_dir_ = std::string("/tmp/logx_recovery_logs_") +
-                   std::to_string(::getpid()) + "_" +
+        log_dir_ = std::string("logx_test_tmp_") +
+                   std::to_string(pal.pid()) + "_" +
                    std::to_string(rand());
-        ::unlink(staging_path_.c_str());
-        ::mkdir(log_dir_.c_str(), 0755);
+        pal.file_unlink(staging_path_.c_str());
+        pal.file_mkdirs(log_dir_.c_str());
     }
     void TearDown() override {
-        ::unlink(staging_path_.c_str());
+        Pal& pal = default_pal();
+        pal.file_unlink(staging_path_.c_str());
         // 简单清理 log_dir
-        DIR* d = ::opendir(log_dir_.c_str());
-        if (d) {
-            struct dirent* ent;
-            while ((ent = ::readdir(d)) != nullptr) {
-                if (ent->d_name[0] == '.') continue;
-                std::string p = log_dir_ + "/" + ent->d_name;
-                ::unlink(p.c_str());
-            }
-            ::closedir(d);
+        for (const auto& f : pal.file_list(log_dir_.c_str())) {
+            pal.file_unlink(f.c_str());
         }
-        ::rmdir(log_dir_.c_str());
+        pal.file_rmdir(log_dir_.c_str());
     }
 };
 
@@ -70,8 +62,9 @@ TEST_F(RecoveryTest, FreshStart_NoFile) {
 
 TEST_F(RecoveryTest, FileTruncationOnRecovery) {
     // 写一个合法文件头 + 半个块(故意截断),再启动恢复 → 应被截断并打点
+    Pal& pal = default_pal();
     std::string today_path = log_dir_ + "/" + "20260831.log";
-    int fd = ::open(today_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    int fd = pal.file_open(today_path.c_str(), true, false);
     ASSERT_GE(fd, 0);
     uint8_t hdr[32] = {};
     put_u32_le(hdr, kMagicFile);
@@ -81,11 +74,11 @@ TEST_F(RecoveryTest, FileTruncationOnRecovery) {
     uint8_t salt[8] = {1,2,3,4,5,6,7,8};
     std::memcpy(hdr + 12, salt, 8);
     put_u32_le(hdr + 28, crc32_update(0, hdr, 28));
-    ASSERT_EQ(::write(fd, hdr, 32), 32);
+    ASSERT_EQ(pal.file_write(fd, hdr, 32), 32);
     // 半块:只写 10 字节(头应当 34B)
     uint8_t half[10] = {0};
-    ::write(fd, half, 10);
-    ::close(fd);
+    pal.file_write(fd, half, 10);
+    pal.file_close(fd);
 
     Instance* inst = new Instance();
     inst->pal = &default_pal();
@@ -121,11 +114,11 @@ TEST_F(RecoveryTest, RingScanStopsOnTear) {
         std::memset(rec + 6, 0, 6);
         chunk.insert(chunk.end(), rec, rec + 12);
     }
-    // 半条:头 6B + payload 4B(后续 2B 截断)
+    // 半条:头 6B 完(len=4 声明 4B payload),payload 只有 2B(截断 2B)
     chunk.push_back(4); chunk.push_back(0);  // len = 4
     chunk.push_back(0x4c); chunk.push_back(0x47); // magic LG
     chunk.push_back(0x00); chunk.push_back(0x00);
-    chunk.insert(chunk.end(), {0,0,0,0});
+    chunk.insert(chunk.end(), {0,0});  // 只有 2B(应 4B)→ 撕裂尾巴
 
     ASSERT_EQ(inst->staging->write_records(chunk.data(),
                 static_cast<uint32_t>(chunk.size())),

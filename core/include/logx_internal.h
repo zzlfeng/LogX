@@ -136,6 +136,10 @@ struct FileScanResult {
 };
 FileScanResult scan_append_target(Instance* inst, const std::string& hint_path);
 
+// 在 log_dir 下扫描所有日志文件,选"日期最大且尾块 seqno 最大"者作为追加目标;
+// 返回文件路径(空 = 无)。recovery 对账用。
+std::string scan_dir_for_target(Instance* inst);
+
 // 当前活跃日志文件的路径;按当天日期 + split_no 计算。
 std::string current_log_path(Instance* inst, uint32_t yyyymmdd, uint8_t split_no);
 

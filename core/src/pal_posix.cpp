@@ -92,6 +92,30 @@ public:
         }
         return static_cast<long>(total);
     }
+    long file_pread(int fd, void* buf, size_t len, uint64_t offset) override {
+        uint8_t* p = static_cast<uint8_t*>(buf);
+        size_t total = 0;
+        while (total < len) {
+            ssize_t n = ::pread(fd, p + total, len - total, static_cast<off_t>(offset + total));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            if (n == 0) break;  // EOF
+            total += static_cast<size_t>(n);
+        }
+        return static_cast<long>(total);
+    }
+    int64_t file_size(int fd) override {
+        struct stat st;
+        if (::fstat(fd, &st) != 0) return -1;
+        return static_cast<int64_t>(st.st_size);
+    }
+    int64_t file_size_path(const char* path) override {
+        struct stat st;
+        if (::stat(path, &st) != 0) return -1;
+        return static_cast<int64_t>(st.st_size);
+    }
     int file_fsync(int fd) override {
 #ifdef __APPLE__
         return ::fcntl(fd, F_FULLFSYNC);
@@ -108,6 +132,9 @@ public:
     }
     int file_unlink(const char* path) override {
         return ::unlink(path);
+    }
+    int file_rmdir(const char* dir_path) override {
+        return ::rmdir(dir_path);
     }
     int file_mkdirs(const char* dir_path) override {
         // 复制路径以便逐级创建
@@ -238,6 +265,12 @@ public:
         struct timespec ts;
         ::clock_gettime(CLOCK_REALTIME, &ts);
         return static_cast<uint64_t>(ts.tv_sec) * 1000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL;
+    }
+    void sleep_ms(uint32_t ms) override {
+        struct timespec ts;
+        ts.tv_sec = ms / 1000;
+        ts.tv_nsec = static_cast<long>(ms % 1000) * 1000000L;
+        while (::nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
     }
     void wallclock_date(uint32_t* yyyymmdd, uint32_t* hhmmss) override {
         time_t now = ::time(nullptr);

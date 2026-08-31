@@ -10,12 +10,11 @@
 #include "logx_c.h"
 #include "logx_internal.h"
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <string>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 #include <vector>
 
 namespace logx {
@@ -40,10 +39,10 @@ bool parse_yyyymmdd(const char* s, uint32_t* out) {
     return true;
 }
 
-void write_all_lines(int fd, const std::vector<std::string>& lines) {
+void write_all_lines(Instance* inst, int fd, const std::vector<std::string>& lines) {
     for (const auto& l : lines) {
         if (l.empty()) continue;
-        ssize_t n = ::write(fd, l.data(), l.size());
+        long n = inst->pal->file_write(fd, l.data(), l.size());
         (void)n;
     }
 }
@@ -58,11 +57,11 @@ std::string make_tmp_path(const std::string& log_dir, uint32_t date) {
 // 为简化 M1/M2:不做语义解析,直接 dump LGXE 序列(按 spec,decoder 也这么干)。
 bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
                      std::vector<std::string>* out_lines) {
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    int fd = inst->pal->file_open(path.c_str(), false, false);
     if (fd < 0) return false;
     uint8_t hdr[32];
-    if (::pread(fd, hdr, 32, 0) != 32) { ::close(fd); return false; }
-    if (get_u32(hdr) != kMagicFile) { ::close(fd); return false; }
+    if (inst->pal->file_pread(fd, hdr, 32, 0) != 32) { inst->pal->file_close(fd); return false; }
+    if (get_u32(hdr) != kMagicFile) { inst->pal->file_close(fd); return false; }
     uint16_t kid_in_file = get_u16(hdr + 10);
     uint8_t salt[8];
     std::memcpy(salt, hdr + 12, 8);
@@ -71,7 +70,7 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
     if (file_encrypted) {
         if (!inst->key_provider) {
             out_lines->push_back("[skipped: no key provider]\n");
-            ::close(fd);
+            inst->pal->file_close(fd);
             return true;
         }
         key32 = inst->key_provider(kid_in_file, inst->key_user);
@@ -79,14 +78,14 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
             char line[128];
             std::snprintf(line, sizeof(line), "[skipped: kid=%u missing key]\n", kid_in_file);
             out_lines->push_back(line);
-            ::close(fd);
+            inst->pal->file_close(fd);
             return true;
         }
     }
     uint64_t off = 32;
     while (off + 34 <= end_size) {
         uint8_t bhdr[34];
-        if (::pread(fd, bhdr, 34, off) != 34) break;
+        if (inst->pal->file_pread(fd, bhdr, 34, off) != 34) break;
         if (get_u32(bhdr) != kMagicBlock) break;
         uint32_t seqno      = get_u32(bhdr + 6);
         uint32_t raw_len    = get_u32(bhdr + 10);
@@ -97,10 +96,11 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
         uint64_t block_size = 34 + payload_len + (enc ? 16 : 0);
         if (off + block_size > end_size) break;
         std::vector<uint8_t> payload(payload_len);
-        if (::pread(fd, payload.data(), payload_len, off + 34) != ssize_t(payload_len)) break;
+        if (inst->pal->file_pread(fd, payload.data(), payload_len, off + 34) !=
+            static_cast<long>(payload_len)) break;
         std::vector<uint8_t> tag(16);
         if (enc) {
-            if (::pread(fd, tag.data(), 16, off + 34 + payload_len) != 16) break;
+            if (inst->pal->file_pread(fd, tag.data(), 16, off + 34 + payload_len) != 16) break;
         }
         // CRC 校验(payload)
         if (crc32_update(0, payload.data(), payload.size()) != crc) {
@@ -141,7 +141,7 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
         }
         off += block_size;
     }
-    ::close(fd);
+    inst->pal->file_close(fd);
     return true;
 }
 
@@ -167,9 +167,9 @@ std::vector<FileSnapshot> take_snapshot(Instance* inst,
         if (endp == name.c_str() || d == 0) continue;
         uint32_t date = static_cast<uint32_t>(d);
         if (date < from_date || date > to_date) continue;
-        struct stat st;
-        if (::stat(f.c_str(), &st) != 0) continue;
-        snaps.push_back({f, static_cast<uint64_t>(st.st_size)});
+        int64_t sz = inst->pal->file_size_path(f.c_str());
+        if (sz < 0) continue;
+        snaps.push_back({f, static_cast<uint64_t>(sz)});
     }
     return snaps;
 }
@@ -203,14 +203,16 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
                                             std::strtoul(s.path.c_str() +
                                                 s.path.find_last_of('/') + 1,
                                                 nullptr, 10)));
-        int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        // O_CREAT | O_TRUNC:先创建,再截断到 0
+        int fd = inst->pal->file_open(tmp.c_str(), true, false);
         if (fd < 0) continue;
-        write_all_lines(fd, lines);
-        ::close(fd);
+        if (inst->pal->file_truncate(fd, 0) != 0) { inst->pal->file_close(fd); continue; }
+        write_all_lines(inst, fd, lines);
+        inst->pal->file_close(fd);
         // 解析日期字串
         std::string date = s.path.substr(s.path.find_last_of('/') + 1, 8);
         if (req.cb) req.cb(req.cb_user, date.c_str(), tmp.c_str(), s.size);
-        ::unlink(tmp.c_str());
+        inst->pal->file_unlink(tmp.c_str());
     }
     return LOGX_OK;
 }

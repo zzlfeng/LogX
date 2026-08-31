@@ -39,10 +39,11 @@ TEST(Format, ShortRecord_OnePiece) {
     std::vector<uint8_t> user;
     ASSERT_TRUE(parse_record(buf, total, &user));
     // 内部格式:[ts_ms:8][pid:4][tid:8][level:1][taglen:2]["Net"][msglen:4]["hello"]
+    // 偏移:ts@0 pid@8 tid@12 level@20 taglen@21 tag@23 msglen@26 msg@30
     EXPECT_EQ(user.size(), 27 + 3 + 4 + 5);
-    EXPECT_EQ(user[19], 3);   // taglen = 3
-    EXPECT_EQ(0, std::memcmp(user.data() + 21, "Net", 3));
-    EXPECT_EQ(0, std::memcmp(user.data() + 27 + 3 + 4 - 5, "hello", 5));
+    EXPECT_EQ(user[21], 3);   // taglen = 3
+    EXPECT_EQ(0, std::memcmp(user.data() + 23, "Net", 3));
+    EXPECT_EQ(0, std::memcmp(user.data() + 30, "hello", 5));
 }
 
 TEST(Format, LongRecord_Slices) {
@@ -117,23 +118,25 @@ TEST(Format, PadRecord) {
 }
 
 TEST(Format, ParseSkipsPadAndReassembles) {
-    // 两条 LGXE 之间夹一条 LGXP PAD
-    uint8_t rec1[64], rec2[64], pad[106];
-    uint32_t r1 = 0, r2 = 0, rp = format_pad(pad, 100);
-    ASSERT_TRUE(format_record(1, "A", (const uint8_t*)"hi", 2, 0, 1, 1,
-                              rec1, sizeof(rec1), &r1));
-    ASSERT_TRUE(format_record(1, "A", (const uint8_t*)"yo", 2, 0, 1, 1,
-                              rec2, sizeof(rec2), &r2));
+    // 一条日志分两片,中间夹一条 LGXP PAD:重组应跨 PAD 连续。
+    // 用户载荷 = "ABCDEFGH"(8B),首片 4B(flags=01) + 末片 4B(flags=11)。
+    uint8_t pad[106];
+    uint32_t rp = format_pad(pad, 100);
     std::vector<uint8_t> concat;
-    concat.insert(concat.end(), rec1, rec1 + r1);
+    // 首片:len=4, LG, flags=01, cksum("ABCD")=0x04
+    uint8_t first[10] = {4, 0, 0x4c, 0x47, 0x01, 0x04, 'A', 'B', 'C', 'D'};
+    concat.insert(concat.end(), first, first + sizeof(first));
     concat.insert(concat.end(), pad, pad + rp);
-    concat.insert(concat.end(), rec2, rec2 + r2);
+    // 末片:len=4, LG, flags=11, cksum("EFGH")=0x0c
+    uint8_t last[10] = {4, 0, 0x4c, 0x47, 0x03, 0x0c, 'E', 'F', 'G', 'H'};
+    concat.insert(concat.end(), last, last + sizeof(last));
 
     std::vector<uint8_t> user;
     ASSERT_TRUE(parse_record(concat.data(),
                              static_cast<uint32_t>(concat.size()), &user));
-    // 应该解析到 rec1 + rec2 的拼接(因为 parse_record 视分片连续,PAD 跳过)
-    EXPECT_EQ(user.size(), (27 + 1 + 4 + 2) * 2);
+    // 首片 + 末片拼接(PAD 被跳过),还原 8B 用户数据
+    EXPECT_EQ(user.size(), 8u);
+    EXPECT_EQ(0, std::memcmp(user.data(), "ABCDEFGH", 8));
 }
 
 TEST(Format, TornRecordCksumFails) {

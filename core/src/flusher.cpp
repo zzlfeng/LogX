@@ -14,15 +14,10 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <string>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <time.h>
-#include <unistd.h>
 #include <vector>
 
 #include "logx_format.h"
@@ -88,20 +83,21 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
 // ---- §B 块写出 ----
 // 把 raw_block + seqno + flag 编码后追加到 fd;返回写入字节数;失败 -1。
 // flag 同时表达压缩算法与加密开关。
-ssize_t append_block_raw(int fd,
-                         const uint8_t* raw_block, uint32_t raw_len,
-                         uint32_t seqno, uint8_t flag,
-                         const uint8_t salt[8],
-                         const uint8_t* key32_or_null,
-                         Instance* inst) {
+long append_block_raw(int fd,
+                      const uint8_t* raw_block, uint32_t raw_len,
+                      uint32_t seqno, uint8_t flag,
+                      const uint8_t salt[8],
+                      const uint8_t* key32_or_null,
+                      Instance* inst) {
+    if (!inst) return -1;
     // 1) 压缩 + 加密
     if ((flag & kFlagEncrypted) && key32_or_null == nullptr) {
-        if (inst) emit_event(inst, LOGX_EV_DEGRADED, -1, "missing key; downgrade to plaintext");
+        emit_event(inst, LOGX_EV_DEGRADED, -1, "missing key; downgrade to plaintext");
         flag &= ~kFlagEncrypted;
     }
     EncodedBlock enc;
     if (!encode_block(flag, key32_or_null, seqno, salt, raw_block, raw_len, &enc)) {
-        if (inst) inst->block_write_errors.fetch_add(1);
+        inst->block_write_errors.fetch_add(1);
         return -1;
     }
     // 2) CRC32(payload)
@@ -129,31 +125,33 @@ ssize_t append_block_raw(int fd,
         // encode_block 已把 [cipher | tag] 合并到 enc.payload 尾部 16B,这里不再追加
     }
     // 5) 写盘
-    ssize_t n = ::write(fd, frame.data(), frame.size());
+    long n = inst->pal->file_write(fd, frame.data(), frame.size());
     if (n < 0) {
-        if (inst) inst->block_write_errors.fetch_add(1);
+        inst->block_write_errors.fetch_add(1);
         return -1;
     }
     return n;
 }
 
-// 一次"块落地"完整流程(把 raw_block + seqno + flag 编码后写到 fd)。
-// 成功返回该块在文件中的字节起止偏移。
-// (声明见 logx_internal.h;实现放在这里以避免链接顺序问题。)
+// 一次"块落地"完整流程:定义在文件末尾 anonymous namespace 之外
+// (MSVC 对 anonymous 内定义与 header 声明不 merge,会产生重载歧义)。
+
+}  // namespace
+
 BlockWriteResult write_and_record(Instance* inst, int fd,
                                   const uint8_t* raw_block, uint32_t raw_len,
                                   uint32_t seqno, uint8_t flag,
                                   const uint8_t salt[8],
                                   const uint8_t* key32_or_null) {
     BlockWriteResult r;
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
+    int64_t sz = inst->pal->file_size(fd);
+    if (sz < 0) {
         inst->block_write_errors.fetch_add(1);
         return r;
     }
-    r.start_offset = static_cast<uint64_t>(st.st_size);
-    ssize_t n = append_block_raw(fd, raw_block, raw_len, seqno, flag, salt,
-                                 key32_or_null, inst);
+    r.start_offset = static_cast<uint64_t>(sz);
+    long n = append_block_raw(fd, raw_block, raw_len, seqno, flag, salt,
+                              key32_or_null, inst);
     if (n < 0) {
         return r;
     }
@@ -188,29 +186,30 @@ bool write_file_header(Instance* inst, int fd,
     // reserved[8] = 0
     uint32_t crc = crc32_update(0, hdr, 28);
     put_u32_le(hdr + 28, crc);
-    ssize_t n = ::write(fd, hdr, 32);
-    return n == 32;
+    return inst->pal->file_write(fd, hdr, 32) == 32;
 }
 
-// 启动时扫描 hint_path;若文件不存在则返回 ok=false 让上层决定创建。
-FileScanResult scan_one(Instance* inst, const std::string& path) {
+// 扫描 hint_path;若文件不存在则返回 ok=false 让上层决定创建。
+// repair = true 时对损坏尾部做 ftruncate 修复(确定追加目标时用);
+// false 时只评估不修改(scan_dir_for_target 遍历候选文件时用,避免副作用)。
+FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
     FileScanResult r;
     r.path = path;
-    int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    int fd = inst->pal->file_open(path.c_str(), false, false);
     if (fd < 0) {
         r.ok = false;
         return r;
     }
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
-        ::close(fd);
+    int64_t sz = inst->pal->file_size(fd);
+    if (sz < 0) {
+        inst->pal->file_close(fd);
         r.ok = false;
         return r;
     }
-    r.last_block_end_offset = static_cast<uint64_t>(st.st_size);
-    if (st.st_size < 32) {
+    r.last_block_end_offset = static_cast<uint64_t>(sz);
+    if (sz < 32) {
         // 文件过短,视为空文件(允许;将由 write_file_header 覆盖)
-        ::close(fd);
+        inst->pal->file_close(fd);
         r.ok = true;
         r.seqno = 0;
         r.last_block_end_offset = 0;
@@ -218,49 +217,49 @@ FileScanResult scan_one(Instance* inst, const std::string& path) {
     }
     // 读 32B 头
     uint8_t hdr[32];
-    ssize_t nr = ::pread(fd, hdr, 32, 0);
+    long nr = inst->pal->file_pread(fd, hdr, 32, 0);
     if (nr != 32) {
-        ::close(fd);
+        inst->pal->file_close(fd);
         r.ok = false;
         return r;
     }
     if (get_u32(hdr) != kMagicFile || get_u32(hdr + 28) != crc32_update(0, hdr, 28)) {
         // 头坏:截到 0
-        ::ftruncate(fd, 0);
+        if (repair) inst->pal->file_truncate(fd, 0);
         r.ok = true;
         r.truncated = true;
         r.last_block_end_offset = 0;
-        ::close(fd);
+        inst->pal->file_close(fd);
         return r;
     }
     // 顺序扫剩余块
     uint64_t off = 32;
-    while (off < static_cast<uint64_t>(st.st_size)) {
+    while (off < static_cast<uint64_t>(sz)) {
         uint8_t bhdr[34];
-        if (::pread(fd, bhdr, 34, off) != 34) {
-            ::ftruncate(fd, off);
+        if (inst->pal->file_pread(fd, bhdr, 34, off) != 34) {
+            if (repair) inst->pal->file_truncate(fd, off);
             r.truncated = true;
             r.last_block_end_offset = off;
-            ::close(fd);
+            inst->pal->file_close(fd);
             r.ok = true;
             return r;
         }
         if (get_u32(bhdr) != kMagicBlock) {
-            ::ftruncate(fd, off);
+            if (repair) inst->pal->file_truncate(fd, off);
             r.truncated = true;
             r.last_block_end_offset = off;
-            ::close(fd);
+            inst->pal->file_close(fd);
             r.ok = true;
             return r;
         }
         uint32_t payload_len = get_u32(bhdr + 14);
         uint8_t flag = bhdr[5];
         uint64_t block_size = 34 + payload_len + ((flag & kFlagEncrypted) ? 16 : 0);
-        if (off + block_size > static_cast<uint64_t>(st.st_size)) {
-            ::ftruncate(fd, off);
+        if (off + block_size > static_cast<uint64_t>(sz)) {
+            if (repair) inst->pal->file_truncate(fd, off);
             r.truncated = true;
             r.last_block_end_offset = off;
-            ::close(fd);
+            inst->pal->file_close(fd);
             r.ok = true;
             return r;
         }
@@ -270,37 +269,12 @@ FileScanResult scan_one(Instance* inst, const std::string& path) {
         off += block_size;
     }
     r.ok = true;
-    ::close(fd);
+    inst->pal->file_close(fd);
     return r;
 }
 
 // 在 hint_path 命中失败时,从 log_dir 扫所有文件;选"文件名日期最大且尾块
 // seqno 最大"者作为追加目标。
-std::string scan_dir_for_target(Instance* inst) {
-    auto files = inst->pal->file_list(inst->log_dir.c_str());
-    std::sort(files.begin(), files.end());
-    std::string best;
-    uint32_t best_date = 0;
-    uint32_t best_seqno = 0;
-    for (const auto& f : files) {
-        size_t pos = f.find_last_of('/');
-        std::string name = (pos == std::string::npos) ? f : f.substr(pos + 1);
-        if (name.size() < 12) continue;
-        if (name.compare(name.size() - 4, 4, ".log") != 0 &&
-            name.find(".log.") == std::string::npos) continue;
-        char* endp = nullptr;
-        unsigned long d = std::strtoul(name.c_str(), &endp, 10);
-        if (endp == name.c_str() || d == 0) continue;
-        uint32_t date = static_cast<uint32_t>(d);
-        FileScanResult r = scan_one(inst, f);
-        if (!r.ok) continue;
-        if (date > best_date || (date == best_date && r.seqno > best_seqno)) {
-            best = f; best_date = date; best_seqno = r.seqno;
-        }
-    }
-    return best;
-}
-
 // 打开/创建追加目标文件;返回 fd;失败 -1。
 // *out_path / *out_salt 由调用方在 retry 时复用。
 int open_or_create_append_target(Instance* inst, const std::string& hint_path,
@@ -310,22 +284,22 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
     std::string path = hint_path.empty()
         ? make_log_path(inst->log_dir, date, split_no)
         : hint_path;
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    int fd = inst->pal->file_open(path.c_str(), true, true);
     if (fd < 0) return -1;
-    struct stat st;
-    if (::fstat(fd, &st) != 0) { ::close(fd); return -1; }
-    if (st.st_size == 0) {
+    int64_t sz = inst->pal->file_size(fd);
+    if (sz < 0) { inst->pal->file_close(fd); return -1; }
+    if (sz == 0) {
         // 新建:写 32B 头
         uint8_t salt[8];
         inst->pal->random_bytes(salt, 8);
         if (!write_file_header(inst, fd, date, inst->kid, salt)) {
-            ::close(fd); return -1;
+            inst->pal->file_close(fd); return -1;
         }
         std::memcpy(out_salt, salt, 8);
     } else {
         // 已存在:读头取 salt
         uint8_t hdr[32];
-        if (::pread(fd, hdr, 32, 0) != 32) { ::close(fd); return -1; }
+        if (inst->pal->file_pread(fd, hdr, 32, 0) != 32) { inst->pal->file_close(fd); return -1; }
         std::memcpy(out_salt, hdr + 12, 8);
     }
     if (out_path) *out_path = path;
@@ -388,9 +362,9 @@ struct FlusherCtx {
     bool     date_changed = true;   // 启动时强制为 true,触发首次 target 选择
 };
 
-void close_current(FlusherCtx* c) {
+void close_current(FlusherCtx* c, Pal* pal) {
     if (c->current_fd >= 0) {
-        ::close(c->current_fd);
+        pal->file_close(c->current_fd);
         c->current_fd = -1;
     }
 }
@@ -400,7 +374,7 @@ void close_current(FlusherCtx* c) {
 int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
     if (!c->date_changed && c->current_fd >= 0) return c->current_fd;
 
-    close_current(c);
+    close_current(c, inst->pal);
     if (c->current_path.empty()) {
         // 优先用 hint(追加目标缓存)
         std::string hint;
@@ -418,7 +392,7 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
             hint = scan_dir_for_target(inst);
         }
         if (!hint.empty()) {
-            FileScanResult sr = scan_one(inst, hint);
+            FileScanResult sr = scan_append_target(inst, hint);  // 命中即修复截断
             if (sr.ok && !sr.truncated && sr.last_block_end_offset > 0) {
                 // 命中并校验过
                 c->current_path = hint;
@@ -442,12 +416,12 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
     if (c->current_fd >= 0 && c->current_size >= inst->max_file_size) {
         if (c->current_split >= 255) {
             // 达上限,停写
-            close_current(c);
+            close_current(c, inst->pal);
             return -1;
         }
         c->current_split += 1;
         c->current_path.clear();
-        close_current(c);
+        close_current(c, inst->pal);
     }
 
     if (c->current_fd < 0) {
@@ -456,9 +430,8 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
                                                      &c->current_path,
                                                      c->current_salt);
         if (c->current_fd < 0) return -1;
-        struct stat st;
-        ::fstat(c->current_fd, &st);
-        c->current_size = static_cast<uint64_t>(st.st_size);
+        int64_t sz = inst->pal->file_size(c->current_fd);
+        c->current_size = sz < 0 ? 0 : static_cast<uint64_t>(sz);
     }
     c->date_changed = false;
     return c->current_fd;
@@ -570,7 +543,32 @@ void flusher_loop(Instance* inst) {
     drain_once(&c, inst);
 }
 
-}  // namespace
+// 在 log_dir 下扫描所有日志文件,选"日期最大且尾块 seqno 最大"者作为追加目标。
+// 定义在 anonymous 外(header 声明 + MSVC merge 限制);recovery 对账也用。
+std::string scan_dir_for_target(Instance* inst) {
+    auto files = inst->pal->file_list(inst->log_dir.c_str());
+    std::sort(files.begin(), files.end());
+    std::string best;
+    uint32_t best_date = 0;
+    uint32_t best_seqno = 0;
+    for (const auto& f : files) {
+        size_t pos = f.find_last_of('/');
+        std::string name = (pos == std::string::npos) ? f : f.substr(pos + 1);
+        if (name.size() < 12) continue;
+        if (name.compare(name.size() - 4, 4, ".log") != 0 &&
+            name.find(".log.") == std::string::npos) continue;
+        char* endp = nullptr;
+        unsigned long d = std::strtoul(name.c_str(), &endp, 10);
+        if (endp == name.c_str() || d == 0) continue;
+        uint32_t date = static_cast<uint32_t>(d);
+        FileScanResult r = scan_one(inst, f, /*repair=*/false);  // 只评估,不修复
+        if (!r.ok) continue;
+        if (date > best_date || (date == best_date && r.seqno > best_seqno)) {
+            best = f; best_date = date; best_seqno = r.seqno;
+        }
+    }
+    return best;
+}
 
 // ---- 对外实现 ----
 
@@ -618,28 +616,28 @@ bool append_block(Instance* inst,
     uint32_t yyyymmdd = 0, hhmmss = 0;
     inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
     std::string path = make_log_path(inst->log_dir, yyyymmdd, 0);
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    int fd = inst->pal->file_open(path.c_str(), true, true);
     if (fd < 0) return false;
     // 若是新建文件,先写 32B 头
-    struct stat st;
-    if (::fstat(fd, &st) != 0) { ::close(fd); return false; }
+    int64_t sz = inst->pal->file_size(fd);
+    if (sz < 0) { inst->pal->file_close(fd); return false; }
     uint8_t salt[8];
     if (file_salt) std::memcpy(salt, file_salt, 8);
-    if (st.st_size == 0) {
+    if (sz == 0) {
         if (!write_file_header(inst, fd, yyyymmdd, inst->kid, salt)) {
-            ::close(fd); return false;
+            inst->pal->file_close(fd); return false;
         }
     } else {
         if (file_salt) {
             // 用 caller 提供的 salt 校验;不一致则报错(防止调用方用错)
             uint8_t on_disk[8];
-            if (::pread(fd, on_disk, 8, 12) != 8) { ::close(fd); return false; }
-            if (std::memcmp(on_disk, salt, 8) != 0) { ::close(fd); return false; }
+            if (inst->pal->file_pread(fd, on_disk, 8, 12) != 8) { inst->pal->file_close(fd); return false; }
+            if (std::memcmp(on_disk, salt, 8) != 0) { inst->pal->file_close(fd); return false; }
         }
     }
     BlockWriteResult wr = write_and_record(inst, fd, raw_block, raw_len,
                                            seqno, flag, salt, nullptr);
-    ::close(fd);
+    inst->pal->file_close(fd);
     if (!wr.ok) return false;
     if (out_block_start_offset) *out_block_start_offset = wr.start_offset;
     if (out_block_end_offset)   *out_block_end_offset   = wr.end_offset;
@@ -653,7 +651,7 @@ std::string current_log_path(Instance* inst, uint32_t yyyymmdd, uint8_t split_no
 void retention_cleanup(Instance* inst) { retention_cleanup_impl(inst); }
 
 FileScanResult scan_append_target(Instance* inst, const std::string& hint_path) {
-    return scan_one(inst, hint_path);
+    return scan_one(inst, hint_path, /*repair=*/true);
 }
 
 void* flusher_main(void* arg) {
@@ -674,9 +672,7 @@ void flush_blocking(Instance* inst) {
         if (bytes == 0) break;
         // 主动再 wake 一次
         inst->pal->ev_signal(inst->flush_event);
-        struct timespec ts{};
-        ts.tv_nsec = 5 * 1000 * 1000;  // 5ms
-        ::nanosleep(&ts, nullptr);
+        inst->pal->sleep_ms(5);
     }
 }
 

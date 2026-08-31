@@ -34,10 +34,18 @@ public:
     /* 循环处理短写,返回写入字节数;失败 -1。 */
     virtual long file_write(int fd, const void* buf, size_t len) = 0;
     virtual long file_pwrite(int fd, const void* buf, size_t len, uint64_t offset) = 0;
+    /* 循环处理短读(从 offset 起),返回读到的字节数;失败 -1。 */
+    virtual long file_pread(int fd, void* buf, size_t len, uint64_t offset) = 0;
+    /* 文件当前大小(fd);失败 -1。 */
+    virtual int64_t file_size(int fd) = 0;
+    /* 路径对应文件大小;失败 -1。 */
+    virtual int64_t file_size_path(const char* path) = 0;
     virtual int  file_fsync(int fd) = 0;            /* fdatasync(fd) - 仅数据,不要元数据 */
     virtual int  file_dir_fsync(const char* dir_path) = 0;  /* 目录项 fsync */
     virtual int  file_unlink(const char* path) = 0;
     virtual int  file_mkdirs(const char* dir_path) = 0;
+    /* 删除空目录(测试/清理用);失败 -1。 */
+    virtual int  file_rmdir(const char* dir_path) = 0;
 
     /* 列出 dir 下所有条目(不含子目录);返回完整路径列表。 */
     virtual std::vector<std::string> file_list(const char* dir_path) = 0;
@@ -76,6 +84,8 @@ public:
     virtual uint64_t monotonic_ns() = 0;
     virtual uint64_t wallclock_ms() = 0;          /* yyyyMMdd HHmmss 字段分离用 */
     virtual void     wallclock_date(uint32_t* yyyymmdd, uint32_t* hhmmss) = 0;
+    /* 休眠 ms(flush 同步自旋 / 重试退避用)。 */
+    virtual void     sleep_ms(uint32_t ms) = 0;
 
     /* ---- 进程 / 线程标识(进格式化) ---- */
     virtual uint32_t pid() = 0;

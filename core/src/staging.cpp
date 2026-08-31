@@ -147,10 +147,15 @@ bool Staging::open(RecoveryState* state, bool* recovered) {
     Header h;
     AppendTargetCache t;
     if (!pick_header(&h, &t)) {
-        // 双 Header 均坏:整区清零重建;上层把 seqno 接到文件 max(seqno)。
+        // 双 Header 均坏:Header 区全零 = 全新文件(从未提交过 Header),
+        // 按全新启动处理;否则整区重建,seqno 由上层接管文件 max(seqno)。
+        bool fresh = true;
+        for (uint32_t i = 0; i < kHeaderTotal; ++i) {
+            if (base_[i] != 0) { fresh = false; break; }
+        }
         wipe_all_locked();
         std::memset(state, 0, sizeof(*state));
-        state->rebuilt = true;
+        state->rebuilt = !fresh;
         *recovered = true;
         return true;
     }
@@ -221,11 +226,12 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total)
         // 检查空闲是否够放下 PAD + 本条
         if (free < pad + total) return WriteStatus::kFull;
         if (pad >= 6) {
-            // 写入 1..n 条 LGXP PAD,占满至环尾;每条 ≤ 20KB payload。
+            // 写入 LGXP PAD 占满至环尾:可连续多条,每条 = 6B 头 + payload(≤ 20KB);
+            // payload = 剩余字节 - 6,保证不越界。
             uint32_t pos = w;
             while (pos < data_size_) {
-                uint32_t this_pad = std::min<uint32_t>(20 * 1024, data_size_ - pos);
-                // 构造单条 PAD:6B 头 + this_pad 字节零 payload
+                uint32_t remain = data_size_ - pos;
+                uint32_t this_pad = std::min<uint32_t>(20 * 1024, remain - 6);
                 uint8_t header[6];
                 put_u16(header + 0, static_cast<uint16_t>(this_pad));
                 put_u16(header + 2, kMagicPad);
@@ -239,7 +245,6 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total)
         } else {
             // pad < 6:无记录可写,留零回绕;消费侧按"距段尾 <6B 跳过"。
             // 此时原 [w, data_size_) 全零,直接 w = 0。
-            // 注意:不留零的写法(std::memset)在这里是 no-op,因为本来就是零。
             w = 0;
         }
         // 重新计算 free(没变,但 w 改了)
@@ -299,6 +304,7 @@ void Staging::zero_range_locked(uint32_t f, uint32_t bytes) {
 
 bool Staging::debug_check_invariant(uint32_t f, uint32_t w) const {
     // 任意字节 [0, data_size_) 若不在 [f, w) 区间内,必须为 0。
+    // 跨回绕时活跃区 = [f, size) ∪ [0, w):需检查 [w, f) 与 [f+len1, size)。
     uint32_t len1, off1, len2, off2;
     if (w >= f) {
         len1 = w - f; off1 = f;
@@ -307,16 +313,14 @@ bool Staging::debug_check_invariant(uint32_t f, uint32_t w) const {
         len1 = data_size_ - f; off1 = f;
         len2 = w;              off2 = 0;
     }
-    // 检查 [0, off1)
-    for (uint32_t i = 0; i < off1; ++i) {
+    // 检查 [len2, off1)(跨回绕时跳过活跃的 [0, w) 段)
+    for (uint32_t i = len2; i < off1; ++i) {
         if (data_base_[i] != 0) return false;
     }
     // 检查 [off1 + len1, data_size_)
     for (uint32_t i = off1 + len1; i < data_size_; ++i) {
         if (data_base_[i] != 0) return false;
     }
-    // 第二段 [off2, off2 + len2) 同理,off2 == 0,len2 == 0(已经检查过)
-    // 不重复
     (void)len2; (void)off2;
     return true;
 }

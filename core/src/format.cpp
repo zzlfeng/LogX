@@ -176,9 +176,14 @@ bool parse_record(const uint8_t* recs, uint32_t recs_len,
         uint16_t magic = recs[pos + 2] | (uint16_t(recs[pos + 3]) << 8);
         uint8_t flags = recs[pos + 4];
         uint8_t cksum = recs[pos + 5];
-        if (magic != kMagicEntry) return false;
         if (recs_len - pos < uint32_t(kHeaderLen + len)) return false;
         const uint8_t* payload = recs + pos + kHeaderLen;
+        if (magic == kMagicPad) {
+            // PAD:不产出内容,直接跳过(分片跨 PAD 仍视为连续)
+            pos += kHeaderLen + len;
+            continue;
+        }
+        if (magic != kMagicEntry) return false;
         if (cksum1(payload, len) != cksum) return false;
         bool is_first = (flags & 0x01) != 0 && (flags & 0x02) == 0;   // 01
         bool is_mid   = (flags & 0x01) == 0 && (flags & 0x02) != 0;   // 10

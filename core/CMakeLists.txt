@@ -12,15 +12,22 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-add_library(logx_core STATIC
+set(LOGX_CORE_SOURCES
     src/staging.cpp
     src/codec.cpp
     src/flusher.cpp
     src/recovery.cpp
     src/format.cpp
-    src/pal_posix.cpp
     src/logx_c.cpp
 )
+# PAL 按平台选择:Windows 用 pal_win32,其余(Android/Linux/macOS)用 pal_posix。
+if(WIN32)
+    list(APPEND LOGX_CORE_SOURCES src/pal_win32.cpp)
+else()
+    list(APPEND LOGX_CORE_SOURCES src/pal_posix.cpp)
+endif()
+
+add_library(logx_core STATIC ${LOGX_CORE_SOURCES})
 
 target_include_directories(logx_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include

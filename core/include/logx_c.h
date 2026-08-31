@@ -75,7 +75,17 @@ typedef void (*logx_error_fn)(void* user,
                              int code,
                              const char* msg);
 
+#ifdef __cplusplus
+}  /* extern "C" */
+
+/* C++ 侧:不透明句柄即 logx::Instance(定义见 logx_internal.h),实现方可直接转换。 */
+namespace logx { struct Instance; }
+typedef logx::Instance logx_instance_t;
+
+extern "C" {
+#else
 typedef struct logx_instance logx_instance_t;
+#endif
 
 /* ===== 生命周期 ===== */
 logx_status_e logx_open(const logx_config_t* cfg,
@@ -124,6 +134,7 @@ typedef struct logx_stats {
 void logx_get_stats(logx_instance_t* inst, logx_stats_t* out);
 
 #ifdef __cplusplus
-}
+}  /* extern "C" */
 #endif
+
 #endif /* LOGX_C_H */
