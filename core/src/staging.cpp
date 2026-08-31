@@ -9,6 +9,7 @@
 //   6. 任意时刻被 kill,撕裂条目最多一条
 
 #include "logx_staging.h"
+#include "logx_format.h"  // kMagicEntry / kMagicPad(记录头 magic)
 
 #include <algorithm>
 #include <atomic>

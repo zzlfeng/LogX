@@ -127,7 +127,8 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
         uint32_t offset = 0;
         bool first = true;
         while (offset < user_total) {
-            uint32_t slice = std::min(kMaxSlicePayload, user_total - offset);
+            uint32_t slice = static_cast<uint32_t>(
+                std::min<uint64_t>(kMaxSlicePayload, user_total - offset));
             bool is_last = (offset + slice == user_total);
             uint8_t flags = 0;
             if (first)        flags = 0x01;        // 01: 首片

@@ -194,8 +194,19 @@ struct BlockView {
     const uint8_t* tag;   // 仅加密块存在
 };
 
-// 文件头 32B。
-struct FileHeader {
+// 文件头 32B(spec §3.2),字段必须紧凑排列:MSVC 默认 4B 对齐会在
+// date/kid 前后插填充(sizeof 会变 36),GCC/Clang 同理,故显式打包。
+#if defined(_MSC_VER)
+#  define LOGX_PACKED_STRUCT  __pragma(pack(push, 1))
+#  define LOGX_PACKED_STRUCT_END __pragma(pack(pop))
+#  define LOGX_PACKED_ATTR
+#else
+#  define LOGX_PACKED_STRUCT
+#  define LOGX_PACKED_STRUCT_END
+#  define LOGX_PACKED_ATTR __attribute__((packed))
+#endif
+LOGX_PACKED_STRUCT
+struct LOGX_PACKED_ATTR FileHeader {
     uint32_t magic;       // 'LGXF'
     uint8_t  ver;
     uint8_t  flag;
@@ -205,6 +216,7 @@ struct FileHeader {
     uint8_t  reserved[8];
     uint32_t crc;         // 覆盖前 28B
 };
+LOGX_PACKED_STRUCT_END
 static_assert(sizeof(FileHeader) == 32, "FileHeader must be 32B");
 
 }  // namespace logx
