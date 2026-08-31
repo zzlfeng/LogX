@@ -1,0 +1,26 @@
+<!-- AndroidManifest.xml 排除规则片段(参见 spec §10) -->
+<!-- 把日志目录与 staging 文件一并排除出自动备份,防止云备份带走明文 staging 与密文日志 -->
+
+<!-- API 31+:用 dataExtractionRules(替代 fullBackupContent) -->
+<dataExtractionRules>
+    <cloud-backup>
+        <exclude domain="file" path="logs/" />
+        <exclude domain="file" path="logx_staging/" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="logs/" />
+        <exclude domain="file" path="logx_staging/" />
+    </device-transfer>
+</dataExtractionRules>
+
+<!-- API 30 及以下:fullBackupContent -->
+<full-backup-content>
+    <exclude domain="file" path="logs/" />
+    <exclude domain="file" path="logx_staging/" />
+</full-backup-content>
+
+<application
+    android:allowBackup="false"
+    android:fullBackupContent="@xml/backup_rules"
+    android:dataExtractionRules="@xml/data_extraction_rules"
+    ... />
