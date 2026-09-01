@@ -34,7 +34,10 @@ target_include_directories(logx_core PUBLIC
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
-    target_link_libraries(logx_core PUBLIC pthread)
+    # Android 上 pthread 并入 libc,不存在 libpthread.so;
+    # Threads::Threads 在 Android 下解析为 -pthread 编译选项而非 -lpthread。
+    find_package(Threads REQUIRED)
+    target_link_libraries(logx_core PUBLIC Threads::Threads)
 endif()
 
 # ---- 构建开关 ----

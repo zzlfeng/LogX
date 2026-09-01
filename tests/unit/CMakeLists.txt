@@ -5,7 +5,22 @@ project(logx_unit_tests CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(GTest REQUIRED)
+# 优先复用环境里已有的 Android/桌面 gtest;找不到时通过 FetchContent
+# 拉取 googletest 源码并在构建目录内交叉编译(产物不落 NDK,不污染 NDK)。
+find_package(GTest QUIET)
+if(NOT GTest_FOUND)
+    include(FetchContent)
+    message(STATUS "GTest not found, fetching googletest via FetchContent")
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.14.0
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(googletest)
+endif()
 
 add_executable(logx_unit_tests
     test_format.cpp
@@ -20,7 +35,8 @@ target_link_libraries(logx_unit_tests
     GTest::gtest_main
 )
 if(NOT WIN32)
-    target_link_libraries(logx_unit_tests PRIVATE pthread)
+    find_package(Threads REQUIRED)
+    target_link_libraries(logx_unit_tests PRIVATE Threads::Threads)
 endif()
 target_include_directories(logx_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/../core/include

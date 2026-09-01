@@ -26,3 +26,13 @@ if(LOGX_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests/unit)
 endif()
+
+# NDK/Android 交叉编译时:把 JNI 胶水层编进 liblogx.so。
+# 桌面/其他平台(ANDROID 未定义)保持纯静态库,不受影响。
+if(ANDROID)
+    add_library(logx SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/android/cpp/logx_jni.cpp
+    )
+    target_link_libraries(logx PRIVATE logx_core)
+    # jni.h / android/log.h 由 NDK 提供,无需手动指定
+endif()

@@ -34,14 +34,16 @@ public:
     Event() { pthread_mutex_init(&mu_, nullptr); pthread_cond_init(&cv_, nullptr); signaled_ = false; }
     ~Event() { pthread_cond_destroy(&cv_); pthread_mutex_destroy(&mu_); }
     void signal_one() {
-        std::lock_guard<pthread_mutex_t> lk(mu_);
+        ::pthread_mutex_lock(&mu_);
         signaled_ = true;
-        pthread_cond_signal(&cv_);
+        ::pthread_cond_signal(&cv_);
+        ::pthread_mutex_unlock(&mu_);
     }
     void wait() {
-        std::lock_guard<pthread_mutex_t> lk(mu_);
-        while (!signaled_) pthread_cond_wait(&cv_, &mu_);
+        ::pthread_mutex_lock(&mu_);
+        while (!signaled_) ::pthread_cond_wait(&cv_, &mu_);
         signaled_ = false;
+        ::pthread_mutex_unlock(&mu_);
     }
 private:
     pthread_mutex_t mu_;
