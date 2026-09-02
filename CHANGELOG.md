@@ -117,7 +117,7 @@ cmake --build . -j
 |---|---|
 | `build-android/core/liblogx_core.a` | core 静态库,平台分支自动走 `pal_posix.cpp` |
 | `build-android/liblogx.so` | 新增 SHARED 目标:JNI 胶水层 + core,导出 4 个 JNI 符号(`nativeInit`/`nativeClose`/`nativeWrite`/`nativeFlush`),依赖 `libc++_shared` |
-| `build-android/tests/unit/logx_unit_tests` | Android 可执行文件(gtest 经 FetchContent 交叉编译) |
+| `build-android/tests/unit/logx_unit_tests` | Android 可执行文件(gtest 经 FetchContent 交叉编译),已在 Redmi K30 Pro 真机通过 21/21 |
 
 ### 构建命令
 
@@ -152,8 +152,8 @@ cmake --build build-android -j
 - `ctest -C Release`:**21/21 单测通过**(100%)
 - 注意:Windows 下需用 Release 配置构建
   (`cmake --build . -j --config Release`),原因见下
-- Android / NDK 29.0.14206865 / arm64-v8a:**交叉编译全绿**
-  (`.a` + `.so` + 单测可执行文件均产出;单测未在设备/模拟器上运行,见"五"构建相关第 5 条)
+- Android / NDK 29.0.14206865 / arm64-v8a:**交叉编译全绿**,单测在 Redmi K30 Pro
+  (arm64-v8a) 真机运行 **21/21 通过**(5 个套件,5ms 总耗时)
 
 ---
 
@@ -171,11 +171,15 @@ cmake --build build-android -j
    `pal_posix` 与 `pal_win32` 已按新增接口对齐)。
 4. **git autocrlf**:Windows 上提交时提示 LF→CRLF(默认 `core.autocrlf=true`)。
    如需统一 LF,可配 `core.autocrlf=false` 或加 `.gitattributes`。
-5. **Android 单测未在设备运行**:交叉编译出的 `logx_unit_tests` 需真机/模拟器执行,
-   当前环境无设备未运行。运行方式:
+5. ~~**Android 单测未在设备运行**~~(2026-09-02 已解决):交叉编译出的
+   `logx_unit_tests` 已在 Redmi K30 Pro(arm64-v8a) 真机运行,21/21 通过。
+   运行方式(已验证):
    `adb push build-android/tests/unit/logx_unit_tests /data/local/tmp/ &&
-    adb shell /data/local/tmp/logx_unit_tests`。
-   同时有 3 处无害 unused 警告(`recovery.cpp`/`format.cpp`),不影响产物。
+    adb push $NDK/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/
+    aarch64-linux-android/libc++_shared.so /data/local/tmp/ &&
+    adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ./logx_unit_tests"`
+   (c++_shared 产物运行时需同目录提供 `libc++_shared.so`)。同时有 3 处无害
+   unused 警告(`recovery.cpp`/`format.cpp`),不影响产物。
 
 ### 设计/实现遗留(README §"已知未完成项"的延续)
 
