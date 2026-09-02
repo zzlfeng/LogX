@@ -1,21 +1,28 @@
 package com.example.logx
 
+import android.app.ActivityManager
+import android.app.Application
 import android.content.Context
+import android.os.Build
+import android.os.Process
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * LogX Kotlin Facade.
  *
- * 与 spec §7 的 Kotlin API 对齐;JNI 层只做转发,本类负责:
- *   - 参数装/拆(目录、压缩算法、加密开关、KID、KeyProvider 桥)
+ * 与 spec §7 的 Kotlin API (v5) 对齐; JNI 层只做转发, 本类负责:
+ *   - 参数装/拆 (目录、压缩算法、加密开关、KID、KeyProvider 桥)
+ *   - 多进程 Safe-by-Default 自动按进程名隔离子目录与 staging 文件
  *   - 进程内单例 + 重复 init 抛 IllegalStateException
- *   - export 临时文件路径(filesDir 系,禁 cacheDir 与外部存储)
+ *   - export 临时文件路径 (filesDir 系, 禁 cacheDir 与外部存储) 配合协程自动生命周期管理
  *
  * 注意:
- *   - 单条日志上限 64KB(格式化后);超过被丢弃 + 打点。
+ *   - 单条日志上限 64KB (格式化后); 超过被丢弃 + 打点。
  *   - 首次 init 之前调用任何写接口一律丢弃 + 计数。
- *   - KeyProvider 返回 null → 该 KID 不可解,export 跳过该文件但不中断。
+ *   - KeyProvider 返回 null → 该 KID 不可解, export 跳过该文件但不中断。
  */
 object LogX {
 
@@ -29,17 +36,17 @@ object LogX {
         fun onError(kind: EventKind, code: Int, message: String)
     }
     fun interface KeyProvider {
-        /** 返回 32B 裸密钥;null = 该 KID 不可解。不得重入 LogX。 */
+        /** 返回 32B 裸密钥; null = 该 KID 不可解。不得重入 LogX。 */
         fun getKey(kid: Int): ByteArray?
     }
     fun interface ExportCallback {
-        /** 返回 0 = 已成功接收并取走;非 0 = 业务侧处理失败。 */
+        /** 返回 0 = 已成功接收并取走; 非 0 = 业务侧处理失败。 */
         fun onExport(date: String, plaintextPath: String, size: Long): Int
     }
 
     data class Config(
         val logDir: File,
-        val stagingDir: File,           // 单 staging 文件名固定 = logx_staging.bin
+        val stagingDir: File,
         val level: Level = Level.I,
         val retentionDays: Int = 7,
         val maxFileSize: Long = 10L * 1024 * 1024,
@@ -49,6 +56,7 @@ object LogX {
         val encrypt: Boolean = false,
         val kid: Int = 1,
         val keyProvider: KeyProvider? = null,
+        val autoProcessIsolation: Boolean = true, // 默认开启多进程目录防呆隔离
     )
 
     @Volatile private var nativeHandle: Long = 0L
@@ -58,31 +66,55 @@ object LogX {
     @Synchronized
     fun init(context: Context, config: Config) {
         if (initCount.incrementAndGet() != 1L) {
-            // 重复 init:抛 IllegalStateException(参见 spec §7)。
+            // 重复 init: 抛 IllegalStateException (参见 spec §7)。
             throw IllegalStateException("LogX.init called more than once")
         }
-        val logDir = config.logDir.apply { mkdirs() }
-        val stagingDir = config.stagingDir.apply { mkdirs() }
-        val stagingFile = File(stagingDir, "logx_staging.bin")
-        // staging 必须 filesDir 系;禁 cacheDir(系统清理会让 mmap 变孤儿,见 spec §10)
+
+        val suffix = if (config.autoProcessIsolation) getProcessSuffix(context) else ""
+        val targetLogDir = if (suffix.isEmpty()) config.logDir else File(config.logDir.parentFile, "${config.logDir.name}_$suffix")
+        val targetStagingDir = if (suffix.isEmpty()) config.stagingDir else File(config.stagingDir.parentFile, "${config.stagingDir.name}_$suffix")
+
+        val logDir = targetLogDir.apply { mkdirs() }
+        val stagingDir = targetStagingDir.apply { mkdirs() }
+        val stagingFileName = if (suffix.isEmpty()) "logx_staging.bin" else "logx_staging_$suffix.bin"
+        val stagingFile = File(stagingDir, stagingFileName)
+
+        // staging 必须 filesDir 系; 禁 cacheDir (系统清理会让 mmap 变孤儿, 见 spec §10)
         require(!stagingDir.absolutePath.contains("/cache/")) {
             "staging dir must not be in cacheDir"
         }
         require(config.maxLogLength < 128 * 1024 - 128 - 1) {
             "maxLogLength must be < (dataSize - 1) = 130943"
         }
+
         nativeHandle = nativeInit(
             logDir.absolutePath,
             stagingFile.absolutePath,
             config.compress.algo.toInt(),
             if (config.encrypt) 1 else 0,
             config.kid,
-            // KeyProvider 桥接:传 null,M3 阶段补全(JNI 全局引用 + trampoline)。
+            // KeyProvider 桥接: 传 null, M3 阶段补全 (JNI 全局引用 + trampoline)。
             null,
         )
         if (nativeHandle == 0L) {
             initCount.set(0)
             throw IllegalStateException("LogX native init failed")
+        }
+    }
+
+    private fun getProcessSuffix(context: Context): String {
+        val processName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Application.getProcessName()
+        } else {
+            val pid = Process.myPid()
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            am?.runningAppProcesses?.firstOrNull { it.pid == pid }?.processName ?: ""
+        }
+        val pkgName = context.packageName
+        return when {
+            processName.isEmpty() || processName == pkgName -> ""
+            processName.startsWith("$pkgName:") -> processName.removePrefix("$pkgName:")
+            else -> processName.replace("[^a-zA-Z0-9_]".toRegex(), "_")
         }
     }
 
@@ -97,26 +129,50 @@ object LogX {
 
     fun log(level: Level, tag: String, payload: ByteArray) {
         val h = nativeHandle
-        if (h == 0L) return  // pre-init 调用:丢弃 + 原子计数(参见 spec §7)
+        if (h == 0L) return  // pre-init 调用: 丢弃 + 原子计数 (参见 spec §7)
         nativeWrite(h, level.v, tag, payload)
     }
 
-    /** 阻塞至 staging 全部落块提交。退后台 / onStop 调用。 */
+    /** 阻塞至进入时刻的目标水位落盘提交。退后台 / onStop 调用。 */
     fun flush() {
         val h = nativeHandle; if (h == 0L) return
         nativeFlush(h)
     }
 
     /**
-     * 按日期范围导出。from/to = yyyyMMdd 闭区间;明文临时文件写在 filesDir 下独立
-     * 临时目录(禁外部存储、禁 cacheDir);回调返回或抛出后立即删除。
+     * 按日期范围导出 (回调模式)。from/to = yyyyMMdd 闭区间;
+     * 明文临时文件写在 filesDir 下独立临时目录 (禁外部存储、禁 cacheDir); 回调返回或抛出后立即删除。
      */
     fun export(from: String, to: String, cb: ExportCallback): Int {
         val h = nativeHandle; if (h == 0L) return -1
         return nativeExport(h, from, to, cb)
     }
 
-    // ---- native 绑定(JNI 实现见 android/cpp/logx_jni.cpp) ----
+    /**
+     * 协程化导出 (推荐): 自动处理 flush、解密导出与临时文件生命周期管理。
+     */
+    suspend fun export(from: String, to: String, block: suspend (File) -> Unit): Int = withContext(Dispatchers.IO) {
+        val h = nativeHandle
+        if (h == 0L) return@withContext -1
+        var result = 0
+        nativeExport(h, from, to) { _, plaintextPath, _ ->
+            val tempFile = File(plaintextPath)
+            try {
+                kotlinx.coroutines.runBlocking {
+                    block(tempFile)
+                }
+                0
+            } catch (e: Throwable) {
+                result = -1
+                -1
+            } finally {
+                if (tempFile.exists()) tempFile.delete()
+            }
+        }
+        result
+    }
+
+    // ---- native 绑定 (JNI 实现见 android/cpp/logx_jni.cpp) ----
     @JvmStatic private external fun nativeInit(
         logDir: String, stagingPath: String,
         compressAlgo: Int, encryptEnable: Int, kid: Int, keyProvider: Any?,

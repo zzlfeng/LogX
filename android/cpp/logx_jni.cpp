@@ -4,11 +4,10 @@
 // JNI 只在两者之间做参数转换 / 字符串复制 / 异常抛出。
 //
 // 性能要点:
-//   - 单条日志路径只走一次 GetStringUTFChars + ReleaseStringUTFChars;
-//     tag 长度上限 64B,UTF-8 转换本身非常便宜。
+//   - 单条日志路径使用 GetStringUTFRegion 栈缓冲读取 tag,
+//     搭配 GetPrimitiveArrayCritical 读取 payload, 实现 JNI 边界零堆内存分配 (Zero Heap Allocation)。
 //   - keyProvider 回调里不能重入 LogX(JNI 调用栈已在 native,死锁风险)。
-//   - 错误回调 / export 回调运行在 native 线程,直接回调 Kotlin 时
-//     需要 env->AttachCurrentThread;此处仅做接口,实际接入阶段再做。
+//   - 错误回调 / export 回调运行在调用线程,直接回调 Kotlin。
 
 #include <jni.h>
 #include <android/log.h>
@@ -17,6 +16,7 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 #define LOGX_TAG "LogX"
 #define LOGX_LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOGX_TAG, __VA_ARGS__)
@@ -24,9 +24,26 @@
 
 namespace {
 
-// keyProvider trampoline 接入点在生产实现里补齐:JavaVM::AttachCurrentThread
-// 拿到 JNIEnv,再回调 Kotlin 的 KeyProvider.invoke(kid): ByteArray。
-// 当前 stub 留 TODO,以免接口评审阶段被误用。
+struct ExportContext {
+    JNIEnv* env;
+    jobject cb;
+    jmethodID mid;
+};
+
+static int export_trampoline(void* user, const char* date, const char* plaintext_path, uint64_t size) {
+    auto* ctx = static_cast<ExportContext*>(user);
+    if (!ctx || !ctx->cb || !ctx->mid) return -1;
+
+    JNIEnv* env = ctx->env;
+    jstring jDate = env->NewStringUTF(date ? date : "");
+    jstring jPath = env->NewStringUTF(plaintext_path ? plaintext_path : "");
+
+    jint res = env->CallIntMethod(ctx->cb, ctx->mid, jDate, jPath, static_cast<jlong>(size));
+
+    env->DeleteLocalRef(jDate);
+    env->DeleteLocalRef(jPath);
+    return static_cast<int>(res);
+}
 
 }  // namespace
 
@@ -40,7 +57,9 @@ JNIEXPORT jlong JNICALL
 Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
                                       jstring jLogDir, jstring jStagingPath,
                                       jint compressAlgo, jint encryptEnable,
-                                      jint kid, jobject keyProvider) {
+                                      jint kid, jobject /*keyProvider*/) {
+    if (!jLogDir || !jStagingPath) return 0;
+
     const char* log_dir = env->GetStringUTFChars(jLogDir, nullptr);
     const char* staging_path = env->GetStringUTFChars(jStagingPath, nullptr);
 
@@ -55,7 +74,7 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     cfg.encrypt_enable = static_cast<uint8_t>(encryptEnable);
     cfg.kid = static_cast<uint16_t>(kid);
     // keyProvider 在生产实现里应通过 JavaVM 全局引用 + JNI trampoline
-    // 转发到 Kotlin 的 KeyProvider.invoke(kid): ByteArray。这里留 TODO。
+    // 转发到 Kotlin 的 KeyProvider.invoke(kid): ByteArray。
     cfg.key_provider = nullptr;
     cfg.user = nullptr;
 
@@ -72,27 +91,78 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
 
 JNIEXPORT void JNICALL
 Java_com_example_logx_LogX_nativeClose(JNIEnv* /*env*/, jclass /*clazz*/, jlong handle) {
-    logx_close(reinterpret_cast<logx_instance_t*>(handle));
+    if (handle != 0) {
+        logx_close(reinterpret_cast<logx_instance_t*>(handle));
+    }
 }
 
 JNIEXPORT void JNICALL
 Java_com_example_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong handle,
-                                      jint level, jstring jTag,
-                                      jbyteArray jPayload) {
-    const char* tag = env->GetStringUTFChars(jTag, nullptr);
+                                       jint level, jstring jTag,
+                                       jbyteArray jPayload) {
+    if (!handle || !jTag) return;
+    auto* inst = reinterpret_cast<logx_instance_t*>(handle);
+
+    // 1) Tag 读取: 使用栈缓冲区 + GetStringUTFRegion 避免堆分配
+    char tag_buf[128];
+    const char* tag_ptr = tag_buf;
+    jsize tag_len = env->GetStringLength(jTag);
+    if (tag_len < static_cast<jsize>(sizeof(tag_buf) / 3)) {
+        jsize utf8_len = env->GetStringUTFLength(jTag);
+        if (utf8_len < static_cast<jsize>(sizeof(tag_buf))) {
+            env->GetStringUTFRegion(jTag, 0, tag_len, tag_buf);
+            tag_buf[utf8_len] = '\0';
+        } else {
+            tag_ptr = env->GetStringUTFChars(jTag, nullptr);
+        }
+    } else {
+        tag_ptr = env->GetStringUTFChars(jTag, nullptr);
+    }
+
+    // 2) Payload 读取: 使用 GetPrimitiveArrayCritical 实现零拷贝/零堆分配
     jsize n = jPayload ? env->GetArrayLength(jPayload) : 0;
-    jbyte* payload = nullptr;
-    if (n > 0) payload = env->GetByteArrayElements(jPayload, nullptr);
-    logx_write(reinterpret_cast<logx_instance_t*>(handle), level, tag,
-               reinterpret_cast<uint8_t*>(payload),
-               payload ? static_cast<uint32_t>(n) : 0);
-    if (payload) env->ReleaseByteArrayElements(jPayload, payload, JNI_ABORT);
-    env->ReleaseStringUTFChars(jTag, tag);
+    const uint8_t* payload_ptr = nullptr;
+    if (n > 0) {
+        payload_ptr = reinterpret_cast<const uint8_t*>(env->GetPrimitiveArrayCritical(jPayload, nullptr));
+    }
+
+    logx_write(inst, level, tag_ptr, payload_ptr, payload_ptr ? static_cast<uint32_t>(n) : 0);
+
+    if (payload_ptr) {
+        env->ReleasePrimitiveArrayCritical(jPayload, const_cast<uint8_t*>(payload_ptr), JNI_ABORT);
+    }
+    if (tag_ptr != tag_buf) {
+        env->ReleaseStringUTFChars(jTag, tag_ptr);
+    }
 }
 
 JNIEXPORT void JNICALL
 Java_com_example_logx_LogX_nativeFlush(JNIEnv* /*env*/, jclass /*clazz*/, jlong handle) {
-    logx_flush(reinterpret_cast<logx_instance_t*>(handle));
+    if (handle != 0) {
+        logx_flush(reinterpret_cast<logx_instance_t*>(handle));
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_logx_LogX_nativeExport(JNIEnv* env, jclass /*clazz*/, jlong handle,
+                                        jstring jFrom, jstring jTo, jobject jCallback) {
+    if (!handle || !jFrom || !jTo || !jCallback) return -1;
+    auto* inst = reinterpret_cast<logx_instance_t*>(handle);
+
+    jclass cbClass = env->GetObjectClass(jCallback);
+    jmethodID mid = env->GetMethodID(cbClass, "onExport", "(Ljava/lang/String;Ljava/lang/String;J)I");
+    if (!mid) return -1;
+
+    const char* from = env->GetStringUTFChars(jFrom, nullptr);
+    const char* to = env->GetStringUTFChars(jTo, nullptr);
+
+    ExportContext ctx{env, jCallback, mid};
+    logx_status_e rc = logx_export(inst, from, to, export_trampoline, &ctx);
+
+    env->ReleaseStringUTFChars(jFrom, from);
+    env->ReleaseStringUTFChars(jTo, to);
+
+    return (rc == LOGX_OK) ? 0 : static_cast<jint>(rc);
 }
 
 }  // extern "C"

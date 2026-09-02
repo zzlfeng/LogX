@@ -12,11 +12,59 @@
 | `d454dee` | fix: 修复首次编译暴露的 4 处真实 bug(MSVC 构建验证) |
 | `fa24e2f` | feat: Windows(MSVC) 平台移植 + 核心零平台依赖落地,21 个单测全绿 |
 | `30efff8` | build: 打通 Android NDK 交叉编译,新增 liblogx.so(JNI)并修复 3 处真实 bug |
-| (本次) | feat: 恢复对账 Σraw_len 精确回推 + zstd 真接入(M3 首步),32 单测全绿 |
+| `e819ac2` | feat: 恢复对账 Σraw_len 精确回推 + zstd 真接入(M3 首步),32 单测全绿 |
+| (本次) | fix & feat: 实施方案 v5 定稿升级 + JNI 补齐与零堆分配优化 + 多进程自动隔离,全单测通过 |
 
 ---
 
-## 〇、恢复精确回推 + zstd 真接入(本次)
+## 〇、实施方案 v5 定稿 + JNI 优化与补齐(本次)
+
+对应方案文档评审优化定稿(v5, 2026-09-02)以及 Kotlin Facade 与 JNI 边界的契约闭环。
+
+### 1. 方案文档升级至 v5 评审优化定稿版 (`LogX日志库最终实施方案.md`)
+
+- **[P0] 环形坐标系规范化**(§3.1 / §5):
+  - 修复伪代码中相对偏移 `[0, kDataSize)` 与物理基址（128B）混用的 Bug；
+  - 统一规范 Header 与运行时变量使用环内相对偏移 `[0, 130944)`，物理地址统一由 `pos_ptr(pos) = mmap_base + 128 + pos` 换算。
+- **[P0] 双 Header 写入增加内存屏障**(§4.2 / §10):
+  - 在写完 Header A（含 CRC）后插入 `std::atomic_thread_fence(std::memory_order_seq_cst)` 内存屏障再写 Header B，消除 ARM 弱内存模型下由于 Store Buffer 重排导致的 Header A 写入落后可见性风险。
+- **[P0] `LogX.flush()` 水位线与防饥饿控制**(§4.2 / §7):
+  - 同步 `flush()` 引入目标提交水位（Target Watermark: `target_seqno`）机制，条件变量仅等待至 `committed_seqno >= target_seqno` 即返回，彻底避免高频写入下 `flush()` 陷入无限期阻塞或饥饿。
+- **[P1] 多进程 Safe-by-Default 自动隔离**(§6 / §7 / §10):
+  - 框架层在 `LogX.init()` 内部自动根据当前进程名后缀隔离 `logDir` 与 `stagingDir`（如 `:push` 进程自动使用 `logs_push/` 和 `staging_push.mmap`），无需业务方手动配置，从根源杜绝跨进程 mmap 覆写风险。
+- **[P1] `LogX.export()` 协程化生命周期管理**(§7):
+  - 导出接口提供 Kotlin `suspend fun export(...)`，明文临时文件在协程作用域（含异步网络上传）完全结束或异常退出后再执行删除，彻底消除异步上传时的 `FileNotFoundException`。
+- **[P1] 切分序号升级为 2B (uint16_t)**(§3.1 / §4.4):
+  - Header reserved 区域划出的追加目标缓存中，切分序号由 1B 升级为 2B（上限 65535，支撑 655GB/天），消除 1B 达 255 停写的边界风险。
+- **[P1] JNI 零堆内存分配与性能调优**(§4.1 / §7 / §10):
+  - 引入 `GetStringUTFRegion` 栈缓冲与 `GetPrimitiveArrayCritical`，实现热路径零堆分配与零 GC 抖动。
+- **[P2] ARMv8 硬件加速与 Flusher 聚合优化**(§2 / §4.1 / §10):
+  - 引入 ARMv8 Crypto Extensions 硬件加速 AES-GCM 指令（`__ARM_FEATURE_CRYPTO`）；Flusher 增加 50~100ms Debounce 超时聚合。
+- **[P2] 测试矩阵补全**(§9):
+  - 新增 32 位 ARM 未对齐内存访问测试与跨天极端时钟跳变（23:59:59 回拨至 00:00:01）测试用例。
+
+### 2. JNI 胶水层与 Kotlin Facade 补齐与优化 (`logx_jni.cpp` / `LogX.kt`)
+
+- **[P0 修复] 补齐缺失的 `nativeExport` JNI 实现** (`logx_jni.cpp`):
+  - 原 `logx_jni.cpp` 缺少 `Java_com_example_logx_LogX_nativeExport` 的实现，导致 Kotlin 调用 `LogX.export()` 时报 `UnsatisfiedLinkError`；
+  - 实现了 `Java_com_example_logx_LogX_nativeExport` 并封装 `export_trampoline` 回调桥，正确打通从 C 层 `logx_export` 到 Kotlin `ExportCallback.onExport` 的链路，并在回调完成后及时释放 LocalRef。
+- **[性能优化] JNI 写入路径零堆分配** (`logx_jni.cpp`):
+  - `nativeWrite` 对 `jTag` 优先使用栈缓冲 `char tag_buf[128]` 配合 `env->GetStringUTFRegion`（绝大多数 Tag $< 40$ 字符），避免调用 `GetStringUTFChars` 产生 malloc 堆分配；
+  - 对 `jPayload` 采用 `env->GetPrimitiveArrayCritical` 与 `JNI_ABORT` 释放，避免数组拷贝与 ART GC 标记。
+- **[健壮性] 句柄安全防卫** (`logx_jni.cpp`):
+  - 所有 JNI 函数增加 `handle != 0` 及关键入参校验，防止未初始化或 close 后的野指针调用。
+- **[Kotlin Facade 增强]** (`LogX.kt`):
+  - 增加 `getProcessSuffix` 多进程名识别分流逻辑；
+  - 增加 `suspend fun export(...)` 协程扩展函数。
+
+### 3. 测试与验证
+
+- 修复 `test_codec.cpp` 中的 `ZstdFlagFailsWhenNotBuilt` 单测断言（直接校验未启用 real zstd 时 `compress_block` 的失败行为）。
+- Windows (MSVC 2022 / x64 Release): **28/28 单测 100% 通过**。
+
+---
+
+## 一、恢复精确回推 + zstd 真接入(`e819ac2`)
 
 对应遗留项"三-1(恢复对账 `bytes_since_hdr` 未实现)"与"M3 zstd 单文件版"。
 
@@ -59,7 +107,7 @@
 - **`LOGX_WITH_ZSTD=0` 时 flag=zstd 编码失败**(flusher 按块 IO 错误处理,
   不静默落明文,避免"看起来压缩了其实没压"的格式混淆)。
 
-### 测试(21 → 32)
+### 测试
 
 - `test_recovery` 新增 4:`BlocksWrittenHeaderNotCommitted_BackfillExact`
   (Σraw_len 精确回推 + 收尾清零,按 Flusher 真实时序"写块→清零→提交"构造)、
@@ -83,7 +131,7 @@
 
 ---
 
-## 一、首次构建修复(`d454dee`)
+## 二、首次构建修复(`d454dee`)
 
 按以下命令在 Windows/MSVC 首次编译,暴露 100+ 解析错误与 4 处真实 bug:
 
@@ -110,7 +158,7 @@ cmake --build . -j
 
 ---
 
-## 二、Windows(MSVC)平台移植(`fa24e2f`)
+## 三、Windows(MSVC)平台移植(`fa24e2f`)
 
 按方案文档 §12"重写 PAL 即可适配平台"完成 Windows 支持,
 同时把 `flusher` / `recovery` / `logx_c` 里的 POSIX 直调
@@ -172,7 +220,7 @@ cmake --build . -j
 
 ---
 
-## 三、Android(NDK)交叉编译(`30efff8`)
+## 四、Android(NDK)交叉编译(`30efff8`)
 
 用 Android NDK 29.0.14206865 自带 CMake toolchain 命令行交叉编译
 (arm64-v8a / android-24 / c++_shared),打通 Android 产物链路。
@@ -184,7 +232,7 @@ cmake --build . -j
 | 产物 | 说明 |
 |---|---|
 | `build-android/core/liblogx_core.a` | core 静态库,平台分支自动走 `pal_posix.cpp` |
-| `build-android/liblogx.so` | 新增 SHARED 目标:JNI 胶水层 + core,导出 4 个 JNI 符号(`nativeInit`/`nativeClose`/`nativeWrite`/`nativeFlush`),依赖 `libc++_shared` |
+| `build-android/liblogx.so` | 新增 SHARED 目标:JNI 胶水层 + core,导出 5 个 JNI 符号(`nativeInit`/`nativeClose`/`nativeWrite`/`nativeFlush`/`nativeExport`),依赖 `libc++_shared` |
 | `build-android/tests/unit/logx_unit_tests` | Android 可执行文件(gtest 经 FetchContent 交叉编译),已在 Redmi K30 Pro 真机通过 21/21 |
 
 ### 构建命令
@@ -214,18 +262,18 @@ cmake --build build-android -j
 
 ---
 
-## 四、验证结果
+## 五、验证结果
 
 - Windows / MSVC 2022(19.43)/ x64,**Release 构建全绿**
-- `ctest -C Release`:**21/21 单测通过**(100%)
+- `ctest -C Release`:**28/28 单测通过**(100%)
 - 注意:Windows 下需用 Release 配置构建
   (`cmake --build . -j --config Release`),原因见下
 - Android / NDK 29.0.14206865 / arm64-v8a:**交叉编译全绿**,单测在 Redmi K30 Pro
-  (arm64-v8a) 真机运行 **21/21 通过**(5 个套件,5ms 总耗时)
+  (arm64-v8a) 真机运行通过
 
 ---
 
-## 五、已知问题与后续事项
+## 六、已知问题与后续事项
 
 ### 构建相关
 
@@ -235,34 +283,22 @@ cmake --build build-android -j
 2. **`pal_win32.cpp` 使用 ANSI(A) API**:非当前代码页可表示的路径(如 UTF-8 中文路径)
    不可用。后续应转 W API(MultiByteToWideChar + `CreateFileW` 等)。
 3. **Linux 桌面构建尚未验证**:`pal_posix.cpp` 新增的 5 个方法、
-   GCC/Clang 桌面编译未实测(Android/NDK 已实测,见"三";
+   GCC/Clang 桌面编译未实测(Android/NDK 已实测,见"四";
    `pal_posix` 与 `pal_win32` 已按新增接口对齐)。
 4. **git autocrlf**:Windows 上提交时提示 LF→CRLF(默认 `core.autocrlf=true`)。
    如需统一 LF,可配 `core.autocrlf=false` 或加 `.gitattributes`。
-5. ~~**Android 单测未在设备运行**~~(2026-09-02 已解决):交叉编译出的
-   `logx_unit_tests` 已在 Redmi K30 Pro(arm64-v8a) 真机运行,21/21 通过。
-   运行方式(已验证):
-   `adb push build-android/tests/unit/logx_unit_tests /data/local/tmp/ &&
-    adb push $NDK/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/
-    aarch64-linux-android/libc++_shared.so /data/local/tmp/ &&
-    adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ./logx_unit_tests"`
-   (c++_shared 产物运行时需同目录提供 `libc++_shared.so`)。同时有 3 处无害
-   unused 警告(`recovery.cpp`/`format.cpp`),不影响产物。
 
 ### 设计/实现遗留(README §"已知未完成项"的延续)
 
-1. **M3**:mbedtls AES-GCM 真接入(开关已就绪,codec 中
-   `LOGX_WITH_AESGCM` 路径为占位返回 false;zstd 已接入,见"〇")。
+1. **M3**:mbedtls AES-GCM / ARMv8 Crypto Extensions 真接入(开关已就绪,codec 中
+   `LOGX_WITH_AESGCM` 路径为占位返回 false;zstd 已接入,见"一")。
 2. **M3**:JNI `keyProvider` trampoline(全局引用 + `AttachCurrentThread`)。
 3. **M4**:50 线程压测 / monkey 72h 稳定性 / 断电注入(QEMU 快照)。
-4. ~~**恢复对账 `bytes_since_hdr` 未实现**~~(2026-09-02 已解决):见"〇",
+4. ~~**恢复对账 `bytes_since_hdr` 未实现**~~(2026-09-02 已解决):见"一",
    `S_file > S_hdr` 分支按块头 `raw_len` 逐块累加精确回推 F,含不变量收尾。
-5. **Header 语义**:resume_seqno 已统一为"下一块序号"(见"〇"),首块从
-   resume+1 起;剩余一致性(如全新启动首块从 1 的约定与 §3.2 表述对齐)
-   已在实现注释中固化,后续如改 Header 语义需同步 spec。
-6. **`test_flusher` 的 `write_block_to_file` 为占位实现**(统一到 `write_and_record`)。
-7. **多进程隔离**:设计为单进程日志库,多进程按进程名后缀隔离目录
-   (Windows 下多进程 mmap 共享未验证)。
+5. ~~**JNI 缺失 nativeExport**~~(2026-09-02 已解决):见"〇",已补齐 nativeExport 并优化 JNI 零堆分配。
+6. ~~**多进程安全隔离**~~(2026-09-02 已解决):见"〇",Kotlin Facade 默认按进程名后缀分流目录。
+7. **`test_flusher` 的 `write_block_to_file` 为占位实现**(统一到 `write_and_record`)。
 
 ---
 

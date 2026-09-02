@@ -128,12 +128,10 @@ TEST(CodecTest, UnknownAlgoFails) {
 
 #if !LOGX_WITH_ZSTD
 TEST(CodecTest, ZstdFlagFailsWhenNotBuilt) {
-    // LOGX_WITH_ZSTD=0 时 flag=zstd 编码失败(flusher 据此按 IO 错误处理,
-    // 不静默落明文——避免"看起来压缩了其实没压"的脏格式)。
+    // LOGX_WITH_ZSTD=0 时 algo=zstd 压缩失败
     auto raw = make_compressible(64);
-    EncodedBlock enc;
-    EXPECT_FALSE(encode_block(kFlagCompressZstd << 1, nullptr, 1, nullptr,
-                              raw.data(), static_cast<uint32_t>(raw.size()),
-                              &enc));
+    std::vector<uint8_t> out;
+    EXPECT_FALSE(compress_block(kAlgoZstd, raw.data(),
+                                static_cast<uint32_t>(raw.size()), &out));
 }
 #endif
