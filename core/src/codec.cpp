@@ -1,20 +1,22 @@
 // codec.cpp - 编解码实现。
 //
-// M1/M2 阶段(本仓库):仅实现 flag = none 的接口(zstd/AES-GCM 留 stub,见
-// LOGX_WITH_ZSTD / LOGX_WITH_AESGCM 编译开关)。
+// 压缩:none / zstd(third_party/zstd vendor 源码,LOGX_WITH_ZSTD 接入);
+// 加密:AES-256-GCM(M3 待接入,LOGX_WITH_AESGCM)。
 //
-// M3 阶段:把 zstd 单文件版 / mbedtls 子集接入,函数签名不变,文件格式不变。
-//
-// flag 字节布局:
-//   bit0       = encrypt
-//   bit1..2    = compress algo (00=none, 01=zstd, 10=zlib)
+// 降级链(spec §6):
+//   - 编码侧压缩失败 → 自动回退 flag=none 继续写(encode_block 内处理);
+//   - LOGX_WITH_ZSTD=0 时 flag=zstd 的块编码失败,调用方(flusher)报
+//     block_write_errors 并按 IO 错误处理该块;
+//   - 解码侧任何失败(帧损坏 / 内容大小超契约上限 / GCM 失败)一律 false,
+//     由调用方"宁丢不脏"丢弃该块。
 
 #include "logx_codec.h"
 
 #include <cstring>
 #include <vector>
 
-#include "logx_staging.h"  // crc32_*
+#include "logx_staging.h"  // crc32_*, kBlockMaxRaw(解压输出上限)
+#include "logx_format.h"   // kMaxRecordTotal
 
 #if LOGX_WITH_ZSTD
 extern "C" {
@@ -26,6 +28,11 @@ namespace logx {
 
 namespace {
 
+// 解压输出上限:块 raw_len 契约上限(20KB + 6B 头)。超出即视为伪造/损坏帧,
+// 拒绝分配(防 ZSTD_getFrameContentSize 声明值被坏块伪造导致的内存炸弹)。
+constexpr unsigned long long kDecompressOutputMax =
+    static_cast<unsigned long long>(kBlockMaxRaw) + 64;
+
 void make_nonce(uint32_t seqno, const uint8_t salt[8], uint8_t nonce_out[12]) {
     std::memcpy(nonce_out, salt, 8);
     // seqno 大端写 nonce 后 4B
@@ -34,10 +41,6 @@ void make_nonce(uint32_t seqno, const uint8_t salt[8], uint8_t nonce_out[12]) {
     nonce_out[10] = (seqno >> 8) & 0xff;
     nonce_out[11] = (seqno) & 0xff;
 }
-
-// 兼容桩:不在 M3 之前启用真加密,避免接口评审阶段被误用;
-// 但仍然走完整流程以便确认"接口契约 + nonce 派生 + flag 兼容"。
-// 关闭加密时走明文,打开加密但 LOGX_WITH_AESGCM=0 时直接失败(DEGRADED)。
 
 }  // namespace
 
@@ -73,6 +76,11 @@ bool decompress_block(uint8_t algo, const uint8_t* in, uint32_t in_len,
     if (algo == kAlgoZstd) {
         unsigned long long total = ZSTD_getFrameContentSize(in, in_len);
         if (total == ZSTD_CONTENTSIZE_ERROR || total == ZSTD_CONTENTSIZE_UNKNOWN) {
+            return false;
+        }
+        // 块内容大小有契约上限(kBlockMaxRaw);声明超限的帧一律拒绝,
+        // 不按声明值分配内存(损坏/伪造块防御)。
+        if (total > kDecompressOutputMax) {
             return false;
         }
         out->resize(static_cast<size_t>(total));
@@ -124,10 +132,13 @@ bool encode_block(uint8_t flag,
         return false;
     }
 
-    // 1) 压缩(若启用)
+    // 1) 压缩(若启用)。压缩失败(zstd 内部错误/资源不足)按 spec §6 降级:
+    //    flag 去掉压缩位,明文继续写,绝不因 codec 故障阻塞/丢日志。
     std::vector<uint8_t> compd;
-    if (!compress_block(comp, raw, raw_len, &compd)) {
-        return false;
+    if (comp != kAlgoNone &&
+        !compress_block(comp, raw, raw_len, &compd)) {
+        comp = kAlgoNone;
+        compd.assign(raw, raw + raw_len);
     }
 
     // 2) 加密(若启用)

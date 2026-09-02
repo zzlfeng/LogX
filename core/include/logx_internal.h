@@ -131,6 +131,11 @@ struct FileScanResult {
     bool     truncated = false;     // 是否发生过截断(为真时续写 seqno 跳 1)
     uint64_t last_block_offset = 0;
     uint64_t last_block_end_offset = 0;
+    // 对账用:k 块回溯过程中逐块累加的 raw_len 总和
+    // (= seqno ∈ (S_hdr, S_file] 各块 raw_len 之和;仅 S_file > S_hdr 分支消费)。
+    // scan 从缓存命中点续扫时只累加新读到的块,缓存命中块本身不在此列,
+    // 因此 recovery 用 last_block_offset + atc.last_block_end_offset 区间信息补齐。
+    uint64_t bytes_since_hint = 0;
     bool     ok = false;
     std::string path;              // 命中文件路径
 };
@@ -139,6 +144,16 @@ FileScanResult scan_append_target(Instance* inst, const std::string& hint_path);
 // 在 log_dir 下扫描所有日志文件,选"日期最大且尾块 seqno 最大"者作为追加目标;
 // 返回文件路径(空 = 无)。recovery 对账用。
 std::string scan_dir_for_target(Instance* inst);
+
+// k 块回溯:从 target_path 中 seqno = upto_seqno(不含)之后的第一块开始,
+// 逐块累加 raw_len 直到文件尾(最后一个有效块),返回 Σraw_len。
+// found_* 输出最后一个有效块的起止偏移;文件 IO 失败返回 false(调用方按
+// 长度异常处理)。spec §4.3 S_file > S_hdr 分支:"取 seqno ∈ (S_hdr, S_file]
+// 的块累加 raw_len,F = (F + Σraw_len) mod 数据区大小"。
+bool sum_raw_len_since(Instance* inst, const std::string& target_path,
+                       uint32_t upto_seqno, uint64_t* out_bytes,
+                       uint64_t* out_last_block_offset,
+                       uint64_t* out_last_block_end_offset);
 
 // 当前活跃日志文件的路径;按当天日期 + split_no 计算。
 std::string current_log_path(Instance* inst, uint32_t yyyymmdd, uint8_t split_no);

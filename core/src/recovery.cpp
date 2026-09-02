@@ -7,9 +7,16 @@
 // 四分支:
 //   S_file == S_hdr      -> 常规;从 F 起补刷
 //   S_file >  S_hdr      -> 块已写但 Header 未提交;Σraw_len 回推 F,剩余补刷
+//                           跨过的区间可能尚未清零,由不变量收尾补清
 //   S_file <  S_hdr      -> 文件尾损坏;截到 S_file,丢失打点,续写 seqno 跳 1
 //   文件缺失/长度异常    -> 信任 header,重刷 staging
 // 双 Header 均损坏       -> 整区重建,新 seqno = 文件 max(seqno)
+//
+// seqno 生命周期注记(CHANGELOG 遗留项 5):resume_seqno 统一取"下一块序号"。
+// 写入路径(Flusher)以 cur_seqno + 1 作为首块 seqno,故此处:
+//   无任何已落盘块        -> resume = 0,首块从 1 开始
+//   常规续写              -> resume = max(S_hdr, S_file),首块 = max + 1
+//   截断后续写(跳 1 空隙)-> resume = max + 1,首块 = max + 2(spec §3.2 防 nonce 重用)
 
 #include "logx_internal.h"
 
@@ -103,39 +110,14 @@ uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
     return pos;
 }
 
-// 把"环形扫描后的写入指针"映射回环坐标。
-// raw 是 [F, total) 一维连续区间;F 是环坐标;W = F + (valid_end - F)
-// 实际环坐标 = (F + valid_end - F) % size = (F + delta) % size = raw 内部坐标 + F;
-// 但 raw 内部坐标已经是 (valid_end),所以环坐标 = valid_end(因为 raw 起点 = F)。
-// 撕裂尾巴长度(用环坐标表示)按环 wrap 计算即可。
-void finalize_invariant(Instance* inst,
-                        uint32_t f, uint32_t raw_total,
-                        uint32_t valid_end, uint32_t truncated_tail) {
-    uint32_t size = inst->staging->data_size();
-    (void)f; (void)raw_total;
-    // 把撕裂尾巴 [valid_end, valid_end + truncated_tail) 清零
-    if (truncated_tail > 0) {
-        inst->staging->zero_range_locked(valid_end, truncated_tail);
-    }
-    // 提交新 Header:seqno 已经在 run_recovery 中递增过;此处只刷新 write_pos。
-    uint32_t cur_seqno = get_u32(inst->staging->raw_base() + 8);
-    uint32_t cur_f = get_u32(inst->staging->raw_base() + 12);
-    // write_pos = valid_end(它是 staging 内的字节偏移)。
-    AppendTargetCache atc{};
-    std::memcpy(&atc, inst->staging->raw_base() + 20, sizeof(atc));
-    inst->staging->commit_header_locked(cur_seqno, cur_f, valid_end, &atc);
-}
-
 // 启动 k 块回溯对账(在 run_recovery 中调用)。
 // 返回:
 //   S_file          : 文件最后有效块 seqno
 //   file_truncated  : 文件发生过截断(影响续写 seqno)
-//   bytes_since_hdr : Σraw_len,从 F 推进到 f_target 用的字节数
-//   target_path     : 命中的文件路径(用于回写 atc)
+//   target_path     : 命中的文件路径(用于 k 块回溯与回写 atc)
 struct ReconcileResult {
     uint32_t S_file = 0;
     bool     file_truncated = false;
-    uint32_t bytes_since_hdr = 0;
     std::string target_path;
 };
 
@@ -206,70 +188,76 @@ void run_recovery(Instance* inst) {
         }
     }
 
-    // 3) 决定 S_hdr / S_file / bytes_since_hdr / 是否截断
+    // 3) 决定 S_hdr / S_file / Σraw_len 回推 / 是否截断
     uint32_t S_hdr = hdr.seqno;
     uint32_t F = hdr.flushed_len;
     uint32_t seqno_file = rec.S_file;
     bool truncated = rec.file_truncated;
 
-    uint32_t f_target = F;
-    uint32_t seqno_next = S_hdr;
+    uint32_t size = inst->staging->data_size();
+
+    // 防御:撕裂写可能让 Header 的裸 write_pos / flushed_len 越界(mmap 页内
+    // 部分写入),越界坐标一律当 0 处理(整区零态),宁丢不脏。
+    if (F >= size) F = 0;
+    uint32_t F_orig = F;  // 回推前的 flushed_len(不变量收尾清零 [F_orig, F) 用)
+    uint32_t w_raw = get_u32(inst->staging->raw_base() + 16);
+    uint32_t w = (w_raw < size) ? w_raw : 0;
+
+    // 跨过区间(S_file > S_hdr 分支)由 F_orig → F 的推进体现,不变量收尾
+    // 按坐标差清零。
 
     if (seqno_file == S_hdr) {
         // 常规:无需回推 F
-        f_target = F;
-        seqno_next = S_hdr;
     } else if (seqno_file > S_hdr) {
-        // 块已写 Header 未提交:按 raw_len 累加回推 F
-        // 这里需要把 hdr 缓存里 atc.last_block_offset / last_block_end_offset 用上。
-        // 但 raw_len 的 Σ 实际由文件扫描给出(已被 Flusher 在每块 commit 时记录);
-        // 我们以 sr.last_block_offset 和 sr.last_block_end_offset 计算被跨过区间:
-        // 它对应的 staging raw_len 总和 = (last_block_end_offset_in_file - file_start)
-        //   = last_block_end_offset - (32 + Σ(prev_block_size))
-        // 但 simpleperf 实现里我们已可信任 last_block_end_offset,而回推 F 更直接的
-        // 方式:在 commit 时同时把 raw_len 写到 atc.last_block_* 上,这里就只能
-        // 退化为"按 append_block 写盘前我们已记录的 raw_len 总和"。
-        // 简化:由 atc.last_block_offset / last_block_end_offset 反推 staging 跨过区间
-        // (spec 思路:这是块已落盘但 Header 未提交,staging 的 [F, ?) 等于这些块的 raw_len 总和)。
-        // 我们的实现在 commit 时不持久化 raw_len 总和;此处采用近似:直接用
-        // (bytes_since_hdr 字段,以后可加进 atc 缓存)。目前恢复窗口很小,
-        // 退化路径:信任 sr.seqno + 0 跨过;留 TODO 接 raw_len 累计。
-        // 占位:bytes_since_hdr = 0;把 staging 当作"未跨过";Flusher 下一轮
-        // 会从 F 开始 drain,原始 bytes 已经在文件中。
-        f_target = F;
-        seqno_next = seqno_file;
-        // 不清零:文件已持有该块,后续 drain 不重复处理。
-        emit_event(inst, LOGX_EV_RECOVERY, -1,
-                   "blocks written but header not committed; trusting file seqno");
-    } else if (seqno_file < S_hdr) {
-        // 文件尾损坏:截到最后有效块,丢失打点
-        f_target = F;
-        seqno_next = S_hdr;
+        // 块已写入但 Header 未提交(spec §4.3):
+        //   取 seqno ∈ (S_hdr, S_file] 的块累加 raw_len,F = (F + Σraw_len) mod size,
+        //   seqno = S_file;剩余部分由环形扫描 + 补刷处理。
+        // raw_len 是块头自描述字段(§3.2),这些块由 Flusher 从 staging
+        // [旧 F, …) 顺序写出,Σraw_len 即精确跨过跨度,无需依赖 atc 缓存
+        // (缓存为空的"首块未提交"场景同样成立,不能退化为重复补写)。
+        uint64_t sum = 0, blk_off = 0, blk_end = 0;
+        if (sum_raw_len_since(inst, rec.target_path, S_hdr,
+                              &sum, &blk_off, &blk_end) && sum > 0) {
+            F = static_cast<uint32_t>((static_cast<uint64_t>(F) + sum) % size);
+        } else {
+            // 回溯失败(IO 错误 / 文件内无更后继的完整块):退化为信任文件 seqno
+            emit_event(inst, LOGX_EV_RECOVERY, -1,
+                       "blocks written but header not committed; trusting file seqno");
+        }
+        // 本分支跨过的区间可能尚未清零(崩溃落在 §4.2 第 4→5 步之间),
+        // 由下方不变量收尾统一补清。
     }
 
-    // 文件尾被截断:无论 S_file 与 S_hdr 大小关系都打点(丢失 ≥ 1 块;
-    // S_file == S_hdr 时也可能发生——文件里恰好只有已提交块 + 半块尾巴)。
-    if (truncated) {
+    // 文件尾被截断(S_file < S_hdr):无论文件尾是否"干净"(断电丢块时
+    // fdatasync 缺席,文件以完整块结尾、无撕裂痕迹),丢失都必须打点;
+    // 只有 truncated(撕裂半块被截)时才额外 +1 兜底计数。
+    if (S_hdr > seqno_file) {
+        uint32_t lost = S_hdr - seqno_file;
+        inst->truncated_blocks.fetch_add(lost);
+        if (truncated) {
+            emit_event(inst, LOGX_EV_RECOVERY, -1, "appended file tail truncated");
+        }
+    } else if (truncated) {
         emit_event(inst, LOGX_EV_RECOVERY, -1, "appended file tail truncated");
-        inst->truncated_blocks.fetch_add(std::max<uint32_t>(1u, S_hdr - seqno_file));
+        inst->truncated_blocks.fetch_add(1);
     }
 
-    // 续写首块 seqno:无任何已落盘块(全新启动/重建后无文件)保持 0,
-    // 第一块从 1 开始;截断后 +2 防 nonce 重用;常规续写 +1。
+    // 4) 续写首块 seqno(语义对齐见文件头注记):
+    //    resume 是"下一块序号",Flusher 首块取 resume + 1。
     uint32_t resume_seqno;
     if (seqno_file == 0 && S_hdr == 0 && !truncated) {
-        resume_seqno = 0;
-    } else if (truncated || (seqno_file != S_hdr && seqno_file < S_hdr)) {
-        resume_seqno = std::max(S_hdr, seqno_file) + 2;
+        resume_seqno = 0;                       // 全新启动:首块 = 1
+    } else if (truncated || seqno_file < S_hdr) {
+        resume_seqno = std::max(S_hdr, seqno_file) + 1;  // 首块 = max + 2(跳 1 空隙)
     } else {
-        resume_seqno = std::max(S_hdr, seqno_file) + 1;
+        resume_seqno = std::max(S_hdr, seqno_file);      // 首块 = max + 1
     }
 
-    // 4) 环形扫描 staging(在 [F, total) 一维连续视图里;简化:取 [F, F + pending_bytes))
-    // 由于 raw 在环上可能跨回绕,先把 staging 物理拷出成"以 F 为起点的连续视图"。
-    uint32_t size = inst->staging->data_size();
+    // 5) 环形扫描 staging:上界 = 裸 write_pos(崩溃前沿;Header 只在逐块提交时
+    //    更新,最后一批未提交记录坐标仅存在于裸 write_pos 字段)。
+    //    注意跨过区间 [旧 F, 新 F) 在 S_file > S_hdr 时属于"文件已持有"的已刷
+    //    数据,不参与扫描——扫描必须从新 F 出发。
     uint32_t f = F;
-    uint32_t w = get_u32(inst->staging->raw_base() + 16);
     uint32_t raw_bytes = (w >= f) ? (w - f) : (size - f + w);
 
     std::vector<uint8_t> view(raw_bytes);
@@ -287,15 +275,22 @@ void run_recovery(Instance* inst) {
     uint32_t valid_end = 0, truncated_tail = 0;
     ring_scan(view.data(), 0, raw_bytes, &valid_end, &truncated_tail);
 
-    // 把"跨越过 / 撕裂尾巴"清零(以 f 为起点的环推进)
+    // 6) 不变量收尾(spec §4.3):提交新 Header 前必须让"除 [新 f, 新 w) 外
+    //    全环为零"成立。需要补清的两段:
+    //    a) S_file > S_hdr 分支跨过的区间 [F_orig, F) —— 可能未清零
+    //    b) 环形扫描发现的撕裂尾巴 [valid_end, valid_end + truncated_tail)
+    //    重刷补写经 Flusher 流程会顺带清零 [F, W'),实际只需补清上述两段。
+    if (F != F_orig) {
+        uint32_t span = (F - F_orig + size) % size;
+        if (span == 0) span = size;  // 整圈(理论不可达:Σraw_len < 数据区)
+        inst->staging->zero_range_locked(F_orig, span);
+    }
     if (truncated_tail > 0) {
         uint32_t zero_off = (f + valid_end) % size;
         inst->staging->zero_range_locked(zero_off, truncated_tail);
     }
 
-    // 5) 写新 Header(seqno = resume_seqno,flushed_len = F,write_pos = valid_end 映射回环)
-    //    注:resume_seqno 是"下一块使用的 seqno",这里我们把它当 S_hdr 提交。
-    //    实际生产路径下 Flusher 在下一轮 drain 会自增 +1 写入第一块;此处写为当前水位。
+    // 7) 写新 Header(seqno = resume_seqno,flushed_len = f,write_pos = 环扫描末尾)
     AppendTargetCache atc{};
     std::memcpy(&atc, inst->staging->raw_base() + 20, sizeof(atc));
     // 更新追加目标缓存:指向 resume 目标(暂用 hint 或原 cache)

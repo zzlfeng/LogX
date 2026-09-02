@@ -12,6 +12,74 @@
 | `d454dee` | fix: 修复首次编译暴露的 4 处真实 bug(MSVC 构建验证) |
 | `fa24e2f` | feat: Windows(MSVC) 平台移植 + 核心零平台依赖落地,21 个单测全绿 |
 | `30efff8` | build: 打通 Android NDK 交叉编译,新增 liblogx.so(JNI)并修复 3 处真实 bug |
+| (本次) | feat: 恢复对账 Σraw_len 精确回推 + zstd 真接入(M3 首步),32 单测全绿 |
+
+---
+
+## 〇、恢复精确回推 + zstd 真接入(本次)
+
+对应遗留项"三-1(恢复对账 `bytes_since_hdr` 未实现)"与"M3 zstd 单文件版"。
+
+### 恢复对账:Σraw_len 精确回推(`recovery.cpp` / `flusher.cpp`)
+
+- **`S_file > S_hdr` 分支落地**(spec §4.3):新增 `sum_raw_len_since()`
+  (`flusher.cpp`),从文件中 seqno ∈ (S_hdr, S_file] 的块逐块累加块头自描述的
+  `raw_len`,F = (F + Σraw_len) mod 数据区大小,seqno = S_file。此前该分支是
+  占位(`bytes_since_hdr = 0`,F 不推进),staging 中被跨过的已落盘数据会被
+  Flusher 下一轮重复压块(重复块风险)。k 块回溯对块头只读不修,无截断副作用。
+- **不变量收尾**:恢复出口前清零 (a) 跨过区间 [F_orig, F)(崩溃可能落在
+  §4.2 第 4→5 步之间,该区间未清零)与 (b) 撕裂尾巴 [W', W_crash),
+  使"除 [flushed_len, write_pos) 外全环为零"在出口处成立(spec §4.3 收尾要求)。
+- **`truncated_blocks` 计数修复**:
+  - `S_file < S_hdr` 且文件尾干净(断电常态分支)此前完全不计数;
+  - `S_file > S_hdr` 时 `S_hdr - seqno_file` uint32 下溢(打出 ~40 亿)。
+  现按 `lost = max(0, S_hdr - S_file)` 计数,truncated 时另计 1 兜底。
+- **裸 write_pos 消毒**:`write_records` 把写指针裸写在 Header A[16](CRC 外),
+  撕裂可能留下 ≥ size 的垃圾值;恢复侧越界一律钳为 0(宁丢不脏),
+  否则会按越界值分配 ~4GB 扫描缓冲。
+- **resume_seqno 语义对齐**(遗留项 5 部分收敛):统一为"下一块序号",
+  Flusher 首块取 resume + 1;截断后续写 resume = max(S_hdr,S_file) + 1
+  (首块 = max + 2,跳 1 空隙防 nonce 重用);全新启动 resume = 0(首块 = 1)。
+
+### zstd 真接入(M3 第一步)
+
+- **vendor 源码**:`third_party/zstd/lib`(v1.5.7,官方 tarball 剔除
+  tests/programs/contrib 等,零源码改动)。单线程配置(ZSTD_MULTITHREAD 未定义)。
+- **CMake 接线**:`core/CMakeLists.txt` 在 `LOGX_WITH_ZSTD=ON` 时把 zstd 的
+  24 个 .c 编进 `logx_core`。两个坑:
+  - `project(logx_core C CXX)` 必须显式启用 C 语言,否则 .c 被当 None
+    不参与编译,链接期报 `ZSTD_*` 未解析;
+  - 解压侧需补 `zstd_ddict.c`(`zstd_decompress.c` 引用,即使不用字典)。
+- **解压上限防御**(`codec.cpp`):块内容契约上限 = `kBlockMaxRaw` + 64B;
+  `ZSTD_getFrameContentSize` 声明值超限直接拒绝(坏块伪造超大声明值
+  → `resize` 内存炸弹)。zstd 默认帧不带校验和,内容完整性靠块级
+  CRC32(spec §3.2 保留它的原因)。
+- **压缩降级链**(`encode_block`):压缩失败自动回退 flag=none 继续写,
+  不因 codec 故障丢日志/阻塞(spec §6 降级矩阵)。
+- **`LOGX_WITH_ZSTD=0` 时 flag=zstd 编码失败**(flusher 按块 IO 错误处理,
+  不静默落明文,避免"看起来压缩了其实没压"的格式混淆)。
+
+### 测试(21 → 32)
+
+- `test_recovery` 新增 4:`BlocksWrittenHeaderNotCommitted_BackfillExact`
+  (Σraw_len 精确回推 + 收尾清零,按 Flusher 真实时序"写块→清零→提交"构造)、
+  `_RemainderRescanned`(在飞记录被清、坐标收敛)、
+  `TruncatedFile_LostCountNoUnderflow`(丢块计数 = S_hdr - S_file)、
+  `CorruptWritePos_ClampedToZero`(越界 write_pos 钳制)。
+- 新增 `test_codec`(7 个):zstd 高压缩数据往返(体积 < 1/4)、不可压数据
+  往返、坏帧头拒绝、全零垃圾拒绝、encode/decode 端到端、unknown algo 失败、
+  未接 zstd 时 flag=zstd 编码失败。
+- 命令行 `adb push` 在 Git Bash 下需 `MSYS_NO_PATHCONV=1`,否则路径被
+  MSYS 转换(`C:/ProgramFiles/Git/data/...`),推到别处后误以为设备在跑新
+  二进制(设备上残留旧文件 + md5 校验发现)。
+
+### 验证
+
+- Windows / MSVC 2022 / x64 Release:**32/32 通过**(`-DLOGX_WITH_ZSTD=ON`)
+- Android / NDK 29 / arm64-v8a(-DLOGX_WITH_ZSTD=ON):**32/32 通过**
+  (Redmi K30 Pro 真机)
+- 注:默认 `LOGX_WITH_ZSTD=OFF` 行为不变(flag=zstd 编码失败路径);
+  实际启用压缩需 `-DLOGX_WITH_ZSTD=ON` 且实例配置 `compress_algo = kAlgoZstd`。
 
 ---
 
@@ -183,16 +251,15 @@ cmake --build build-android -j
 
 ### 设计/实现遗留(README §"已知未完成项"的延续)
 
-1. **M3**:zstd 单文件版 / mbedtls AES-GCM 真接入(开关已就绪,codec 中
-   `LOGX_WITH_ZSTD` 路径已接真实调用,AES-GCM 为占位返回 false)。
+1. **M3**:mbedtls AES-GCM 真接入(开关已就绪,codec 中
+   `LOGX_WITH_AESGCM` 路径为占位返回 false;zstd 已接入,见"〇")。
 2. **M3**:JNI `keyProvider` trampoline(全局引用 + `AttachCurrentThread`)。
 3. **M4**:50 线程压测 / monkey 72h 稳定性 / 断电注入(QEMU 快照)。
-4. **恢复对账 `bytes_since_hdr` 未实现**(`recovery.cpp` 注释 TODO):
-   `S_file > S_hdr`(块已写 Header 未提交)时回推 F 用的是"信任文件 seqno"近似,
-   未按 raw_len 累加回推。
-5. **Header 语义**:`resume_seqno` 写入 Header 作为"水位",实际 drain 时再 +1 作为
-   块 seqno(首块从 2 开始而非 1)。当前无正确性问题(seqno 唯一性更宽松),
-   但语义上"已落盘块数"与"下一块序号"未完全对齐,后续可统一。
+4. ~~**恢复对账 `bytes_since_hdr` 未实现**~~(2026-09-02 已解决):见"〇",
+   `S_file > S_hdr` 分支按块头 `raw_len` 逐块累加精确回推 F,含不变量收尾。
+5. **Header 语义**:resume_seqno 已统一为"下一块序号"(见"〇"),首块从
+   resume+1 起;剩余一致性(如全新启动首块从 1 的约定与 §3.2 表述对齐)
+   已在实现注释中固化,后续如改 Header 语义需同步 spec。
 6. **`test_flusher` 的 `write_block_to_file` 为占位实现**(统一到 `write_and_record`)。
 7. **多进程隔离**:设计为单进程日志库,多进程按进程名后缀隔离目录
    (Windows 下多进程 mmap 共享未验证)。

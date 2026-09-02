@@ -654,6 +654,44 @@ FileScanResult scan_append_target(Instance* inst, const std::string& hint_path) 
     return scan_one(inst, hint_path, /*repair=*/true);
 }
 
+// k 块回溯:从 seqno ∈ (upto_seqno, ...] 的第一块起累加 raw_len 到文件尾。
+// 与 scan_one 相同的遍历纪律(块头 magic / 长度自洽),但只读不修——
+// 跨过区间是否清零由 recovery 决定,这里不产生截断副作用。
+bool sum_raw_len_since(Instance* inst, const std::string& target_path,
+                       uint32_t upto_seqno, uint64_t* out_bytes,
+                       uint64_t* out_last_block_offset,
+                       uint64_t* out_last_block_end_offset) {
+    *out_bytes = 0;
+    *out_last_block_offset = 0;
+    *out_last_block_end_offset = 0;
+    int fd = inst->pal->file_open(target_path.c_str(), false, false);
+    if (fd < 0) return false;
+    int64_t sz = inst->pal->file_size(fd);
+    if (sz < kFileHeaderSize) {
+        inst->pal->file_close(fd);
+        return false;
+    }
+    uint64_t off = kFileHeaderSize;
+    while (off + 34 <= static_cast<uint64_t>(sz)) {
+        uint8_t bhdr[34];
+        if (inst->pal->file_pread(fd, bhdr, 34, off) != 34) break;
+        if (get_u32(bhdr) != kMagicBlock) break;   // 撕裂半头:计入后续对账失败,宁丢不脏
+        uint32_t seqno = get_u32(bhdr + 6);
+        uint32_t payload_len = get_u32(bhdr + 14);
+        uint8_t flag = bhdr[5];
+        uint64_t block_size = 34 + payload_len + ((flag & kFlagEncrypted) ? 16 : 0);
+        if (off + block_size > static_cast<uint64_t>(sz)) break;  // 半块尾巴
+        if (seqno > upto_seqno) {
+            *out_bytes += get_u32(bhdr + 10);      // raw_len(spec §3.2 对账关键字段)
+        }
+        *out_last_block_offset = off;
+        *out_last_block_end_offset = off + block_size;
+        off += block_size;
+    }
+    inst->pal->file_close(fd);
+    return true;
+}
+
 void* flusher_main(void* arg) {
     Instance* inst = static_cast<Instance*>(arg);
     flusher_loop(inst);

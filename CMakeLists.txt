@@ -17,7 +17,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 endif()
 
 option(LOGX_BUILD_TESTS "Build unit tests" ON)
-option(LOGX_WITH_ZSTD   "Link real zstd"   OFF)
+option(LOGX_WITH_ZSTD   "Link real zstd (vendored third_party/zstd)" OFF)
 option(LOGX_WITH_AESGCM "Link real AES-GCM (mbedtls)" OFF)
 
 add_subdirectory(core)

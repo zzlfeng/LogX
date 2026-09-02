@@ -27,6 +27,7 @@ add_executable(logx_unit_tests
     test_staging.cpp
     test_recovery.cpp
     test_flusher.cpp
+    test_codec.cpp
 )
 target_link_libraries(logx_unit_tests
     PRIVATE
