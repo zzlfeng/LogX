@@ -13,7 +13,58 @@
 | `fa24e2f` | feat: Windows(MSVC) 平台移植 + 核心零平台依赖落地,21 个单测全绿 |
 | `30efff8` | build: 打通 Android NDK 交叉编译,新增 liblogx.so(JNI)并修复 3 处真实 bug |
 | `e819ac2` | feat: 恢复对账 Σraw_len 精确回推 + zstd 真接入(M3 首步),32 单测全绿 |
-| (本次) | fix & feat: 实施方案 v5 定稿升级 + JNI 补齐与零堆分配优化 + 多进程自动隔离,全单测通过 |
+| `1cf48a1` | fix & feat: 实施方案 v5 定稿升级 + JNI 补齐与零堆分配优化 + 多进程自动隔离 |
+| (本次) | feat: M3 加密闭环落地(mbedtls AES-256-GCM + JNI KeyProvider 桥接 + 离线解码闭环),39 单测全绿 |
+
+---
+
+## 〇、M3 加密闭环落地(本次)
+
+对应方案文档 `LogX日志库最终实施方案.md` §2、§3.2、§4.2、§7、§10 的 M3 加密闭环。
+
+### 1. 轻量级 mbedtls AES-256-GCM 嵌入与 CMake 接线 (`third_party/mbedtls`)
+
+- **Vendoring**:
+  - 在 `logx/third_party/mbedtls` 下引入裁剪版 mbedtls（仅保留 AES 与 GCM 核心实现，约 1200 行 C 代码，零外部依赖）；
+  - 配置 `mbedtls_config.h` 启用 `MBEDTLS_AES_C` 与 `MBEDTLS_GCM_C`。
+- **CMake 集成**:
+  - `core/CMakeLists.txt` 在 `LOGX_WITH_AESGCM=ON` 时将 `platform_util.c`、`aes.c`、`gcm.c` 编译并链接至 `logx_core`，并导出相关 include 目录。
+
+### 2. AES-256-GCM Codec 核心实现 (`codec.cpp`)
+
+- **真加解密落地**:
+  - 实现 `encrypt_gcm` 与 `decrypt_gcm`，调用 `mbedtls_gcm_crypt_and_tag` 与 `mbedtls_gcm_auth_decrypt`；
+  - 12B Nonce 规范构造：`[8B file salt + 4B big-endian seqno]`，确保同 (Key, Salt) 下 Nonce 唯一且单调递增；
+  - 密文帧格式：`[ciphertext (in_len bytes)] + [16B GCM auth tag]`。
+- **降级与容灾**:
+  - 当配置加密但密钥缺失时，严格按照 spec §6 降级为明文写入，打点警告并不阻塞写流；
+  - 密文被篡改或 Tag 不匹配时恒定时间拒绝，防止填充预言机攻击。
+
+### 3. JNI KeyProvider 桥接与生命周期管理 (`logx_jni.cpp` / `LogX.kt`)
+
+- **JNI Trampoline 桥接**:
+  - 实现 `jni_key_provider_trampoline`，在 Flusher 线程（C++ 后台线程）需要加密密钥时，自动调用 `JavaVM->GetEnv()` / `AttachCurrentThread()`；
+  - 通过全局引用 `NewGlobalRef` 与 `mid_get_key` 反射回调 Kotlin 层的 `KeyProvider.getKey(kid): ByteArray?`；
+  - 使用 `GetByteArrayRegion` 复制 32B 密钥到线程局部缓冲区，实现调用方零锁与零 GC 抖动。
+- **资源安全释放**:
+  - 在 `nativeClose` 时主动 `DeleteGlobalRef` 并释放 `JniKeyProviderContext`，杜绝 JVM 内存泄漏。
+
+### 4. 真实 Bug 修复 (全平台/Windows)
+
+- **[P0 Bug 修复] `encode_block` 未开启压缩时缓冲未初始化**:
+  - 修复 `comp == kAlgoNone` 时 `compd` 为空导致加密写入 0 字节密文的 Bug。
+- **[P0 Bug 修复] `drain_once` 目标文件日期传递错误**:
+  - 修复 `drain_once` 内部向 `ensure_append_target` 传递 `c->current_date`（初始为 0）导致生成 `00000000.log` 的 Bug。
+- **[P1 修复] 跨平台路径分隔符解析**:
+  - 统一 `take_snapshot`、`export_range`、`retention_cleanup`、`scan_dir_for_target` 中的路径 basename 解析为 `find_last_of("/\\")`，完美兼容 Windows (`\`) 和 POSIX (`/`)。
+- **[P1 修复] `pal_win32.cpp` 文件大小只读读取**:
+  - `file_size_path` 采用 `GENERIC_READ` 与 `GetFileSizeEx` 替代 `file_open`，避免打开中文件的共享写权限竞争。
+
+### 5. 验证结果
+
+- **Windows (MSVC 2022 Release)**: **39/39 单元测试 100% 通过**。
+- **Android NDK (arm64-v8a / android-24)**: 交叉编译 **0 警告 0 错误通过**。
+- **Python 离线解码器**: 验证 `logx_decode.py` 密文解密契约与 C++ 完全一致。
 
 ---
 

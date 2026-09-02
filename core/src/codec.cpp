@@ -24,6 +24,12 @@ extern "C" {
 }
 #endif
 
+#if LOGX_WITH_AESGCM
+extern "C" {
+#include <mbedtls/gcm.h>
+}
+#endif
+
 namespace logx {
 
 namespace {
@@ -93,27 +99,78 @@ bool decompress_block(uint8_t algo, const uint8_t* in, uint32_t in_len,
     return false;
 }
 
-bool encrypt_gcm(const uint8_t[32], const uint8_t[12],
-                 const uint8_t*, uint32_t,
+bool encrypt_gcm(const uint8_t key[32], const uint8_t nonce[12],
+                 const uint8_t* in, uint32_t in_len,
                  std::vector<uint8_t>* out_cipher_and_tag) {
 #if LOGX_WITH_AESGCM
-    // TODO M3:接入 mbedtls_gcm;固定 key+nonce 一次调用,out = ciphertext || tag(16B)。
     out_cipher_and_tag->clear();
-    return false;  // 占位
+    if (!key || !nonce) return false;
+    if (in_len > 0 && !in) return false;
+
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+
+    int ret = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (ret != 0) {
+        mbedtls_gcm_free(&gcm);
+        return false;
+    }
+
+    out_cipher_and_tag->resize(in_len + 16);
+    unsigned char* out_data = out_cipher_and_tag->data();
+    unsigned char* tag_data = out_data + in_len;
+
+    ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, in_len,
+                                    nonce, 12,
+                                    nullptr, 0,
+                                    in, out_data,
+                                    16, tag_data);
+    mbedtls_gcm_free(&gcm);
+    if (ret != 0) {
+        out_cipher_and_tag->clear();
+        return false;
+    }
+    return true;
 #else
-    // 没接真库时:不实现加密;调用方应走降级(flag bit0 = 0)。
+    (void)key; (void)nonce; (void)in; (void)in_len;
     (void)out_cipher_and_tag;
     return false;
 #endif
 }
 
-bool decrypt_gcm(const uint8_t[32], const uint8_t[12],
-                 const uint8_t*, uint32_t, const uint8_t[16],
+bool decrypt_gcm(const uint8_t key[32], const uint8_t nonce[12],
+                 const uint8_t* in, uint32_t in_len, const uint8_t tag[16],
                  std::vector<uint8_t>* out_plain) {
 #if LOGX_WITH_AESGCM
-    (void)out_plain;
-    return false;  // 占位
+    out_plain->clear();
+    if (!key || !nonce || !tag) return false;
+    if (in_len > 0 && !in) return false;
+
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+
+    int ret = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (ret != 0) {
+        mbedtls_gcm_free(&gcm);
+        return false;
+    }
+
+    out_plain->resize(in_len);
+    unsigned char* out_data = in_len > 0 ? out_plain->data() : nullptr;
+
+    ret = mbedtls_gcm_auth_decrypt(&gcm, in_len,
+                                   nonce, 12,
+                                   nullptr, 0,
+                                   tag, 16,
+                                   in, out_data);
+    mbedtls_gcm_free(&gcm);
+    if (ret != 0) {
+        out_plain->clear();
+        return false;
+    }
+    return true;
 #else
+    (void)key; (void)nonce; (void)in; (void)in_len; (void)tag;
     (void)out_plain;
     return false;
 #endif
@@ -135,9 +192,12 @@ bool encode_block(uint8_t flag,
     // 1) 压缩(若启用)。压缩失败(zstd 内部错误/资源不足)按 spec §6 降级:
     //    flag 去掉压缩位,明文继续写,绝不因 codec 故障阻塞/丢日志。
     std::vector<uint8_t> compd;
-    if (comp != kAlgoNone &&
-        !compress_block(comp, raw, raw_len, &compd)) {
-        comp = kAlgoNone;
+    if (comp != kAlgoNone) {
+        if (!compress_block(comp, raw, raw_len, &compd)) {
+            comp = kAlgoNone;
+            compd.assign(raw, raw + raw_len);
+        }
+    } else {
         compd.assign(raw, raw + raw_len);
     }
 

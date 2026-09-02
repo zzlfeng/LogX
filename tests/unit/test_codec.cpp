@@ -135,3 +135,118 @@ TEST(CodecTest, ZstdFlagFailsWhenNotBuilt) {
                                 static_cast<uint32_t>(raw.size()), &out));
 }
 #endif
+
+#if LOGX_WITH_AESGCM
+
+TEST(CodecTest, GCMRoundTrip_PlainAndCipher) {
+    uint8_t key[32] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                       0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+                       0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                       0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38};
+    uint8_t nonce[12] = {1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 1};
+    auto plain = make_randomish(1024);
+
+    std::vector<uint8_t> cipher_and_tag;
+    ASSERT_TRUE(encrypt_gcm(key, nonce, plain.data(),
+                            static_cast<uint32_t>(plain.size()),
+                            &cipher_and_tag));
+    EXPECT_EQ(cipher_and_tag.size(), plain.size() + 16);
+
+    uint32_t cipher_len = static_cast<uint32_t>(plain.size());
+    const uint8_t* cipher_ptr = cipher_and_tag.data();
+    const uint8_t* tag_ptr = cipher_and_tag.data() + cipher_len;
+
+    std::vector<uint8_t> decrypted;
+    ASSERT_TRUE(decrypt_gcm(key, nonce, cipher_ptr, cipher_len, tag_ptr, &decrypted));
+    EXPECT_EQ(decrypted, plain);
+}
+
+TEST(CodecTest, GCMRejectsWrongKey) {
+    uint8_t key1[32] = {1, 2, 3};
+    uint8_t key2[32] = {4, 5, 6};
+    uint8_t nonce[12] = {1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 1};
+    auto plain = make_randomish(256);
+
+    std::vector<uint8_t> cipher_and_tag;
+    ASSERT_TRUE(encrypt_gcm(key1, nonce, plain.data(),
+                            static_cast<uint32_t>(plain.size()),
+                            &cipher_and_tag));
+
+    uint32_t cipher_len = static_cast<uint32_t>(plain.size());
+    const uint8_t* cipher_ptr = cipher_and_tag.data();
+    const uint8_t* tag_ptr = cipher_and_tag.data() + cipher_len;
+
+    std::vector<uint8_t> decrypted;
+    EXPECT_FALSE(decrypt_gcm(key2, nonce, cipher_ptr, cipher_len, tag_ptr, &decrypted));
+}
+
+TEST(CodecTest, GCMRejectsCorruptTagAndCiphertext) {
+    uint8_t key[32] = {0xAA};
+    uint8_t nonce[12] = {1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 2};
+    auto plain = make_randomish(512);
+
+    std::vector<uint8_t> cipher_and_tag;
+    ASSERT_TRUE(encrypt_gcm(key, nonce, plain.data(),
+                            static_cast<uint32_t>(plain.size()),
+                            &cipher_and_tag));
+
+    uint32_t cipher_len = static_cast<uint32_t>(plain.size());
+
+    // 1) 篡改 Tag
+    std::vector<uint8_t> bad_tag_buf = cipher_and_tag;
+    bad_tag_buf.back() ^= 0xFF;
+    std::vector<uint8_t> decrypted;
+    EXPECT_FALSE(decrypt_gcm(key, nonce, bad_tag_buf.data(), cipher_len,
+                             bad_tag_buf.data() + cipher_len, &decrypted));
+
+    // 2) 篡改密文
+    std::vector<uint8_t> bad_cipher_buf = cipher_and_tag;
+    bad_cipher_buf[0] ^= 0xFF;
+    EXPECT_FALSE(decrypt_gcm(key, nonce, bad_cipher_buf.data(), cipher_len,
+                             bad_cipher_buf.data() + cipher_len, &decrypted));
+}
+
+TEST(CodecTest, EncodeBlockWithZstdAndAESGCM_RoundTrips) {
+    auto raw = make_compressible(8 * 1024);
+    uint8_t key[32] = {0x55, 0x66, 0x77, 0x88};
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint32_t seqno = 100;
+
+    uint8_t flag = (kFlagCompressZstd << 1) | kFlagEncrypted;
+
+    EncodedBlock enc;
+    ASSERT_TRUE(encode_block(flag, key, seqno, salt, raw.data(),
+                             static_cast<uint32_t>(raw.size()), &enc));
+    EXPECT_TRUE(enc.enc_ok);
+
+    ASSERT_GT(enc.payload.size(), 16u);
+    uint32_t payload_len = static_cast<uint32_t>(enc.payload.size()) - 16;
+    const uint8_t* payload_ptr = enc.payload.data();
+    const uint8_t* tag_ptr = enc.payload.data() + payload_len;
+
+    std::vector<uint8_t> out;
+    ASSERT_TRUE(decode_block(flag, key, seqno, salt,
+                             payload_ptr, payload_len, tag_ptr,
+                             nullptr, static_cast<uint32_t>(raw.size()), &out));
+    EXPECT_EQ(out, raw);
+}
+
+TEST(CodecTest, EncodeBlockMissingKey_DowngradesToPlaintext) {
+    auto raw = make_compressible(1024);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint32_t seqno = 101;
+
+    uint8_t flag = (kFlagCompressZstd << 1) | kFlagEncrypted;
+
+    EncodedBlock enc;
+    EXPECT_FALSE(encode_block(flag, nullptr, seqno, salt, raw.data(),
+                              static_cast<uint32_t>(raw.size()), &enc));
+
+    uint8_t plain_flag = (kFlagCompressZstd << 1);
+    ASSERT_TRUE(encode_block(plain_flag, nullptr, seqno, salt, raw.data(),
+                             static_cast<uint32_t>(raw.size()), &enc));
+    EXPECT_FALSE(enc.enc_ok);
+}
+
+#endif  // LOGX_WITH_AESGCM
+

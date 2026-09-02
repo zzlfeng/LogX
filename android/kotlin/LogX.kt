@@ -93,10 +93,8 @@ object LogX {
             config.compress.algo.toInt(),
             if (config.encrypt) 1 else 0,
             config.kid,
-            // KeyProvider 桥接: 传 null, M3 阶段补全 (JNI 全局引用 + trampoline)。
-            null,
+            config.keyProvider,
         )
-        if (nativeHandle == 0L) {
             initCount.set(0)
             throw IllegalStateException("LogX native init failed")
         }

@@ -100,8 +100,11 @@ long append_block_raw(int fd,
         inst->block_write_errors.fetch_add(1);
         return -1;
     }
-    // 2) CRC32(payload)
-    uint32_t crc = crc32_update(0, enc.payload.data(), enc.payload.size());
+    // 2) 确定 payload_len 与 CRC32(payload)
+    uint32_t payload_len = enc.enc_ok
+        ? static_cast<uint32_t>(enc.payload.size() - 16)
+        : static_cast<uint32_t>(enc.payload.size());
+    uint32_t crc = crc32_update(0, enc.payload.data(), payload_len);
     // 3) 构造 34B 头
     uint8_t hdr[34];
     put_u32_le(hdr + 0, kMagicBlock);
@@ -109,7 +112,7 @@ long append_block_raw(int fd,
     hdr[5] = flag;
     put_u32_le(hdr + 6,  seqno);
     put_u32_le(hdr + 10, raw_len);
-    put_u32_le(hdr + 14, static_cast<uint32_t>(enc.payload.size()));
+    put_u32_le(hdr + 14, payload_len);
     put_u32_le(hdr + 18, crc);
     std::memcpy(hdr + 22, salt, 8);
     hdr[30] = (seqno >> 24) & 0xff;
@@ -118,7 +121,7 @@ long append_block_raw(int fd,
     hdr[33] = (seqno) & 0xff;
     // 4) 拼装 frame
     std::vector<uint8_t> frame;
-    frame.reserve(34 + enc.payload.size() + 16);
+    frame.reserve(34 + enc.payload.size());
     frame.insert(frame.end(), hdr, hdr + 34);
     frame.insert(frame.end(), enc.payload.begin(), enc.payload.end());
     if (enc.enc_ok) {
@@ -310,7 +313,7 @@ void retention_cleanup_impl(Instance* inst) {
     auto files = inst->pal->file_list(inst->log_dir.c_str());
     std::sort(files.begin(), files.end());
     auto parse_date = [](const std::string& path, uint32_t* out_date) -> bool {
-        size_t pos = path.find_last_of('/');
+        size_t pos = path.find_last_of("/\\");
         std::string name = (pos == std::string::npos) ? path : path.substr(pos + 1);
         if (name.size() < 12) return false;
         if (name.compare(name.size() - 4, 4, ".log") != 0 &&
@@ -396,9 +399,10 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
             if (sr.ok && !sr.truncated && sr.last_block_end_offset > 0) {
                 // 命中并校验过
                 c->current_path = hint;
-                c->current_date = sr.path.size() >= 12
-                    ? static_cast<uint32_t>(std::strtoul(sr.path.c_str() +
-                          sr.path.find_last_of('/') + 1, nullptr, 10))
+                size_t base_idx = sr.path.find_last_of("/\\");
+                const char* fn = (base_idx == std::string::npos) ? sr.path.c_str() : (sr.path.c_str() + base_idx + 1);
+                c->current_date = std::strlen(fn) >= 8
+                    ? static_cast<uint32_t>(std::strtoul(fn, nullptr, 10))
                     : today;
                 c->current_split = 0;
             }
@@ -492,7 +496,9 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         }
 
         // 5.1 决定追加目标文件(跨天/切分)
-        int fd = ensure_append_target(c, c->current_date, inst);
+        int fd = ensure_append_target(c, yyyymmdd, inst);
+        atc.date = c->current_date;
+        atc.split_no = c->current_split;
         if (fd < 0) {
             emit_event(inst, LOGX_EV_IO, -1, "append target open failed");
             // 不再尝试,清零 cur_f..(cur_f+blk.raw_len) 以维持不变量
@@ -552,7 +558,7 @@ std::string scan_dir_for_target(Instance* inst) {
     uint32_t best_date = 0;
     uint32_t best_seqno = 0;
     for (const auto& f : files) {
-        size_t pos = f.find_last_of('/');
+        size_t pos = f.find_last_of("/\\");
         std::string name = (pos == std::string::npos) ? f : f.substr(pos + 1);
         if (name.size() < 12) continue;
         if (name.compare(name.size() - 4, 4, ".log") != 0 &&

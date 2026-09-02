@@ -146,9 +146,14 @@ public:
         return static_cast<int64_t>(sz.QuadPart);
     }
     int64_t file_size_path(const char* path) override {
-        WIN32_FILE_ATTRIBUTE_DATA d;
-        if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) return -1;
-        return (static_cast<int64_t>(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
+        HANDLE h = CreateFileA(path, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return -1;
+        LARGE_INTEGER sz;
+        BOOL ok = GetFileSizeEx(h, &sz);
+        CloseHandle(h);
+        return ok ? static_cast<int64_t>(sz.QuadPart) : -1;
     }
     int file_fsync(int fd) override {
         HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));

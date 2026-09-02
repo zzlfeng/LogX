@@ -1,0 +1,30 @@
+#ifndef MBEDTLS_CIPHER_H
+#define MBEDTLS_CIPHER_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    MBEDTLS_CIPHER_ID_NONE = 0,
+    MBEDTLS_CIPHER_ID_NULL,
+    MBEDTLS_CIPHER_ID_AES,
+    MBEDTLS_CIPHER_ID_DES,
+    MBEDTLS_CIPHER_ID_3DES,
+    MBEDTLS_CIPHER_ID_CAMELLIA,
+    MBEDTLS_CIPHER_ID_BLOWFISH,
+    MBEDTLS_CIPHER_ID_ARC4,
+    MBEDTLS_CIPHER_ID_ARIA,
+    MBEDTLS_CIPHER_ID_CHACHA20,
+} mbedtls_cipher_id_t;
+
+#define MBEDTLS_OPERATION_NONE -1
+#define MBEDTLS_DECRYPT         0
+#define MBEDTLS_ENCRYPT         1
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* MBEDTLS_CIPHER_H */
+

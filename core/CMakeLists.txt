@@ -93,6 +93,19 @@ if(LOGX_WITH_ZSTD)
 endif()
 if(LOGX_WITH_AESGCM)
     target_compile_definitions(logx_core PUBLIC LOGX_WITH_AESGCM=1)
+    set(LOGX_MBEDTLS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mbedtls)
+    if(NOT EXISTS ${LOGX_MBEDTLS_DIR}/include/mbedtls/gcm.h)
+        message(FATAL_ERROR "LOGX_WITH_AESGCM=ON but ${LOGX_MBEDTLS_DIR} not found")
+    endif()
+    target_sources(logx_core PRIVATE
+        ${LOGX_MBEDTLS_DIR}/src/aes.c
+        ${LOGX_MBEDTLS_DIR}/src/gcm.c
+        ${LOGX_MBEDTLS_DIR}/src/platform_util.c
+    )
+    target_include_directories(logx_core PRIVATE ${LOGX_MBEDTLS_DIR}/include)
+    if(BUILD_SHARED_LIBS)
+        set_target_properties(logx_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    endif()
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

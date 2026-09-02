@@ -157,7 +157,7 @@ std::vector<FileSnapshot> take_snapshot(Instance* inst,
     std::sort(files.begin(), files.end());
     std::vector<FileSnapshot> snaps;
     for (const auto& f : files) {
-        size_t base = f.find_last_of('/');
+        size_t base = f.find_last_of("/\\");
         std::string name = (base == std::string::npos) ? f : f.substr(base + 1);
         if (name.size() < 12) continue;
         if (name.compare(name.size() - 4, 4, ".log") != 0 &&
@@ -198,19 +198,18 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
             emit_event(inst, LOGX_EV_IO, -1, "decode file failed");
             continue;
         }
+        size_t last_slash = s.path.find_last_of("/\\");
+        const char* fname = (last_slash == std::string::npos) ? s.path.c_str() : (s.path.c_str() + last_slash + 1);
         std::string tmp = make_tmp_path(inst->log_dir,
-                                        static_cast<uint32_t>(
-                                            std::strtoul(s.path.c_str() +
-                                                s.path.find_last_of('/') + 1,
-                                                nullptr, 10)));
+                                        static_cast<uint32_t>(std::strtoul(fname, nullptr, 10)));
         // O_CREAT | O_TRUNC:先创建,再截断到 0
         int fd = inst->pal->file_open(tmp.c_str(), true, false);
         if (fd < 0) continue;
         if (inst->pal->file_truncate(fd, 0) != 0) { inst->pal->file_close(fd); continue; }
         write_all_lines(inst, fd, lines);
         inst->pal->file_close(fd);
-        // 解析日期字串
-        std::string date = s.path.substr(s.path.find_last_of('/') + 1, 8);
+        // 解析日期字串 (8 字符)
+        std::string date(fname, fname + 8);
         if (req.cb) req.cb(req.cb_user, date.c_str(), tmp.c_str(), s.size);
         inst->pal->file_unlink(tmp.c_str());
     }

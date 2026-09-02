@@ -24,6 +24,52 @@
 
 namespace {
 
+struct JniKeyProviderContext {
+    JavaVM* jvm = nullptr;
+    jobject g_provider = nullptr;
+    jmethodID mid_get_key = nullptr;
+};
+
+static thread_local uint8_t g_tls_key_buf[32];
+
+static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
+    auto* ctx = static_cast<JniKeyProviderContext*>(user);
+    if (!ctx || !ctx->jvm || !ctx->g_provider || !ctx->mid_get_key) {
+        return nullptr;
+    }
+
+    JNIEnv* env = nullptr;
+    jint getEnvRes = ctx->jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (getEnvRes == JNI_EDETACHED) {
+#if defined(__ANDROID__)
+        if (ctx->jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            return nullptr;
+        }
+#else
+        if (ctx->jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) {
+            return nullptr;
+        }
+#endif
+    } else if (getEnvRes != JNI_OK || !env) {
+        return nullptr;
+    }
+
+    jbyteArray jKeyArr = static_cast<jbyteArray>(
+        env->CallObjectMethod(ctx->g_provider, ctx->mid_get_key, static_cast<jint>(kid))
+    );
+
+    const uint8_t* res = nullptr;
+    if (jKeyArr) {
+        jsize len = env->GetArrayLength(jKeyArr);
+        if (len == 32) {
+            env->GetByteArrayRegion(jKeyArr, 0, 32, reinterpret_cast<jbyte*>(g_tls_key_buf));
+            res = g_tls_key_buf;
+        }
+        env->DeleteLocalRef(jKeyArr);
+    }
+    return res;
+}
+
 struct ExportContext {
     JNIEnv* env;
     jobject cb;
@@ -57,11 +103,25 @@ JNIEXPORT jlong JNICALL
 Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
                                       jstring jLogDir, jstring jStagingPath,
                                       jint compressAlgo, jint encryptEnable,
-                                      jint kid, jobject /*keyProvider*/) {
+                                      jint kid, jobject jKeyProvider) {
     if (!jLogDir || !jStagingPath) return 0;
 
     const char* log_dir = env->GetStringUTFChars(jLogDir, nullptr);
     const char* staging_path = env->GetStringUTFChars(jStagingPath, nullptr);
+
+    JniKeyProviderContext* kp_ctx = nullptr;
+    if (jKeyProvider) {
+        JavaVM* jvm = nullptr;
+        env->GetJavaVM(&jvm);
+        jclass kpClass = env->GetObjectClass(jKeyProvider);
+        jmethodID mid = env->GetMethodID(kpClass, "getKey", "(I)[B");
+        if (jvm && mid) {
+            kp_ctx = new JniKeyProviderContext();
+            kp_ctx->jvm = jvm;
+            kp_ctx->g_provider = env->NewGlobalRef(jKeyProvider);
+            kp_ctx->mid_get_key = mid;
+        }
+    }
 
     logx_config_t cfg{};
     cfg.log_dir = log_dir;
@@ -73,10 +133,8 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     cfg.compress_algo = static_cast<uint8_t>(compressAlgo);
     cfg.encrypt_enable = static_cast<uint8_t>(encryptEnable);
     cfg.kid = static_cast<uint16_t>(kid);
-    // keyProvider 在生产实现里应通过 JavaVM 全局引用 + JNI trampoline
-    // 转发到 Kotlin 的 KeyProvider.invoke(kid): ByteArray。
-    cfg.key_provider = nullptr;
-    cfg.user = nullptr;
+    cfg.key_provider = kp_ctx ? jni_key_provider_trampoline : nullptr;
+    cfg.user = kp_ctx;
 
     logx_instance_t* inst = nullptr;
     logx_status_e rc = logx_open(&cfg, &inst);
@@ -84,15 +142,28 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     env->ReleaseStringUTFChars(jLogDir, log_dir);
     env->ReleaseStringUTFChars(jStagingPath, staging_path);
     if (rc != LOGX_OK) {
+        if (kp_ctx) {
+            env->DeleteGlobalRef(kp_ctx->g_provider);
+            delete kp_ctx;
+        }
         return 0;
     }
     return reinterpret_cast<jlong>(inst);
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_logx_LogX_nativeClose(JNIEnv* /*env*/, jclass /*clazz*/, jlong handle) {
+Java_com_example_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong handle) {
     if (handle != 0) {
-        logx_close(reinterpret_cast<logx_instance_t*>(handle));
+        auto* inst = reinterpret_cast<logx_instance_t*>(handle);
+        auto* kp_ctx = static_cast<JniKeyProviderContext*>(inst->key_user);
+        if (kp_ctx) {
+            if (kp_ctx->g_provider) {
+                env->DeleteGlobalRef(kp_ctx->g_provider);
+            }
+            delete kp_ctx;
+            inst->key_user = nullptr;
+        }
+        logx_close(inst);
     }
 }
 
