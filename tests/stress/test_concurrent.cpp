@@ -16,6 +16,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "logx_c.h"
@@ -166,12 +167,16 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
             log_files.push_back(f);
         }
     }
-    auto parse_split = [](const std::string& f) -> int {
-        auto p = f.rfind(".log.");
-        return (p == std::string::npos) ? 0 : std::atoi(f.c_str() + p + 5);
+    auto parse_key = [](const std::string& f) -> std::pair<uint32_t, int> {
+        size_t base = f.find_last_of("/\\");
+        std::string name = (base == std::string::npos) ? f : f.substr(base + 1);
+        uint32_t d = static_cast<uint32_t>(std::strtoul(name.c_str(), nullptr, 10));
+        auto p = name.rfind(".log.");
+        int s = (p == std::string::npos) ? 0 : std::atoi(name.c_str() + p + 5);
+        return {d, s};
     };
     std::sort(log_files.begin(), log_files.end(), [&](const std::string& a, const std::string& b) {
-        return parse_split(a) < parse_split(b);
+        return parse_key(a) < parse_key(b);
     });
     ASSERT_FALSE(log_files.empty());
     std::cout << "  - Total log files generated: " << log_files.size() << " (Files rotated successfully!)" << std::endl;

@@ -1,4 +1,4 @@
-﻿# tests/stress/CMakeLists.txt - 压力与高并发测试套件
+# tests/stress/CMakeLists.txt - 压力与高并发测试套件
 cmake_minimum_required(VERSION 3.16)
 project(logx_stress_tests CXX)
 
@@ -21,6 +21,7 @@ endif()
 
 add_executable(logx_stress_tests
     test_concurrent.cpp
+    test_crash_recovery.cpp
 )
 
 target_link_libraries(logx_stress_tests

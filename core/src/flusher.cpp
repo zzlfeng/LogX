@@ -34,6 +34,8 @@ constexpr uint32_t kSingleRecordMaxRaw = 20 * 1024 + 6;
 // 在 raw 流里看下一条记录的字节数(头+payload);不足返回 0。
 uint32_t peek_record_len(const uint8_t* p, uint32_t off, uint32_t total) {
     if (total - off < 6) return 0;
+    uint16_t magic = uint16_t(p[off + 2]) | (uint16_t(p[off + 3]) << 8);
+    if (magic != kMagicEntry && magic != kMagicPad) return 0;
     uint32_t len = uint32_t(p[off]) | (uint32_t(p[off + 1]) << 8);
     uint32_t sz = 6 + len;
     if (off + sz > total) return 0;
@@ -609,6 +611,7 @@ void flusher_loop(Instance* inst) {
         }
     }
     drain_once(&c, inst);
+    close_current(&c, inst->pal);
 }
 
 // 在 log_dir 下扫描所有日志文件,选"日期最大且尾块 seqno 最大"者作为追加目标。

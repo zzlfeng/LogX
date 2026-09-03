@@ -290,7 +290,10 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total)
             w = 0;
         } else {
             // pad < 6:无记录可写,留零回绕;消费侧按"距段尾 <6B 跳过"。
-            // 此时原 [w, data_size_) 全零,直接 w = 0。
+            // 必须严格清零残留的 1..5 字节, 杜绝旧轮次内存脏数据!
+            if (pad > 0) {
+                std::memset(data_base_ + w, 0, pad);
+            }
             w = 0;
         }
         // 重新计算 free(没变,但 w 改了)

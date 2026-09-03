@@ -93,6 +93,18 @@ inline uint32_t get_u32(const uint8_t* p) {
 }
 inline void put_u16(uint8_t* p, uint16_t v) { p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; }
 inline uint16_t get_u16(const uint8_t* p) { return uint16_t(p[0]) | (uint16_t(p[1]) << 8); }
+inline void put_u64(uint8_t* p, uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        p[i] = static_cast<uint8_t>((v >> (i * 8)) & 0xff);
+    }
+}
+inline uint64_t get_u64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v |= (static_cast<uint64_t>(p[i]) << (i * 8));
+    }
+    return v;
+}
 
 // CRC32(IEEE 802.3);codec 也会用到,放这里共享。
 uint32_t crc32_update(uint32_t crc, const uint8_t* p, size_t len);

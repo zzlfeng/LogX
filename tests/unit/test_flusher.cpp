@@ -367,16 +367,15 @@ TEST(Flush, RetentionCleanup_TriggeredOnFlushBlocking) {
                       std::to_string(pal.pid()) + "_" +
                       std::to_string(rand());
     pal.file_mkdirs(dir.c_str());
-
-    logx_config_t cfg{};
-    cfg.log_dir = dir.c_str();
     std::string st_path = dir + "/staging.mmap";
-    cfg.staging_path = st_path.c_str();
-    cfg.max_log_length = 4096;
-    cfg.retention_days = 7;
 
-    logx_instance_t* inst = nullptr;
-    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    Instance inst{};
+    inst.log_dir = dir;
+    inst.pal = &pal;
+    inst.retention_days = 7;
+    inst.staging = new Staging(&pal, st_path, 8 * 1024);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst.staging->open(&st, &rec));
 
     // 构造一个 10 天前的历史过期文件
     std::string old_file = dir + "/20240101.log";
@@ -385,14 +384,13 @@ TEST(Flush, RetentionCleanup_TriggeredOnFlushBlocking) {
     pal.file_close(fd);
     ASSERT_GT(pal.file_size_path(old_file.c_str()), 0);
 
-    // 写入一条正常日志并调用 logx_flush (退后台)
-    ASSERT_EQ(logx_write(inst, 2, "TAG", (const uint8_t*)"hello", 5), LOGX_OK);
-    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+    // 调用 flush_blocking (退后台落盘触发)
+    flush_blocking(&inst);
 
     // 验证退后台 flush 自动触发清理: 过期文件被自动清除
     EXPECT_LT(pal.file_size_path(old_file.c_str()), 0);
 
-    logx_close(inst);
+    delete inst.staging;
 
     for (const auto& f : pal.file_list(dir.c_str())) {
         pal.file_unlink(f.c_str());

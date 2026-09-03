@@ -137,10 +137,12 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
         hint = buf;
     }
     FileScanResult sr;
+    bool was_truncated = false;
     if (!hint.empty()) {
         sr = scan_append_target(inst, hint);
-        if (!sr.ok || sr.truncated) {
-            // 缓存指向文件不存在或被截;扩展到全保留文件扫描
+        if (sr.truncated) was_truncated = true;
+        if (!sr.ok) {
+            // 缓存指向文件不存在或不可读;扩展到全保留文件扫描
             std::string best = scan_dir_for_target(inst);
             if (!best.empty()) sr = scan_append_target(inst, best);
             else return r;  // 目录里也没有任何文件:全新启动(非截断)
@@ -155,7 +157,7 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
         return r;
     }
     r.S_file = sr.seqno;
-    r.file_truncated = sr.truncated;
+    r.file_truncated = sr.truncated || was_truncated;
     r.target_path = sr.path;
     return r;
 }
