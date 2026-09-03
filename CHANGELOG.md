@@ -103,6 +103,37 @@
 
 ---
 
+## 深度系统复核记录(2026-09-03, 周边链路与工程化审查)
+
+在「独立复核」与「测试逻辑复核」基础上,进一步贯通审查 Python 解码器、Kotlin Facade、JNI 桥接、切分恢复及平台持久化调用。
+**结论:C++ 核心算法闭环属实,但周边交付件存在 2 处阻塞级缺陷(Python 解码器逻辑瘫痪、Kotlin Facade 语法截断且缺失 Gradle)及 3 处系统偏差。**
+统一归口为计划表任务 **T4.0-8 ~ T4.0-12**。
+
+### A. 周边交付件阻塞级缺陷 (归入 T4.0)
+
+1. **Python 离线解码器 `logx_decode.py` 逻辑缺陷 (T4.0-8, P0)**:
+   - **重组状态机 Bug**: `reassemble` 遇 `is_whole` (flags=0, 普通整条日志) 时执行 `state = 1`。但整条日志无后续分片重置 state, 循环结束断言 `state == 0` 失败, **导致对任何普通整条日志解码恒定返回 None** (实测已写单行 python 脚本复现)。
+   - **单块单日志错误假设**: `decode_file` / `main` 将每个 Block 当作一条日志直接调用 `parse_user_payload(blk.user_payload)`。而 spec §3.2 与 C++ 实现为**单块可装入多条连续记录**。面对真实日志文件必定抛出 `'NoneType' object is not subscriptable`。
+   - **缺少跨块分片缓存**: 未实现跨 Block 的分片段缓存重组。声称的 "T3.4 端到端联调" 需推翻重构。
+
+2. **Kotlin Facade `LogX.kt` 语法截断与编译缺失 (T4.0-9, P0)**:
+   - **语法错误与调用必崩**: `LogX.init()` 第 97~100 行漏写 `if (nativeHandle == 0L) {`, 导致花括号结构非法。且无论 nativeInit 是否成功, 每次调用 init 必触发 `throw IllegalStateException("LogX native init failed")`。
+   - **构建缺失**: 仓库根目录与 android 目录下零 Gradle 配置 (`build.gradle` 等不存在), Kotlin 代码从未参与自动化 CI 编译。
+
+### B. 接口与逻辑偏差 (归入 T4.0)
+
+3. **JNI Config 参数硬编码与 ErrorHandler 虚置 (T4.0-10, P1)**:
+   - `nativeInit` 签名未接收 Kotlin Config 中的 `retentionDays`, `maxFileSize`, `flushThreshold`, `maxLogLength`, JNI 内部全部写死默认值, 业务自定义配置被静默忽略。
+   - Kotlin 的 `errorHandler` 仅为本地属性, JNI 未向 C++ 的 `err_fn` 注册 Trampoline, 底层 `emit_event` (降级/丢日志/截断) 永远无法通知 Kotlin 层。
+
+4. **崩溃重启后切分序号重置为 0 的历史覆写风险 (T4.0-11, P1)**:
+   - `flusher.cpp` 的 `ensure_append_target` 从现有文件恢复时, 未从文件名解析切分序号, 直接强制 `c->current_split = 0`。若当天已有 `YYYYMMDD.log.1` 且已满 10MB, 重启后再切分仍会生成 `.log.1`, 导致倒退覆写历史切分文件。
+
+5. **数据持久化 API 全库调用为 0 (T4.0-12, P1)**:
+   - `pal_posix.cpp` 与 `pal_win32.cpp` 中实现的 `file_fsync`, `file_dir_fsync`, `mmap_msync` 在全库 `core/src/` 中调用次数为 **0**。spec §10 明确要求的“新建日志文件后对父目录 fsync 一次”未接入代码。
+
+---
+
 ## 〇、M3 加密闭环落地(本次)
 
 对应方案文档 `LogX日志库最终实施方案.md` §2、§3.2、§4.2、§7、§10 的 M3 加密闭环。
@@ -441,11 +472,16 @@ cmake --build build-android -j
 5. ~~**JNI 缺失 nativeExport**~~(2026-09-02 已解决):见"〇",已补齐 nativeExport 并优化 JNI 零堆分配。
 6. ~~**多进程安全隔离**~~(2026-09-02 已解决):见"〇",Kotlin Facade 默认按进程名后缀分流目录。
 7. **`test_flusher` 的 `write_block_to_file` 为占位实现**(统一到 `write_and_record`)。
-8. **v5 spec 未落地项**(2026-09-03 复核新增,统一由计划表 T4.0 回补,详见"独立复核记录"):
-   ① `flush()` 水位线(现为自旋等空,§7);② 切分序号仍 uint8_t(§3.1);
+8. **v5 spec 未落地项与系统缺陷**(2026-09-03 复核扩充, 统一由计划表 T4.0 回补, 详见"独立复核记录"与"深度系统复核记录"):
+   ① `flush()` 水位线(现为自旋等空,§7); ② 切分序号仍 uint8_t(§3.1);
    ③ 双 Header 屏障顺序/内存序偏离纪律(现为 A→B→release fence,§4.2);
-   ④ Flusher Debounce(§4.1);⑤ ARMv8 Crypto 加速(§10);
-   ⑥ 30s 定时 msync/fdatasync 持久化(§11);⑦ 未对齐访问与时钟跳变测试用例(§9)。
+   ④ Flusher Debounce(§4.1); ⑤ ARMv8 Crypto 加速(§10);
+   ⑥ 30s 定时 msync/fdatasync 持久化(§11); ⑦ 未对齐访问与时钟跳变测试用例(§9);
+   ⑧ Python 解码器重构(is_whole 状态机致命 Bug + 单块多日志与跨块分片重组,§2/§10);
+   ⑨ `LogX.kt` 语法截断修复(补 if 判断) + 建立 Gradle 编译工程(§7);
+   ⑩ JNI Config 参数传递与 ErrorHandler 桥接打通(§7/§10);
+   ⑪ 恢复后切分序号从文件名解析(消除强制归 0 覆写风险,§4.3/§4.4);
+   ⑫ 新建日志文件父目录 fsync 业务接线(§10)。
 
 ---
 
