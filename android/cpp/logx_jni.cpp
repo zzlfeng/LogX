@@ -13,6 +13,7 @@
 #include <android/log.h>
 
 #include "logx_c.h"
+#include "logx_internal.h"
 
 #include <cstring>
 #include <string>
@@ -144,6 +145,9 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
                                       jstring jLogDir, jstring jStagingPath,
                                       jint compressAlgo, jint encryptEnable,
                                       jint kid, jobject jKeyProvider,
+                                      jint retentionDays, jlong maxFileSize,
+                                      jint maxLogLength, jint flushThreshold) {
+    if (!jLogDir || !jStagingPath) return 0;
 
     const char* log_dir = env->GetStringUTFChars(jLogDir, nullptr);
     const char* staging_path = env->GetStringUTFChars(jStagingPath, nullptr);

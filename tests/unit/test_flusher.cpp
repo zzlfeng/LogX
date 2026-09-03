@@ -584,8 +584,10 @@ TEST(Flush, HeapDegraded_WritesAndFlushesCorrectly) {
                       std::to_string(rand());
     pal.file_mkdirs(dir.c_str());
 
-    // 使用非法文件名路径, 使得 file_open 失败, 从而触发 Staging::open 里的堆内存降级
-    std::string bad_staging_path = dir + "/invalid:name/staging.mmap";
+    // 使用已存在的目录作为 staging 文件路径, 使得 file_open (O_RDWR) 失败 (EISDIR),
+    // 从而跨平台 (POSIX/Windows) 可靠触发 Staging::open 里的堆内存降级
+    std::string bad_staging_path = dir + "/staging_as_dir";
+    pal.file_mkdirs(bad_staging_path.c_str());
 
     logx_config_t cfg{};
     cfg.log_dir = dir.c_str();
@@ -625,6 +627,7 @@ TEST(Flush, HeapDegraded_WritesAndFlushesCorrectly) {
     for (const auto& f : pal.file_list(dir.c_str())) {
         pal.file_unlink(f.c_str());
     }
+    pal.file_rmdir(bad_staging_path.c_str());
     pal.file_rmdir(dir.c_str());
 }
 
@@ -686,8 +689,9 @@ TEST(ErrorMonitoring, InitStageEventsCapturedViaConfig) {
                       std::to_string(rand());
     pal.file_mkdirs(dir.c_str());
 
-    // 使用非法路径触发启动阶段的堆内存降级
-    std::string bad_staging_path = dir + "/invalid:name/staging.mmap";
+    // 使用已存在的目录作为 staging 文件路径, 跨平台可靠触发启动阶段的堆内存降级
+    std::string bad_staging_path = dir + "/staging_as_dir";
+    pal.file_mkdirs(bad_staging_path.c_str());
 
     struct InitTracker {
         bool got_degraded = false;
@@ -725,5 +729,6 @@ TEST(ErrorMonitoring, InitStageEventsCapturedViaConfig) {
     for (const auto& f : pal.file_list(dir.c_str())) {
         pal.file_unlink(f.c_str());
     }
+    pal.file_rmdir(bad_staging_path.c_str());
     pal.file_rmdir(dir.c_str());
 }

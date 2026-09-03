@@ -24,7 +24,9 @@ logx/
 │   └── stress/            # 压测套件 (50 线程极限并发 + 15ms flush 竞争 + 50 轮崩溃注入自愈)
 ```
 
-## 构建
+## 构建与测试
+
+### 桌面端 (Windows MSVC)
 
 ```bash
 cd logx
@@ -34,6 +36,32 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
          -DLOGX_WITH_AESGCM=ON
 cmake --build . -j
 ctest --output-on-failure
+```
+
+### Android 交叉编译与真机测试 (NDK + adb)
+
+```bash
+# 交叉编译 (以 arm64-v8a 为例)
+cmake -S . -B build-android \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+  -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
+  -DLOGX_BUILD_TESTS=ON -DLOGX_BUILD_STRESS=ON \
+  -DLOGX_WITH_ZSTD=ON -DLOGX_WITH_AESGCM=ON -G Ninja
+
+cmake --build build-android -j
+
+# 推送二进制至设备并执行
+adb shell mkdir -p /data/local/tmp/logx_test
+adb push $ANDROID_NDK/.../libc++_shared.so /data/local/tmp/logx_test/
+adb push build-android/liblogx.so /data/local/tmp/logx_test/
+adb push build-android/tests/unit/logx_unit_tests /data/local/tmp/logx_test/
+adb push build-android/tests/stress/logx_stress_tests /data/local/tmp/logx_test/
+adb shell "chmod 755 /data/local/tmp/logx_test/*"
+
+# 在真机上运行测试
+adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_unit_tests"
+adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_stress_tests"
 ```
 
 > M1/M2 阶段 `LOGX_WITH_ZSTD` 与 `LOGX_WITH_AESGCM` 默认 OFF(flag=none 跑通);
@@ -98,7 +126,7 @@ lifecycleScope.launch(Dispatchers.IO) {
   - 硬件级未对齐内存访问校验 (零 SIGBUS) 与 23:59:59 跨日/回拨时钟跳变仿真；
   - 崩溃注入与 50 轮随机多阶段崩溃恢复自愈测试，397/397 条日志 100% 挽回；
   - 根治环尾不足 6B 留零脏内存与滑动窗口重同步提前截断 Bug；
-  - 全量 59 个单元测试 + 4 个压测用例 100% 全部通过 (CTest 1.11s 全绿)。
+  - 全量 59 个单元测试 + 4 个压测用例在 Windows (MSVC) 与 Android 真机 (Redmi K30 Pro, arm64-v8a, Android 12) 上 100% 全部通过 (双端全绿)。
 
 ## 后续规划 (M5 阶段)
 

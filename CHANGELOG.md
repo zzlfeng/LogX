@@ -18,6 +18,8 @@
 | `2118592` | feat(stress): add 50-thread concurrent stress test and fix critical ring buffer race conditions |
 | `15fa92c` | feat(retention): implement automatic log retention cleanup on rollover, flush, and startup |
 | `78a2e3c` | feat(test): complete T4.5 fault injection, unaligned access and crash recovery matrix |
+| `0f963b3` | docs: update specifications, roadmap and changelog for M4 completion |
+| `HEAD` | test(android): 跑通 Android 真机 (Redmi K30 Pro) 全量单元测试与压测矩阵并修复跨平台缺陷 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -557,13 +559,40 @@ cmake --build build-android -j
 
 ---
 
+## 八、Android 真机测试与跨平台加固 (2026-09-03)
+
+在真实 Android 物理设备上完成了 `logx_unit_tests` (59 个单元测试) 与 `logx_stress_tests` (4 个压力测试) 的全量交叉编译与真机端到端执行。
+
+### 1. 设备与环境
+- **设备型号**: Redmi K30 Pro (`d16ced26`)
+- **系统版本**: Android 12 (API Level 31)
+- **CPU 架构**: `arm64-v8a`
+- **NDK 版本**: Android NDK 29.0.14206865 (Clang 21.0.0 / libc++_shared)
+
+### 2. 发现并修复的真实缺陷
+1. **`android/cpp/logx_jni.cpp` 编译报错与签名补齐**:
+   - `Java_com_example_logx_LogX_nativeInit` 扩展参数时漏写右括号与大括号，补齐 `retentionDays`, `maxFileSize`, `maxLogLength`, `flushThreshold` 参数；
+   - 补充包含 `logx_internal.h`，解决 `inst->key_user` 在不透明类型指针下访问成员报错的问题。
+2. **`tests/unit/test_flusher.cpp` 跨平台堆降级测试加固**:
+   - 原测试使用 `invalid:name` 文件名假定 `file_open` 必然失败，该假定仅在 Windows NTFS 下成立；在 Linux/Android (ext4/f2fs) 下 `:` 为完全合法的普通字符，导致 staging 成功以文件 mmap 打开而非触发降级；
+   - 修复为使用已存在的同名目录作为 `staging_path`，在 POSIX (Linux/Android) 下触发标准 `EISDIR` 错误，Windows 下触发 `ERROR_ACCESS_DENIED`，跨平台可靠触发堆内存降级与 `LOGX_EV_DEGRADED` 异常打点。
+
+### 3. 真机实测结果
+- **单元测试 (`logx_unit_tests`)**: **59/59 100% 全部通过 (耗时 123ms)**
+  - `Format` (9/9)、`StagingTest` (7/7)、`RecoveryTest` (10/10)、`Split` (4/4)、`Flush` (10/10)、`ErrorMonitoring` (2/2)、`CodecTest` (13/13)、`Robustness` (4/4) 全部全绿。
+- **压力与故障恢复测试 (`logx_stress_tests`)**: **4/4 100% 全部通过 (耗时 820ms)**
+  - **50 线程高并发 + 15ms 强切竞争**: 达到 **85,796 logs/s**，触发文件上限成功轮转 13 个日志分卷，端到端导出 20,924 条日志，**0 损坏、0 丢失、seqno 严格单调递增**。
+  - **崩溃自愈压测**: Staging 仅写入强杀自愈通过；磁盘尾部坏块安全截断并通过；50 轮多阶段随机崩溃注入压测，397/397 条日志 100% 挽回。
+
+---
+
 ## 附:构建命令速查
 
 ### Windows(桌面,MSVC)
 
 ```bash
 # 配置(自动选 MSVC + pal_win32)
-cmake .. -DLOGX_BUILD_TESTS=ON
+cmake .. -DLOGX_BUILD_TESTS=ON -DLOGX_BUILD_STRESS=ON -DLOGX_WITH_ZSTD=ON -DLOGX_WITH_AESGCM=ON
 
 # 构建(必须 Release,Debug 与 Anaconda GTest 不匹配)
 cmake --build . -j --config Release
@@ -572,7 +601,7 @@ cmake --build . -j --config Release
 ctest -C Release --output-on-failure
 ```
 
-### Android(NDK 交叉编译)
+### Android(NDK 交叉编译与真机运行)
 
 ```bash
 # 配置(自动选 Clang + pal_posix;NDK 目录只读引用)
@@ -580,12 +609,21 @@ cmake -S . -B build-android \
   -DCMAKE_TOOLCHAIN_FILE="D:/DevEnv/Android/SDK/ndk/29.0.14206865/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
   -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
-  -DLOGX_BUILD_TESTS=ON -G Ninja
+  -DLOGX_BUILD_TESTS=ON -DLOGX_BUILD_STRESS=ON \
+  -DLOGX_WITH_ZSTD=ON -DLOGX_WITH_AESGCM=ON -G Ninja
 
-# 构建(.a + liblogx.so + logx_unit_tests)
+# 构建(.a + liblogx.so + 测试二进制)
 cmake --build build-android -j
 
-# 在设备/模拟器上运行单测(可选)
-# adb push build-android/tests/unit/logx_unit_tests /data/local/tmp/
-# adb shell /data/local/tmp/logx_unit_tests
+# 推送二进制至设备
+adb shell mkdir -p /data/local/tmp/logx_test
+adb push D:/DevEnv/Android/SDK/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so /data/local/tmp/logx_test/
+adb push build-android/liblogx.so /data/local/tmp/logx_test/
+adb push build-android/tests/unit/logx_unit_tests /data/local/tmp/logx_test/
+adb push build-android/tests/stress/logx_stress_tests /data/local/tmp/logx_test/
+adb shell "chmod 755 /data/local/tmp/logx_test/*"
+
+# 在真机上运行测试
+adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_unit_tests"
+adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_stress_tests"
 ```
