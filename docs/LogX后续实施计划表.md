@@ -13,8 +13,8 @@
 > 偏差明细见 [CHANGELOG.md](./logx/CHANGELOG.md) 「独立复核记录」。  
 >
 > **v1.2 修订说明**:同日完成**测试逻辑复核**(39 个用例与实现源码逐行对照):
-> 断言数值/偏移/语义全部正确,但发现 **4 个"名不符实"用例**(断言通过却未覆盖
-> 声称的分支)与 **8 处已实现功能的覆盖缺口**(最重要的是块级 CRC32 读路径
+> 断言数值/偏移/语义基本正确,但发现 **5 个"名不符实/逻辑失真"用例**(断言通过却未覆盖
+> 声称的分支，甚至断言恒真/手动假降级)与 **8 处已实现功能的覆盖缺口**(最重要的是块级 CRC32 读路径
 > 验证无实现消费、无测试)。归口为新增任务 **T4.0B**,明细见
 > [CHANGELOG.md](./logx/CHANGELOG.md) 「测试逻辑复核记录」。  
 >
@@ -74,7 +74,7 @@ gantt
 | 任务编号 | 任务名称 | 责任模块 / 文件 | 优先级 | 预计工时 | 详细实施要点与验收标准 |
 |---|---|---|---|---|---|
 | **T4.0** | **v5 spec 未落地项与系统缺陷回补**(2026-09-03 复核扩充) | `core/src/logx_c.cpp`, `core/src/flusher.cpp`, `core/src/staging.cpp`, `core/include/logx_staging.h`, `decoder/logx_decode.py`, `android/kotlin/LogX.kt`, `android/cpp/logx_jni.cpp`, `tests/unit/` | **P0** | 2.5d | 依 [CHANGELOG.md](./logx/CHANGELOG.md) 偏差表逐项回补 (共 12 项):<br>1. `flush()` 水位线 `target_seqno` 防饥饿(现为自旋等空,spec §7);<br>2. 切分序号 uint8_t → uint16_t(spec §3.1/§4.4);<br>3. 双 Header 提交改为"写 A → seq_cst fence → 写 B"(现为 A→B→release fence,spec §4.2/§10);<br>4. Flusher 50~100ms Debounce 超时聚合(现为无超时阻塞 ev_wait,spec §4.1);<br>5. ARMv8 Crypto Extensions 硬件加速(spec §10);<br>6. 运行期每 30s 定时 msync/fdatasync 持久化(spec §11);<br>7. 补未对齐访问、23:59:59 时钟跳变 gtest 用例(spec §9);<br>8. **修复 Python 解码器 `logx_decode.py`**: 重构重组状态机(修复 is_whole 逻辑)、支持单块内多条连续日志解析、支持跨块分片重组并实测通过;<br>9. **修复 `LogX.kt` 语法截断**: 补齐 `if (nativeHandle == 0L)` 条件，避免无条件 throw；搭建基础 Gradle 编译验证;<br>10. **JNI Config 参数传递与 ErrorHandler 桥接**: 将 retentionDays、maxFileSize 等参数由 Kotlin 传至 C++，打通 C++ `err_fn` 到 Kotlin `ErrorHandler`;<br>11. **修复重启后切分序号重置为 0 风险**: `ensure_append_target` 从现有文件名正确提取 split 序号，避免覆写历史切分文件;<br>12. **持久化与目录项 fsync 业务接线**: 新建日志文件后对目录执行 fsync，退后台与 close 执行数据持久化。<br>**验收**:每项附测试或脚本验证;12 项偏差逐项销号。 |
-| **T4.0B** | **测试用例修正与覆盖缺口补齐**(2026-09-03 测试逻辑复核新增) | `tests/unit/test_staging.cpp`, `test_flusher.cpp`, `test_recovery.cpp`, `test_codec.cpp`, `core/src/flusher.cpp`, `core/src/codec.cpp` | **P0** | 1.0d | 依 [CHANGELOG.md](./logx/CHANGELOG.md) 「测试逻辑复核记录」逐项处置(预计新增/修正约 10 个用例):<br>**A. 修正 4 个"名不符实"用例**:<br>1. `DualHeaderCorruptionBHandWins`:先 commit 非零值(如 seqno=7)再只破坏 A,断言 B 胜出(现两 Header 全零相同,断言恒真);<br>2. `TornTailNotClosedAsValidBlock`:构造改为声明 len=4 只给 2B payload,真实验证 `first==0` 撕裂封块分支(现为完整合法记录);<br>3. `OneBlockManySmallRecords`:扩到 ≥300 条记录,断言 16KB 封块分支与每块 raw_len ≤ 16KB(现 5600B 单块,封块分支零覆盖;注释"每块 285 条"算错,应为 ≈292);<br>4. `BlocksWrittenHeaderNotCommitted_RemainderRescanned`:改名或重构为把在飞记录放在 snap 之后的真实位置(现构造 raw_len=28 > pending 14B,物理不可达)。<br>**B. 补齐 8 处覆盖缺口**(按优先级):<br>1. **块级 CRC32 读路径**(P0,最重要):写路径已产 crc32(payload) 但 `scan_one`/`decode_block` 均不校验——先补实现消费,再补坏 CRC 拒绝用例(spec §3.2/宁丢不脏);<br>2. 双 Header 均损坏 → 整区重建 + seqno 接管文件 max(spec §4.3);<br>3. 追加目标缓存 O(1) 命中快路径(现所有 recovery 用例 atc.date=0,只走慢路径);<br>4. 保留期清理 `retention_cleanup_impl`(过期文件删除/staging 豁免);<br>5. 按天轮换与 10MB 切分 `.1/.2`(make_log_path + 轮次边界);<br>6. `write_records` kTooLarge 分支(kFull 已测);<br>7. keyProvider 返回 null 时 export 跳过 + 打点语义(spec §7);<br>8. format 入参防御(level>5 / payload=null / 中片 flags=10 断言)。<br>**验收**:gcheck 全绿;`grep` 确认 4 个用例断言已指向真实分支;CRC32 读路径有实现 + 用例。 |
+| **T4.0B** | **测试用例修正与覆盖缺口补齐**(2026-09-03 测试逻辑复核新增) | `tests/unit/test_staging.cpp`, `test_flusher.cpp`, `test_recovery.cpp`, `test_codec.cpp`, `core/src/flusher.cpp`, `core/src/codec.cpp` | **P0** | 1.0d | 依 [CHANGELOG.md](./logx/CHANGELOG.md) 「测试逻辑复核记录」逐项处置(预计新增/修正约 11 个用例):<br>**A. 修正 5 个"名不符实/逻辑失真"用例**:<br>1. `DualHeaderCorruptionBHandWins`:先 commit 非零值(如 seqno=7)再只破坏 A,断言 B 胜出(现两 Header 全零相同,断言恒真);<br>2. `TornTailNotClosedAsValidBlock`:构造改为声明 len=4 只给 2B payload,真实验证 `first==0` 撕裂封块分支(现为完整合法记录);<br>3. `OneBlockManySmallRecords`:扩到 ≥300 条记录,断言 16KB 封块分支与每块 raw_len ≤ 16KB(现 5600B 单块,封块分支零覆盖;注释"每块 285 条"算错,应为 ≈292);<br>4. `BlocksWrittenHeaderNotCommitted_RemainderRescanned`:改名或重构为把在飞记录放在 snap 之后的真实位置(现构造 raw_len=28 > pending 14B,物理不可达);<br>5. `EncodeBlockMissingKey_DowngradesToPlaintext`:改在 `append_block_raw` 级别验证传入 `flag=kFlagEncrypted` 但 `key=null` 时底层自动降级明文落盘并触发 `LOGX_EV_DEGRADED`(现为调用方手动改 flag, 真实降级链路零执行)。<br>**B. 补齐 8 处覆盖缺口**(按优先级):<br>1. **块级 CRC32 读路径**(P0,最重要):写路径已产 crc32(payload) 但 `scan_one`/`decode_block` 均不校验——先补实现消费,再补坏 CRC 拒绝用例(spec §3.2/宁丢不脏);<br>2. 双 Header 均损坏 → 整区重建 + seqno 接管文件 max(spec §4.3);<br>3. 追加目标缓存 O(1) 命中快路径(现所有 recovery 用例 atc.date=0,只走慢路径);<br>4. 保留期清理 `retention_cleanup_impl`(过期文件删除/staging 豁免);<br>5. 按天轮换与 10MB 切分 `.1/.2`(make_log_path + 轮次边界);<br>6. `write_records` kTooLarge 分支(kFull 已测);<br>7. keyProvider 返回 null 时 export 跳过 + 打点语义(spec §7);<br>8. format 入参防御(level>5 / payload=null / 中片 flags=10 断言)。<br>**验收**:当前功能覆盖度由 ~65% 提升至 ≥95%; gcheck 全绿; `grep` 确认 5 个用例断言已指向真实分支; CRC32 读路径有实现 + 用例。 |
 | **T4.1** | mmap 失败堆内存 staging 降级 | `core/src/staging.cpp`, `core/src/flusher.cpp` | **P1** | 1.0d | 1. `mmap` 创建失败时降级分配 128KB 堆内存；<br>2. Flusher 启用定时 5s / 64KB 兜底 write 落盘；<br>3. 显式标记并通知 `ErrorHandler(DEGRADED)`。 |
 | **T4.2** | 关键异常监控打点与 ErrorHandler 对齐 | `core/src/logx_c.cpp`, `android/kotlin/LogX.kt` | **P1** | 0.5d | 1. 打通 `DROP` (超长/环满)、`IO` (写盘失败)、`RECOVERY` (截断丢块)、`DEGRADED` (mmap/密钥降级) 等事件；<br>2. 确保在 JNI 层正确回调 Kotlin 注册的 `ErrorHandler`。 |
 | **T4.3** | 日志保留期自动清理机制 | `core/src/flusher.cpp` | **P1** | 0.5d | 1. 在 Flusher 启动时及退后台/跨天时扫描日志目录；<br>2. 自动删除 `retentionDays` 之前的超期日志文件，staging 文件豁免。 |
@@ -102,7 +102,7 @@ gantt
 
 2026-09-03 ~ 2026-09-06 (M4 阶段前置):
   [T4.0] v5 spec 未落地项与系统缺陷回补 (12项: 水位线/切分2B/屏障/Debounce/ARMv8/30s持久化/测试用例/Python解码器重构/LogX.kt语法修复/JNI配置与错误桥接/切分序号覆写风险/目录fsync)
-  [T4.0B] 测试用例修正 (4 个名不符实用例) + 覆盖缺口补齐 (8 处,含 CRC32 读路径)
+  [T4.0B] 测试用例修正 (5 个名不符实用例) + 覆盖缺口补齐 (8 处,含 CRC32 读路径)
   【交付】: 复核偏差表 12 项逐项销号,spec 与代码重新对齐;解码工具与 Kotlin Facade 实测可用;测试断言指向真实分支。
 
 2026-09-07 ~ 2026-09-12 (M4 阶段):
@@ -133,7 +133,7 @@ gantt
 
 > 状态标注(2026-09-03 复核):✅ = 已有实测依据;⬜ = 未完成/无实证/实测未通过。
 
-- [x] ✅ `LOGX_WITH_ZSTD=ON` + `LOGX_WITH_AESGCM=ON` 下，C++ 单元测试全绿 39/39（含明/密文共存、错误密钥拒绝、篡改 Tag 拒绝；2026-09-03 MSVC Release 实测复现）。⚠️ 测试逻辑复核后,T4.0B 将修正 4 个名不符实用例并补 8 处覆盖缺口。
+- [x] ✅ `LOGX_WITH_ZSTD=ON` + `LOGX_WITH_AESGCM=ON` 下，C++ 单元测试全绿 39/39（含明/密文共存、错误密钥拒绝、篡改 Tag 拒绝；2026-09-03 MSVC Release 实测复现）。⚠️ 测试逻辑复核后,T4.0B 将修正 5 个名不符实用例并补 8 处覆盖缺口(当前已实现功能覆盖度约 65%~70%, 目标提升至 ≥95%)。
 - [ ] ⬜ Python 解码工具 `logx_decode.py` 成功解析由实际引擎产出的加密日志（实测发现整条日志 reassemble 返回 None 及单块假设缺陷，待 T4.0-8 修复后联调）。
 - [ ] ⬜ Kotlin Facade `LogX.kt` 建立自动化编译与单测工程（实测发现语法截断错误，待 T4.0-9 修复并接入 Gradle）。
 - [ ] ⬜ JNI 边界通过真实 Android 设备验证 keyProvider 无内存泄漏（历史记录为单测通过;泄漏专项监测归 T4.4）。
