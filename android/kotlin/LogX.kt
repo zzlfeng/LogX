@@ -56,6 +56,7 @@ object LogX {
         val encrypt: Boolean = false,
         val kid: Int = 1,
         val keyProvider: KeyProvider? = null,
+        val errorHandler: ErrorHandler? = null,
         val autoProcessIsolation: Boolean = true, // 默认开启多进程目录防呆隔离
     )
 
@@ -68,6 +69,9 @@ object LogX {
         if (initCount.incrementAndGet() != 1L) {
             // 重复 init: 抛 IllegalStateException (参见 spec §7)。
             throw IllegalStateException("LogX.init called more than once")
+        }
+        if (config.errorHandler != null) {
+            errorHandler = config.errorHandler
         }
 
         val suffix = if (config.autoProcessIsolation) getProcessSuffix(context) else ""
@@ -122,6 +126,22 @@ object LogX {
     }
 
     fun setErrorHandler(handler: ErrorHandler?) { errorHandler = handler }
+
+    @JvmStatic
+    fun onNativeError(kindInt: Int, code: Int, message: String) {
+        val kind = when (kindInt) {
+            1 -> EventKind.DEGRADED
+            2 -> EventKind.DROP
+            3 -> EventKind.IO
+            4 -> EventKind.RECOVERY
+            else -> EventKind.IO
+        }
+        try {
+            errorHandler?.onError(kind, code, message)
+        } catch (t: Throwable) {
+            // 保护内核不被业务异常打崩
+        }
+    }
 
     fun v(tag: String, msg: String) = log(Level.V, tag, msg.toByteArray())
     fun d(tag: String, msg: String) = log(Level.D, tag, msg.toByteArray())

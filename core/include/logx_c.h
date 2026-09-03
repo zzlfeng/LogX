@@ -45,6 +45,12 @@ typedef enum {
     LOGX_EV_RECOVERY = 4,   /* 启动恢复告警(截尾/作废重建/丢失计数) */
 } logx_event_kind_e;
 
+/* ===== 错误回调 ===== */
+typedef void (*logx_error_fn)(void* user,
+                             logx_event_kind_e kind,
+                             int code,
+                             const char* msg);
+
 /* ===== 配置 ===== */
 typedef struct logx_config {
     const char* log_dir;          /* 正式日志目录,应用私有;NULL = 必填 */
@@ -67,13 +73,11 @@ typedef struct logx_config {
     const uint8_t* (*key_provider)(uint16_t kid, void* user);
 
     void* user;                  /* 透传给 key_provider */
-} logx_config_t;
 
-/* ===== 错误回调 ===== */
-typedef void (*logx_error_fn)(void* user,
-                             logx_event_kind_e kind,
-                             int code,
-                             const char* msg);
+    /* 错误回调(可选);若提供,启动恢复阶段事件亦会通知 */
+    logx_error_fn err_fn;
+    void* err_user;              /* 透传给 err_fn */
+} logx_config_t;
 
 #ifdef __cplusplus
 }  /* extern "C" */

@@ -251,6 +251,8 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->kid = cfg->kid;
     inst->key_provider = cfg->key_provider;
     inst->key_user = cfg->user;
+    inst->err_fn = cfg->err_fn;
+    inst->err_user = cfg->err_user;
     inst->pal = &default_pal();
     inst->mu = inst->pal->mutex_create();
     inst->flush_event = inst->pal->ev_create();
@@ -321,10 +323,9 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     // 1) 锁外格式化(包含校验和计算)
     uint8_t buf[kMaxRecordTotal];
     uint32_t total = 0;
-    if (!build_records(inst, level, tag, payload, payload_len, buf, &total)) {
-        return LOGX_ERR_TOO_LARGE;
-    }
-    if (total > inst->max_log_length) {
+    if (!build_records(inst, level, tag, payload, payload_len, buf, &total) ||
+        total > inst->max_log_length) {
+        emit_event(inst, LOGX_EV_DROP, -1, "log too large");
         return LOGX_ERR_TOO_LARGE;
     }
 
@@ -338,6 +339,7 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         need_wake = pending >= inst->flush_threshold;
     } else if (st == Staging::WriteStatus::kFull) {
         inst->drop_no_space.fetch_add(1);
+        emit_event(inst, LOGX_EV_DROP, -1, "staging full");
     }
     inst->pal->mutex_unlock(inst->mu);
 

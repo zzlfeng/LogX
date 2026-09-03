@@ -30,6 +30,46 @@ struct JniKeyProviderContext {
     jmethodID mid_get_key = nullptr;
 };
 
+struct JniErrorContext {
+    JavaVM* jvm = nullptr;
+    jclass g_logx_class = nullptr;
+    jmethodID mid_on_error = nullptr;
+};
+
+static JniErrorContext g_err_ctx;
+
+static void jni_error_trampoline(void* /*user*/, logx_event_kind_e kind, int code, const char* msg) {
+    if (!g_err_ctx.jvm || !g_err_ctx.g_logx_class || !g_err_ctx.mid_on_error) {
+        return;
+    }
+    JNIEnv* env = nullptr;
+    bool need_detach = false;
+    jint getEnvRes = g_err_ctx.jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (getEnvRes == JNI_EDETACHED) {
+#if defined(__ANDROID__)
+        if (g_err_ctx.jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+            need_detach = true;
+        }
+#else
+        if (g_err_ctx.jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) == JNI_OK) {
+            need_detach = true;
+        }
+#endif
+    } else if (getEnvRes != JNI_OK || !env) {
+        return;
+    }
+
+    if (env) {
+        jstring jMsg = env->NewStringUTF(msg ? msg : "");
+        env->CallStaticVoidMethod(g_err_ctx.g_logx_class, g_err_ctx.mid_on_error,
+                                  static_cast<jint>(kind), static_cast<jint>(code), jMsg);
+        env->DeleteLocalRef(jMsg);
+        if (need_detach) {
+            g_err_ctx.jvm->DetachCurrentThread();
+        }
+    }
+}
+
 static thread_local uint8_t g_tls_key_buf[32];
 
 static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
@@ -109,12 +149,23 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     const char* staging_path = env->GetStringUTFChars(jStagingPath, nullptr);
 
     JniKeyProviderContext* kp_ctx = nullptr;
-    if (jKeyProvider) {
-        JavaVM* jvm = nullptr;
-        env->GetJavaVM(&jvm);
+    JavaVM* jvm = nullptr;
+    env->GetJavaVM(&jvm);
+
+    if (jvm && !g_err_ctx.g_logx_class) {
+        jclass localLogX = env->FindClass("com/example/logx/LogX");
+        if (localLogX) {
+            g_err_ctx.jvm = jvm;
+            g_err_ctx.g_logx_class = static_cast<jclass>(env->NewGlobalRef(localLogX));
+            g_err_ctx.mid_on_error = env->GetStaticMethodID(localLogX, "onNativeError", "(IILjava/lang/String;)V");
+            env->DeleteLocalRef(localLogX);
+        }
+    }
+
+    if (jKeyProvider && jvm) {
         jclass kpClass = env->GetObjectClass(jKeyProvider);
         jmethodID mid = env->GetMethodID(kpClass, "getKey", "(I)[B");
-        if (jvm && mid) {
+        if (mid) {
             kp_ctx = new JniKeyProviderContext();
             kp_ctx->jvm = jvm;
             kp_ctx->g_provider = env->NewGlobalRef(jKeyProvider);
@@ -130,6 +181,12 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     cfg.max_file_size = maxFileSize > 0 ? static_cast<uint64_t>(maxFileSize) : (10ULL * 1024 * 1024);
     cfg.flush_threshold = flushThreshold > 0 ? static_cast<uint32_t>(flushThreshold) : (8 * 1024);
     cfg.compress_algo = static_cast<uint8_t>(compressAlgo);
+    cfg.encrypt_enable = static_cast<uint8_t>(encryptEnable);
+    cfg.kid = static_cast<uint16_t>(kid);
+    cfg.key_provider = kp_ctx ? jni_key_provider_trampoline : nullptr;
+    cfg.user = kp_ctx;
+    cfg.err_fn = jni_error_trampoline;
+    cfg.err_user = nullptr;
 
     logx_instance_t* inst = nullptr;
     logx_status_e rc = logx_open(&cfg, &inst);
@@ -157,6 +214,12 @@ Java_com_example_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong hand
             }
             delete kp_ctx;
             inst->key_user = nullptr;
+        }
+        if (g_err_ctx.g_logx_class) {
+            env->DeleteGlobalRef(g_err_ctx.g_logx_class);
+            g_err_ctx.g_logx_class = nullptr;
+            g_err_ctx.mid_on_error = nullptr;
+            g_err_ctx.jvm = nullptr;
         }
         logx_close(inst);
     }

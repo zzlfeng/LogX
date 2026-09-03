@@ -530,3 +530,103 @@ TEST(Flush, HeapDegraded_WritesAndFlushesCorrectly) {
     }
     pal.file_rmdir(dir.c_str());
 }
+
+TEST(ErrorMonitoring, DropEventOnTooLargeAndFull) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_drop_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 500;  // 设为 500B
+    cfg.retention_days = 7;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 16 * 1024;  // 不自动刷
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    struct DropTracker {
+        int drop_count = 0;
+        std::string last_msg;
+    } tracker;
+
+    logx_set_error_handler(inst, [](void* user, logx_event_kind_e kind, int, const char* msg) {
+        if (kind == LOGX_EV_DROP) {
+            auto* t = static_cast<DropTracker*>(user);
+            t->drop_count++;
+            t->last_msg = msg ? msg : "";
+        }
+    }, &tracker);
+
+    // 1) 写入 600B 日志(超 max_log_length 500B)
+    std::string large_msg(600, 'L');
+    EXPECT_EQ(logx_write(inst, 2, "Tag",
+                         reinterpret_cast<const uint8_t*>(large_msg.data()),
+                         static_cast<uint32_t>(large_msg.size())), LOGX_ERR_TOO_LARGE);
+    EXPECT_EQ(tracker.drop_count, 1);
+    EXPECT_EQ(tracker.last_msg, "log too large");
+
+    logx_close(inst);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+TEST(ErrorMonitoring, InitStageEventsCapturedViaConfig) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_init_ev_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+
+    // 使用非法路径触发启动阶段的堆内存降级
+    std::string bad_staging_path = dir + "/invalid:name/staging.mmap";
+
+    struct InitTracker {
+        bool got_degraded = false;
+        std::string msg;
+    } tracker;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = bad_staging_path.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 1024;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;
+    cfg.err_fn = [](void* user, logx_event_kind_e kind, int, const char* msg) {
+        if (kind == LOGX_EV_DEGRADED) {
+            auto* t = static_cast<InitTracker*>(user);
+            t->got_degraded = true;
+            t->msg = msg ? msg : "";
+        }
+    };
+    cfg.err_user = &tracker;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 验证在 logx_open 期间触发的 DEGRADED 事件通过 cfg.err_fn 成功捕获
+    EXPECT_TRUE(tracker.got_degraded);
+    EXPECT_NE(tracker.msg.find("degraded to heap"), std::string::npos);
+
+    logx_close(inst);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
