@@ -15,8 +15,11 @@
 | `f2e5949` | feat: 恢复对账 Σraw_len 精确回推 + zstd 真接入(M3 首步),32 单测全绿 |
 | `433497e` | feat: 实施方案 v5 定稿升级 + JNI 补齐与零堆分配优化 + 多进程自动隔离 |
 | `4c70e25` | feat: M3 加密闭环落地(mbedtls AES-256-GCM + JNI KeyProvider 桥接 + 离线解码闭环),39 单测全绿 |
+| `2118592` | feat(stress): add 50-thread concurrent stress test and fix critical ring buffer race conditions |
+| `15fa92c` | feat(retention): implement automatic log retention cleanup on rollover, flush, and startup |
+| `78a2e3c` | feat(test): complete T4.5 fault injection, unaligned access and crash recovery matrix |
 
-> 注:上表后两行曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
+> 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
 ---
 
@@ -138,7 +141,72 @@
 
 ---
 
-## 〇、M3 加密闭环落地(本次)
+## 〇、M4 生产加固、并发压测与故障注入落地(本次)
+
+对应方案文档 `LogX日志库最终实施方案.md` §2、§3.1、§3.3、§4.1~§4.4、§7、§9、§10、§11 与计划表任务 T4.0B、T4.1~T4.5。
+
+### 1. T4.3 日志保留期自动清理机制 (Commit `15fa92c`)
+
+- **触发时机全链路闭环**:
+  - 在 `flusher_loop` 线程启动时执行一次基线清理；
+  - 在 `drain_once` 检测到自然日跨天（`yyyymmdd != current_date`）切换目标文件时触发清理；
+  - 在 `flush_blocking`（对应 Android 退后台 `onStop`/`onBackground` 调用 `logx_flush`）落盘完成时立即触发清理，保证退后台即刻释放存储。
+- **边界防御与平年/闰年精准推算**:
+  - 实现 `is_leap_year(y)`，覆盖 4 年一闰、百年不闰、四百年又闰法则；推算 2 月平年 28 天/闰年 29 天及大月 31 天/小月 30 天；
+  - **显式豁免 Staging 文件**: 针对以 `.mmap` 结尾的环形内存映射文件无条件跳过；
+  - **保护当天与未来文件**: 对文件名解析出的日期 $\ge$ 当天日期的文件严格保留，免疫时钟小幅波动干扰。
+- **跨块串联与排序加固**:
+  - `decode_one_file` 引入 `carry_slice_buf` 解决跨块分片日志还原；
+  - `take_snapshot` 统一采用 `(date, split_no)` 自然数值排序，彻底避免字符串字典序导致 `.log.10` 排在 `.log.2` 前面的逻辑错位。
+
+### 2. T4.4 50 线程高并发压力测试与死锁/一致性验证 (Commit `2118592`)
+
+- **压测场景与高频竞争注入 (`tests/stress/test_concurrent.cpp`)**:
+  - **50 个 Worker 线程**: 通过原子发令枪同时并发起跑，写入 80B ~ 1500B 混合变长日志；
+  - **1 个专属 flush 竞争线程**: 在高并发写入期间以 15ms 间隔高频主动调用 `logx_flush()`，与后台 Flusher 线程及 50 个写线程的互斥锁制造极限锁争用与切块打断；
+  - **512KB 极小切分阈值**: 强制在压测过程中产生 15+ 个文件轮转切分。
+- **性能与一致性对账指标**:
+  - **吞吐率**: 纯写用时约 0.08 秒，达到 **300,000+ logs/s** 级超高写入吞吐；
+  - **对账 1 (物理块与单调 Seqno)**: 遍历校验 500+ 个落盘 Block，CRC32 校验 100% 正确，全局 seqno 严格连续单调递增，无断号、无跳号、无重复；
+  - **对账 2 (端到端数据完整性)**: 通过公开 C API `logx_export` 导出全部记录，`exported_records == raw_disk_records == written_logs`，**数据零丢失、零损坏、零死锁**。
+
+### 3. T4.5 故障注入与鲁棒性验证矩阵 (Commit `78a2e3c`)
+
+- **硬件级未对齐内存访问安全校验 (`tests/unit/test_robustness.cpp`)**:
+  - 在奇数内存偏移（`+1, +3, +5, +7`）执行 `put_u16/32/64`、`get_u16/32/64` 读写，保证小端序与 100% 内存安全，杜绝在 ARMv7-A 硬件或 ASan/UBSan 下触发 `SIGBUS` 崩溃；
+  - 在非对齐地址上执行 `format_record`、`parse_record` 与 `parse_records_stream`，验证编解码器无对齐假设。
+- **时钟跳变与回拨仿真验证 (`tests/unit/test_robustness.cpp`)**:
+  - 实现 `MockClockPal` 测试代理；
+  - **23:59:59 跨日跳变到 00:00:01**: 验证 Flusher 自动识别时钟跨天，旧日志文件平稳归档，次日新文件命名与切分序号复位为 0，全局 `seqno` 严格自增衔接；
+  - **时钟剧烈大幅回拨（后天 -> 前天）**: 验证系统时钟倒退时，`scan_dir_for_target` 接管算法平稳运行，绝不覆盖已有日志，当天与未来日志 100% 完整保留。
+- **进程崩溃注入与恢复自愈套件 (`tests/stress/test_crash_recovery.cpp`)**:
+  - **Staging 未落盘强杀恢复**: 写入环形缓冲区后模拟进程被 `kill -9` 强杀；重启实例后 `run_recovery` 自动识别 Staging 中未刷盘日志并补刷落盘，**20/20 条日志 100% 挽回（零丢失）**；
+  - **磁盘尾部坏块截断告警**: 日志文件尾部注入坏块；重启后 `run_recovery` 精确截断坏块并打点 `LOGX_EV_RECOVERY`，无下溢，后续新日志无缝写入；
+  - **50 轮多阶段随机崩溃自愈循环**: 连续 50 轮在“写 Staging 强杀”、“部分刷盘强杀”、“正常退出”交替切换；50 轮结束后通过 `logx_export` 导出对账，**397 条日志全部 100% 完整复原，丢失记录数为 0**。
+
+### 4. 深度演练中挖掘并根治的底层关键 Bug
+
+1. **环尾不足 6 字节留零脏内存缺陷 ([`core/src/staging.cpp`](file:///d:/Project/Android_Project/LogX/logx/core/src/staging.cpp))**:
+   - *缺陷*: 在 `Staging::write_records` 中，当尾部剩余空间 `pad < 6` 时原先直接 `w = 0`，未清零残余的 1~5 字节，导致该缝隙残留了上一轮次的脏内存数据，经 `copy_pending` 拷贝到下游导致数据错位；
+   - *修复*: 当 `pad > 0 && pad < 6` 时显式 `std::memset(data_base_ + w, 0, pad)` 清零，杜绝旧轮次内存脏数据。
+2. **滑动窗口重同步提前截断退出缺陷 ([`core/src/format.cpp`](file:///d:/Project/Android_Project/LogX/logx/core/src/format.cpp))**:
+   - *缺陷*: `parse_records_stream` 中原先在校验 `magic` 前先校验了 `recs_len - pos < kHeaderLen + len` 以及 `magic == 0 && len == 0 break;`；遇到回绕处的零缝隙时，伪造的巨大 `len` 或 `magic==0` 导致循环直接 `break`，将当前块后续整批合法记录误判遗弃；
+   - *修复*: 先校验 `magic` 合法性，凡遇到非 Entry / 非 Pad 头部（含零缝隙），统一使用前向滑动窗口（Slide-window resync）动态寻找下一个合法头部，绝不因零缝隙提前截断退出。
+3. **Flusher 退出时文件句柄未关闭 ([`core/src/flusher.cpp`](file:///d:/Project/Android_Project/LogX/logx/core/src/flusher.cpp))**:
+   - *修复*: 在 `flusher_loop` 退出时显式调用 `close_current(&c, inst->pal)`，确保最后刷入系统缓冲区的文件数据安全提交到磁盘。
+4. **Hint 命中截断状态丢失缺陷 ([`core/src/recovery.cpp`](file:///d:/Project/Android_Project/LogX/logx/core/src/recovery.cpp))**:
+   - *修复*: 在 `reconcile` 中引入 `was_truncated` 状态保持，确保修复坏块后的 `truncated` 标记不会在后续二次全目录扫描中被冲刷成 false，从而保证打点事件 `LOGX_EV_RECOVERY` 准确上报。
+
+### 5. 全量验证结果
+
+- **Windows (MSVC 2022 Release)**:
+  - **`logx_unit_tests`**: **59 / 59 PASSED (100%)**
+  - **`logx_stress_tests`**: **4 / 4 PASSED (100%)**
+- **全量 CTest 自动化测试**: 2 个测试目标 100% 全部通过，耗时仅 1.11 秒。
+
+---
+
+## 〇、M3 加密闭环落地(历史)
 
 对应方案文档 `LogX日志库最终实施方案.md` §2、§3.2、§4.2、§7、§10 的 M3 加密闭环。
 

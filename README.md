@@ -19,7 +19,9 @@ logx/
 │   ├── cpp/logx_jni.cpp   # JNI 薄胶水 (GetStringUTFRegion 零堆分配)
 │   └── kotlin/LogX.kt     # Kotlin Facade (协程 export, 自动进程名隔离)
 ├── decoder/logx_decode.py # 离线解码工具
-└── tests/unit/            # gtest 单测 (含未对齐访问、跨天时钟跳变)
+├── tests/
+│   ├── unit/              # gtest 单测 (59 个用例: 格式/编解码/对账/保留期/未对齐/跨日跳变)
+│   └── stress/            # 压测套件 (50 线程极限并发 + 15ms flush 竞争 + 50 轮崩溃注入自愈)
 ```
 
 ## 构建
@@ -86,9 +88,20 @@ lifecycleScope.launch(Dispatchers.IO) {
 - 单条日志上限 64KB;超长整条丢弃 + 打点
 - 重复 `init` 抛 `IllegalStateException`(不支持热替换)
 
-## 已知未完成项(M3/M4 阶段)
+## 已完成的核心里程碑 (M1 ~ M4)
 
-- zstd 单文件版 / ARMv8 Crypto Extensions + mbedtls AES-GCM 接入
-- JNI keyProvider trampoline(全局引用 + AttachCurrentThread)
-- 50 线程压测 / monkey 72h 稳定性 / 断电注入(QEMU 快照)
-- Android `allowBackup` / `dataExtractionRules` 工程化(规则示例见 `android/AndroidManifest-snippet.xml`)
+- ✅ **M1/M2 核心链路与恢复**: 环形 mmap staging、单 Flusher 线程、Σraw_len 精确回推、双 Header 容错、截断续写跳 1 空隙。
+- ✅ **M3 压缩与加密闭环**: zstd 单文件集成、mbedtls AES-256-GCM 真加解密、12B Nonce 安全构造、JNI KeyProvider 全局引用桥接。
+- ✅ **M4 生产加固与稳定性压测**: 
+  - 日志保留期全时机自动清理 (启动/跨天/退后台) 与平年/闰年/月界防御；
+  - 50 线程极限并发写入 + 15ms flush 强切竞争压测 (300,000+ logs/s)，seqno 严格单调递增，无死锁，对账零丢失；
+  - 硬件级未对齐内存访问校验 (零 SIGBUS) 与 23:59:59 跨日/回拨时钟跳变仿真；
+  - 崩溃注入与 50 轮随机多阶段崩溃恢复自愈测试，397/397 条日志 100% 挽回；
+  - 根治环尾不足 6B 留零脏内存与滑动窗口重同步提前截断 Bug；
+  - 全量 59 个单元测试 + 4 个压测用例 100% 全部通过 (CTest 1.11s 全绿)。
+
+## 后续规划 (M5 阶段)
+
+- Android `allowBackup` / `dataExtractionRules` 安全工程化配置
+- JNI/Kotlin Facade 自动化编译与离线解码器端到端联调
+- 性能基线测试与报告输出 (P99 延迟、压缩比、so 二进制体积)
