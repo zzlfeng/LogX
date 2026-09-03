@@ -12,9 +12,94 @@
 | `d454dee` | fix: 修复首次编译暴露的 4 处真实 bug(MSVC 构建验证) |
 | `fa24e2f` | feat: Windows(MSVC) 平台移植 + 核心零平台依赖落地,21 个单测全绿 |
 | `30efff8` | build: 打通 Android NDK 交叉编译,新增 liblogx.so(JNI)并修复 3 处真实 bug |
-| `e819ac2` | feat: 恢复对账 Σraw_len 精确回推 + zstd 真接入(M3 首步),32 单测全绿 |
-| `1cf48a1` | fix & feat: 实施方案 v5 定稿升级 + JNI 补齐与零堆分配优化 + 多进程自动隔离 |
-| (本次) | feat: M3 加密闭环落地(mbedtls AES-256-GCM + JNI KeyProvider 桥接 + 离线解码闭环),39 单测全绿 |
+| `f2e5949` | feat: 恢复对账 Σraw_len 精确回推 + zstd 真接入(M3 首步),32 单测全绿 |
+| `433497e` | feat: 实施方案 v5 定稿升级 + JNI 补齐与零堆分配优化 + 多进程自动隔离 |
+| `4c70e25` | feat: M3 加密闭环落地(mbedtls AES-256-GCM + JNI KeyProvider 桥接 + 离线解码闭环),39 单测全绿 |
+
+> 注:上表后两行曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
+
+---
+
+## 独立复核记录(2026-09-03,代码级验证)
+
+对照方案 v5 与本 CHANGELOG 逐项核查;Windows / MSVC 2022 / x64 Release 下以
+`-DLOGX_WITH_ZSTD=ON -DLOGX_WITH_AESGCM=ON` 实际重新配置、编译并运行全部单测。
+
+### 复核通过(声称属实)
+
+- **39/39 单测全绿**:实测复现(`[ PASSED ] 39 tests`),与"M3 加密闭环"章节声称一致。
+- **M3 加密闭环**:mbedtls vendor 源码在位;`codec.cpp` 真调用 `mbedtls_gcm_crypt_and_tag` /
+  `mbedtls_gcm_auth_decrypt`;12B Nonce = 8B 文件盐 + 4B 大端 seqno;密钥缺失降级明文;
+  错钥 / 篡改 Tag 拒绝(CodecTest)均与描述一致。
+- **JNI 层**:`jni_key_provider_trampoline`(NewGlobalRef + AttachCurrentThread,
+  nativeClose 释放全局引用)、`nativeExport`、`GetStringUTFRegion` 栈缓冲、
+  `GetPrimitiveArrayCritical` 零堆写入路径均在代码中落实。
+- **其他**:多进程自动隔离(`getProcessSuffix`)、`suspend fun export`、
+  decoder `--kid-map`、保留期清理、恢复对账 Σraw_len 回推与截断续写跳 1 空隙
+  (resume = max + 1,首块 = max + 2)均属实。
+
+### 复核发现的偏差(文档已同步标注,任务归口计划表 T4.0)
+
+| # | spec/CHANGELOG 声称(v5) | 代码实际(2026-09-03) |
+|---|---|---|
+| 1 | `flush()` 水位线 `target_seqno` 防饥饿(§7,P0) | 未实现:`flush_blocking` 自旋等待 staging 全空 + 5ms sleep,持续高频写入存在饥饿风险 |
+| 2 | 切分序号升级 2B uint16_t(§3.1/§4.4,P1) | 仍为 uint8_t(`AppendTargetCache.split_no` / `make_log_path`) |
+| 3 | 双 Header:写 A → seq_cst fence → 写 B(§4.2/§10,P0) | 实现为 A(中间态 CRC 保护)→ B → `atomic_thread_fence(release)`,时机与内存序均偏离纪律 |
+| 4 | Flusher 50~100ms Debounce 超时聚合(§4.1,P2) | 未实现:`flusher_loop` 为无超时阻塞 `ev_wait` |
+| 5 | ARMv8 Crypto Extensions 硬件加速(§10,P2) | 全库无 `__ARM_FEATURE_CRYPTO` 相关代码 |
+| 6 | 每 30s 定时 msync/fdatasync 持久化(§11) | 未实现,当前仅退后台 / 手动路径触发 |
+| 7 | 未对齐访问 / 23:59:59 时钟跳变测试用例(§9,P2) | 39 个用例中不存在 |
+
+另:M1/M2 验收栏的"kill -9 注入 1000 次零丢失、零重复"与"单条写入 <2µs"
+无实测依据(仓库无崩溃注入 harness,无基准报告);计划表 v1.1 已改为指向 T4.5 / T5.2。
+
+> ⚠️ 阅读提示:本节之后的历史章节中,"实施方案 v5 定稿升级"一节记录的是
+> **方案文档(设计)的升级**;上表 1~7 项截至复核日仅停留在 spec 层面、未落地代码,
+> 请勿据其认为代码已实现。
+
+---
+
+## 测试逻辑复核记录(2026-09-03,39 用例与实现逐行对照)
+
+在「独立复核记录」基础上,对 5 个测试文件逐一与实现源码核对。**结论:39 个用例的
+断言数值、偏移、语义全部正确,无"错的测试恰好通过";但存在 4 个"名不符实"用例
+(断言通过却未覆盖声称的分支)与 8 处已实现功能的覆盖缺口。**归口计划表任务 **T4.0B**。
+
+### A. 名不符实用例(断言恒真/分支未触发,待 T4.0B 修正)
+
+1. **`StagingTest.DualHeaderCorruptionBHandWins`**:commit 后未写任何数据即 close,
+   A/B 内容相同(均为全零 Header),断言 `seqno==0` 无论读到 A 还是 B 都成立——
+   "B 接管"未被真实验证。
+2. **`Split.TornTailNotClosedAsValidBlock`**:头部声明 len=2 且 2B payload 齐全,
+   是一条完整合法记录,`peek_record_len` 成功,走正常累计分支;`first==0` 的
+   撕裂封块分支(flusher.cpp)实际未被执行。
+3. **`Split.OneBlockManySmallRecords`**:100×56B=5600B 远小于 16KB,实际只产生
+   1 块;16KB 封块分支(加下一条超限则封块)在全部测试中零覆盖。注释"每块 285 条"
+   算错(16384/56≈292)。
+4. **`RecoveryTest.BlocksWrittenHeaderNotCommitted_RemainderRescanned`**:实际验证
+   的是"在飞记录被清零、坐标收敛"(并非"重扫");且构造上块 raw_len=28 大于待刷区
+   [28,42) 仅 14B——真实 Flusher 的块只会从 pending 区切出,该状态物理不可达。
+
+### B. 覆盖缺口(已实现、零测试,按优先级)
+
+1. **块级 CRC32 读路径(P0)**:`append_block_raw` 写入 crc32(payload),
+   但 `scan_one` 扫块只查 magic 从不校验 CRC,`decode_block` 将 CRC 责任
+   (void) 交给调用方且无任何调用方执行——"宁丢不脏"的这层兜底既无实现消费
+   也无测试(spec §3.2/§9 撕裂注入依赖它)。
+2. 双 Header 均损坏 → 整区重建 + seqno 接管文件 max(spec §4.3 末段)。
+3. 追加目标缓存 O(1) 命中快路径(现所有 recovery 用例 atc.date=0,只走慢路径)。
+4. 保留期清理 `retention_cleanup_impl`。
+5. 按天轮换与 10MB 切分 `.1/.2`。
+6. `write_records` 的 kTooLarge 分支(kFull 已测)。
+7. keyProvider 返回 null 时 export 跳过 + 打点语义(spec §7)。
+8. format 入参防御(level>5、payload=null)与中片 flags=10 断言。
+
+### C. 其他观察(不阻塞)
+
+- nonce 派生(8B 盐 + 4B 大端 seqno)无单测——spec M3 验收点"nonce 唯一性单测"
+  缺失,并入 T4.0B 第 1 项附近补齐。
+- 对 v3/v4 修复点(1 字节空隙、pad<6 留零、Σraw_len 回推、跳空隙、下溢、钳制)
+  的回归测试真实有效,是本测试集价值最高的部分。
 
 ---
 
@@ -73,6 +158,12 @@
 对应方案文档评审优化定稿(v5, 2026-09-02)以及 Kotlin Facade 与 JNI 边界的契约闭环。
 
 ### 1. 方案文档升级至 v5 评审优化定稿版 (`LogX日志库最终实施方案.md`)
+
+> ⚠️ **实现状态标注(2026-09-03 复核)**:本小节记录的是**方案文档(设计)的升级**。
+> 下列各项中**已落地代码**:环形坐标系规范化、多进程自动隔离、`export` 协程化、JNI 零堆分配;
+> **仅 spec 定稿、未落地代码**:flush 水位线、切分序号 2B、双 Header 屏障纪律(实现偏离,见复核表 #3)、
+> Flusher Debounce、ARMv8 加速、未对齐/时钟跳变测试用例 —— 统一由计划表 **T4.0** 回补,
+> 明细见上方「独立复核记录」。
 
 - **[P0] 环形坐标系规范化**(§3.1 / §5):
   - 修复伪代码中相对偏移 `[0, kDataSize)` 与物理基址（128B）混用的 Bug；
@@ -341,15 +432,20 @@ cmake --build build-android -j
 
 ### 设计/实现遗留(README §"已知未完成项"的延续)
 
-1. **M3**:mbedtls AES-GCM / ARMv8 Crypto Extensions 真接入(开关已就绪,codec 中
-   `LOGX_WITH_AESGCM` 路径为占位返回 false;zstd 已接入,见"一")。
-2. **M3**:JNI `keyProvider` trampoline(全局引用 + `AttachCurrentThread`)。
+1. ~~**M3**:mbedtls AES-GCM 真接入~~(2026-09-02 已解决,见"〇";其中 ARMv8 Crypto
+   Extensions 硬件加速仍未落地,归 T4.0)。
+2. ~~**M3**:JNI `keyProvider` trampoline~~(2026-09-02 已解决,见"〇")。
 3. **M4**:50 线程压测 / monkey 72h 稳定性 / 断电注入(QEMU 快照)。
 4. ~~**恢复对账 `bytes_since_hdr` 未实现**~~(2026-09-02 已解决):见"一",
    `S_file > S_hdr` 分支按块头 `raw_len` 逐块累加精确回推 F,含不变量收尾。
 5. ~~**JNI 缺失 nativeExport**~~(2026-09-02 已解决):见"〇",已补齐 nativeExport 并优化 JNI 零堆分配。
 6. ~~**多进程安全隔离**~~(2026-09-02 已解决):见"〇",Kotlin Facade 默认按进程名后缀分流目录。
 7. **`test_flusher` 的 `write_block_to_file` 为占位实现**(统一到 `write_and_record`)。
+8. **v5 spec 未落地项**(2026-09-03 复核新增,统一由计划表 T4.0 回补,详见"独立复核记录"):
+   ① `flush()` 水位线(现为自旋等空,§7);② 切分序号仍 uint8_t(§3.1);
+   ③ 双 Header 屏障顺序/内存序偏离纪律(现为 A→B→release fence,§4.2);
+   ④ Flusher Debounce(§4.1);⑤ ARMv8 Crypto 加速(§10);
+   ⑥ 30s 定时 msync/fdatasync 持久化(§11);⑦ 未对齐访问与时钟跳变测试用例(§9)。
 
 ---
 

@@ -1,6 +1,7 @@
 # ---- CMake / C++ build ----
 build/
 build-*/
+build_*
 out/
 cmake-build-*/
 CMakeCache.txt
