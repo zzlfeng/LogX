@@ -69,12 +69,14 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
     bool file_encrypted = (hdr[5] & kFlagEncrypted) != 0;
     if (file_encrypted) {
         if (!inst->key_provider) {
+            emit_event(inst, LOGX_EV_DEGRADED, -1, "export: no key provider for encrypted file");
             out_lines->push_back("[skipped: no key provider]\n");
             inst->pal->file_close(fd);
             return true;
         }
         key32 = inst->key_provider(kid_in_file, inst->key_user);
         if (!key32) {
+            emit_event(inst, LOGX_EV_DEGRADED, -1, "export: missing key for kid");
             char line[128];
             std::snprintf(line, sizeof(line), "[skipped: kid=%u missing key]\n", kid_in_file);
             out_lines->push_back(line);
@@ -122,22 +124,23 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
             off += block_size;
             continue;
         }
-        // 把 raw 流按 LGXE 重组并还原"内部用户载荷"。
-        std::vector<uint8_t> user;
-        if (parse_record(raw.data(), raw.size(), &user)) {
-            // 简化:dump 二进制到 hex 行;decoder 工具再做语义解析。
+        // 把 raw 流按 LGXE 重组并还原"内部用户载荷"(支持单块多条记录流式解析)。
+        std::vector<std::vector<uint8_t>> users;
+        if (parse_records_stream(raw.data(), raw.size(), &users)) {
             static const char hex[] = "0123456789abcdef";
-            std::string hexline;
-            hexline.reserve(user.size() * 2 + 32);
-            char prefix[64];
-            std::snprintf(prefix, sizeof(prefix), "seq=%u raw=%u ", seqno, raw_len);
-            hexline.append(prefix);
-            for (uint8_t b : user) {
-                hexline.push_back(hex[b >> 4]);
-                hexline.push_back(hex[b & 0xf]);
+            for (const auto& user : users) {
+                std::string hexline;
+                hexline.reserve(user.size() * 2 + 32);
+                char prefix[64];
+                std::snprintf(prefix, sizeof(prefix), "seq=%u raw=%u ", seqno, raw_len);
+                hexline.append(prefix);
+                for (uint8_t b : user) {
+                    hexline.push_back(hex[b >> 4]);
+                    hexline.push_back(hex[b & 0xf]);
+                }
+                hexline.push_back('\n');
+                out_lines->push_back(std::move(hexline));
             }
-            hexline.push_back('\n');
-            out_lines->push_back(std::move(hexline));
         }
         off += block_size;
     }
@@ -207,10 +210,12 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
         if (fd < 0) continue;
         if (inst->pal->file_truncate(fd, 0) != 0) { inst->pal->file_close(fd); continue; }
         write_all_lines(inst, fd, lines);
+        int64_t tmp_size = inst->pal->file_size(fd);
         inst->pal->file_close(fd);
         // 解析日期字串 (8 字符)
         std::string date(fname, fname + 8);
-        if (req.cb) req.cb(req.cb_user, date.c_str(), tmp.c_str(), s.size);
+        uint64_t export_size = tmp_size > 0 ? static_cast<uint64_t>(tmp_size) : 0;
+        if (req.cb) req.cb(req.cb_user, date.c_str(), tmp.c_str(), export_size);
         inst->pal->file_unlink(tmp.c_str());
     }
     return LOGX_OK;

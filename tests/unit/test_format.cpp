@@ -40,7 +40,8 @@ TEST(Format, ShortRecord_OnePiece) {
     ASSERT_TRUE(parse_record(buf, total, &user));
     // 内部格式:[ts_ms:8][pid:4][tid:8][level:1][taglen:2]["Net"][msglen:4]["hello"]
     // 偏移:ts@0 pid@8 tid@12 level@20 taglen@21 tag@23 msglen@26 msg@30
-    EXPECT_EQ(user.size(), 27 + 3 + 4 + 5);
+    // 总长: 8 + 4 + 8 + 1 + 2 + 3 + 4 + 5 = 35 字节 (27 + 3 + 5)
+    EXPECT_EQ(user.size(), 27u + 3u + 5u);
     EXPECT_EQ(user[21], 3);   // taglen = 3
     EXPECT_EQ(0, std::memcmp(user.data() + 23, "Net", 3));
     EXPECT_EQ(0, std::memcmp(user.data() + 30, "hello", 5));
@@ -83,7 +84,7 @@ TEST(Format, LongRecord_Slices) {
     // parse_record 还原 = 50KB
     std::vector<uint8_t> user;
     ASSERT_TRUE(parse_record(buf, total, &user));
-    EXPECT_EQ(user.size(), 27 + 1 + 4 + 50 * 1024);
+    EXPECT_EQ(user.size(), 27u + 1u + 50u * 1024u);
 }
 
 TEST(Format, RejectOverMax) {
@@ -148,4 +149,53 @@ TEST(Format, TornRecordCksumFails) {
     buf[total - 1] ^= 0xFF;
     std::vector<uint8_t> user;
     EXPECT_FALSE(parse_record(buf, total, &user));
+}
+
+TEST(Format, EdgeDefenses_RejectsInvalidInputs) {
+    uint8_t buf[kMaxRecordTotal];
+    uint32_t total = 0;
+
+    // 1) level > 5
+    EXPECT_FALSE(format_record(6, "tag", (const uint8_t*)"msg", 3, 0, 0, 0,
+                               buf, sizeof(buf), &total));
+
+    // 2) tag == nullptr
+    EXPECT_FALSE(format_record(2, nullptr, (const uint8_t*)"msg", 3, 0, 0, 0,
+                               buf, sizeof(buf), &total));
+
+    // 3) payload == nullptr && payload_len > 0
+    EXPECT_FALSE(format_record(2, "tag", nullptr, 10, 0, 0, 0,
+                               buf, sizeof(buf), &total));
+
+    // 4) 输出缓冲区不足
+    EXPECT_FALSE(format_record(2, "tag", (const uint8_t*)"msg", 3, 0, 0, 0,
+                               buf, 1024, &total));
+}
+
+TEST(Format, MultipleWholeRecordsInOneBlock_StreamParsed) {
+    // 模拟 1 个 16KB 块内包含 3 条连续的整记录 (is_whole)
+    std::vector<uint8_t> raw_block;
+    for (int i = 0; i < 3; ++i) {
+        uint8_t buf[kMaxRecordTotal];
+        uint32_t total = 0;
+        std::string msg = "multi_record_" + std::to_string(i);
+        ASSERT_TRUE(format_record(2, "TestTag", (const uint8_t*)msg.data(),
+                                  static_cast<uint32_t>(msg.size()),
+                                  1000 + i, 101, 202, buf, sizeof(buf), &total));
+        raw_block.insert(raw_block.end(), buf, buf + total);
+    }
+
+    // 单条解析器面对多条记录应按 spec 纪律拒绝 (单条不允许多记录)
+    std::vector<uint8_t> single_out;
+    EXPECT_FALSE(parse_record(raw_block.data(), static_cast<uint32_t>(raw_block.size()), &single_out));
+
+    // 流式解析器应成功解析并拆解出全部 3 条独立记录
+    std::vector<std::vector<uint8_t>> stream_outs;
+    ASSERT_TRUE(parse_records_stream(raw_block.data(), static_cast<uint32_t>(raw_block.size()), &stream_outs));
+    ASSERT_EQ(stream_outs.size(), 3u);
+
+    for (int i = 0; i < 3; ++i) {
+        std::string expected_msg = "multi_record_" + std::to_string(i);
+        EXPECT_EQ(stream_outs[i].size(), 27u + 7u + expected_msg.size());
+    }
 }

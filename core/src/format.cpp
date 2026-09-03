@@ -93,8 +93,8 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
 
     // ---- 内部用户数据(待分片的载荷)----
     // 内部格式:[ts_ms:8][pid:4][tid:8][level:1][taglen:2][tag:N][msglen:4][msg:M]
-    const uint32_t hdr_size = 8 + 4 + 8 + 1 + 2 + 4;  // 27B
-    const uint64_t user_total = static_cast<uint64_t>(hdr_size) + tag_len + 4 + payload_len;
+    const uint32_t hdr_size = 8 + 4 + 8 + 1 + 2 + 4;  // 27B (已包含 4B msglen)
+    const uint64_t user_total = static_cast<uint64_t>(hdr_size) + tag_len + payload_len;
     if (user_total > 60u * 1024u) return false;
 
     // 把内部数据先组装到 scratch(最多 60KB,远超 20KB 单片上限)。
@@ -154,10 +154,12 @@ uint32_t format_pad(uint8_t* out_buf, uint32_t pad_len) {
     if (pad_len > 20 * 1024) pad_len = 20 * 1024;  // 防御性
     put_u16(out_buf, static_cast<uint16_t>(pad_len));
     put_u16(out_buf + 2, kMagicPad);
-    out_buf[4] = 0x00;  // flags
-    out_buf[5] = 0x00;  // cksum (PAD payload 全零,自然为 0)
-    std::memset(out_buf + 6, 0, pad_len);
-    return 6 + pad_len;
+    out_buf[4] = 0;
+    out_buf[5] = 0;  // PAD cksum 恒为 0
+    if (pad_len > 0) {
+        std::memset(out_buf + kHeaderLen, 0, pad_len);
+    }
+    return kHeaderLen + pad_len;
 }
 
 // 复读用户 payload(测试与 decoder 共用):仅对整条 / 末片有效。
@@ -207,6 +209,49 @@ bool parse_record(const uint8_t* recs, uint32_t recs_len,
     }
     if (!got_last) return false;
     *out_user_payload = std::move(user);
+    return true;
+}
+
+bool parse_records_stream(const uint8_t* recs, uint32_t recs_len,
+                          std::vector<std::vector<uint8_t>>* out_user_payloads) {
+    out_user_payloads->clear();
+    std::vector<uint8_t> current_slice_buf;
+    uint32_t pos = 0;
+    while (pos < recs_len) {
+        if (recs_len - pos < kHeaderLen) return false;
+        uint16_t len = recs[pos] | (uint16_t(recs[pos + 1]) << 8);
+        uint16_t magic = recs[pos + 2] | (uint16_t(recs[pos + 3]) << 8);
+        uint8_t flags = recs[pos + 4];
+        uint8_t cksum = recs[pos + 5];
+        if (recs_len - pos < uint32_t(kHeaderLen + len)) return false;
+        const uint8_t* payload = recs + pos + kHeaderLen;
+        if (magic == kMagicPad) {
+            pos += kHeaderLen + len;
+            continue;
+        }
+        if (magic != kMagicEntry) return false;
+        if (cksum1(payload, len) != cksum) return false;
+
+        bool is_first = (flags & 0x01) != 0 && (flags & 0x02) == 0;   // 01
+        bool is_mid   = (flags & 0x01) == 0 && (flags & 0x02) != 0;   // 10
+        bool is_last  = (flags & 0x01) != 0 && (flags & 0x02) != 0;   // 11
+        bool is_whole = (flags & 0x03) == 0;                            // 00
+
+        if (is_whole) {
+            out_user_payloads->emplace_back(payload, payload + len);
+        } else if (is_first) {
+            current_slice_buf.assign(payload, payload + len);
+        } else if (is_mid) {
+            if (current_slice_buf.empty()) return false;
+            current_slice_buf.insert(current_slice_buf.end(), payload, payload + len);
+        } else if (is_last) {
+            if (current_slice_buf.empty()) return false;
+            current_slice_buf.insert(current_slice_buf.end(), payload, payload + len);
+            out_user_payloads->push_back(std::move(current_slice_buf));
+            current_slice_buf.clear();
+        }
+        pos += kHeaderLen + len;
+    }
     return true;
 }
 

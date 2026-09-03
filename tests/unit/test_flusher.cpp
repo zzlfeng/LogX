@@ -413,3 +413,68 @@ TEST(Flush, FileSizeThreshold_RotatesToSplitFile) {
     }
     pal.file_rmdir(dir.c_str());
 }
+
+TEST(Flush, ExportWithMultipleRecordsAndMissingKey_HandledGracefully) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_exp_multi_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 16 * 1024;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;  // 明文模式
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 写入 5 条不同日志到同一个 16KB 块内
+    for (int i = 0; i < 5; ++i) {
+        std::string msg = "export_stream_msg_" + std::to_string(i);
+        ASSERT_EQ(logx_write(inst, 2, "Tag",
+                             reinterpret_cast<const uint8_t*>(msg.data()),
+                             static_cast<uint32_t>(msg.size())), LOGX_OK);
+    }
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    pal.wallclock_date(&yyyymmdd, &hhmmss);
+    char date_str[16];
+    std::snprintf(date_str, sizeof(date_str), "%08u", yyyymmdd);
+
+    // 执行 export, 回调应成功接收到包含全部 5 条记录的临时文件
+    int lines_count = 0;
+    auto cb = [](void* user, const char* /*date*/, const char* plaintext_path, uint64_t size) -> int {
+        int* count = static_cast<int*>(user);
+        EXPECT_GT(size, 0u);
+        Pal& p = default_pal();
+        int fd = p.file_open(plaintext_path, false, false);
+        if (fd >= 0) {
+            std::vector<char> buf(size + 1, 0);
+            p.file_pread(fd, buf.data(), size, 0);
+            p.file_close(fd);
+            for (uint64_t i = 0; i < size; ++i) {
+                if (buf[i] == '\n') (*count)++;
+            }
+        }
+        return 0;
+    };
+
+    EXPECT_EQ(logx_export(inst, date_str, date_str, cb, &lines_count), LOGX_OK);
+    EXPECT_EQ(lines_count, 5);  // 必须完整导出 5 条日志!
+
+    logx_close(inst);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}

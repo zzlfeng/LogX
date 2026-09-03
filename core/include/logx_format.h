@@ -39,11 +39,17 @@ bool format_record(uint8_t level, const char* tag,
 // 返回写入 out_buf 的字节数(== 6 + pad_len)。
 uint32_t format_pad(uint8_t* out_buf, uint32_t pad_len);
 
-// 解析一段 LGXE 序列(可能含多条分片,跨 PAD 之后仍视为连续)。
+// 解析一段 LGXE 序列(单条记录的所有分片,跨 PAD 仍连续)。
 // out_user_payload = 拼接后的"内部用户载荷"(hdr_size+tag+msg)。
 // 返回 false = 分片不完整、magic 错、cksum 失败。
 bool parse_record(const uint8_t* recs, uint32_t recs_len,
                   std::vector<uint8_t>* out_user_payload);
+
+// 流式解析一段 LGXE 序列(单块内可能包含多条独立整记录与/或连续分片)。
+// out_user_payloads = 成功还原的完整"内部用户载荷"列表。
+// 返回 false = 格式严重损坏(magic 错 / 校验和失败 / 结构截断)。
+bool parse_records_stream(const uint8_t* recs, uint32_t recs_len,
+                          std::vector<std::vector<uint8_t>>* out_user_payloads);
 
 }  // namespace logx
 #endif /* LOGX_FORMAT_H */
