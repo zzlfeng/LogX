@@ -231,21 +231,84 @@ TEST(CodecTest, EncodeBlockWithZstdAndAESGCM_RoundTrips) {
     EXPECT_EQ(out, raw);
 }
 
+TEST(CodecTest, MakeNonce_ByteOrderAndSaltPreserved) {
+    // 验证 spec §3.2: 12B Nonce 前 8B 为文件盐, 后 4B 为大端 seqno
+    uint8_t salt[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    uint32_t seqno = 0x12345678u;
+    uint8_t nonce[12] = {0};
+    make_nonce(seqno, salt, nonce);
+
+    EXPECT_EQ(std::memcmp(nonce, salt, 8), 0);
+    EXPECT_EQ(nonce[8],  0x12);
+    EXPECT_EQ(nonce[9],  0x34);
+    EXPECT_EQ(nonce[10], 0x56);
+    EXPECT_EQ(nonce[11], 0x78);
+}
+
 TEST(CodecTest, EncodeBlockMissingKey_DowngradesToPlaintext) {
-    auto raw = make_compressible(1024);
+    // 真实生产降级链路 (spec §6 / §10):
+    // 开启加密但 key 为空 (如 KeyProvider 找不到 KID 或返回 null) 时,
+    // 底层 append_block_raw 绝不中断写盘, 而是清除 kFlagEncrypted 位自动降级为明文落盘并打点。
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_downgrade_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string path = dir + "/20260903.log";
+
+    Instance inst{};
+    inst.log_dir = dir;
+    inst.pal = &pal;
+    inst.compress_algo = kAlgoNone;
+    inst.encrypt_enable = true;
+    inst.kid = 99;
+
     uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    uint32_t seqno = 101;
+    int fd = pal.file_open(path.c_str(), true, false);
+    ASSERT_GE(fd, 0);
 
-    uint8_t flag = (kFlagCompressZstd << 1) | kFlagEncrypted;
+    // 写入文件头
+    uint8_t hdr[32] = {};
+    put_u32_le(hdr, kMagicFile);
+    hdr[4] = 1; hdr[5] = kFlagEncrypted;
+    put_u32_le(hdr + 6, 20260903u);
+    put_u16(hdr + 10, 99);
+    std::memcpy(hdr + 12, salt, 8);
+    put_u32_le(hdr + 28, crc32_update(0, hdr, 28));
+    ASSERT_EQ(pal.file_write(fd, hdr, 32), 32);
 
-    EncodedBlock enc;
-    EXPECT_FALSE(encode_block(flag, nullptr, seqno, salt, raw.data(),
-                              static_cast<uint32_t>(raw.size()), &enc));
+    auto raw = make_compressible(256);
+    uint8_t enc_flag = kFlagEncrypted;  // 要求加密, 但传入 key = nullptr
 
-    uint8_t plain_flag = (kFlagCompressZstd << 1);
-    ASSERT_TRUE(encode_block(plain_flag, nullptr, seqno, salt, raw.data(),
-                             static_cast<uint32_t>(raw.size()), &enc));
-    EXPECT_FALSE(enc.enc_ok);
+    BlockWriteResult wr = write_and_record(&inst, fd, raw.data(),
+                                           static_cast<uint32_t>(raw.size()),
+                                           1, enc_flag, salt, /*key32_or_null=*/nullptr);
+    EXPECT_TRUE(wr.ok);
+    pal.file_close(fd);
+
+    // 读取落盘的块头: 验证 kFlagEncrypted 被清除, 真实以明文落盘
+    fd = pal.file_open(path.c_str(), false, false);
+    uint8_t bhdr[34];
+    EXPECT_EQ(pal.file_pread(fd, bhdr, 34, 32), 34);
+    EXPECT_EQ(get_u32(bhdr), kMagicBlock);
+    EXPECT_EQ(bhdr[5] & kFlagEncrypted, 0);  // 加密位已清除!
+
+    uint32_t payload_len = get_u32(bhdr + 14);
+    EXPECT_EQ(payload_len, raw.size());
+    std::vector<uint8_t> payload_buf(payload_len);
+    EXPECT_EQ(pal.file_pread(fd, payload_buf.data(), payload_len, 32 + 34), payload_len);
+    pal.file_close(fd);
+
+    // 验证明文内容与 raw 一致 (直接无密解码)
+    std::vector<uint8_t> decoded;
+    ASSERT_TRUE(decode_block(bhdr[5], nullptr, 1, salt,
+                             payload_buf.data(), payload_len, nullptr,
+                             nullptr, static_cast<uint32_t>(raw.size()), &decoded));
+    EXPECT_EQ(decoded, raw);
+
+    // 清理
+    pal.file_unlink(path.c_str());
+    pal.file_rmdir(dir.c_str());
 }
 
 #endif  // LOGX_WITH_AESGCM

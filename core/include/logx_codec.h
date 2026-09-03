@@ -43,6 +43,9 @@ bool decrypt_gcm(const uint8_t key[32], const uint8_t nonce[12],
                  const uint8_t tag[16],
                  std::vector<uint8_t>* out_plain);
 
+// Nonce 派生: 12B nonce = 8B salt + 4B 大端 seqno
+void make_nonce(uint32_t seqno, const uint8_t salt[8], uint8_t nonce_out[12]);
+
 // 把压缩+加密封装进单一编码流程;flag 同时表达加密与压缩。
 // payload_out = [compressed? plaintext : original][+encrypted tail if enc]
 // 失败原因:codec 错 / 输出超限(理论上不会,raw ≤ 20KB + 6B 头)。

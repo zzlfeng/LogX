@@ -93,6 +93,9 @@ TEST_F(StagingTest, DualHeaderCorruptionBHandWins) {
     Staging s(&default_pal(), path_, kDataSize);
     RecoveryState st; bool rec = false;
     ASSERT_TRUE(s.open(&st, &rec));
+    // 提交非零状态 (seqno=7, F=64, w=64) 到双 Header
+    AppendTargetCache atc{};
+    s.commit_header_locked(7, 64, 64, &atc);
     // 关闭 staging
     s.close();
     // 损坏 Header A(magic 改成 0)
@@ -102,12 +105,14 @@ TEST_F(StagingTest, DualHeaderCorruptionBHandWins) {
     uint8_t zero[4] = {0, 0, 0, 0};
     pal.file_pwrite(fd, zero, 4, 0);
     pal.file_close(fd);
-    // 重新打开:应该回退到 B
+    // 重新打开: Header A 损坏, 应该由 Header B 接管并成功恢复出已提交的非零状态
     Staging s2(&default_pal(), path_, kDataSize);
     RecoveryState st2; bool rec2 = false;
     ASSERT_TRUE(s2.open(&st2, &rec2));
-    // B 是空白,seqno/flushed/write_pos 应为 0
-    EXPECT_EQ(st2.seqno, 0u);
+    EXPECT_EQ(st2.seqno, 7u);
+    EXPECT_EQ(st2.flushed_len, 64u);
+    EXPECT_EQ(st2.write_pos, 64u);
+    EXPECT_FALSE(st2.rebuilt);
 }
 
 TEST_F(StagingTest, FlushAndZeroMaintainsInvariant) {

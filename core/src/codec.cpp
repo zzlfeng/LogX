@@ -39,6 +39,8 @@ namespace {
 constexpr unsigned long long kDecompressOutputMax =
     static_cast<unsigned long long>(kBlockMaxRaw) + 64;
 
+}  // namespace
+
 void make_nonce(uint32_t seqno, const uint8_t salt[8], uint8_t nonce_out[12]) {
     std::memcpy(nonce_out, salt, 8);
     // seqno 大端写 nonce 后 4B
@@ -47,8 +49,6 @@ void make_nonce(uint32_t seqno, const uint8_t salt[8], uint8_t nonce_out[12]) {
     nonce_out[10] = (seqno >> 8) & 0xff;
     nonce_out[11] = (seqno) & 0xff;
 }
-
-}  // namespace
 
 bool compress_block(uint8_t algo, const uint8_t* in, uint32_t in_len,
                     std::vector<uint8_t>* out) {

@@ -176,16 +176,25 @@ void run_recovery(Instance* inst) {
     if (!hdr.rebuilt) {
         rec = reconcile(inst, hdr);
     } else {
-        // 整区重建:seqno 接管为文件 max(seqno)
+        // 整区重建:seqno 接管为文件 max(seqno), 环坐标归零并提交初始 Header
         std::string best = scan_dir_for_target(inst);
+        AppendTargetCache atc{};
         if (!best.empty()) {
             FileScanResult sr = scan_append_target(inst, best);
             if (sr.ok) {
                 hdr.seqno = sr.seqno;
-                hdr.flushed_len = 0;
-                hdr.write_pos = 0;
+                size_t base = sr.path.find_last_of("/\\");
+                std::string name = (base == std::string::npos) ? sr.path : sr.path.substr(base + 1);
+                if (name.size() >= 12) {
+                    char* endp = nullptr;
+                    unsigned long d = std::strtoul(name.c_str(), &endp, 10);
+                    atc.date = static_cast<uint32_t>(d);
+                    atc.split_no = 0;
+                }
             }
         }
+        inst->staging->commit_header_locked(hdr.seqno, 0, 0, &atc);
+        return;
     }
 
     // 3) 决定 S_hdr / S_file / Σraw_len 回推 / 是否截断

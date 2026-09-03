@@ -44,20 +44,26 @@ std::vector<uint8_t> make_entry(uint32_t pl, uint8_t flags = 0x00) {
 }
 }
 
-TEST(Split, OneBlockManySmallRecords) {
+TEST(Split, MultipleBlocksAccumulateTo16KBThreshold) {
+    // 写入 350 条 56B 记录(50B payload + 6B 头) = 19600B
+    // 触发 16KB(16384B) 切块阈值:
+    // 块 1: floor(16384 / 56) = 292 条 = 16352B
+    // 块 2: 350 - 292 = 58 条 = 3248B
     std::vector<uint8_t> raw;
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 350; ++i) {
         auto r = make_entry(50);
         raw.insert(raw.end(), r.begin(), r.end());
     }
     std::vector<PendingBlock> blocks;
     uint32_t n = split_into_blocks(raw.data(),
                                    static_cast<uint32_t>(raw.size()), &blocks);
-    EXPECT_GE(n, 1u);
-    // 每块 raw_len 应是 16 的整数倍:6 + 50 = 56;每块 285 条;首块 ≈ 16KB
-    for (auto& b : blocks) {
-        EXPECT_GT(b.raw_len, 0u);
-    }
+    EXPECT_EQ(n, 2u);
+    ASSERT_EQ(blocks.size(), 2u);
+    EXPECT_EQ(blocks[0].raw_offset, 0u);
+    EXPECT_EQ(blocks[0].raw_len, 292u * 56u);
+    EXPECT_EQ(blocks[1].raw_offset, 292u * 56u);
+    EXPECT_EQ(blocks[1].raw_len, 58u * 56u);
+
     // Σ raw_len == raw.size()
     uint64_t sum = 0;
     for (auto& b : blocks) sum += b.raw_len;
@@ -86,14 +92,14 @@ TEST(Split, WrappingTailTrailingZeroesCloseBlock) {
 }
 
 TEST(Split, TornTailNotClosedAsValidBlock) {
-    // raw = [record A 30B] + [半条头 6B + payload 2B] → 应 1 块,raw_len = 38B
-    // (撕裂尾巴归入当前块并封块)
+    // raw = [record A 30B] + [声明 len=4 但 payload 仅 2B 的撕裂记录] → 应 1 块, raw_len = 38B
+    // (peek_record_len 检测越界返回 0，触发 first==0 撕裂尾巴归入当前块并封块)
     auto a = make_entry(24);
     std::vector<uint8_t> raw(a.begin(), a.end());
-    raw.push_back(2); raw.push_back(0);             // len = 2
-    raw.push_back(0x4c); raw.push_back(0x47);       // magic
+    raw.push_back(4); raw.push_back(0);             // 声明 len = 4 (完整记录需 6+4=10B)
+    raw.push_back(0x4c); raw.push_back(0x47);       // magic LG
     raw.push_back(0); raw.push_back(0);             // flags / cksum
-    raw.push_back(0); raw.push_back(0);             // payload (撕裂 2B)
+    raw.push_back(0); raw.push_back(0);             // payload 仅 2B (撕裂截断, 仅 8B 数据)
     std::vector<PendingBlock> blocks;
     split_into_blocks(raw.data(), static_cast<uint32_t>(raw.size()), &blocks);
     EXPECT_EQ(blocks.size(), 1u);
@@ -301,3 +307,109 @@ TEST(Flush, EndToEndFormattedLog_WriteAndExport) {
 }
 
 #endif  // LOGX_WITH_AESGCM
+
+TEST(Flush, RetentionCleanup_DeletesExpiredLogsKeepsStaging) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_ret_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    pal.wallclock_date(&yyyymmdd, &hhmmss);
+
+    // 1) 构造过期文件 (20250101.log, 20250101.log.1)
+    std::string exp1 = dir + "/20250101.log";
+    std::string exp2 = dir + "/20250101.log.1";
+    int fd1 = pal.file_open(exp1.c_str(), true, false);
+    pal.file_write(fd1, "dummy", 5);
+    pal.file_close(fd1);
+    int fd2 = pal.file_open(exp2.c_str(), true, false);
+    pal.file_write(fd2, "dummy", 5);
+    pal.file_close(fd2);
+
+    // 2) 构造不过期文件 (今天的 log 与 staging.mmap)
+    char today_name[64];
+    std::snprintf(today_name, sizeof(today_name), "%08u.log", yyyymmdd);
+    std::string today_file = dir + "/" + today_name;
+    int fd3 = pal.file_open(today_file.c_str(), true, false);
+    pal.file_write(fd3, "today", 5);
+    pal.file_close(fd3);
+
+    std::string staging_file = dir + "/staging.mmap";
+    int fd4 = pal.file_open(staging_file.c_str(), true, false);
+    pal.file_write(fd4, "staging", 7);
+    pal.file_close(fd4);
+
+    // 3) 执行保留期清理 (retention_days = 7)
+    Instance inst{};
+    inst.log_dir = dir;
+    inst.pal = &pal;
+    inst.retention_days = 7;
+    retention_cleanup(&inst);
+
+    // 4) 验证: 过期文件被精确删除, 当天文件与 staging 文件豁免保留
+    EXPECT_LT(pal.file_size_path(exp1.c_str()), 0);
+    EXPECT_LT(pal.file_size_path(exp2.c_str()), 0);
+    EXPECT_GT(pal.file_size_path(today_file.c_str()), 0);
+    EXPECT_GT(pal.file_size_path(staging_file.c_str()), 0);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+TEST(Flush, FileSizeThreshold_RotatesToSplitFile) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_split_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 500;  // 阈值 500B, 极易触发切分
+    cfg.flush_threshold = 256;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 写入 15 条日志(每条约 60B, 总体积 > 900B, 远超 max_file_size 500B)
+    for (int i = 0; i < 15; ++i) {
+        std::string msg = "split_test_log_message_index_" + std::to_string(i);
+        ASSERT_EQ(logx_write(inst, 2, "TestTag",
+                             reinterpret_cast<const uint8_t*>(msg.data()),
+                             static_cast<uint32_t>(msg.size())), LOGX_OK);
+        // 每 3 条 flush 一次触发 flusher 检查并写盘
+        if (i % 3 == 0) logx_flush(inst);
+    }
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+    logx_close(inst);
+
+    // 检查目录内生成的文件: 必须出现 .1 切分文件
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    pal.wallclock_date(&yyyymmdd, &hhmmss);
+    char split0_name[64], split1_name[64];
+    std::snprintf(split0_name, sizeof(split0_name), "%08u.log", yyyymmdd);
+    std::snprintf(split1_name, sizeof(split1_name), "%08u.log.1", yyyymmdd);
+
+    std::string path0 = dir + "/" + split0_name;
+    std::string path1 = dir + "/" + split1_name;
+
+    EXPECT_GT(pal.file_size_path(path0.c_str()), 0);
+    EXPECT_GT(pal.file_size_path(path1.c_str()), 0);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}

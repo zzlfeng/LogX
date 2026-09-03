@@ -402,7 +402,11 @@ void close_current(FlusherCtx* c, Pal* pal) {
 // 决定"这一轮的追加目标文件";失败/跨天时切换。
 // 返回 fd;失败 -1。*out_salt 写到调用方缓冲。
 int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
-    if (!c->date_changed && c->current_fd >= 0) return c->current_fd;
+    if (!c->date_changed && c->current_fd >= 0) {
+        if (c->current_size < inst->max_file_size) {
+            return c->current_fd;
+        }
+    }
 
     close_current(c, inst->pal);
     if (c->current_path.empty()) {
@@ -444,7 +448,7 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
     }
 
     // 切分序号决策:如果当前 size ≥ max_file_size → split+1 切到新文件。
-    if (c->current_fd >= 0 && c->current_size >= inst->max_file_size) {
+    if (c->current_size >= inst->max_file_size) {
         if (c->current_split >= 255) {
             // 达上限,停写
             close_current(c, inst->pal);
@@ -452,6 +456,7 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
         }
         c->current_split += 1;
         c->current_path.clear();
+        c->current_size = 0;
         close_current(c, inst->pal);
     }
 

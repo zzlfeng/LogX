@@ -202,12 +202,14 @@ TEST_F(RecoveryTest, BlocksWrittenHeaderNotCommitted_BackfillExact) {
 }
 
 TEST_F(RecoveryTest, BlocksWrittenHeaderNotCommitted_RemainderRescanned) {
-    // 同上,但崩溃时还有第三条记录已写 staging(裸 write_pos=42)未落任何块:
-    // 恢复后 F 回推到 56,扫描从 56 出发……注意第三条写在裸 write_pos=42
-    // 处(跨过区间 [28,42)),会被 F 回推"越过"——恢复把 [28,42) 清零,
-    // 第三条位于 42..56,而扫描从新 F=56 出发不再覆盖它,属宁丢不脏:
-    // spec §4.3 场景里,在飞块之后的记录必须等块重新补写后重写。
-    // 本用例验证:F 精确回推 56、第三条所在区间被清零、不变量成立。
+    // 真实在飞场景:
+    // Staging 写入 3 条记录: 前 2 条(共 28B) + 第 3 条(14B), 裸 write_pos = 42。
+    // Flusher 切出第 1 块(前两条 28B)并成功落盘(seqno=1), 清零 [0, 28);
+    // 但 Header 尚未提交即发生崩溃(Header 仍停留在 F=0, seqno=0, w=42)。
+    // 启动恢复:
+    // 1. 文件 S_file=1 > S_hdr=0 -> Σraw_len=28, F 精确回推到 28;
+    // 2. 环形扫描从新 F=28 出发扫描至裸 write_pos=42, 成功重扫出第 3 条有效记录!
+    // 3. 验证: seqno=1, F=28, w=42(第 3 条被安全保留), 不变量 debug_check_invariant(28, 42) 成立。
     Instance* inst = new Instance();
     inst->pal = &default_pal();
     inst->log_dir = log_dir_;
@@ -216,38 +218,34 @@ TEST_F(RecoveryTest, BlocksWrittenHeaderNotCommitted_RemainderRescanned) {
     RecoveryState st; bool rec = false;
     ASSERT_TRUE(inst->staging->open(&st, &rec));
 
+    // 写入 3 条记录 (前 2 条 28B, 第 3 条 14B)
     std::vector<uint8_t> recs;
     append_entry_record(&recs, 0x10);
     append_entry_record(&recs, 0x20);
+    append_entry_record(&recs, 0x30);
     ASSERT_EQ(inst->staging->write_records(recs.data(),
                 static_cast<uint32_t>(recs.size())),
-              Staging::WriteStatus::kOk);
-    AppendTargetCache atc{};
-    inst->staging->commit_header_locked(1, 28, 28, &atc);
-
-    // 第三条记录落在 28..42(裸 write_pos 推到 42)
-    std::vector<uint8_t> third;
-    append_entry_record(&third, 0x30);
-    ASSERT_EQ(inst->staging->write_records(third.data(),
-                static_cast<uint32_t>(third.size())),
               Staging::WriteStatus::kOk);   // 裸 write_pos = 42
 
-    uint8_t salt[8] = {1,2,3,4,5,6,7,8};
+    // 模拟 Flusher 刷盘: 仅将前两条 (28B) 写入文件, seqno=1
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     ASSERT_TRUE(append_block(inst, salt, 0, recs.data(),
-                             static_cast<uint32_t>(recs.size()),
-                             2, 0, nullptr, nullptr));
+                             28, 1, 0, nullptr, nullptr));
 
-    // 崩溃现场:块已落盘,清零只覆盖 [0,28)(前两条),Header 未提交;
-    // 裸 write_pos = 42 由 write_records 直接写在 Header A[16]。
+    // 崩溃现场: 前 28B 已按 Flusher 纪律清零, 但 Header 未及提交 (保持 F=0, seqno=0, w=42)
     inst->staging->zero_range_locked(0, 28);
-    inst->staging->commit_header_locked(1, 28, 42, &atc);
+    AppendTargetCache atc{};
+    inst->staging->commit_header_locked(0, 0, 42, &atc);
 
     run_recovery(inst);
+
     const uint8_t* base = inst->staging->raw_base();
-    EXPECT_EQ(get_u32(base + 8), 2u);
-    EXPECT_EQ(get_u32(base + 12), 56u);  // F = 28 + Σraw_len(28) 精确回推
-    EXPECT_EQ(get_u32(base + 16), 56u);  // 在飞记录被清,write_pos 收敛到 F
-    EXPECT_TRUE(inst->staging->debug_check_invariant(56, 56));
+    EXPECT_EQ(get_u32(base + 8), 1u);    // seqno = S_file = 1
+    EXPECT_EQ(get_u32(base + 12), 28u);  // F 精确回推到 28
+    EXPECT_EQ(get_u32(base + 16), 42u);  // 第 3 条记录被成功重扫并保留, write_pos = 42
+    // 活跃区间 [28, 42) 校验不变量
+    EXPECT_TRUE(inst->staging->debug_check_invariant(28, 42));
+
     delete inst->staging;
     delete inst;
 }
@@ -370,6 +368,99 @@ TEST_F(RecoveryTest, CorruptBlockCrc32_TruncatedOnRecovery) {
     // 3) 发生截断, 续写首块跳空隙 (seqno = max(S_hdr, S_file) + 2 = max(2, 1) + 2 = 4, Header resume=3)
     const uint8_t* base = inst->staging->raw_base();
     EXPECT_EQ(get_u32(base + 8), 3u);
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, AppendTargetCache_HitFastPath) {
+    // 验证 追加目标缓存 (AppendTargetCache, spec §4.2) O(1) 命中快路径:
+    // 当 Header reserved 存有有效 target (date != 0) 时,
+    // reconcile 优先尝试 hint, 命中后直接完成校验, 无需进行全目录扫文件。
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    std::vector<uint8_t> rec1;
+    append_entry_record(&rec1, 0x10);
+
+    // 写入 1 个有效块 (seqno=1)
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint64_t b1_start = 0, b1_end = 0;
+    ASSERT_TRUE(append_block(inst, salt, 0, rec1.data(),
+                             static_cast<uint32_t>(rec1.size()),
+                             1, 0, &b1_start, &b1_end));
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+
+    // 构造有效 ATC 缓存写入 Header
+    AppendTargetCache atc{};
+    atc.date = yyyymmdd;
+    atc.split_no = 0;
+    atc.last_block_offset = static_cast<uint32_t>(b1_start);
+    atc.last_block_end_offset = static_cast<uint32_t>(b1_end);
+    inst->staging->commit_header_locked(1, 14, 14, &atc);
+
+    run_recovery(inst);
+
+    const uint8_t* base = inst->staging->raw_base();
+    EXPECT_EQ(get_u32(base + 8), 1u);   // seqno = 1
+    EXPECT_EQ(get_u32(base + 12), 14u); // flushed_len = 14
+    EXPECT_EQ(get_u32(base + 16), 14u); // write_pos = 14
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, BothHeadersCorrupt_RebuiltAndTakesOverFileSeqno) {
+    // 双 Header 均损坏场景 (spec §4.3 末段):
+    // 若断电或硬件坏页导致 Header A 与 Header B 均校验失败,
+    // Staging 触发整区重建 (rebuilt=true), recovery 扫描现有文件接管最高 seqno,
+    // 确保后续生成的新块序号单调递增不发生 Nonce 回退。
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    std::vector<uint8_t> rec1;
+    append_entry_record(&rec1, 0x10);
+
+    // 现有文件已写入 2 个块, 最终 seqno=5
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint64_t b1_start = 0, b1_end = 0;
+    ASSERT_TRUE(append_block(inst, salt, 0, rec1.data(),
+                             static_cast<uint32_t>(rec1.size()),
+                             1, 0, &b1_start, &b1_end));
+    ASSERT_TRUE(append_block(inst, salt, b1_end, rec1.data(),
+                             static_cast<uint32_t>(rec1.size()),
+                             5, 0, nullptr, nullptr));
+
+    // 故意将 Staging 文件头部 128 字节 (覆盖 Header A 与 Header B) 填满非零损坏垃圾数据
+    inst->staging->close();
+    int sfd = inst->pal->file_open(staging_path_.c_str(), false, false);
+    ASSERT_GE(sfd, 0);
+    uint8_t garbage[128];
+    std::memset(garbage, 0xEE, sizeof(garbage));
+    ASSERT_EQ(inst->pal->file_pwrite(sfd, garbage, sizeof(garbage), 0), static_cast<long>(sizeof(garbage)));
+    inst->pal->file_close(sfd);
+
+    // 启动恢复: 内部 open 并识别双 Header 损坏, 触发整区重建
+    run_recovery(inst);
+
+    // 验证: 接管了现有文件的最高 seqno = 5; 环形区坐标收敛为 0 态
+    const uint8_t* base = inst->staging->raw_base();
+    EXPECT_EQ(get_u32(base + 8), 5u);   // seqno 接管为 5
+    EXPECT_EQ(get_u32(base + 12), 0u);  // flushed_len 归零
+    EXPECT_EQ(get_u32(base + 16), 0u);  // write_pos 归零
+    EXPECT_TRUE(inst->staging->debug_check_invariant(0, 0));
 
     delete inst->staging;
     delete inst;
