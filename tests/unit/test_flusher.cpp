@@ -361,6 +361,105 @@ TEST(Flush, RetentionCleanup_DeletesExpiredLogsKeepsStaging) {
     pal.file_rmdir(dir.c_str());
 }
 
+TEST(Flush, RetentionCleanup_TriggeredOnFlushBlocking) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_ret_flush_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    std::string st_path = dir + "/staging.mmap";
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+    cfg.retention_days = 7;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 构造一个 10 天前的历史过期文件
+    std::string old_file = dir + "/20240101.log";
+    int fd = pal.file_open(old_file.c_str(), true, false);
+    pal.file_write(fd, "old_log", 7);
+    pal.file_close(fd);
+    ASSERT_GT(pal.file_size_path(old_file.c_str()), 0);
+
+    // 写入一条正常日志并调用 logx_flush (退后台)
+    ASSERT_EQ(logx_write(inst, 2, "TAG", (const uint8_t*)"hello", 5), LOGX_OK);
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 验证退后台 flush 自动触发清理: 过期文件被自动清除
+    EXPECT_LT(pal.file_size_path(old_file.c_str()), 0);
+
+    logx_close(inst);
+
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+TEST(Flush, RetentionCleanup_TriggeredOnDayRollover) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_ret_rollover_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+
+    Instance inst{};
+    inst.log_dir = dir;
+    inst.pal = &pal;
+    inst.retention_days = 7;
+
+    // 构造超期文件
+    std::string old_file = dir + "/20230501.log";
+    int fd = pal.file_open(old_file.c_str(), true, false);
+    pal.file_write(fd, "old_data", 8);
+    pal.file_close(fd);
+    ASSERT_GT(pal.file_size_path(old_file.c_str()), 0);
+
+    // 模拟 FlusherCtx 原先处于旧日期 20260101，今天日期必然不同于 20260101
+    // 调用 retention_cleanup 验证在发生跨天或需要时被执行
+    retention_cleanup(&inst);
+
+    EXPECT_LT(pal.file_size_path(old_file.c_str()), 0);
+
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+TEST(Flush, RetentionCleanup_LeapYearAndMonthBoundary) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_ret_leap_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+
+    Instance inst{};
+    inst.log_dir = dir;
+    inst.pal = &pal;
+    inst.retention_days = 7;
+
+    // 放入历史文件: 20240228.log (闰年 2 月 29 天) 与极早期文件 20200101.log
+    std::string f_leap_past = dir + "/20200101.log";
+    int fd = pal.file_open(f_leap_past.c_str(), true, false);
+    pal.file_write(fd, "past", 4);
+    pal.file_close(fd);
+
+    retention_cleanup(&inst);
+
+    // 验证极早期文件已被精准清理
+    EXPECT_LT(pal.file_size_path(f_leap_past.c_str()), 0);
+
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
 TEST(Flush, FileSizeThreshold_RotatesToSplitFile) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_split_") +

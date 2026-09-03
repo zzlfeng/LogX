@@ -341,6 +341,7 @@ void retention_cleanup_impl(Instance* inst) {
     auto parse_date = [](const std::string& path, uint32_t* out_date) -> bool {
         size_t pos = path.find_last_of("/\\");
         std::string name = (pos == std::string::npos) ? path : path.substr(pos + 1);
+        if (name.find("staging") != std::string::npos) return false;
         if (name.size() < 12) return false;
         if (name.compare(name.size() - 4, 4, ".log") != 0 &&
             name.find(".log.") == std::string::npos) return false;
@@ -354,16 +355,20 @@ void retention_cleanup_impl(Instance* inst) {
     inst->pal->wallclock_date(&yyyymmdd_now, &hhmmss_now);
     uint32_t threshold = yyyymmdd_now;
     uint32_t days = inst->retention_days;
+    auto is_leap_year = [](uint32_t y) -> bool {
+        return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    };
     while (days > 0 && threshold > 0) {
         uint32_t y = threshold / 10000;
         uint32_t m = (threshold / 100) % 100;
         uint32_t d = threshold % 100;
-        if (d > 1) --d;
-        else {
+        if (d > 1) {
+            --d;
+        } else {
             if (m > 1) {
                 --m;
                 static const uint8_t md[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-                d = md[m - 1];
+                d = (m == 2 && is_leap_year(y)) ? 29 : md[m - 1];
             } else {
                 if (y > 1) { --y; m = 12; d = 31; }
                 else { threshold = 0; break; }
@@ -375,7 +380,10 @@ void retention_cleanup_impl(Instance* inst) {
     for (const auto& f : files) {
         uint32_t d;
         if (!parse_date(f, &d)) continue;
-        if (d < threshold) inst->pal->file_unlink(f.c_str());
+        // 严格保护当天与未来时钟漂移文件, 只删除严格小于 threshold 的超期文件
+        if (d < threshold && d < yyyymmdd_now) {
+            inst->pal->file_unlink(f.c_str());
+        }
     }
 }
 
@@ -439,11 +447,12 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
         }
     }
 
-    // 跨天:轮换到新文件
+    // 跨天:轮换到新文件并清理超期日志
     if (c->current_date != today) {
         c->current_path.clear();
         c->current_date = today;
         c->current_split = 0;
+        retention_cleanup_impl(inst);
     }
 
     // 切分序号决策:如果当前 size ≥ max_file_size → split+1 切到新文件。
@@ -771,6 +780,8 @@ void flush_blocking(Instance* inst) {
         inst->pal->ev_signal(inst->flush_event);
         inst->pal->sleep_ms(5);
     }
+    // 退后台落盘完成时, 执行保留期超期清理
+    retention_cleanup_impl(inst);
 }
 
 }  // namespace logx

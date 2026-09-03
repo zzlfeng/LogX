@@ -192,6 +192,7 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
         ASSERT_EQ(pal.file_pread(fd, fhdr, 32, 0), 32);
         EXPECT_EQ(get_u32(fhdr), kMagicFile);
 
+        std::vector<uint8_t> carry_slice_buf;
         uint64_t off = 32;
         while (off + 34 <= static_cast<uint64_t>(fsize)) {
             uint8_t bhdr[34];
@@ -217,7 +218,7 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
             EXPECT_EQ(crc32_update(0, payload.data(), payload_len), crc);
 
             std::vector<std::vector<uint8_t>> recs;
-            parse_records_stream(payload.data(), payload_len, &recs);
+            parse_records_stream(payload.data(), payload_len, &recs, &carry_slice_buf);
             for (const auto& r : recs) {
                 std::string s(r.begin(), r.end());
                 auto pos_tid = s.find("tid=");

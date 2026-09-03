@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace logx {
@@ -85,6 +86,7 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
         }
     }
     uint64_t off = 32;
+    std::vector<uint8_t> carry_slice_buf;
     while (off + 34 <= end_size) {
         uint8_t bhdr[34];
         if (inst->pal->file_pread(fd, bhdr, 34, off) != 34) break;
@@ -124,9 +126,9 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
             off += block_size;
             continue;
         }
-        // 把 raw 流按 LGXE 重组并还原"内部用户载荷"(支持单块多条记录流式解析)。
+        // 把 raw 流按 LGXE 重组并还原"内部用户载荷"(支持单块多条记录与跨块分片流式解析)。
         std::vector<std::vector<uint8_t>> users;
-        if (parse_records_stream(raw.data(), raw.size(), &users)) {
+        if (parse_records_stream(raw.data(), raw.size(), &users, &carry_slice_buf)) {
             static const char hex[] = "0123456789abcdef";
             for (const auto& user : users) {
                 std::string hexline;
@@ -157,7 +159,17 @@ struct FileSnapshot {
 std::vector<FileSnapshot> take_snapshot(Instance* inst,
                                        uint32_t from_date, uint32_t to_date) {
     auto files = inst->pal->file_list(inst->log_dir.c_str());
-    std::sort(files.begin(), files.end());
+    auto parse_key = [](const std::string& f) -> std::pair<uint32_t, int> {
+        size_t base = f.find_last_of("/\\");
+        std::string name = (base == std::string::npos) ? f : f.substr(base + 1);
+        uint32_t d = static_cast<uint32_t>(std::strtoul(name.c_str(), nullptr, 10));
+        auto p = name.rfind(".log.");
+        int s = (p == std::string::npos) ? 0 : std::atoi(name.c_str() + p + 5);
+        return {d, s};
+    };
+    std::sort(files.begin(), files.end(), [&](const std::string& a, const std::string& b) {
+        return parse_key(a) < parse_key(b);
+    });
     std::vector<FileSnapshot> snaps;
     for (const auto& f : files) {
         size_t base = f.find_last_of("/\\");
