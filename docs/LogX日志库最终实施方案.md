@@ -35,7 +35,7 @@
 |---|---|
 | 架构 | 环形 mmap staging(128KB,清零回收)+ 分块压缩加密 + 直接 `write()` 落盘 + seqno 对账恢复(k 块回溯) |
 | 并发 | 全局轻量 mutex(临界区=一次 memcpy)+ 单 Flusher 线程 |
-| 平台 | 第一期仅 Android;核心全在 C++,C ABI 边界为后续 iOS/Flutter 预留 |
+| 平台 | 第一期以 Android 为主，最低支持 Android 5.0 (API Level 21)；核心全在 C++（经 PAL 跨平台抽象隔离），C ABI 边界为后续 iOS/Flutter 预留 |
 | 压缩 | zstd level 3(块格式 flag 预留 zlib/none) |
 | 加密 | AES-256-GCM(ARM64 硬件指令加速 / mbedtls 兜底),init 时由调用方注入密钥,KID 支持换钥,可整体开关 |
 | 上报 | 库只提供 `export()` 解密导出,上报由业务侧接入 |
@@ -389,6 +389,7 @@ zstd、ARMv8 硬件加速 AES-GCM (mbedtls 兜底)、nonce 派生(8B 每文件�
 - 回绕缝残留(<6B)必须四处同规则:生产留零(§4.1)、切块跳过并计入 raw_len(§4.2)、恢复扫描跳过后回绕(§4.3)、解码容忍块尾零残留(decoder),配固定 gtest 用例
 - Android `allowBackup`/`fullBackupContent`(API 31+ 为 `dataExtractionRules`)必须排除日志目录与 staging 文件,防止云备份带走明文 staging 与密文日志
 - JNI 只做转发不持逻辑;平台壳零逻辑(C ABI 纪律,为 iOS 预留)
+- **平台最低兼容基线 (Android API 21 / 5.0)**: 全库（Native C++ 内核、PAL 抽象层、JNI 桥接层、Kotlin Facade）必须严格保证向后兼容至 Android API 21 (Android 5.0 Lollipop)。后续所有代码编写与系统 API 引入均以此为硬性标准；禁止直接使用未做 `Build.VERSION.SDK_INT` 降级保护的高版本特性（如 API 28+ 的 `Application.getProcessName`、API 31+ 的 `dataExtractionRules` 均已做多版本分流适配），严禁破坏 API 21 运行兼容性。
 
 ## 11. 耐久性分层说明
 

@@ -38,13 +38,18 @@ cmake --build . -j
 ctest --output-on-failure
 ```
 
-### Android 交叉编译与真机测试 (NDK + adb)
+### Android 平台与交叉编译 (NDK + adb)
+
+#### 平台与系统要求
+- **Android 最低支持版本**: **Android 5.0 (API Level 21)**，支持全部主流 ABI（`arm64-v8a`、`armeabi-v7a`、`x86_64`、`x86`）。
+- **代码编写标准**: 全库（Native C++、PAL 跨平台抽象层、JNI 桥接层、Kotlin Facade）**统一遵循 Android API 21 基线编写**。严禁直接调用无版本降级保护的高版本系统特性或 libc API；若使用高版本 Android 特性（如 API 28+ 的 `Application.getProcessName`、API 31+ 的 `dataExtractionRules`），必须通过 `Build.VERSION.SDK_INT` 分支提供健全的 API 21 降级回退通道。
+- **宿主 App 接入**: `minSdkVersion 21` 或更高。
 
 ```bash
-# 交叉编译 (以 arm64-v8a 为例)
+# 交叉编译 (最低支持 Android 5.0 / API 21, 以 arm64-v8a 为例)
 cmake -S . -B build-android \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 \
   -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
   -DLOGX_BUILD_TESTS=ON -DLOGX_BUILD_STRESS=ON \
   -DLOGX_WITH_ZSTD=ON -DLOGX_WITH_AESGCM=ON -G Ninja

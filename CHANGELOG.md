@@ -487,7 +487,7 @@ cmake --build . -j
 ```bash
 cmake -S . -B build-android \
   -DCMAKE_TOOLCHAIN_FILE="D:/DevEnv/Android/SDK/ndk/29.0.14206865/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 \
   -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
   -DLOGX_BUILD_TESTS=ON -G Ninja
 cmake --build build-android -j
@@ -604,10 +604,10 @@ ctest -C Release --output-on-failure
 ### Android(NDK 交叉编译与真机运行)
 
 ```bash
-# 配置(自动选 Clang + pal_posix;NDK 目录只读引用)
+# 配置(自动选 Clang + pal_posix; 最低支持 Android 5.0 / API 21; NDK 目录只读引用)
 cmake -S . -B build-android \
   -DCMAKE_TOOLCHAIN_FILE="D:/DevEnv/Android/SDK/ndk/29.0.14206865/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 \
   -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
   -DLOGX_BUILD_TESTS=ON -DLOGX_BUILD_STRESS=ON \
   -DLOGX_WITH_ZSTD=ON -DLOGX_WITH_AESGCM=ON -G Ninja

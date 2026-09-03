@@ -18,6 +18,8 @@ import kotlinx.coroutines.withContext
  *   - 多进程 Safe-by-Default 自动按进程名隔离子目录与 staging 文件
  *   - 进程内单例 + 重复 init 抛 IllegalStateException
  *   - export 临时文件路径 (filesDir 系, 禁 cacheDir 与外部存储) 配合协程自动生命周期管理
+ *   - 最低兼容标准: Android 5.0 (API Level 21 / minSdk = 21)。
+ *     高版本系统特性 (如 API 28+ Application.getProcessName) 均内置 API 21 降级回退分支。
  *
  * 注意:
  *   - 单条日志上限 64KB (格式化后); 超过被丢弃 + 打点。
