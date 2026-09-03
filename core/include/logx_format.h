@@ -49,7 +49,8 @@ bool parse_record(const uint8_t* recs, uint32_t recs_len,
 // out_user_payloads = 成功还原的完整"内部用户载荷"列表。
 // 返回 false = 格式严重损坏(magic 错 / 校验和失败 / 结构截断)。
 bool parse_records_stream(const uint8_t* recs, uint32_t recs_len,
-                          std::vector<std::vector<uint8_t>>* out_user_payloads);
+                          std::vector<std::vector<uint8_t>>* out_user_payloads,
+                          std::vector<uint8_t>* carry_slice_buf = nullptr);
 
 }  // namespace logx
 #endif /* LOGX_FORMAT_H */

@@ -17,6 +17,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 endif()
 
 option(LOGX_BUILD_TESTS "Build unit tests" ON)
+option(LOGX_BUILD_STRESS "Build stress tests" ON)
 option(LOGX_WITH_ZSTD   "Link real zstd (vendored third_party/zstd)" OFF)
 option(LOGX_WITH_AESGCM "Link real AES-GCM (mbedtls)" OFF)
 
@@ -25,6 +26,11 @@ add_subdirectory(core)
 if(LOGX_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests/unit)
+endif()
+
+if(LOGX_BUILD_STRESS)
+    enable_testing()
+    add_subdirectory(tests/stress)
 endif()
 
 # NDK/Android 交叉编译时:把 JNI 胶水层编进 liblogx.so。

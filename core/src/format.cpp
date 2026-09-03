@@ -213,24 +213,47 @@ bool parse_record(const uint8_t* recs, uint32_t recs_len,
 }
 
 bool parse_records_stream(const uint8_t* recs, uint32_t recs_len,
-                          std::vector<std::vector<uint8_t>>* out_user_payloads) {
+                          std::vector<std::vector<uint8_t>>* out_user_payloads,
+                          std::vector<uint8_t>* carry_slice_buf) {
     out_user_payloads->clear();
-    std::vector<uint8_t> current_slice_buf;
+    std::vector<uint8_t> local_buf;
+    std::vector<uint8_t>& current_slice_buf = carry_slice_buf ? *carry_slice_buf : local_buf;
     uint32_t pos = 0;
     while (pos < recs_len) {
-        if (recs_len - pos < kHeaderLen) return false;
+        if (recs_len - pos < kHeaderLen) {
+            // 距段尾不足 6B (spec §3.3): 缝残留/留零回绕, 正常结束解析
+            break;
+        }
         uint16_t len = recs[pos] | (uint16_t(recs[pos + 1]) << 8);
         uint16_t magic = recs[pos + 2] | (uint16_t(recs[pos + 3]) << 8);
         uint8_t flags = recs[pos + 4];
         uint8_t cksum = recs[pos + 5];
-        if (recs_len - pos < uint32_t(kHeaderLen + len)) return false;
+        if (magic == 0 && len == 0) {
+            // 尾部全零填充, 正常结束当前块解析
+            break;
+        }
+        if (recs_len - pos < uint32_t(kHeaderLen + len)) break;
         const uint8_t* payload = recs + pos + kHeaderLen;
         if (magic == kMagicPad) {
             pos += kHeaderLen + len;
             continue;
         }
-        if (magic != kMagicEntry) return false;
-        if (cksum1(payload, len) != cksum) return false;
+        if (magic != kMagicEntry) {
+            // 尝试检测是否为跨回绕的 1..5 字节段尾留零 (spec §3.3 自愈重同步)
+            bool resynced = false;
+            for (uint32_t s = 1; s < kHeaderLen && pos + s + kHeaderLen <= recs_len; ++s) {
+                if (recs[pos + s - 1] != 0) break;  // 必须全为 0
+                uint16_t next_magic = recs[pos + s + 2] | (uint16_t(recs[pos + s + 3]) << 8);
+                if (next_magic == kMagicEntry || next_magic == kMagicPad) {
+                    pos += s;
+                    resynced = true;
+                    break;
+                }
+            }
+            if (resynced) continue;
+            break;
+        }
+        if (cksum1(payload, len) != cksum) break;
 
         bool is_first = (flags & 0x01) != 0 && (flags & 0x02) == 0;   // 01
         bool is_mid   = (flags & 0x01) == 0 && (flags & 0x02) != 0;   // 10
@@ -242,13 +265,15 @@ bool parse_records_stream(const uint8_t* recs, uint32_t recs_len,
         } else if (is_first) {
             current_slice_buf.assign(payload, payload + len);
         } else if (is_mid) {
-            if (current_slice_buf.empty()) return false;
-            current_slice_buf.insert(current_slice_buf.end(), payload, payload + len);
+            if (!current_slice_buf.empty()) {
+                current_slice_buf.insert(current_slice_buf.end(), payload, payload + len);
+            }
         } else if (is_last) {
-            if (current_slice_buf.empty()) return false;
-            current_slice_buf.insert(current_slice_buf.end(), payload, payload + len);
-            out_user_payloads->push_back(std::move(current_slice_buf));
-            current_slice_buf.clear();
+            if (!current_slice_buf.empty()) {
+                current_slice_buf.insert(current_slice_buf.end(), payload, payload + len);
+                out_user_payloads->push_back(std::move(current_slice_buf));
+                current_slice_buf.clear();
+            }
         }
         pos += kHeaderLen + len;
     }

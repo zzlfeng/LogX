@@ -272,7 +272,7 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total)
             // 写入 LGXP PAD 占满至环尾:可连续多条,每条 = 6B 头 + payload(≤ 20KB);
             // payload = 剩余字节 - 6,保证不越界。
             uint32_t pos = w;
-            while (pos < data_size_) {
+            while (pos + 6 <= data_size_) {
                 uint32_t remain = data_size_ - pos;
                 uint32_t this_pad = std::min<uint32_t>(20 * 1024, remain - 6);
                 uint8_t header[6];
@@ -283,6 +283,9 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total)
                 std::memcpy(data_base_ + pos, header, 6);
                 std::memset(data_base_ + pos + 6, 0, this_pad);
                 pos += 6 + this_pad;
+            }
+            if (pos < data_size_) {
+                std::memset(data_base_ + pos, 0, data_size_ - pos);
             }
             w = 0;
         } else {

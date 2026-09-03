@@ -59,8 +59,7 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
             break;
         }
         if (first > kSingleRecordMaxRaw) {
-            // 单条独占一块(理论上 format_record 已拒绝 > kMaxRecordTotal;
-            // 这里大于 20KB+6B 头的记录不会进入 raw 流)
+            // 单条独占一块
             out->push_back({blk_begin, first});
             pos += first;
             continue;
@@ -478,20 +477,23 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
     if (yyyymmdd != c->current_date) c->date_changed = true;
 
-    // 1) 锁内取快照 [F, snap)
-    uint32_t f, snap;
-    uint32_t bytes = inst->staging->snapshot_pending(&f, &snap);
-    if (bytes == 0) return;
-
-    // 2) 拷出到 scratch
+    // 1) 锁内取快照并把待刷字节拷贝到 scratch (锁内时间仅微秒级内存拷贝)
     std::vector<uint8_t> scratch(inst->staging->data_size());
-    uint32_t copied = inst->staging->copy_pending(f, snap, scratch.data(),
-                                                  static_cast<uint32_t>(scratch.size()));
-    if (copied != bytes) {
-        // 不应发生:dst 容量等于数据区大小
-        emit_event(inst, LOGX_EV_IO, -1, "copy_pending mismatch");
-        return;
+    uint32_t f = 0, snap = 0, bytes = 0;
+    inst->pal->mutex_lock(inst->mu);
+    bytes = inst->staging->snapshot_pending(&f, &snap);
+    if (bytes > 0) {
+        uint32_t copied = inst->staging->copy_pending(f, snap, scratch.data(),
+                                                      static_cast<uint32_t>(scratch.size()));
+        if (copied != bytes) {
+            inst->pal->mutex_unlock(inst->mu);
+            emit_event(inst, LOGX_EV_IO, -1, "copy_pending mismatch");
+            return;
+        }
     }
+    inst->pal->mutex_unlock(inst->mu);
+
+    if (bytes == 0) return;
 
     // 3) 沿记录边界切块
     std::vector<PendingBlock> blocks;
@@ -510,7 +512,6 @@ void drain_once(FlusherCtx* c, Instance* inst) {
 
     // 当前写指针;清零 [f, f+raw_len) 后需要推进;按块依次 commit。
     uint32_t cur_f = f;
-    const uint32_t cur_w = snap;  // commit 时 write_pos = 锁内快照(诊断用)
 
     for (const auto& blk : blocks) {
         if (blk.raw_len == 0) continue;
@@ -534,8 +535,14 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         if (fd < 0) {
             emit_event(inst, LOGX_EV_IO, -1, "append target open failed");
             // 不再尝试,清零 cur_f..(cur_f+blk.raw_len) 以维持不变量
+            inst->pal->mutex_lock(inst->mu);
             inst->staging->zero_range_locked(cur_f, blk.raw_len);
-            cur_f = (cur_f + blk.raw_len) % inst->staging->data_size();
+            uint32_t new_f = (cur_f + blk.raw_len) % inst->staging->data_size();
+            uint32_t latest_w = get_u32(inst->staging->raw_base() + 16);
+            inst->staging->commit_header_locked(get_u32(inst->staging->raw_base() + 8),
+                                                new_f, latest_w, &atc);
+            inst->pal->mutex_unlock(inst->mu);
+            cur_f = new_f;
             continue;
         }
 
@@ -550,20 +557,27 @@ void drain_once(FlusherCtx* c, Instance* inst) {
                                                key);
         if (!wr.ok) {
             emit_event(inst, LOGX_EV_IO, -1, "write block failed");
+            inst->pal->mutex_lock(inst->mu);
             inst->staging->zero_range_locked(cur_f, blk.raw_len);
-            cur_f = (cur_f + blk.raw_len) % inst->staging->data_size();
+            uint32_t new_f = (cur_f + blk.raw_len) % inst->staging->data_size();
+            uint32_t latest_w = get_u32(inst->staging->raw_base() + 16);
+            inst->staging->commit_header_locked(cur_seqno, new_f, latest_w, &atc);
+            inst->pal->mutex_unlock(inst->mu);
+            cur_f = new_f;
             continue;
         }
 
-        // 5.3 清零 [cur_f, cur_f+raw_len)
+        // 5.3 清零 [cur_f, cur_f+raw_len) 与 5.4 提交 Header (保持锁内最新 write_pos)
+        inst->pal->mutex_lock(inst->mu);
         inst->staging->zero_range_locked(cur_f, blk.raw_len);
 
-        // 5.4 提交 Header(seqno+1)
         uint32_t new_seqno = cur_seqno + 1;
         atc.last_block_offset = static_cast<uint32_t>(wr.start_offset);
         atc.last_block_end_offset = static_cast<uint32_t>(wr.end_offset);
         uint32_t new_f = (cur_f + blk.raw_len) % inst->staging->data_size();
-        inst->staging->commit_header_locked(new_seqno, new_f, cur_w, &atc);
+        uint32_t latest_w = get_u32(inst->staging->raw_base() + 16);
+        inst->staging->commit_header_locked(new_seqno, new_f, latest_w, &atc);
+        inst->pal->mutex_unlock(inst->mu);
 
         c->current_size = wr.end_offset;
         cur_f = new_f;
