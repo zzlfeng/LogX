@@ -478,3 +478,55 @@ TEST(Flush, ExportWithMultipleRecordsAndMissingKey_HandledGracefully) {
     }
     pal.file_rmdir(dir.c_str());
 }
+
+TEST(Flush, HeapDegraded_WritesAndFlushesCorrectly) {
+    // 验证在 mmap 降级模式下, 环形缓冲区的日志依然能够被 Flusher 正常切块、落盘和导出
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_degraded_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+
+    // 使用非法文件名路径, 使得 file_open 失败, 从而触发 Staging::open 里的堆内存降级
+    std::string bad_staging_path = dir + "/invalid:name/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = bad_staging_path.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 1024;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    EXPECT_TRUE(inst->staging->is_degraded());
+
+    // 写入一条日志到堆环形区
+    std::string msg = "degraded_heap_log_content";
+    ASSERT_EQ(logx_write(inst, 2, "HeapTag",
+                         reinterpret_cast<const uint8_t*>(msg.data()),
+                         static_cast<uint32_t>(msg.size())), LOGX_OK);
+
+    // 刷盘
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 验证磁盘上生成了日志文件
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    pal.wallclock_date(&yyyymmdd, &hhmmss);
+    char log_name[64];
+    std::snprintf(log_name, sizeof(log_name), "%08u.log", yyyymmdd);
+    std::string log_path = dir + "/" + log_name;
+
+    EXPECT_GT(pal.file_size_path(log_path.c_str()), 0);
+
+    logx_close(inst);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}

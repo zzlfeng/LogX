@@ -147,6 +147,9 @@ public:
     // 不变量校验(debug 构建调用):除 [f, w) 外全环为零。返回 true = 满足。
     bool debug_check_invariant(uint32_t f, uint32_t w) const;
 
+    // 是否处于 mmap 失败堆内存降级模式 (spec §2 / §10)
+    bool is_degraded() const { return is_heap_degraded_; }
+
     // 仅供测试 / 调试:把 staging 当 byte slice 暴露(不可在生产逻辑里用)。
     uint8_t* raw_base() { return base_; }
     uint32_t raw_size() const { return total_size_; }
@@ -168,7 +171,10 @@ private:
     int fd_;
     PalMmap mm_;
 
-    uint8_t* base_;          // mmap 起始 = Header A
+    bool is_heap_degraded_ = false;
+    std::vector<uint8_t> heap_buf_;
+
+    uint8_t* base_;          // mmap 起始 = Header A (或堆内存起始)
     uint8_t* data_base_;     // 数据区起始(== base + kHeaderTotal)
 };
 

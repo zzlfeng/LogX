@@ -157,3 +157,83 @@ TEST_F(StagingTest, SmallRecordPreservesAllInvariantsAcrossWrap) {
     // 不变量:活跃区 [f,w) = [pos, size) ∪ [0, 6)
     EXPECT_TRUE(s.debug_check_invariant(pos, 6));
 }
+
+class MockMmapFailPal : public Pal {
+public:
+    explicit MockMmapFailPal(Pal* real) : real_(real) {}
+    int file_open(const char* path, bool create, bool append) override { return real_->file_open(path, create, append); }
+    int file_close(int fd) override { return real_->file_close(fd); }
+    int file_truncate(int fd, uint64_t len) override { return real_->file_truncate(fd, len); }
+    long file_write(int fd, const void* buf, size_t len) override { return real_->file_write(fd, buf, len); }
+    long file_pwrite(int fd, const void* buf, size_t len, uint64_t off) override { return real_->file_pwrite(fd, buf, len, off); }
+    long file_pread(int fd, void* buf, size_t len, uint64_t off) override { return real_->file_pread(fd, buf, len, off); }
+    int64_t file_size(int fd) override { return real_->file_size(fd); }
+    int64_t file_size_path(const char* path) override { return real_->file_size_path(path); }
+    int file_fsync(int fd) override { return real_->file_fsync(fd); }
+    int file_dir_fsync(const char* dir) override { return real_->file_dir_fsync(dir); }
+    int file_unlink(const char* path) override { return real_->file_unlink(path); }
+    int file_mkdirs(const char* path) override { return real_->file_mkdirs(path); }
+    int file_rmdir(const char* path) override { return real_->file_rmdir(path); }
+    std::vector<std::string> file_list(const char* dir) override { return real_->file_list(dir); }
+    PalMmap mmap_open(int, size_t, bool) override { return PalMmap{nullptr, -1}; } // 故意注入 mmap 失败!
+    int mmap_sync(const PalMmap&, bool) override { return -1; }
+    int mmap_close(const PalMmap&) override { return -1; }
+    void* mutex_create() override { return real_->mutex_create(); }
+    void mutex_destroy(void* h) override { real_->mutex_destroy(h); }
+    void mutex_lock(void* h) override { real_->mutex_lock(h); }
+    void mutex_unlock(void* h) override { real_->mutex_unlock(h); }
+    int threading_init() override { return real_->threading_init(); }
+    int thread_start(void* (*fn)(void*), void* arg, void** out) override { return real_->thread_start(fn, arg, out); }
+    int thread_join(void* h) override { return real_->thread_join(h); }
+    void* ev_create() override { return real_->ev_create(); }
+    void ev_destroy(void* h) override { real_->ev_destroy(h); }
+    void ev_signal(void* h) override { real_->ev_signal(h); }
+    void ev_wait(void* h) override { real_->ev_wait(h); }
+    bool ev_wait_timeout(void* h, uint32_t ms) override { return real_->ev_wait_timeout(h, ms); }
+    uint64_t atomic_add(uint64_t* p, int64_t d) override { return real_->atomic_add(p, d); }
+    uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
+    uint64_t monotonic_ns() override { return real_->monotonic_ns(); }
+    uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
+    void wallclock_date(uint32_t* d, uint32_t* t) override { real_->wallclock_date(d, t); }
+    void sleep_ms(uint32_t ms) override { real_->sleep_ms(ms); }
+    uint32_t pid() override { return real_->pid(); }
+    uint64_t tid() override { return real_->tid(); }
+    void random_bytes(void* buf, size_t len) override { real_->random_bytes(buf, len); }
+    void debug_log(const char* s) override { real_->debug_log(s); }
+private:
+    Pal* real_;
+};
+
+TEST_F(StagingTest, MmapFailure_DegradesToHeapMemory) {
+    MockMmapFailPal mock(&default_pal());
+    Staging s(&mock, path_, kDataSize);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(s.open(&st, &rec));
+    EXPECT_TRUE(s.is_degraded());
+    EXPECT_FALSE(st.rebuilt);
+    EXPECT_EQ(st.seqno, 0u);
+
+    // 写入 100B 记录验证正常运作
+    std::vector<uint8_t> recs(100, 0x42);
+    EXPECT_EQ(s.write_records(recs.data(), 100), Staging::WriteStatus::kOk);
+    EXPECT_EQ(get_u32(s.raw_base() + 16), 100u);
+    EXPECT_TRUE(s.debug_check_invariant(0, 100));
+
+    // 快照与清零
+    uint32_t f = 0, snap = 0;
+    EXPECT_EQ(s.snapshot_pending(&f, &snap), 100u);
+    EXPECT_EQ(f, 0u);
+    EXPECT_EQ(snap, 100u);
+
+    std::vector<uint8_t> scratch(100);
+    EXPECT_EQ(s.copy_pending(f, snap, scratch.data(), 100), 100u);
+    EXPECT_EQ(scratch, recs);
+
+    s.zero_range_locked(0, 100);
+    AppendTargetCache atc{};
+    s.commit_header_locked(1, 100, 100, &atc);
+    EXPECT_TRUE(s.debug_check_invariant(100, 100));
+
+    s.close();
+    EXPECT_FALSE(s.is_degraded());
+}

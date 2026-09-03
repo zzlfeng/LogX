@@ -60,6 +60,10 @@ public:
     ~Event() { if (h_) CloseHandle(h_); }
     void signal_one() { if (h_) SetEvent(h_); }
     void wait() { if (h_) WaitForSingleObject(h_, INFINITE); }
+    bool wait_timeout(uint32_t ms) {
+        if (!h_) return false;
+        return WaitForSingleObject(h_, ms) == WAIT_OBJECT_0;
+    }
 private:
     HANDLE h_;
 };
@@ -295,6 +299,9 @@ public:
     void  ev_destroy(void* h) override { delete static_cast<Event*>(h); }
     void  ev_signal(void* h) override { static_cast<Event*>(h)->signal_one(); }
     void  ev_wait(void* h) override { static_cast<Event*>(h)->wait(); }
+    bool  ev_wait_timeout(void* h, uint32_t ms) override {
+        return static_cast<Event*>(h)->wait_timeout(ms);
+    }
 
     // ---- 原子 ----
     uint64_t atomic_add(uint64_t* p, int64_t delta) override {

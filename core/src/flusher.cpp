@@ -576,7 +576,14 @@ void flusher_loop(Instance* inst) {
     retention_cleanup_impl(inst);
     while (!inst->flusher_exit.load()) {
         drain_once(&c, inst);
-        if (inst->flush_event) inst->pal->ev_wait(inst->flush_event);
+        if (inst->flush_event) {
+            if (inst->staging && inst->staging->is_degraded()) {
+                // 堆内存降级模式 (spec §2 / §10): 启用 5s (5000ms) 定时兜底落盘
+                inst->pal->ev_wait_timeout(inst->flush_event, 5000);
+            } else {
+                inst->pal->ev_wait(inst->flush_event);
+            }
+        }
     }
     drain_once(&c, inst);
 }

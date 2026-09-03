@@ -45,6 +45,30 @@ public:
         signaled_ = false;
         ::pthread_mutex_unlock(&mu_);
     }
+    bool wait_timeout(uint32_t ms) {
+        ::pthread_mutex_lock(&mu_);
+        if (signaled_) {
+            signaled_ = false;
+            ::pthread_mutex_unlock(&mu_);
+            return true;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += ms / 1000;
+        ts.tv_nsec += (ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000L;
+        }
+        int rc = 0;
+        while (!signaled_ && rc == 0) {
+            rc = ::pthread_cond_timedwait(&cv_, &mu_, &ts);
+        }
+        bool ok = signaled_;
+        signaled_ = false;
+        ::pthread_mutex_unlock(&mu_);
+        return ok;
+    }
 private:
     pthread_mutex_t mu_;
     pthread_cond_t  cv_;
@@ -248,6 +272,9 @@ public:
     void  ev_destroy(void* h) override { delete static_cast<Event*>(h); }
     void  ev_signal(void* h) override { static_cast<Event*>(h)->signal_one(); }
     void  ev_wait(void* h) override { static_cast<Event*>(h)->wait(); }
+    bool  ev_wait_timeout(void* h, uint32_t ms) override {
+        return static_cast<Event*>(h)->wait_timeout(ms);
+    }
 
     // ---- 原子 ----
     uint64_t atomic_add(uint64_t* p, int64_t delta) override {

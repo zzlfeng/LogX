@@ -56,8 +56,13 @@ Staging::~Staging() { close(); }
 
 void Staging::close() {
     if (base_) {
-        pal_->mmap_sync(mm_, false);  // 退后台时上层会显式 msync(MS_SYNC)
-        pal_->mmap_close(mm_);
+        if (!is_heap_degraded_) {
+            pal_->mmap_sync(mm_, false);  // 退后台时上层会显式 msync(MS_SYNC)
+            pal_->mmap_close(mm_);
+        } else {
+            heap_buf_.clear();
+            heap_buf_.shrink_to_fit();
+        }
         base_ = nullptr;
         data_base_ = nullptr;
     }
@@ -65,6 +70,7 @@ void Staging::close() {
         pal_->file_close(fd_);
         fd_ = -1;
     }
+    is_heap_degraded_ = false;
 }
 
 uint32_t Staging::compute_header_crc(const uint8_t* p) const {
@@ -124,21 +130,58 @@ bool Staging::pick_header(Header* out, AppendTargetCache* out_target) const {
 bool Staging::open(RecoveryState* state, bool* recovered) {
     // 1. open(O_RDWR, create_if_missing)
     fd_ = pal_->file_open(path_.c_str(), true, false);
-    if (fd_ < 0) return false;
+    if (fd_ < 0) {
+        // 文件打开失败: 降级分配堆内存 (spec §2 / §10)
+        try {
+            heap_buf_.assign(total_size_, 0);
+        } catch (...) {
+            return false;
+        }
+        base_ = heap_buf_.data();
+        data_base_ = base_ + kHeaderTotal;
+        is_heap_degraded_ = true;
+        std::memset(state, 0, sizeof(*state));
+        state->rebuilt = false;
+        *recovered = false;
+        return true;
+    }
 
     // 2. ftruncate 到 total_size_;保证文件大小固定,首字节为 0。
     if (pal_->file_truncate(fd_, total_size_) != 0) {
         pal_->file_close(fd_);
         fd_ = -1;
-        return false;
+        try {
+            heap_buf_.assign(total_size_, 0);
+        } catch (...) {
+            return false;
+        }
+        base_ = heap_buf_.data();
+        data_base_ = base_ + kHeaderTotal;
+        is_heap_degraded_ = true;
+        std::memset(state, 0, sizeof(*state));
+        state->rebuilt = false;
+        *recovered = false;
+        return true;
     }
 
     // 3. mmap(必须是 MAP_SHARED)。
     mm_ = pal_->mmap_open(fd_, total_size_, true);
     if (!mm_.base) {
+        // mmap 失败: 触发堆内存降级 (spec §2 / §10)
         pal_->file_close(fd_);
         fd_ = -1;
-        return false;
+        try {
+            heap_buf_.assign(total_size_, 0);
+        } catch (...) {
+            return false;
+        }
+        base_ = heap_buf_.data();
+        data_base_ = base_ + kHeaderTotal;
+        is_heap_degraded_ = true;
+        std::memset(state, 0, sizeof(*state));
+        state->rebuilt = false;
+        *recovered = false;
+        return true;
     }
     base_ = static_cast<uint8_t*>(mm_.base);
     data_base_ = base_ + kHeaderTotal;

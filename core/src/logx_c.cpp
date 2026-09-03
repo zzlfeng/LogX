@@ -275,6 +275,10 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     // 启动恢复(在创建 Flusher 之前,确保 Header 与 staging 已就绪)
     run_recovery(inst);
 
+    if (inst->staging->is_degraded()) {
+        emit_event(inst, LOGX_EV_DEGRADED, -1, "staging: mmap failed, degraded to heap");
+    }
+
     // 启动 Flusher 线程
     if (inst->pal->thread_start(&flusher_main, inst, &inst->flusher_thread) != 0) {
         delete inst->staging;

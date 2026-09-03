@@ -75,6 +75,7 @@ public:
     virtual void  ev_destroy(void* h) = 0;
     virtual void  ev_signal(void* h) = 0;
     virtual void  ev_wait(void* h) = 0;   /* 进入等待,ev_signal 唤醒;不限制虚假唤醒 */
+    virtual bool  ev_wait_timeout(void* h, uint32_t ms) = 0; /* 带超时等待,超时返回 false,被唤醒返回 true */
 
     /* ---- 原子 ---- */
     virtual uint64_t atomic_add(uint64_t* p, int64_t delta) = 0;
