@@ -108,6 +108,9 @@ inline void put_u32_le(uint8_t* p, uint32_t v) {
     p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff;
 }
 
+// 生成日志文件路径: split=0 为 dir/YYYYMMDD.log, split>0 为 dir/YYYYMMDD.log.N
+std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint8_t split);
+
 // 写一个完整块到日志文件;返回成功与否。
 bool write_block_to_file(Instance* inst,
                          const uint8_t* raw, const PendingBlock& blk,

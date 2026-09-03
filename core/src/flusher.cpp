@@ -266,6 +266,33 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
             r.ok = true;
             return r;
         }
+        // 校验块 CRC32(payload) 与 Tag 可读性 (宁丢不脏)
+        uint32_t expected_crc = get_u32(bhdr + 18);
+        bool block_valid = true;
+        if (payload_len > 0) {
+            std::vector<uint8_t> pbuf(payload_len);
+            if (inst->pal->file_pread(fd, pbuf.data(), payload_len, off + 34) != static_cast<long>(payload_len)) {
+                block_valid = false;
+            } else if (crc32_update(0, pbuf.data(), payload_len) != expected_crc) {
+                block_valid = false;
+            }
+        } else if (expected_crc != 0) {
+            block_valid = false;
+        }
+        if (block_valid && (flag & kFlagEncrypted)) {
+            uint8_t tag[16];
+            if (inst->pal->file_pread(fd, tag, 16, off + 34 + payload_len) != 16) {
+                block_valid = false;
+            }
+        }
+        if (!block_valid) {
+            if (repair) inst->pal->file_truncate(fd, off);
+            r.truncated = true;
+            r.last_block_end_offset = off;
+            inst->pal->file_close(fd);
+            r.ok = true;
+            return r;
+        }
         r.seqno = get_u32(bhdr + 6);
         r.last_block_offset = off;
         r.last_block_end_offset = off + block_size;

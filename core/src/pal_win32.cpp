@@ -77,7 +77,9 @@ public:
             // O_APPEND 语义:后续写从文件尾开始
             SetFilePointer(h, 0, nullptr, FILE_END);
         }
-        int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDWR | _O_BINARY);
+        int flags = _O_RDWR | _O_BINARY;
+        if (append) flags |= _O_APPEND;
+        int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), flags);
         if (fd < 0) { CloseHandle(h); return -1; }
         return fd;
     }

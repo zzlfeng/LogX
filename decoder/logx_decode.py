@@ -104,27 +104,40 @@ class LogSlice:
     @property
     def is_whole(self) -> bool: return (self.flags & 0x03) == 0x00
 
-def reassemble(slices: List[LogSlice]) -> Optional[bytes]:
-    """把 LGXE 序列重组为内部用户载荷。失败返回 None。"""
-    out = bytearray()
-    state = 0  # 0=期望首片/整条,1=期望中片/末片
-    for s in slices:
+class RecordReassembler:
+    """流式分片重组器：支持单块内多条日志与跨块连续分片重组。"""
+    def __init__(self):
+        self.cur_slices: List[bytes] = []
+        self.in_split = False
+
+    def feed(self, s: LogSlice) -> List[bytes]:
+        results = []
         if s.is_whole:
-            if state != 0: return None
-            out += s.payload
-            state = 1
-            continue
-        if s.is_first:
-            if state != 0: return None
-            out += s.payload
-            state = 1
-            continue
-        if s.is_mid or s.is_last:
-            if state != 1: return None
-            out += s.payload
-            if s.is_last: state = 0
-            continue
-    return bytes(out) if state == 0 else None
+            if self.in_split:
+                self.cur_slices.clear()
+                self.in_split = False
+            results.append(s.payload)
+        elif s.is_first:
+            self.cur_slices = [s.payload]
+            self.in_split = True
+        elif s.is_mid:
+            if self.in_split:
+                self.cur_slices.append(s.payload)
+        elif s.is_last:
+            if self.in_split:
+                self.cur_slices.append(s.payload)
+                results.append(b"".join(self.cur_slices))
+                self.cur_slices = []
+                self.in_split = False
+        return results
+
+def reassemble(slices: List[LogSlice]) -> Optional[bytes]:
+    """把单条长日志切片重组为内部用户载荷。失败返回 None。"""
+    asm = RecordReassembler()
+    out = []
+    for s in slices:
+        out.extend(asm.feed(s))
+    return out[0] if out else None
 
 def parse_lgxe(raw: bytes) -> List[LogSlice]:
     """从 raw 字节流中抽取 LGXE 序列(跳过 LGXP 与 < 6B 零残留)。"""
@@ -176,70 +189,89 @@ def parse_file_header(b: bytes) -> FileHeader:
     )
 
 @dataclass
-class DecodedBlock:
+class DecodedBlockResult:
     seqno: int
     raw_len: int
-    user_payload: Optional[bytes] = None
+    raw_bytes: Optional[bytes] = None
     error: Optional[str] = None
 
-def decode_block(bhdr: bytes, payload: bytes, tag: Optional[bytes],
-                 flag: int, raw_len: int, kid_keys: Dict[int, bytes],
-                 kid_in_file: int) -> DecodedBlock:
+def decode_block_raw(bhdr: bytes, payload: bytes, tag: Optional[bytes],
+                     flag: int, raw_len: int, kid_keys: Dict[int, bytes],
+                     kid_in_file: int) -> DecodedBlockResult:
     seqno = get_u32(bhdr, 6)
+    expected_crc = get_u32(bhdr, 18)
+    actual_crc = crc32_update(0, payload)
+    if expected_crc != actual_crc:
+        return DecodedBlockResult(seqno, raw_len, error=f"crc32 mismatch: expected {expected_crc:#x} != {actual_crc:#x}")
+
     algo = (flag & COMP_MASK) >> 1
     enc = bool(flag & FLAG_ENCRYPTED)
     if enc:
         key = kid_keys.get(kid_in_file)
         if key is None:
-            return DecodedBlock(seqno, raw_len, error=f"missing key for kid={kid_in_file}")
+            return DecodedBlockResult(seqno, raw_len, error=f"missing key for kid={kid_in_file}")
         nonce = bhdr[22:34]  # salt[8] + seqno_be[4]
         try:
             ct_with_tag = payload + (tag or b'')
             plain = decrypt_gcm(key, bytes(nonce), bytes(ct_with_tag))
         except Exception as e:
-            return DecodedBlock(seqno, raw_len, error=f"gcm fail: {e}")
+            return DecodedBlockResult(seqno, raw_len, error=f"gcm fail: {e}")
     else:
         plain = bytes(payload)
     try:
         raw = decompress(algo, plain)
     except Exception as e:
-        return DecodedBlock(seqno, raw_len, error=f"decompress fail: {e}")
-    if len(raw) != raw_len:
-        # raw_len 与解压长度不一致;不致命(记 warn),仍尝试重组
-        pass
-    slices = parse_lgxe(raw)
-    user = reassemble(slices)
-    return DecodedBlock(seqno, raw_len, user_payload=user)
+        return DecodedBlockResult(seqno, raw_len, error=f"decompress fail: {e}")
+    return DecodedBlockResult(seqno, raw_len, raw_bytes=raw)
 
-def decode_file(path: str, kid_keys: Dict[int, bytes]) -> List[DecodedBlock]:
+def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[bytes], List[str]]:
+    """解码整个文件，返回 (用户载荷列表, 警告与错误列表)。"""
     with open(path, 'rb') as f:
         data = f.read()
     if len(data) < 32:
-        return []
-    fh = parse_file_header(data[:32])
-    out = []
+        return [], [f"{path}: file too short (<32B)"]
+    try:
+        fh = parse_file_header(data[:32])
+    except Exception as e:
+        return [], [f"{path}: bad file header: {e}"]
+
+    user_records: List[bytes] = []
+    errors: List[str] = []
+    reassembler = RecordReassembler()
+
     off = 32
     while off + 34 <= len(data):
         bhdr = data[off:off+34]
         if bhdr[:4] != MAGIC_BLOCK:
+            errors.append(f"{path} off={off}: bad block magic {bhdr[:4]!r}")
             break
         payload_len = get_u32(bhdr, 14)
         flag = bhdr[5]
         block_size = 34 + payload_len + (16 if (flag & FLAG_ENCRYPTED) else 0)
         if off + block_size > len(data):
+            errors.append(f"{path} off={off}: truncated block")
             break
         raw_len = get_u32(bhdr, 10)
         payload = data[off+34:off+34+payload_len]
         tag = data[off+34+payload_len:off+34+payload_len+16] if (flag & FLAG_ENCRYPTED) else None
-        out.append(decode_block(bhdr, payload, tag, flag, raw_len, kid_keys, fh.kid))
+
+        blk_res = decode_block_raw(bhdr, payload, tag, flag, raw_len, kid_keys, fh.kid)
+        if blk_res.error:
+            errors.append(f"{path} seq={blk_res.seqno}: {blk_res.error}")
+            break
+        if blk_res.raw_bytes:
+            slices = parse_lgxe(blk_res.raw_bytes)
+            for s in slices:
+                for full_payload in reassembler.feed(s):
+                    user_records.append(full_payload)
         off += block_size
-    return out
+    return user_records, errors
 
 # ---------------- 内部用户载荷 → 可读行 ----------------
 def parse_user_payload(b: bytes) -> Tuple[int, int, int, int, str, bytes]:
     """返回 (ts_ms, pid, tid, level, tag, msg)。"""
     if len(b) < 27:
-        raise RuntimeError("user payload too short")
+        raise RuntimeError("user payload too short (<27B)")
     ts_ms = struct.unpack('<Q', b[0:8])[0]
     pid   = struct.unpack('<I', b[8:12])[0]
     tid   = struct.unpack('<Q', b[12:20])[0]
@@ -265,15 +297,19 @@ def parse_kid_map(s: str) -> Dict[int, bytes]:
     return out
 
 def main(argv: List[str]) -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument('log_dir')
-    ap.add_argument('--from', dest='from_date', default=None)
-    ap.add_argument('--to',   dest='to_date',   default=None)
-    ap.add_argument('--kid-map', default='', help='kid=hexkey,kid=hexkey,...')
-    ap.add_argument('--out', default=None, help='输出目录;省略则打 stdout')
+    ap = argparse.ArgumentParser(description="LogX 离线日志解码工具")
+    ap.add_argument('log_dir', help="日志存储目录")
+    ap.add_argument('--from', dest='from_date', default=None, help="起始日期 YYYYMMDD")
+    ap.add_argument('--to',   dest='to_date',   default=None, help="结束日期 YYYYMMDD")
+    ap.add_argument('--kid-map', default='', help='KID与16进制密钥映射: kid=hexkey,kid=hexkey,...')
+    ap.add_argument('--out', default=None, help='输出目录;省略则输出至 stdout')
     args = ap.parse_args(argv)
 
     kid_keys = parse_kid_map(args.kid_map) if args.kid_map else {}
+
+    if not os.path.exists(args.log_dir):
+        print(f"[error] log_dir not found: {args.log_dir}", file=sys.stderr)
+        return 1
 
     files = sorted(
         os.path.join(args.log_dir, n) for n in os.listdir(args.log_dir)
@@ -302,27 +338,25 @@ def main(argv: List[str]) -> int:
             out_fh = sys.stdout
             out_path = None
 
-        try:
-            blocks = decode_file(path, kid_keys)
-        except Exception as e:
-            print(f"[{date}] {type(e).__name__}: {e}", file=sys.stderr)
+        user_payloads, errors = decode_file_records(path, kid_keys)
+        for err in errors:
+            print(f"[{date}] {err}", file=sys.stderr)
             rc = 2
-            continue
 
-        for blk in blocks:
-            if blk.error:
-                print(f"[{date} seq={blk.seqno}] {blk.error}", file=sys.stderr)
-                continue
+        for payload in user_payloads:
             try:
-                ts_ms, pid, tid, level, tag, msg = parse_user_payload(blk.user_payload)
+                ts_ms, pid, tid, level, tag, msg = parse_user_payload(payload)
             except Exception as e:
-                print(f"[{date} seq={blk.seqno}] bad user payload: {e}", file=sys.stderr)
+                print(f"[{date}] bad user payload: {e}", file=sys.stderr)
+                rc = 2
                 continue
             try:
                 msg_text = msg.decode('utf-8', errors='replace')
             except Exception:
                 msg_text = repr(msg)
-            line = f"{date} {ts_ms} pid={pid} tid={tid} L{level} {tag}: {msg_text}\n"
+            level_names = {0: "V", 1: "D", 2: "I", 3: "W", 4: "E", 5: "F"}
+            lvl_str = level_names.get(level, str(level))
+            line = f"{date} {ts_ms} pid={pid} tid={tid} [{lvl_str}] {tag}: {msg_text}\n"
             out_fh.write(line)
     if out_dir and out_fh:
         out_fh.close()

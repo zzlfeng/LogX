@@ -94,7 +94,12 @@ object LogX {
             if (config.encrypt) 1 else 0,
             config.kid,
             config.keyProvider,
+            config.retentionDays,
+            config.maxFileSize,
+            config.maxLogLength,
+            config.flushThreshold
         )
+        if (nativeHandle == 0L) {
             initCount.set(0)
             throw IllegalStateException("LogX native init failed")
         }
@@ -174,6 +179,7 @@ object LogX {
     @JvmStatic private external fun nativeInit(
         logDir: String, stagingPath: String,
         compressAlgo: Int, encryptEnable: Int, kid: Int, keyProvider: Any?,
+        retentionDays: Int, maxFileSize: Long, maxLogLength: Int, flushThreshold: Int
     ): Long
     @JvmStatic private external fun nativeClose(handle: Long)
     @JvmStatic private external fun nativeWrite(handle: Long, level: Int,

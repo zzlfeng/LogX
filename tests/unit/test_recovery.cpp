@@ -312,3 +312,65 @@ TEST_F(RecoveryTest, CorruptWritePos_ClampedToZero) {
     delete inst->staging;
     delete inst;
 }
+
+TEST_F(RecoveryTest, CorruptBlockCrc32_TruncatedOnRecovery) {
+    // 块级 CRC32 读路径校验 (spec §3.2/宁丢不脏):
+    // 若块头完整但 payload 数据损坏 (断电/坏页导致比特翻转),
+    // scan_one 必须校验出 CRC 失败并将文件截断至坏块起始处, 触发 truncated 打点与跳空隙。
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    std::vector<uint8_t> rec1, rec2;
+    append_entry_record(&rec1, 0x10);
+    append_entry_record(&rec2, 0x20);
+
+    // 写入第 1 个有效块 (seqno=1)
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint64_t b1_start = 0, b1_end = 0;
+    ASSERT_TRUE(append_block(inst, salt, 0, rec1.data(),
+                             static_cast<uint32_t>(rec1.size()),
+                             1, 0, &b1_start, &b1_end));
+
+    // 写入第 2 个块 (seqno=2)
+    uint64_t b2_start = 0, b2_end = 0;
+    ASSERT_TRUE(append_block(inst, salt, 0, rec2.data(),
+                             static_cast<uint32_t>(rec2.size()),
+                             2, 0, &b2_start, &b2_end));
+
+    // 故意篡改第 2 块的 payload(破坏 CRC32)
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+    std::string today_path = make_log_path(log_dir_, yyyymmdd, 0);
+    int fd = inst->pal->file_open(today_path.c_str(), false, false);
+    ASSERT_GE(fd, 0);
+    uint8_t bad_byte = 0xFF;
+    // 第 2 块起始位置 + 34B 头 + 2B payload 偏移处翻转
+    inst->pal->file_pwrite(fd, &bad_byte, 1, b2_start + 34 + 2);
+    inst->pal->file_close(fd);
+
+    // Header 记录当时提交水位 seqno=2, flushed_len=28
+    AppendTargetCache atc{};
+    inst->staging->commit_header_locked(2, 28, 28, &atc);
+
+    // 启动恢复: scan_one 扫描第 2 块时必须校验 CRC 失败并截断到 b2_start (即 b1_end)
+    run_recovery(inst);
+
+    // 1) 验证文件长度已精确截断回第 1 块末尾
+    int64_t sz_after = inst->pal->file_size_path(today_path.c_str());
+    EXPECT_EQ(sz_after, static_cast<int64_t>(b1_end));
+
+    // 2) 丢失计数增加
+    EXPECT_GE(inst->truncated_blocks.load(), 1u);
+
+    // 3) 发生截断, 续写首块跳空隙 (seqno = max(S_hdr, S_file) + 2 = max(2, 1) + 2 = 4, Header resume=3)
+    const uint8_t* base = inst->staging->raw_base();
+    EXPECT_EQ(get_u32(base + 8), 3u);
+
+    delete inst->staging;
+    delete inst;
+}
