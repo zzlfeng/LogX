@@ -55,6 +55,12 @@
 - **描述：** 函数签名承诺接收 `raw`/`raw_len` 用于校验，实现中以 `(void)` 忽略。若调用方未做 CRC 校验则数据完整性无保证；`test_codec.cpp` 多处以 `nullptr, 0` 传入，测试完全绕过该路径。
 - **修复建议：** 在函数内部实现输出长度/CRC 校验，或删除参数并在 API 文档中明确调用方责任。
 
+### 🟡 [C-04] 缺少 ARMv8 Crypto Extensions 硬件加速（T4.0-5 偏差）
+- **来源：** 报告三 §四 T4.0-5（Spec 偏差）
+- **位置：** `core/src/codec.cpp`、`core/include/logx_codec.h`
+- **描述：** spec §10 规定支持 ARMv8 Crypto Extensions 专用硬件加速指令；当前代码全库无 `__ARM_FEATURE_CRYPTO` 引用，移动端加密吞吐完全依赖通用软实现，未发挥移动端硬件加速性能。
+- **修复建议：** 引入 ARMv8 Crypto Extensions 条件编译及 AES 指令优化实现。
+
 ---
 
 ## 二、Flusher 与文件写出
@@ -114,6 +120,12 @@
 - **描述：** `/dev/urandom` 或 `BCryptGenRandom`/`rand_s` 失败时的退化路径按时间+地址周期性填充，熵极低；若生产路径触发将影响加密 nonce 与盐值安全。
 - **修复建议：** 退化路径失败应报错/拒绝服务，而非静默生成低熵随机数。
 
+### 🟠 [F-10] 缺少 50~100ms Debounce 聚集刷盘机制（T4.0-4 偏差）
+- **来源：** 报告三 §四 T4.0-4（Spec 偏差）
+- **位置：** `core/src/flusher.cpp:605-611`
+- **描述：** spec §4.1 规定 Flusher 具备 50~100ms Debounce 聚集刷盘机制，以避免低频或零散写入触发过度频繁写盘；当前 `flusher_loop` 为无超时阻塞 `ev_wait`（仅堆内存降级模式有 5s 超时），缺乏定时聚集刷盘兜底机制。
+- **修复建议：** 引入带 50~100ms 超时的等待或定时器机制，实现聚集刷盘与定时兜底。
+
 ---
 
 ## 三、Staging 环形缓冲
@@ -147,6 +159,12 @@
 - **位置：** `core/src/logx_c.cpp:297-302`
 - **描述：** 防御性编程缺失，若未来析构函数引用 `staging` 指针会引发 double-free。
 - **修复建议：** delete 后置 nullptr。
+
+### 🟡 [S-06] 双 Header 提交内存序轻微偏离 Spec（T4.0-3 偏差）
+- **来源：** 报告三 §四 T4.0-3（Spec 偏差）
+- **位置：** `core/src/staging.cpp:180-205`
+- **描述：** spec §4.2/§10 规定双 Header 写入应为“写 Header A → seq_cst 内存屏障 → 写 Header B”；当前实现为 A(中间态 CRC) → B → release fence，在极端掉电窗口下内存序存在轻微偏离。
+- **修复建议：** 严格按照 Spec 要求在 Header A 与 B 的提交之间插入完整顺序一致性屏障（或显式同步语义）。
 
 ---
 
@@ -201,8 +219,8 @@
 
 ## 六、C ABI 与导出
 
-### 🟠 [E-01] 错误回调注册无并发保护（`err_fn`/`err_user` 数据竞争）
-- **来源：** 报告一 BUG-4 ＝ 报告二 R2-高#5
+###  [E-01] 错误回调注册无并发保护（`err_fn`/`err_user` 数据竞争）
+- **来源：** 报告一 BUG-4 ＝ 报告二 R2-高#5（均定为 P0/高优先级）
 - **位置：** `core/src/logx_c.cpp:379-385`；并发读方 `logx_internal.h` 的 `emit_event`
 - **描述：** `logx_set_error_handler` 无锁写 `err_fn`/`err_user`，后台 Flusher 在 `emit_event` 中并发读取，构成数据竞争；头文件注释声明"可被任意线程调用"，风险更高。
 - **修复建议：** 读写均加 `inst->mu` 保护，或改用 `std::atomic<logx_error_fn>` + `std::atomic<void*>`。
@@ -247,8 +265,8 @@
 
 ## 七、PAL 跨平台抽象层
 
-### 🟠 [P-01] Windows `HANDLE` → `int` 转换在 64 位 Windows 上截断高 32 位
-- **来源：** 报告一 BUG-5（列 P0）＝ 报告二 R2-中#10
+###  [P-01] Windows `HANDLE` → `int` 转换在 64 位 Windows 上截断高 32 位
+- **来源：** 报告一 BUG-5（列 P0）＝ 报告二 R2-中#10（综合定级 P0）
 - **位置：** `core/src/pal_win32.cpp:39-44`（`handle_to_int`）、`PalMmap.out_handle`、`thread_join`（报告一"风险-5"同根）
 - **描述：** HANDLE 为 8 字节，强转 `int`（4 字节）截断高 32 位；还原的 HANDLE 可能错误，导致关闭错误句柄或资源泄漏。
 - **修复建议：** 将 `PalMmap.out_handle` 及相关存储类型改为 `intptr_t` 或直接用 `HANDLE`。
@@ -377,25 +395,25 @@
 - **描述：** 测试设置 `flusher_exit = true` 后调用 `thread_join()`。但 Flusher 退出循环后还会执行最终 `drain_once()`（`core/src/flusher.cpp:613`），staging 数据已被正常刷盘，**没有验证"未刷盘 staging 在进程突然死亡后的恢复"**。
 - **修复建议：** 使用独立子进程，在指定故障窗口直接终止进程，不能先让 Flusher 正常退出。
 
-### 🔴 [T-02] 测试名称 `ExportWithMultipleRecordsAndMissingKey_HandledGracefully` 与实现不符
+### 🟠 [T-02] 测试名称 `ExportWithMultipleRecordsAndMissingKey_HandledGracefully` 与实现不符
 - **来源：** 报告一 TEST-BUG-1 ＝ 报告二 R2-测#2
 - **位置：** `tests/unit/test_flusher.cpp:514`
 - **描述：** 测试名暗示"缺失密钥优雅降级"，实际配置 `encrypt_enable = 0`（明文模式），根本没有涉及缺失 key 场景，误导维护人员。
 - **修复建议：** 更正测试名或补真实缺失密钥场景。
 
-### 🔴 [T-03] 加密块测试绕过生产文件头逻辑
-- **来源：** 报告二 R2-测#3；报告一 TEST-BUG-8 关联
+###  [T-03] 加密块测试绕过生产文件头逻辑且未验证加密生效
+- **来源：** 报告二 R2-测#3 ＋ 报告一 TEST-BUG-8
 - **位置：** `tests/unit/test_flusher.cpp:192`
-- **描述：** 测试手工写入带加密标志的文件头，因此无法发现生产 `write_file_header()` 固定写入明文标志的问题（见 F-01）。报告一另指出 `EncryptedBlockFileWriteAndDecode_Roundtrip` 只验证解密后大小正确，未验证"密文 ≠ 明文"（即加密确实发生）。
+- **描述：** 测试手工写入带加密标志的文件头，因此无法发现生产 `write_file_header()` 固定写入明文标志的问题（见 F-01）。报告一另在 TEST-BUG-8 中指出 `EncryptedBlockFileWriteAndDecode_Roundtrip` 只验证解密后大小正确，未验证"密文 ≠ 明文"（即加密确实发生）。
 - **修复建议：** 补生产路径加密文件创建→导出端到端测试；增加密文/明文差异断言。
 
-### 🔴 [T-04] PAL 注入时机晚于 Flusher 线程启动，产生数据竞争
+### 🟠 [T-04] PAL 注入时机晚于 Flusher 线程启动，产生数据竞争
 - **来源：** 报告一 TEST-BUG-3 ＝ 报告二 R2-测#4
 - **位置：** `tests/unit/test_robustness.cpp:181, 234`
 - **描述：** `logx_open` 内部已启动 Flusher 线程，测试随后才将 `inst->pal` 改为 Mock PAL；Flusher 读 `inst->pal` 与测试写 `inst->pal` 并发，数据竞争，测试结果不可信。
 - **修复建议：** 在创建实例前注入 PAL，或提供显式 PAL 注入入口。
 
-### 🔴 [T-05] `FlushAndZeroMaintainsInvariant` 断言永远为真，无检测意义
+### 🟠 [T-05] `FlushAndZeroMaintainsInvariant` 断言永远为真，无检测意义
 - **来源：** 报告一 TEST-BUG-2 ＝ 报告二 R2-测#5
 - **位置：** `tests/unit/test_staging.cpp:127`
 - **描述：** 先清零 `[0, 256)` 再调用 `debug_check_invariant(0, 256)`，被检查区域已全为零，断言必然为 true，无法验证清零与坐标推进逻辑。
@@ -489,9 +507,9 @@
 |:---|:---|:---|:---|:---|
 | **T4.0-1** | §7 `flush()` 水位线 `target_seqno` 防饥饿 | `flush_blocking` 仍为轮询 staging 空 + 5ms sleep | 高并发下 flush 容易饥饿阻塞 | F-08 |
 | **T4.0-2** | §3.1/§4.4 切分序号 2B (uint16_t) | 仍为 `uint8_t split_no` | 单日超 255 分卷停写丢日志 | F-07 |
-| **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | 实现为 A(中间态 CRC)→ B → release fence | 掉电极端窗口内存序轻微偏离 | — |
-| **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | `flusher_loop` 仍为无超时阻塞 `ev_wait`（仅堆降级模式有 5s 超时） | 缺乏低频写定时兜底刷盘机制 | — |
-| **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | 全库无 `__ARM_FEATURE_CRYPTO` 引用 | 缺少专用硬件加密指令加速 | — |
+| **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | 实现为 A(中间态 CRC)→ B → release fence | 掉电极端窗口内存序轻微偏离 | S-06 |
+| **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | `flusher_loop` 仍为无超时阻塞 `ev_wait`（仅堆降级模式有 5s 超时） | 缺乏低频写定时兜底刷盘机制 | F-10 |
+| **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | 全库无 `__ARM_FEATURE_CRYPTO` 引用 | 缺少专用硬件加密指令加速 | C-04 |
 | **T4.0-6** | §11 运行期每 30s 定时 msync/fdatasync | 定时器未实现；PAL 接口已实现但全库 0 调用 | 掉电下脏页刷盘时机不可控 | F-04 |
 | **T4.0-7** | §9 未对齐访问 / 23:59:59 时钟跳变用例 | ✅ 已通过 T4.5 落地 | — | — |
 | **T4.0-8** | §2/§10 离线解码工具 `logx_decode.py` | 坏块 break、死代码残留、容错性待对齐 | 影响离线日志捞取成功率 | D-01~D-04 |
@@ -560,7 +578,8 @@
 | P-03 | file_rmdir 错误转译 | J-02 | g_err_ctx 多实例互踩 |
 | K-01 | Kotlin export 丢返回值 | K-02 | runBlocking 嵌套 |
 | D-01 | Python cksum break 丢记录 | D-02 | Python 坏块 break 丢文件 |
-| D-03 | GCM 失败策略不一致 | T-02~T-11 | 测试问题（详见第十一节） |
+| D-03 | GCM 失败策略不一致 | F-10 | 缺少 50~100ms Debounce 聚集刷盘 |
+| T-02~T-11 | 测试用例缺陷（详见第十一节） | — | — |
 
 ### 🟡 P2 —— 质量 / 性能 / 可维护性
 
@@ -573,11 +592,13 @@
 | P-05 | SetFilePointer 冗余 | P-06 | atomic_add 对齐断言 |
 | J-03 | NewStringUTF 编码风险 | K-03 | errorHandler GC 延迟 |
 | K-04 | setErrorHandler 并发校验 | D-04 | Python 死代码 |
-| D-05 | Python 64MB 解压上限 | — | — |
+| D-05 | Python 64MB 解压上限 | C-04 | 缺少 ARMv8 硬件加速（T4.0-5） |
+| S-06 | 双 Header 提交内存序偏离（T4.0-3） | — | — |
 
 ### 修复顺序建议（综合三份报告）
 
-1. **P0 数据正确性**：文件头加密标志（F-01）→ 压缩降级 flag（C-01）→ 分卷号恢复（F-02）→ 短写检测（F-03）→ 真实崩溃恢复测试（T-01）
-2. **P1 并发与持久化**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ JNI 关闭顺序（J-01）→ 持久化同步接入（F-04）→ 恢复校验加强（F-05）
-3. **P2 API 与测试质量**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
-4. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）
+1. **P0 核心数据正确性与崩溃恢复**：文件头加密标志（F-01）→ 压缩降级 flag（C-01）→ 分卷号恢复（F-02）→ 真实崩溃恢复测试（T-01）
+2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ JNI 关闭顺序与 UAF 防护（J-01）→ Win64 句柄截断修复（P-01）
+3. **P1 协议健壮性与持久化**：短写检测（F-03）→ 持久化同步接入（F-04）→ 恢复校验加强（F-05）→ 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
+4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
+5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）
