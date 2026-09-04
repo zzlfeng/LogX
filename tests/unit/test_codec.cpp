@@ -2,7 +2,9 @@
 //
 // 覆盖:
 //   - zstd 压缩往返(可压缩数据体积真实缩水;随机数据不放大爆掉)
-//   - encode_block 压缩失败自动降级 flag=none(经 decode_block 验证语义)
+//   - encode_block 压缩失败自动降级 flag=none,final_flag 与 payload 编码状态
+//     一致,块可正常解码(经 seam 注入 zstd 运行时失败 + kAlgoZlib 未实现路径
+//     两种触发方式验证;加密组合用例在 AESGCM guard 内)
 //   - decode_block 对损坏帧 / 伪造内容大小帧拒绝(宁丢不脏)
 //   - none 算法恒等往返;未知算法失败
 
@@ -10,6 +12,7 @@
 #include "logx_codec.h"
 #include <gtest/gtest.h>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 using namespace logx;
@@ -312,4 +315,185 @@ TEST(CodecTest, EncodeBlockMissingKey_DowngradesToPlaintext) {
 }
 
 #endif  // LOGX_WITH_AESGCM
+
+TEST(CodecTest, EncodeBlock_CompressionFailureDowngradesToNoneAndDecodesSuccessfully) {
+    // 覆盖 C-01: 压缩失败降级链(spec §6)。
+    // 用未实现的压缩算法(kAlgoZlib)触发降级;本用例不依赖 AESGCM,
+    // 置于 LOGX_WITH_AESGCM guard 之外,默认构建也参与编译。
+    auto raw = make_compressible(1024);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t flag = (kAlgoZlib << 1);
+
+    EncodedBlock enc;
+    // 1) 编码必须平滑降级成功, 绝不阻塞或丢日志
+    ASSERT_TRUE(encode_block(flag, nullptr, /*seqno=*/10, salt,
+                             raw.data(), static_cast<uint32_t>(raw.size()), &enc));
+
+    // 2) 验证 final_flag: 压缩位已被清除为 kAlgoNone
+    EXPECT_EQ((enc.final_flag >> 1) & 0x3, kAlgoNone);
+    EXPECT_EQ(enc.final_flag & kFlagEncrypted, 0);
+
+    // 3) 使用 enc.final_flag 能够正常解码还原
+    std::vector<uint8_t> decoded;
+    ASSERT_TRUE(decode_block(enc.final_flag, nullptr, 10, salt,
+                             enc.payload.data(),
+                             static_cast<uint32_t>(enc.payload.size()),
+                             nullptr, nullptr, static_cast<uint32_t>(raw.size()),
+                             &decoded));
+    EXPECT_EQ(decoded, raw);
+
+    // 4) 反证/防退化断言: 若使用未降级的原始 flag 解码, 必然失败(毒丸块复现)
+    std::vector<uint8_t> fail_out;
+    EXPECT_FALSE(decode_block(flag, nullptr, 10, salt,
+                              enc.payload.data(),
+                              static_cast<uint32_t>(enc.payload.size()),
+                              nullptr, nullptr, static_cast<uint32_t>(raw.size()),
+                              &fail_out));
+}
+
+TEST(CodecTest, Flusher_CompressionFailureDowngradesAndEmitsDegradedEvent) {
+    // 覆盖 C-01 在 Flusher 链路的完整闭环:
+    // 1. 验证落盘块头 hdr[5] 压缩位确已清零(非毒丸块)
+    // 2. 验证触发了 LOGX_EV_DEGRADED 告警事件
+    // 3. 验证落盘块可由 decode_block 正常还原
+    // (不依赖 AESGCM,置于 guard 之外)
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_comp_downgrade_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string path = dir + "/20260904.log";
+
+    int degraded_ev_count = 0;
+    std::string degraded_msg;
+    logx_error_fn err_cb = [](void* user, logx_event_kind_e kind, int, const char* msg) {
+        if (kind == LOGX_EV_DEGRADED) {
+            auto* p = static_cast<std::pair<int*, std::string*>*>(user);
+            (*p->first)++;
+            *p->second = msg ? msg : "";
+        }
+    };
+    std::pair<int*, std::string*> cb_user(&degraded_ev_count, &degraded_msg);
+
+    Instance inst{};
+    inst.log_dir = dir;
+    inst.pal = &pal;
+    inst.compress_algo = kAlgoNone;
+    inst.encrypt_enable = false;
+    inst.err_fn = err_cb;
+    inst.err_user = &cb_user;
+
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    int fd = pal.file_open(path.c_str(), true, false);
+    ASSERT_GE(fd, 0);
+
+    // 写入文件头
+    uint8_t hdr[32] = {};
+    put_u32_le(hdr, kMagicFile);
+    hdr[4] = 1; hdr[5] = 0;
+    put_u32_le(hdr + 6, 20260904u);
+    put_u16(hdr + 10, 0);
+    std::memcpy(hdr + 12, salt, 8);
+    put_u32_le(hdr + 28, crc32_update(0, hdr, 28));
+    ASSERT_EQ(pal.file_write(fd, hdr, 32), 32);
+
+    auto raw = make_compressible(512);
+    uint8_t flag = (kAlgoZlib << 1);  // 触发压缩降级
+
+    BlockWriteResult wr = write_and_record(&inst, fd, raw.data(),
+                                           static_cast<uint32_t>(raw.size()),
+                                           1, flag, salt, nullptr);
+    EXPECT_TRUE(wr.ok);
+    pal.file_close(fd);
+
+    // 验证触发了降级事件
+    EXPECT_GT(degraded_ev_count, 0);
+    EXPECT_NE(degraded_msg.find("compression failed"), std::string::npos);
+
+    // 读取落盘的块头
+    fd = pal.file_open(path.c_str(), false, false);
+    uint8_t bhdr[34];
+    EXPECT_EQ(pal.file_pread(fd, bhdr, 34, 32), 34);
+    EXPECT_EQ(get_u32(bhdr), kMagicBlock);
+    // 核心验证: 块头 hdr[5] 的压缩位已被清除为 kAlgoNone!
+    EXPECT_EQ((bhdr[5] >> 1) & 0x3, kAlgoNone);
+
+    uint32_t payload_len = get_u32(bhdr + 14);
+    EXPECT_EQ(payload_len, raw.size());
+    std::vector<uint8_t> payload_buf(payload_len);
+    EXPECT_EQ(pal.file_pread(fd, payload_buf.data(), payload_len, 32 + 34), payload_len);
+    pal.file_close(fd);
+
+    // 验证明文内容能够成功解码
+    std::vector<uint8_t> decoded;
+    ASSERT_TRUE(decode_block(bhdr[5], nullptr, 1, salt,
+                             payload_buf.data(), payload_len, nullptr,
+                             nullptr, static_cast<uint32_t>(raw.size()), &decoded));
+    EXPECT_EQ(decoded, raw);
+
+    // 清理
+    pal.file_unlink(path.c_str());
+    pal.file_rmdir(dir.c_str());
+}
+
+#if LOGX_WITH_AESGCM
+
+TEST(CodecTest, EncodeBlock_CompressionDowngradeKeepsEncryption) {
+    // 加密组合验证: 开启加密时压缩降级, 加密位保留而压缩位清零,
+    // 密文块用降级后 flag 仍可解密还原
+    auto raw = make_compressible(1024);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t key[32] = {0x11, 0x22, 0x33, 0x44};
+    uint8_t flag_enc = (kAlgoZlib << 1) | kFlagEncrypted;
+
+    EncodedBlock enc;
+    ASSERT_TRUE(encode_block(flag_enc, key, /*seqno=*/11, salt,
+                             raw.data(), static_cast<uint32_t>(raw.size()), &enc));
+    EXPECT_TRUE(enc.enc_ok);
+    EXPECT_EQ((enc.final_flag >> 1) & 0x3, kAlgoNone);
+    EXPECT_NE(enc.final_flag & kFlagEncrypted, 0);
+
+    ASSERT_GT(enc.payload.size(), 16u);
+    uint32_t ct_len = static_cast<uint32_t>(enc.payload.size()) - 16;
+    std::vector<uint8_t> dec;
+    ASSERT_TRUE(decode_block(enc.final_flag, key, 11, salt,
+                             enc.payload.data(), ct_len,
+                             enc.payload.data() + ct_len,
+                             nullptr, static_cast<uint32_t>(raw.size()),
+                             &dec));
+    EXPECT_EQ(dec, raw);
+}
+
+#endif  // LOGX_WITH_AESGCM
+
+#if LOGX_WITH_ZSTD
+
+TEST(CodecTest, EncodeBlock_ZstdRuntimeFailureDowngradesViaSeam) {
+    // 已接入真实 zstd 的构建里,经测试 seam 强制 compress_block 失败,
+    // 覆盖"zstd 运行时失败 → 降级"路径(zlib 未实现路径之外的真实场景)。
+    auto raw = make_compressible(4 * 1024);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t flag = (kAlgoZstd << 1);
+
+    set_compress_fail_injection(true);
+    EncodedBlock enc;
+    ASSERT_TRUE(encode_block(flag, nullptr, /*seqno=*/12, salt,
+                             raw.data(), static_cast<uint32_t>(raw.size()), &enc));
+    set_compress_fail_injection(false);
+
+    // 降级生效: 压缩位清零, payload 为未压缩原文(非 zstd 帧)
+    EXPECT_EQ((enc.final_flag >> 1) & 0x3, kAlgoNone);
+    EXPECT_EQ(enc.payload, raw);
+
+    // 用降级后 flag 解码完整还原
+    std::vector<uint8_t> decoded;
+    ASSERT_TRUE(decode_block(enc.final_flag, nullptr, 12, salt,
+                             enc.payload.data(),
+                             static_cast<uint32_t>(enc.payload.size()),
+                             nullptr, nullptr, static_cast<uint32_t>(raw.size()),
+                             &decoded));
+    EXPECT_EQ(decoded, raw);
+}
+
+#endif  // LOGX_WITH_ZSTD
 

@@ -52,6 +52,7 @@ void make_nonce(uint32_t seqno, const uint8_t salt[8], uint8_t nonce_out[12]);
 struct EncodedBlock {
     std::vector<uint8_t> payload;
     bool enc_ok = false;  // 仅当输入 encrypt=true 时有效
+    uint8_t final_flag = 0;  // 实际编码落盘 flag(反映压缩/加密降级后的真实状态)
 };
 bool encode_block(uint8_t flag,
                   const uint8_t* key32_or_null,  // null = 关闭加密
@@ -59,6 +60,11 @@ bool encode_block(uint8_t flag,
                   const uint8_t salt[8],
                   const uint8_t* raw, uint32_t raw_len,
                   EncodedBlock* out);
+
+// ---- 测试专用 seam(生产代码不得调用) ----
+// 打开后 compress_block 对所有非 none 算法直接返回失败,用于在已接入真实
+// zstd 的构建里复现"运行时压缩失败 → 降级 flag=none"链路(spec §6)。
+void set_compress_fail_injection(bool enabled);
 
 // 解码端:输入是"块在文件中的切片",输出 raw 字节。
 // flag 同上;失败原因:crc / gcm / 压缩失败。

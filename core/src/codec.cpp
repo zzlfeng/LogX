@@ -4,14 +4,18 @@
 // 加密:AES-256-GCM(M3 待接入,LOGX_WITH_AESGCM)。
 //
 // 降级链(spec §6):
-//   - 编码侧压缩失败 → 自动回退 flag=none 继续写(encode_block 内处理);
-//   - LOGX_WITH_ZSTD=0 时 flag=zstd 的块编码失败,调用方(flusher)报
-//     block_write_errors 并按 IO 错误处理该块;
+//   - 编码侧压缩失败(zstd 运行时错误 / 算法未实现) → 自动回退 flag=none
+//     继续写(encode_block 内处理);实际生效 flag 经 EncodedBlock.final_flag
+//     传回,调用方(flusher)必须以 final_flag 写块头 hdr[5],否则块头声明的
+//     压缩算法与 payload 真实编码不一致,构成解码必然失败的"毒丸块"(C-01);
+//   - "配置请求编译期未接入/未实现的算法"由 logx_open fail-fast 拒绝,
+//     不进入运行期降级路径;
 //   - 解码侧任何失败(帧损坏 / 内容大小超契约上限 / GCM 失败)一律 false,
 //     由调用方"宁丢不脏"丢弃该块。
 
 #include "logx_codec.h"
 
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -39,7 +43,15 @@ namespace {
 constexpr unsigned long long kDecompressOutputMax =
     static_cast<unsigned long long>(kBlockMaxRaw) + 64;
 
+// 压缩失败注入开关(测试 seam,见 logx_codec.h 声明)。
+// atomic:测试线程写、Flusher 线程读,避免数据竞争。
+std::atomic<bool> g_inject_compress_fail{false};
+
 }  // namespace
+
+void set_compress_fail_injection(bool enabled) {
+    g_inject_compress_fail.store(enabled, std::memory_order_relaxed);
+}
 
 void make_nonce(uint32_t seqno, const uint8_t salt[8], uint8_t nonce_out[12]) {
     std::memcpy(nonce_out, salt, 8);
@@ -56,6 +68,11 @@ bool compress_block(uint8_t algo, const uint8_t* in, uint32_t in_len,
     if (algo == kAlgoNone) {
         out->assign(in, in + in_len);
         return true;
+    }
+    // 测试 seam:强制非 none 算法压缩失败(复现运行时降级链路)
+    if (g_inject_compress_fail.load(std::memory_order_relaxed)) {
+        out->clear();
+        return false;
     }
 #if LOGX_WITH_ZSTD
     if (algo == kAlgoZstd) {
@@ -217,6 +234,14 @@ bool encode_block(uint8_t flag,
         out->payload = std::move(compd);
         out->enc_ok = false;
     }
+
+    uint8_t final_flag = flag & ~0x07;
+    if (out->enc_ok) {
+        final_flag |= kFlagEncrypted;
+    }
+    final_flag |= static_cast<uint8_t>((comp & 0x03) << 1);
+    out->final_flag = final_flag;
+
     return true;
 }
 

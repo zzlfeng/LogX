@@ -101,6 +101,12 @@ long append_block_raw(int fd,
         inst->block_write_errors.fetch_add(1);
         return -1;
     }
+    // 若发生压缩降级,通知监控层
+    uint8_t orig_comp = (flag >> 1) & 0x3;
+    uint8_t final_comp = (enc.final_flag >> 1) & 0x3;
+    if (orig_comp != kAlgoNone && final_comp == kAlgoNone) {
+        emit_event(inst, LOGX_EV_DEGRADED, -1, "compression failed; downgrade to none");
+    }
     // 2) 确定 payload_len 与 CRC32(payload)
     uint32_t payload_len = enc.enc_ok
         ? static_cast<uint32_t>(enc.payload.size() - 16)
@@ -110,7 +116,7 @@ long append_block_raw(int fd,
     uint8_t hdr[34];
     put_u32_le(hdr + 0, kMagicBlock);
     hdr[4] = 1;
-    hdr[5] = flag;
+    hdr[5] = enc.final_flag;
     put_u32_le(hdr + 6,  seqno);
     put_u32_le(hdr + 10, raw_len);
     put_u32_le(hdr + 14, payload_len);

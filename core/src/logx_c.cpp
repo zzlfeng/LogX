@@ -251,6 +251,20 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
         // 必须 < 数据区 − 1,否则放不进环
         return LOGX_ERR_INVALID_ARG;
     }
+    // 压缩算法配置 fail-fast:请求编译期未接入/未实现的算法时拒绝启动,
+    // 避免"每个块都触发运行期降级"的确定性场景(降级链仅用于运行时偶发失败,
+    // 见 codec.cpp spec §6 注释)。
+    if (cfg->compress_algo > kAlgoZlib) {
+        return LOGX_ERR_INVALID_ARG;  // 未知算法(保留值)
+    }
+    if (cfg->compress_algo == kAlgoZlib) {
+        return LOGX_ERR_INVALID_ARG;  // zlib 压缩尚未实现(compress_block 恒失败)
+    }
+#if !LOGX_WITH_ZSTD
+    if (cfg->compress_algo == kAlgoZstd) {
+        return LOGX_ERR_INVALID_ARG;  // 配置请求 zstd 但编译期未接入
+    }
+#endif
     Instance* inst = new Instance();
     inst->log_dir = cfg->log_dir;
     inst->staging_path = cfg->staging_path;
