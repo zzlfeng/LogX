@@ -36,12 +36,18 @@
 
 ## 一、编解码模块
 
-### 🔴 [C-01] 压缩失败降级后未更新块头 flag（毒丸块）
+### ✅ [C-01] 压缩失败降级后未更新块头 flag（毒丸块）[已闭环]
 - **来源：** 报告二 R2-高#2 ＝ 报告三 BUG-C1（两份报告独立发现，均为 P0）
-- **位置：** `core/src/codec.cpp:197`、`core/src/flusher.cpp:113`
-- **描述：** `encode_block()` 内部将压缩算法降级为 none，但该修改只存在于局部变量，返回的 `EncodedBlock` 未携带最终 flag。Flusher 仍将原始 Zstd flag 写入块头 `hdr[5]`，导致：payload 实际为未压缩数据、块头声明为 Zstd、C++ 导出与 Python 解码器均尝试 Zstd 解压必然失败，**整块日志无法导出**。spec §6 承诺的"压缩失败平滑降级"实际落地为"静默产出毒丸块"。
+- **位置：** `core/src/codec.cpp`、`core/src/flusher.cpp`、`core/src/logx_c.cpp`
+- **状态：** ✅ **已修复并闭环验证**（Commit `d0d157e` 及加固提交）
+- **描述：** 原 `encode_block()` 内部将压缩算法降级为 none，但该修改只存在于局部变量，返回的 `EncodedBlock` 未携带最终 flag。Flusher 仍将原始 Zstd flag 写入块头 `hdr[5]`，导致：payload 实际为未压缩数据、块头声明为 Zstd、C++ 导出与 Python 解码器均尝试 Zstd 解压必然失败，**整块日志无法导出**。spec §6 承诺的"压缩失败平滑降级"实际落地为"静默产出毒丸块"。
 - **测试掩盖原因（报告三）：** `test_codec.cpp` 从未构造"开启压缩→运行时压缩失败→降级→解码还原"的负向闭环用例。
-- **修复建议：** `EncodedBlock` 增加 `uint8_t final_flag`，或将 `encode_block` 首参改为 `uint8_t* inout_flag`；补充降级往返负向测试。
+- **修复方案与落地：**
+  1. `EncodedBlock` 新增 `uint8_t final_flag`，`encode_block()` 计算实际生效的最终 flag（压缩降级清除 bit1..2，加密位跟随 `enc_ok`）。
+  2. `append_block_raw` 严格使用 `enc.final_flag` 写入块头 `hdr[5]`，且发生压缩降级时派发 `LOGX_EV_DEGRADED` 告警事件。
+  3. `logx_open` 增加 fail-fast 校验：未知算法、未实现的 zlib 以及未开启 ZSTD 宏却配置 zstd 均一律拒绝启动。
+  4. 引入 `ScopedCompressFailInjection` RAII 守卫与测试 Seam，提供多线程无竞争的故障注入与异常安全重置。
+  5. 补齐往返解码、反证防退化断言、加密组合及 `logx_open` fail-fast 单元测试，双构建矩阵全绿通过。
 
 ### 🟠 [C-02] `kFlagCompressZstd` 与 `kFlagEncrypted` 数值相同（均为 0x1），命名歧义
 - **来源：** 报告一 BUG-2（汇总表列 P0）；报告三 BUG-J1 关联（JNI 端 Compress.ZSTD(1) 映射与 flag 字节布局语义不统一）
@@ -465,7 +471,7 @@
 |------|------|------|
 | `parse_records_stream` 跨块 carry（多块衔接场景） | 🔴 高 | 报告一 |
 | `parse_records_stream` 重同步路径（坏 magic/cksum 后继续解析） | 🔴 高 | 报告一 |
-| `encode_block` 压缩降级链（zstd 失败 → 明文降级 → 解码往返） | 🔴 高 | 报告一/三（掩盖 C-01） |
+| `encode_block` 压缩降级链（zstd 失败 → 明文降级 → 解码往返） | ✅ 已补齐 | 报告一/三（Commit `d0d157e` 闭环） |
 | 生产路径加密文件创建和导出（端到端） | 🔴 高 | 报告二（掩盖 F-01） |
 | `logx_c.cpp` export 路径（`export_range`、`decode_one_file`） | 🔴 高 | 报告一 |
 | 真实进程级崩溃窗口（独立子进程强杀） | 🔴 高 | 报告二（掩盖 T-01） |
@@ -552,7 +558,7 @@
 
 | 编号 | 问题 | 来源 |
 |:---|:---|:---|
-| C-01 | 压缩降级未更新块头 flag（毒丸块，解码必失败） | 报告二#2 / 报告三 BUG-C1 |
+| C-01 | 压缩降级未更新块头 flag（毒丸块，解码必失败）[✅ 已修复] | 报告二#2 / 报告三 BUG-C1 |
 | F-01 | 生产路径加密文件头未记录加密标志（加密文件无法导出） | 报告二#1 |
 | F-02 | 恢复后 `current_split` 强制归零，覆写历史分卷 | 报告二#9 / 报告三 BUG-X2（报告二列中等） |
 | J-01 | `nativeClose` 提前释放 kp_ctx，Flusher UAF | 报告二#6 / 报告三 BUG-J5（报告三列 P1） |

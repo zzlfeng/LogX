@@ -39,6 +39,19 @@ std::vector<uint8_t> make_randomish(size_t n) {
     return v;
 }
 
+// 测试 Seam 的 RAII 守卫:确保即使用例中途断言失败(ASSERT_* return),
+// 也会在析构时恢复全局注入状态,杜绝污染同进程后续用例。
+struct ScopedCompressFailInjection {
+    explicit ScopedCompressFailInjection(bool enabled = true) {
+        set_compress_fail_injection(enabled);
+    }
+    ~ScopedCompressFailInjection() {
+        set_compress_fail_injection(false);
+    }
+    ScopedCompressFailInjection(const ScopedCompressFailInjection&) = delete;
+    ScopedCompressFailInjection& operator=(const ScopedCompressFailInjection&) = delete;
+};
+
 }  // namespace
 
 #if LOGX_WITH_ZSTD
@@ -436,6 +449,60 @@ TEST(CodecTest, Flusher_CompressionFailureDowngradesAndEmitsDegradedEvent) {
     pal.file_rmdir(dir.c_str());
 }
 
+TEST(CodecTest, LogxOpen_CompressAlgo_FailFast) {
+    // 覆盖 logx_open fail-fast:请求未知算法/未实现的 zlib/未开启宏时的 zstd
+    // 一律返回 LOGX_ERR_INVALID_ARG 拒绝启动(spec §6)。
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_cfg_comp_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 4096;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 8 * 1024;
+
+    logx_instance_t* inst = nullptr;
+
+    // 1. 未知算法 (> kAlgoZlib) 必须拒绝启动
+    cfg.compress_algo = kAlgoZlib + 1;
+    EXPECT_EQ(logx_open(&cfg, &inst), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(inst, nullptr);
+
+    // 2. 未实现的 zlib (== kAlgoZlib) 必须拒绝启动
+    cfg.compress_algo = kAlgoZlib;
+    EXPECT_EQ(logx_open(&cfg, &inst), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(inst, nullptr);
+
+#if !LOGX_WITH_ZSTD
+    // 3. 编译期未接入 ZSTD 时, 配置 zstd 必须拒绝启动
+    cfg.compress_algo = kAlgoZstd;
+    EXPECT_EQ(logx_open(&cfg, &inst), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(inst, nullptr);
+#else
+    // 编译期已接入 ZSTD 时, 配置 zstd 能够正常启动
+    cfg.compress_algo = kAlgoZstd;
+    EXPECT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    ASSERT_NE(inst, nullptr);
+    logx_close(inst);
+    inst = nullptr;
+#endif
+
+    // 4. 配置 kAlgoNone 正常启动
+    cfg.compress_algo = kAlgoNone;
+    EXPECT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    ASSERT_NE(inst, nullptr);
+    logx_close(inst);
+
+    pal.file_unlink(staging.c_str());
+    pal.file_rmdir(dir.c_str());
+}
+
 #if LOGX_WITH_AESGCM
 
 TEST(CodecTest, EncodeBlock_CompressionDowngradeKeepsEncryption) {
@@ -471,15 +538,15 @@ TEST(CodecTest, EncodeBlock_CompressionDowngradeKeepsEncryption) {
 TEST(CodecTest, EncodeBlock_ZstdRuntimeFailureDowngradesViaSeam) {
     // 已接入真实 zstd 的构建里,经测试 seam 强制 compress_block 失败,
     // 覆盖"zstd 运行时失败 → 降级"路径(zlib 未实现路径之外的真实场景)。
+    // 使用 ScopedCompressFailInjection RAII 守卫,确保断言退出时自动清理。
     auto raw = make_compressible(4 * 1024);
     uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     uint8_t flag = (kAlgoZstd << 1);
 
-    set_compress_fail_injection(true);
+    ScopedCompressFailInjection seam_guard(true);
     EncodedBlock enc;
     ASSERT_TRUE(encode_block(flag, nullptr, /*seqno=*/12, salt,
                              raw.data(), static_cast<uint32_t>(raw.size()), &enc));
-    set_compress_fail_injection(false);
 
     // 降级生效: 压缩位清零, payload 为未压缩原文(非 zstd 帧)
     EXPECT_EQ((enc.final_flag >> 1) & 0x3, kAlgoNone);
@@ -493,6 +560,86 @@ TEST(CodecTest, EncodeBlock_ZstdRuntimeFailureDowngradesViaSeam) {
                              nullptr, nullptr, static_cast<uint32_t>(raw.size()),
                              &decoded));
     EXPECT_EQ(decoded, raw);
+}
+
+TEST(CodecTest, Flusher_ZstdRuntimeFailureDowngradesAndEmitsDegradedEventViaSeam) {
+    // 真实 ZSTD 构建下经 seam 注入触发 Flusher 完整落盘降级与事件闭环
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_zstd_seam_down_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string path = dir + "/20260904.log";
+
+    int degraded_ev_count = 0;
+    std::string degraded_msg;
+    logx_error_fn err_cb = [](void* user, logx_event_kind_e kind, int, const char* msg) {
+        if (kind == LOGX_EV_DEGRADED) {
+            auto* p = static_cast<std::pair<int*, std::string*>*>(user);
+            (*p->first)++;
+            *p->second = msg ? msg : "";
+        }
+    };
+    std::pair<int*, std::string*> cb_user(&degraded_ev_count, &degraded_msg);
+
+    Instance inst{};
+    inst.log_dir = dir;
+    inst.pal = &pal;
+    inst.compress_algo = kAlgoZstd;
+    inst.encrypt_enable = false;
+    inst.err_fn = err_cb;
+    inst.err_user = &cb_user;
+
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    int fd = pal.file_open(path.c_str(), true, false);
+    ASSERT_GE(fd, 0);
+
+    // 写入文件头
+    uint8_t hdr[32] = {};
+    put_u32_le(hdr, kMagicFile);
+    hdr[4] = 1; hdr[5] = 0;
+    put_u32_le(hdr + 6, 20260904u);
+    put_u16(hdr + 10, 0);
+    std::memcpy(hdr + 12, salt, 8);
+    put_u32_le(hdr + 28, crc32_update(0, hdr, 28));
+    ASSERT_EQ(pal.file_write(fd, hdr, 32), 32);
+
+    auto raw = make_compressible(2048);
+    uint8_t flag = (kAlgoZstd << 1);
+
+    ScopedCompressFailInjection seam_guard(true);
+    BlockWriteResult wr = write_and_record(&inst, fd, raw.data(),
+                                           static_cast<uint32_t>(raw.size()),
+                                           1, flag, salt, nullptr);
+    EXPECT_TRUE(wr.ok);
+    pal.file_close(fd);
+
+    // 验证触发了降级事件
+    EXPECT_GT(degraded_ev_count, 0);
+    EXPECT_NE(degraded_msg.find("compression failed"), std::string::npos);
+
+    // 读取落盘的块头
+    fd = pal.file_open(path.c_str(), false, false);
+    uint8_t bhdr[34];
+    EXPECT_EQ(pal.file_pread(fd, bhdr, 34, 32), 34);
+    EXPECT_EQ(get_u32(bhdr), kMagicBlock);
+    EXPECT_EQ((bhdr[5] >> 1) & 0x3, kAlgoNone);
+
+    uint32_t payload_len = get_u32(bhdr + 14);
+    EXPECT_EQ(payload_len, raw.size());
+    std::vector<uint8_t> payload_buf(payload_len);
+    EXPECT_EQ(pal.file_pread(fd, payload_buf.data(), payload_len, 32 + 34), payload_len);
+    pal.file_close(fd);
+
+    // 验证明文内容能够成功解码
+    std::vector<uint8_t> decoded;
+    ASSERT_TRUE(decode_block(bhdr[5], nullptr, 1, salt,
+                             payload_buf.data(), payload_len, nullptr,
+                             nullptr, static_cast<uint32_t>(raw.size()), &decoded));
+    EXPECT_EQ(decoded, raw);
+
+    pal.file_unlink(path.c_str());
+    pal.file_rmdir(dir.c_str());
 }
 
 #endif  // LOGX_WITH_ZSTD
