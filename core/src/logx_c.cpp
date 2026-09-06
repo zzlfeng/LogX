@@ -67,8 +67,10 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
     uint8_t salt[8];
     std::memcpy(salt, hdr + 12, 8);
     const uint8_t* key32 = nullptr;
+    bool key_lookup_attempted = false;
     bool file_encrypted = flag_encrypted(hdr[5]);
     if (file_encrypted) {
+        key_lookup_attempted = true;
         if (!inst->key_provider) {
             emit_event(inst, LOGX_EV_DEGRADED, -1, "export: no key provider for encrypted file");
             out_lines->push_back("[skipped: no key provider]\n");
@@ -105,6 +107,10 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
         std::vector<uint8_t> tag(16);
         if (enc) {
             if (inst->pal->file_pread(fd, tag.data(), 16, off + 34 + payload_len) != 16) break;
+            if (!key32 && !key_lookup_attempted && inst->key_provider) {
+                key_lookup_attempted = true;
+                key32 = inst->key_provider(kid_in_file, inst->key_user);
+            }
         }
         // CRC 校验(payload)
         if (crc32_update(0, payload.data(), payload.size()) != crc) {
@@ -265,6 +271,15 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
         return LOGX_ERR_INVALID_ARG;  // 配置请求 zstd 但编译期未接入
     }
 #endif
+    // 加密配置 fail-fast: 未接入 AES-GCM 或开启加密却未提供 key_provider 时拒绝启动
+#if !LOGX_WITH_AESGCM
+    if (cfg->encrypt_enable != 0) {
+        return LOGX_ERR_INVALID_ARG;  // 配置请求加密但编译期未接入 AES-GCM
+    }
+#endif
+    if (cfg->encrypt_enable != 0 && !cfg->key_provider) {
+        return LOGX_ERR_INVALID_ARG;  // 开启加密却未提供 key_provider
+    }
     Instance* inst = new Instance();
     inst->log_dir = cfg->log_dir;
     inst->staging_path = cfg->staging_path;

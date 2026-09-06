@@ -889,6 +889,21 @@ TEST(CodecTest, LogxOpen_CompressAlgo_FailFast) {
     EXPECT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     ASSERT_NE(inst, nullptr);
     logx_close(inst);
+    inst = nullptr;
+
+    // 5. 加密开启但未配置 key_provider 必须拒绝启动 (fail-fast 防错误配置)
+    cfg.encrypt_enable = 1;
+    cfg.key_provider = nullptr;
+    EXPECT_EQ(logx_open(&cfg, &inst), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(inst, nullptr);
+
+#if !LOGX_WITH_AESGCM
+    // 6. 编译期未接入 AES-GCM 时, 配置加密必须拒绝启动
+    static uint8_t s_dummy_key[32] = {1};
+    cfg.key_provider = [](uint16_t, void*) -> const uint8_t* { return s_dummy_key; };
+    EXPECT_EQ(logx_open(&cfg, &inst), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(inst, nullptr);
+#endif
 
     pal.file_unlink(staging.c_str());
     pal.file_rmdir(dir.c_str());

@@ -105,11 +105,17 @@
 
 ## 二、Flusher 与文件写出
 
-### 🔴 [F-01] 生产路径加密文件头没有记录加密标志
+### ✅ [F-01] 生产路径加密文件头没有记录加密标志 [已闭环]
 - **来源：** 报告二 R2-高#1
-- **位置：** `core/src/flusher.cpp:186`（`write_file_header` 固定写 `hdr[5] = 0`）、导出判定 `core/src/logx_c.cpp:70`
-- **描述：** 即使后续块使用 AES-GCM，文件头仍声明为明文文件。导出路径根据**文件头**判断是否需要密钥，生产路径生成的加密文件会被当作明文处理，最终无法正确导出。现有加密测试（`test_flusher.cpp:192`）手工构造带 `kFlagEncrypted` 的文件头，绕过了该问题，未覆盖生产文件创建流程。
-- **修复建议：** `write_file_header` 写入实际加密标志（或导出端改为按块头判定）；补充生产路径加密文件创建→导出端到端测试。
+- **位置：** `core/src/flusher.cpp:186`（`write_file_header`）、导出判定与校验 `core/src/logx_c.cpp:70, 107, 275`
+- **状态：** ✅ **已修复并双矩阵闭环验证**
+- **描述：** 原 `write_file_header()` 固定写 `hdr[5] = 0`，即使后续块使用 AES-GCM，文件头仍声明为明文文件。导出路径根据**文件头**判断是否需要密钥，生产路径生成的加密文件会被当作明文处理，导致 `key32 = nullptr`，所有加密块在 `decode_block` 处全部失败并输出 `[seq=%u decode fail]`。现有加密测试（`test_flusher.cpp:192`）手工构造带 `kFlagEncrypted` 的文件头绕过了该问题，而 `EndToEndFormattedLog_WriteAndExport` 仅断言 `EXPECT_GT(size, 0u)`，因失败占位行产生 20B 字节产生假绿。
+- **修复方案与落地：**
+  1. `write_file_header` 改为调用 `hdr[5] = make_flag(inst->compress_algo, inst->encrypt_enable != 0)`，遵循 C-02 编码契约，如实记录加密状态与初始压缩算法。
+  2. `logx_c.cpp:decode_one_file` 增加块级惰性取 Key 兜底：若块头含 `kFlagEncrypted` 而 `key32 == nullptr`，且 `key_provider` 存在，则用 `kid_in_file` 惰性获取密钥并缓存（引入 `key_lookup_attempted` 失败记忆，防重复空耗调用），确保修复前落盘的历史存量加密文件（`hdr[5] == 0`）与混合文件仍能平滑解密。
+  3. `logx_c.cpp:logx_open` 增加 fail-fast 启动校验：配置 `encrypt_enable != 0` 但未提供 `key_provider` 或编译期未接入 AES-GCM 时，立即返回 `LOGX_ERR_INVALID_ARG` 拒绝启动，彻底阻断错误配置。
+  4. `test_flusher.cpp` 彻底清理假绿：加固 `EndToEndFormattedLog_WriteAndExport`，核验落盘文件头 `hdr[5]` 的 `kFlagEncrypted` 标志与 CRC，并断言导出明文不含 `decode fail` 且包含真实载荷 Hex 特征；新增 `ExportHistoricalEncryptedFileWithUnsetFileHeaderFlag_RecoversSuccessfully`（采用动态墙钟日期 + 超长保留期，根除时效炸弹）验证历史存量 `hdr[5]=0` 文件的向前兼容解密；`EncryptedBlockFileWriteAndDecode_Roundtrip` 补充密文与明文不一致断言（联动 TEST-BUG-8）。
+  5. 双构建矩阵（全开 ON/ON: 69/69 单测 + 4/4 压测；基础 OFF/OFF: 52/52 单测 + 4/4 压测）重新编译验证 100% 全绿通过。
 
 ### 🔴 [F-02] 恢复后分卷号被强制重置为 0，可能覆写历史分卷文件
 - **来源：** 报告二 R2-中#9（列为中等）；报告三 BUG-X2（校准为 P0）；T4.0-11
@@ -595,7 +601,7 @@
 | 编号 | 问题 | 来源 |
 |:---|:---|:---|
 | C-01 | 压缩降级未更新块头 flag（毒丸块，解码必失败）[✅ 已修复] | 报告二#2 / 报告三 BUG-C1 |
-| F-01 | 生产路径加密文件头未记录加密标志（加密文件无法导出） | 报告二#1 |
+| F-01 | 生产路径加密文件头未记录加密标志（加密文件无法导出）[✅ 已修复] | 报告二#1 |
 | F-02 | 恢复后 `current_split` 强制归零，覆写历史分卷 | 报告二#9 / 报告三 BUG-X2（报告二列中等） |
 | J-01 | `nativeClose` 提前释放 kp_ctx，Flusher UAF | 报告二#6 / 报告三 BUG-J5（报告三列 P1） |
 | S-01 | CRC32 表初始化多线程数据竞争（UB） | 报告一 BUG-3 / 报告二#4 |
@@ -639,7 +645,7 @@
 
 ### 修复顺序建议（综合三份报告）
 
-1. **P0 核心数据正确性与崩溃恢复**：文件头加密标志（F-01）→ 压缩降级 flag（C-01）→ 分卷号恢复（F-02）→ 真实崩溃恢复测试（T-01）
+1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → 分卷号恢复（F-02）→ 真实崩溃恢复测试（T-01）
 2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ JNI 关闭顺序与 UAF 防护（J-01）→ Win64 句柄截断修复（P-01）
 3. **P1 协议健壮性与持久化**：短写检测（F-03）→ 持久化同步接入（F-04）→ 恢复校验加强（F-05）→ 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
 4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全

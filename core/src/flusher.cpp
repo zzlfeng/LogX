@@ -189,7 +189,7 @@ bool write_file_header(Instance* inst, int fd,
     std::memset(hdr, 0, sizeof(hdr));
     put_u32_le(hdr + 0, kMagicFile);
     hdr[4] = 1;     // ver
-    hdr[5] = 0;     // flag
+    hdr[5] = make_flag(inst->compress_algo, inst->encrypt_enable != 0);     // flag
     put_u32_le(hdr + 6, date);
     put_u16(hdr + 10, kid);
     std::memcpy(hdr + 12, salt, 8);

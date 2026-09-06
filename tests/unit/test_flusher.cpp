@@ -227,6 +227,9 @@ TEST(Flush, EncryptedBlockFileWriteAndDecode_Roundtrip) {
     EXPECT_EQ(pal.file_pread(fd, tag_buf, 16, 32 + 34 + payload_len), 16);
     pal.file_close(fd);
 
+    // 验证密文与明文不一致(加密真实发生,联动 TEST-BUG-8)
+    EXPECT_NE(payload_buf, rec);
+
     // 调用 decode_block 验证完整还原
     std::vector<uint8_t> decoded_raw;
     ASSERT_TRUE(decode_block(blk_flag, key, 5, salt,
@@ -280,26 +283,172 @@ TEST(Flush, EndToEndFormattedLog_WriteAndExport) {
     // 阻塞 flush 确保落盘
     ASSERT_EQ(logx_flush(inst), LOGX_OK);
 
-    // 执行 export 导出
     uint32_t yyyymmdd = 0, hhmmss = 0;
     pal.wallclock_date(&yyyymmdd, &hhmmss);
     char date_str[16];
     std::snprintf(date_str, sizeof(date_str), "%08u", yyyymmdd);
 
-    int export_called = 0;
-    auto export_cb = [](void* user, const char* /*d*/, const char* /*path*/, uint64_t size) -> int {
-        int* counter = static_cast<int*>(user);
-        (*counter)++;
+    // 核心验证 1: 直接核验生产落盘日志文件头(解决 F-01: 必须记录加密标志!)
+    std::string log_path = dir + "/" + date_str + ".log";
+    int log_fd = pal.file_open(log_path.c_str(), false, false);
+    ASSERT_GE(log_fd, 0);
+    uint8_t fhdr[32] = {};
+    ASSERT_EQ(pal.file_pread(log_fd, fhdr, 32, 0), 32);
+    pal.file_close(log_fd);
+
+    EXPECT_EQ(get_u32(fhdr), kMagicFile);
+    EXPECT_EQ(fhdr[4], 1);  // ver
+    EXPECT_TRUE(flag_encrypted(fhdr[5]));  // F-01: 生产写入必须标记加密
+    EXPECT_EQ(flag_algo(fhdr[5]), kAlgoNone);
+    EXPECT_EQ(get_u32(fhdr + 6), yyyymmdd);
+    EXPECT_EQ(get_u16(fhdr + 10), 10);     // kid
+    EXPECT_EQ(get_u32(fhdr + 28), crc32_update(0, fhdr, 28));
+
+    // 核心验证 2: 执行 export 导出,并校验导出明文内容(清理原有仅 EXPECT_GT(size, 0) 的假绿漏洞)
+    struct ExportContext {
+        int export_called = 0;
+        std::string full_content;
+        Pal* pal = nullptr;
+    } exp_ctx;
+    exp_ctx.pal = &pal;
+
+    auto export_cb = [](void* user, const char* /*d*/, const char* path, uint64_t size) -> int {
+        auto* ctx = static_cast<ExportContext*>(user);
+        ctx->export_called++;
         EXPECT_GT(size, 0u);
+        int fd = ctx->pal->file_open(path, false, false);
+        if (fd >= 0) {
+            std::vector<char> buf(size);
+            if (ctx->pal->file_pread(fd, buf.data(), size, 0) == static_cast<long>(size)) {
+                ctx->full_content.append(buf.data(), size);
+            }
+            ctx->pal->file_close(fd);
+        }
         return 0;
     };
 
-    EXPECT_EQ(logx_export(inst, date_str, date_str, export_cb, &export_called), LOGX_OK);
-    EXPECT_GE(export_called, 1);
+    EXPECT_EQ(logx_export(inst, date_str, date_str, export_cb, &exp_ctx), LOGX_OK);
+    EXPECT_GE(exp_ctx.export_called, 1);
+
+    // 彻底清除假绿: 严禁输出失败占位行,并断言包含写入载荷的 Hex 特征
+    EXPECT_EQ(exp_ctx.full_content.find("decode fail"), std::string::npos);
+    EXPECT_EQ(exp_ctx.full_content.find("[skipped:"), std::string::npos);
+    EXPECT_NE(exp_ctx.full_content.find("seq="), std::string::npos);
+    EXPECT_NE(exp_ctx.full_content.find("raw="), std::string::npos);
+    // "Network" hex: 4e6574776f726b
+    EXPECT_NE(exp_ctx.full_content.find("4e6574776f726b"), std::string::npos);
 
     logx_close(inst);
 
     // 清理目录
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+TEST(Flush, ExportHistoricalEncryptedFileWithUnsetFileHeaderFlag_RecoversSuccessfully) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_hist_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    uint32_t date = 0, hhmmss = 0;
+    pal.wallclock_date(&date, &hhmmss);
+    char date_str_buf[16];
+    std::snprintf(date_str_buf, sizeof(date_str_buf), "%08u", date);
+    std::string date_str = date_str_buf;
+    std::string path = dir + "/" + date_str + ".log";
+
+    static uint8_t s_key[32] = {0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44,
+                                0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0x12, 0x34,
+                                0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x13, 0x24,
+                                0x35, 0x46, 0x57, 0x68, 0x79, 0x8A, 0x9B, 0xAC};
+    uint8_t salt[8] = {1, 3, 5, 7, 9, 2, 4, 6};
+
+    int fd = pal.file_open(path.c_str(), true, false);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(pal.file_truncate(fd, 0), 0);
+
+    // 模拟修复前落盘的历史存量文件: 文件头 hdr[5] == 0 (未声明加密,但实际 kid=20)
+    uint8_t hdr[32] = {};
+    put_u32_le(hdr, kMagicFile);
+    hdr[4] = 1;
+    hdr[5] = 0;  // 历史遗留缺陷: 文件头未记录加密标志!
+    put_u32_le(hdr + 6, date);
+    put_u16(hdr + 10, 20);  // kid = 20
+    std::memcpy(hdr + 12, salt, 8);
+    put_u32_le(hdr + 28, crc32_update(0, hdr, 28));
+    ASSERT_EQ(pal.file_write(fd, hdr, 32), 32);
+
+    // 写入真实加密块 (flag = kFlagEncrypted)
+    Instance dummy_inst{};
+    dummy_inst.pal = &pal;
+    dummy_inst.encrypt_enable = true;
+    dummy_inst.compress_algo = kAlgoNone;
+    dummy_inst.kid = 20;
+
+    auto rec = make_entry(96);
+    uint8_t blk_flag = kFlagEncrypted;
+    BlockWriteResult wr = write_and_record(&dummy_inst, fd, rec.data(),
+                                           static_cast<uint32_t>(rec.size()),
+                                           /*seqno=*/1, blk_flag, salt, s_key);
+    ASSERT_TRUE(wr.ok);
+    pal.file_close(fd);
+
+    // 打开 LogX 实例并挂载 key_provider，测试 export 是否能通过惰性取 key 成功解密导出
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.retention_days = 36500;  // 长期保留, 杜绝测试时效隐患
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 1;
+    cfg.kid = 20;
+    cfg.key_provider = [](uint16_t kid, void*) -> const uint8_t* {
+        if (kid == 20) return s_key;
+        return nullptr;
+    };
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    struct ExportContext {
+        int export_called = 0;
+        std::string full_content;
+        Pal* pal = nullptr;
+    } exp_ctx;
+    exp_ctx.pal = &pal;
+
+    auto export_cb = [](void* user, const char* /*d*/, const char* path, uint64_t size) -> int {
+        auto* ctx = static_cast<ExportContext*>(user);
+        ctx->export_called++;
+        EXPECT_GT(size, 0u);
+        int fd = ctx->pal->file_open(path, false, false);
+        if (fd >= 0) {
+            std::vector<char> buf(size);
+            if (ctx->pal->file_pread(fd, buf.data(), size, 0) == static_cast<long>(size)) {
+                ctx->full_content.append(buf.data(), size);
+            }
+            ctx->pal->file_close(fd);
+        }
+        return 0;
+    };
+
+    EXPECT_EQ(logx_export(inst, date_str.c_str(), date_str.c_str(), export_cb, &exp_ctx), LOGX_OK);
+    EXPECT_GE(exp_ctx.export_called, 1);
+
+    // 核心断言: 即使文件头未声明加密, 导出端也能通过块头惰性取 key 兜底成功解密历史数据!
+    EXPECT_EQ(exp_ctx.full_content.find("decode fail"), std::string::npos);
+    EXPECT_EQ(exp_ctx.full_content.find("[skipped:"), std::string::npos);
+    EXPECT_NE(exp_ctx.full_content.find("seq=1"), std::string::npos);
+
+    logx_close(inst);
+
+    // 清理
     for (const auto& f : pal.file_list(dir.c_str())) {
         pal.file_unlink(f.c_str());
     }
