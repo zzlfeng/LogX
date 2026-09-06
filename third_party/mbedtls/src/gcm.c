@@ -161,6 +161,7 @@ static int gcm_starts(mbedtls_gcm_context *ctx,
     size_t i;
 
     if (ctx == NULL || iv == NULL) return MBEDTLS_ERR_GCM_BAD_INPUT;
+    if (add_len > 0 && add == NULL) return MBEDTLS_ERR_GCM_BAD_INPUT;
     if (iv_len != 12) {
         /* Standard GCM for LogX uses 12-byte IV/Nonce */
         return MBEDTLS_ERR_GCM_BAD_INPUT;
@@ -213,6 +214,7 @@ int mbedtls_gcm_crypt_and_tag(mbedtls_gcm_context *ctx,
 
     if (ctx == NULL || iv == NULL || tag == NULL) return MBEDTLS_ERR_GCM_BAD_INPUT;
     if (length > 0 && (input == NULL || output == NULL)) return MBEDTLS_ERR_GCM_BAD_INPUT;
+    if (add_len > 0 && add == NULL) return MBEDTLS_ERR_GCM_BAD_INPUT;
 
     ret = gcm_starts(ctx, mode, iv, iv_len, add, add_len);
     if (ret != 0) return ret;

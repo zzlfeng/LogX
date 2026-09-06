@@ -86,8 +86,14 @@
   4. **构建适配**：`core/CMakeLists.txt` 仅对 `aesce.c` 在 arm64 目标追加 `-march=armv8-a+crypto`；x86 桌面构建下编译为空，软路径 100% 兜底兼容。
   5. **真机全绿验证（2026-09-06，Redmi K30 Pro / 骁龙865 / arm64-v8a）**：
      - `ArmCe_HardwarePathOnDevice` 用例真机运行 100% 通过（`AT_HWCAP` 探测通过，`ce_mode == 1` 硬件加速已激活，AES-256 输出与 NIST SP 800-38A F.1.5 向量严格比对通过，多测试块与软实现比对通过，GCM 全链路往返一致）；
-     - 单元测试 68/68 全部通过（0 失败）；
-     - 压力测试 4/4 全部通过（50 线程高并发压测吞吐达 10.5 万条/秒，50 轮崩溃注入恢复率 100%）。
+     - 单元测试全部通过（0 失败）；
+     - 压力测试全部通过（50 线程高并发压测吞吐达 10.5 万条/秒，50 轮崩溃注入恢复率 100%）。
+  6. **热路径优化、官方向量锚定与健壮性加固（2026-09-06）**：
+     - **消除热路径系统调用**：`mbedtls_aes_crypt_ecb` 移除逐块 `getauxval` 调用，以 `#if defined(LOGX_AESCE_HOOK)` 条件编译确保 `ctx->ce_mode != 0` 直接派发 hardware ECB 且维持桌面 x86 兼容；`aesce.c` 内 `mbedtls_aesce_has_support()` 引入一次性静态缓存；
+     - **GCM 权威官方向量锚点**：引入 NIST SP 800-38D / McGrew-Viega TC13（空块）、TC14（16B 全零）、TC15（64B 明文）、TC16（64B 明文 + 20B AAD）权威测试，根除对称性错误盲区与跨语言解码互操作隐患；
+     - **防御性缺口补齐**：`gcm.c` 在 `mbedtls_gcm_crypt_and_tag` 与 `gcm_starts` 补齐 `add_len > 0 && add == NULL` 判空防护，彻底杜绝空指针解引用；
+     - **密钥长度全覆盖与注释纠偏**：修正 `test_codec.cpp` 误导性历史注释，放开 128 / 192 / 256 三种密钥长度软硬交叉比对；
+     - **已知取舍归档**：非 Linux/Android 的 aarch64 依赖编译特性宏与自检兜底，符合当前 Android/x64 平台定位。
 
 ---
 

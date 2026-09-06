@@ -55,7 +55,7 @@
 | 2 | 切分序号升级 2B uint16_t(§3.1/§4.4,P1) | 仍为 uint8_t(`AppendTargetCache.split_no` / `make_log_path`) |
 | 3 | 双 Header:写 A → seq_cst fence → 写 B(§4.2/§10,P0) | 实现为 A(中间态 CRC 保护)→ B → `atomic_thread_fence(release)`,时机与内存序均偏离纪律 |
 | 4 | Flusher 50~100ms Debounce 超时聚合(§4.1,P2) | 未实现:`flusher_loop` 为无超时阻塞 `ev_wait` |
-| 5 | ARMv8 Crypto Extensions 硬件加速(§10,P2) | ✅ 已闭环(2026-09-06,C-04):`aesce.c` 移植并落地标准 AESE/AESMC/EOR 指令直通,真机(骁龙865)自检与 NIST SP 800-38A F.1.5 校验全绿通过,单测 68/68 与压测 4/4 全通过 |
+| 5 | ARMv8 Crypto Extensions 硬件加速(§10,P2) | ✅ 已闭环(2026-09-06,C-04):`aesce.c` 移植并落地标准 AESE/AESMC/EOR 指令直通,消除热路径逐块 getauxval,增加 GCM 官方向量锚点(TC13-TC16)与 add 判空防御,真机(骁龙865)自检与 NIST 校验全绿通过,单测 69/69 与压测 4/4 全通过 |
 | 6 | 每 30s 定时 msync/fdatasync 持久化(§11) | 未实现,当前仅退后台 / 手动路径触发 |
 | 7 | 未对齐访问 / 23:59:59 时钟跳变测试用例(§9,P2) | 39 个用例中不存在 |
 

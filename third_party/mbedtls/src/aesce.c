@@ -44,8 +44,12 @@
 unsigned int mbedtls_aesce_has_support(void)
 {
 #if defined(LOGX_AESCE_COMPILED) && (defined(__linux__) || defined(__ANDROID__))
-    unsigned long hwcap = getauxval(AT_HWCAP);
-    return (hwcap & HWCAP_AES) != 0 ? 1u : 0u;
+    static int s_cached_support = -1;
+    if (s_cached_support == -1) {
+        unsigned long hwcap = getauxval(AT_HWCAP);
+        s_cached_support = (hwcap & HWCAP_AES) != 0 ? 1 : 0;
+    }
+    return (unsigned int) s_cached_support;
 #elif defined(LOGX_AESCE_COMPILED)
     return 1;   /* aarch64 with compile-time crypto, without auxv */
 #else
