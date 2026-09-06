@@ -103,6 +103,17 @@ if(LOGX_WITH_AESGCM)
         ${LOGX_MBEDTLS_DIR}/src/platform_util.c
     )
     target_include_directories(logx_core PRIVATE ${LOGX_MBEDTLS_DIR}/include)
+    # ARMv8 Crypto Extensions(§10/T4.0-5):仅对 aesce.c 启用 +crypto 指令集,
+    # 不影响其他翻译单元;aesce.c 自身在非 aarch64/无 crypto 目标下编译为空。
+    set(LOGX_CE_SRC ${LOGX_MBEDTLS_DIR}/src/aesce.c)
+    target_sources(logx_core PRIVATE ${LOGX_CE_SRC})
+    if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+        set_source_files_properties(${LOGX_CE_SRC} PROPERTIES
+            COMPILE_OPTIONS "-march=armv8-a+crypto")
+    elseif(NOT ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        set_source_files_properties(${LOGX_CE_SRC} PROPERTIES
+            COMPILE_OPTIONS "-march=armv8-a+crypto")
+    endif()
     if(BUILD_SHARED_LIBS)
         set_target_properties(logx_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
     endif()

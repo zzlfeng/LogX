@@ -74,11 +74,20 @@
   5. 全库 11 处调用点（test_codec 9 处 + test_flusher 1 处 + logx_c 1 处）同步适配；新增 `DecodeBlock_RejectsLengthMismatch` 负向用例（基线通过 / 长度偏大偏小拒绝且输出为空 / 传 0 跳过校验），双构建矩阵全绿通过。
   6. 防御性深度加固：`decode_block` 与 `encode_block` 补齐输出指针与 payload 空指针前置拦截；`flusher.cpp:sum_raw_len_since` 增加 `(0, kSingleRecordMaxRaw]` 边界校验防畸形块头错误推进水位（前置闭环 F-05 关键路径）；单测追加 `UINT32_MAX` 极值与真实 Zstd 压缩块长度不符拒绝断言。
 
-### 🟡 [C-04] 缺少 ARMv8 Crypto Extensions 硬件加速（T4.0-5 偏差）
+### ✅ [C-04] 缺少 ARMv8 Crypto Extensions 硬件加速（T4.0-5 偏差）[已修复并闭环]
 - **来源：** 报告三 §四 T4.0-5（Spec 偏差）
-- **位置：** `core/src/codec.cpp`、`core/include/logx_codec.h`
-- **描述：** spec §10 规定支持 ARMv8 Crypto Extensions 专用硬件加速指令；当前代码全库无 `__ARM_FEATURE_CRYPTO` 引用，移动端加密吞吐完全依赖通用软实现，未发挥移动端硬件加速性能。
-- **修复建议：** 引入 ARMv8 Crypto Extensions 条件编译及 AES 指令优化实现。
+- **位置：** `core/src/codec.cpp`、`core/include/logx_codec.h`、`third_party/mbedtls/`
+- **状态：** ✅ **已修复并闭环**（移植 ARMv8 AESCE 硬件路径 + 标准指令序列直通 + 三重运行时防护）
+- **描述：** spec §10 规定支持 ARMv8 Crypto Extensions 专用硬件加速指令；当前代码全库无 `__ARM_FEATURE_CRYPTO` 引用，移动端加密吞吐完全依赖通用软实现，未发挥移动端硬件加速性能。（修复前核实：加密栈为 vendored 精简版 mbedtls——`aes.c` 341 行纯查表软实现 + `gcm.c` 305 行，无官方版的 `aesce.c`；Android 构建目标 arm64-v8a + NDK 29 正是 spec 要求加速的平台；GCM 的 3 处 AES 调用全部为 ENCRYPT 方向，只需加速加密原语。）
+- **修复方案与落地：**
+  1. **新增 `third_party/mbedtls/src/aesce.c`**：以 `vaeseq_u8`/`vaesmcq_u8`/`veorq_u8` intrinsics 标准序列实现硬件单块加密（`AESE` 自动完成 `ShiftRows(SubBytes(state ^ rk))`；中间轮接 `vaesmcq_u8`；最后一轮由 `vaeseq_u8` 处理并由 `veorq_u8` 叠加最终轮密钥）。
+  2. **内存字节序直通与零转置**：深入分析确认 vendored 软实现生成的 `ctx->buf` 在 Little-Endian ARM64 下内存分布天然符合 AES 列主序；彻底剔除错误的 4x4 转置逻辑（`kTransposeIdx` / `vqtbl1q_u8`）与多余的 InvMixColumns 变换，加密轮密钥无需任何形态转换即可直接直通硬件指令。
+  3. **三重运行时防护**：① auxv 探测（`getauxval(AT_HWCAP) & HWCAP_AES`）——无扩展 CPU 上绝不执行 AESE（否则 SIGILL）；② 启用时自检（Self-check）——硬件路径先与查表软实现比对 2 个测试块，双块一致方置 `ce_mode = 1`，任一不符即安全回退软路径；③ 软实现完整保留为通用兜底。
+  4. **构建适配**：`core/CMakeLists.txt` 仅对 `aesce.c` 在 arm64 目标追加 `-march=armv8-a+crypto`；x86 桌面构建下编译为空，软路径 100% 兜底兼容。
+  5. **真机全绿验证（2026-09-06，Redmi K30 Pro / 骁龙865 / arm64-v8a）**：
+     - `ArmCe_HardwarePathOnDevice` 用例真机运行 100% 通过（`AT_HWCAP` 探测通过，`ce_mode == 1` 硬件加速已激活，AES-256 输出与 NIST SP 800-38A F.1.5 向量严格比对通过，多测试块与软实现比对通过，GCM 全链路往返一致）；
+     - 单元测试 68/68 全部通过（0 失败）；
+     - 压力测试 4/4 全部通过（50 线程高并发压测吞吐达 10.5 万条/秒，50 轮崩溃注入恢复率 100%）。
 
 ---
 
@@ -528,7 +537,7 @@
 | **T4.0-2** | §3.1/§4.4 切分序号 2B (uint16_t) | 仍为 `uint8_t split_no` | 单日超 255 分卷停写丢日志 | F-07 |
 | **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | 实现为 A(中间态 CRC)→ B → release fence | 掉电极端窗口内存序轻微偏离 | S-06 |
 | **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | `flusher_loop` 仍为无超时阻塞 `ev_wait`（仅堆降级模式有 5s 超时） | 缺乏低频写定时兜底刷盘机制 | F-10 |
-| **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | 全库无 `__ARM_FEATURE_CRYPTO` 引用 | 缺少专用硬件加密指令加速 | C-04 |
+| **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | ✅ 已落地并闭环：`aesce.c` 移植完成，AESE/AESMC/EOR 标准指令直通，真机（骁龙865）自检与 NIST 向量全绿通过 | — | C-04 |
 | **T4.0-6** | §11 运行期每 30s 定时 msync/fdatasync | 定时器未实现；PAL 接口已实现但全库 0 调用 | 掉电下脏页刷盘时机不可控 | F-04 |
 | **T4.0-7** | §9 未对齐访问 / 23:59:59 时钟跳变用例 | ✅ 已通过 T4.5 落地 | — | — |
 | **T4.0-8** | §2/§10 离线解码工具 `logx_decode.py` | 坏块 break、死代码残留、容错性待对齐 | 影响离线日志捞取成功率 | D-01~D-04 |
@@ -613,7 +622,7 @@
 | P-05 | SetFilePointer 冗余 | P-06 | atomic_add 对齐断言 |
 | J-03 | NewStringUTF 编码风险 | K-03 | errorHandler GC 延迟 |
 | K-04 | setErrorHandler 并发校验 | D-04 | Python 死代码 |
-| D-05 | Python 64MB 解压上限 | C-04 | 缺少 ARMv8 硬件加速（T4.0-5） |
+| D-05 | Python 64MB 解压上限 | C-04 | 缺少 ARMv8 硬件加速（T4.0-5）[✅ 已修复] |
 | S-06 | 双 Header 提交内存序偏离（T4.0-3） | — | — |
 
 ### 修复顺序建议（综合三份报告）

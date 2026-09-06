@@ -1,6 +1,27 @@
 #include "mbedtls/aes.h"
 #include "mbedtls/platform_util.h"
+#include "mbedtls/mbedtls_config.h"
 #include <string.h>
+
+/*
+ * ARMv8 Crypto Extensions hook (aesce.c). Call sites are guarded by
+ * MBEDTLS_AESCE_C && __aarch64__ - NOT by the compiler feature macros,
+ * because the -march=armv8-a+crypto option is applied only to aesce.c, so
+ * the feature macros differ between the two TUs. When aesce.c was compiled
+ * without the crypto features its stubs return an error, and the runtime
+ * auxv probe keeps the intrinsics path inert on CPUs lacking the
+ * extension; both cases fall back to the table-based software path here.
+ */
+#if defined(MBEDTLS_AESCE_C) && defined(__aarch64__)
+#define LOGX_AESCE_HOOK 1
+int aesce_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key, unsigned int keybits);
+int aesce_crypt_ecb(mbedtls_aes_context *ctx, const unsigned char input[16], unsigned char output[16]);
+unsigned int mbedtls_aesce_has_support(void);
+#define CE_MODE_ENABLED() (mbedtls_aesce_has_support())
+#else
+static unsigned int mbedtls_aesce_has_support(void) { return 0; }
+#define CE_MODE_ENABLED() 0
+#endif
 
 #ifndef GET_UINT32_LE
 #define GET_UINT32_LE(n,b,i)                            \
@@ -104,7 +125,8 @@ void mbedtls_aes_free(mbedtls_aes_context *ctx) {
     mbedtls_platform_zeroize(ctx, sizeof(mbedtls_aes_context));
 }
 
-int mbedtls_aes_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key, unsigned int keybits) {
+/* Software key schedule (table-based). Public as the CE self-check reference. */
+int mbedtls_aes_setkey_enc_soft(mbedtls_aes_context *ctx, const unsigned char *key, unsigned int keybits) {
     unsigned int i;
     uint32_t *RK;
 
@@ -116,6 +138,7 @@ int mbedtls_aes_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key, u
         case 256: ctx->nr = 14; break;
         default: return MBEDTLS_ERR_AES_INVALID_KEY_LENGTH;
     }
+    ctx->ce_mode = 0;
 
     ctx->rk = RK = ctx->buf;
 
@@ -164,6 +187,23 @@ int mbedtls_aes_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key, u
     return 0;
 }
 
+/*
+ * Public setkey: try the ARMv8 CE path when the CPU probe passes; any
+ * failure (unsupported key size, self-check mismatch) falls back to the
+ * table-based software schedule. The soft schedule always runs first, so
+ * the software path remains correct even when CE refuses.
+ */
+int mbedtls_aes_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key, unsigned int keybits) {
+    if (ctx == NULL || key == NULL) return MBEDTLS_ERR_AES_INVALID_PARAM;
+    if (CE_MODE_ENABLED() && mbedtls_aes_setkey_enc_soft(ctx, key, keybits) == 0) {
+        if (aesce_setkey_enc(ctx, key, keybits) == 0) {
+            return 0;   /* ctx left in CE key form; crypt_ecb takes the CE path */
+        }
+        /* aesce_setkey_enc restored the standard keys on failure. */
+    }
+    return mbedtls_aes_setkey_enc_soft(ctx, key, keybits);
+}
+
 int mbedtls_aes_setkey_dec(mbedtls_aes_context *ctx, const unsigned char *key, unsigned int keybits) {
     int ret;
     mbedtls_aes_context cty;
@@ -171,11 +211,16 @@ int mbedtls_aes_setkey_dec(mbedtls_aes_context *ctx, const unsigned char *key, u
     int i, j;
 
     mbedtls_aes_init(&cty);
-    ret = mbedtls_aes_setkey_enc(&cty, key, keybits);
+    /*
+     * Derive from the software encryption schedule: decryption in this library
+     * uses software only, ensuring keys are populated in standard form.
+     */
+    ret = mbedtls_aes_setkey_enc_soft(&cty, key, keybits);
     if (ret != 0) {
         mbedtls_aes_free(&cty);
         return ret;
     }
+    ctx->ce_mode = 0;
 
     ctx->nr = cty.nr;
     ctx->rk = RK = ctx->buf;
@@ -330,9 +375,28 @@ static void aes_decrypt_block(mbedtls_aes_context *ctx, const unsigned char inpu
     }
 }
 
+/* Software ECB (table-based). Public as the CE self-check reference. */
+int mbedtls_aes_crypt_ecb_soft(mbedtls_aes_context *ctx, int mode, const unsigned char input[16], unsigned char output[16]) {
+    if (ctx == NULL || input == NULL || output == NULL) return MBEDTLS_ERR_AES_INVALID_PARAM;
+    if (mode == MBEDTLS_AES_ENCRYPT) {
+        aes_encrypt_block(ctx, input, output);
+    } else {
+        aes_decrypt_block(ctx, input, output);
+    }
+    return 0;
+}
+
+/*
+ * Public ECB: ENCRYPT direction takes the CE path only when this context's
+ * keys were converted to the self-check-approved CE form (ce_mode != 0).
+ * GCM only ever calls ENCRYPT; DECRYPT always uses the software path.
+ */
 int mbedtls_aes_crypt_ecb(mbedtls_aes_context *ctx, int mode, const unsigned char input[16], unsigned char output[16]) {
     if (ctx == NULL || input == NULL || output == NULL) return MBEDTLS_ERR_AES_INVALID_PARAM;
     if (mode == MBEDTLS_AES_ENCRYPT) {
+        if (ctx->ce_mode != 0 && CE_MODE_ENABLED()) {
+            return aesce_crypt_ecb(ctx, input, output);
+        }
         aes_encrypt_block(ctx, input, output);
     } else {
         aes_decrypt_block(ctx, input, output);

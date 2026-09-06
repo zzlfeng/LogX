@@ -41,7 +41,10 @@ if(NOT WIN32)
     target_link_libraries(logx_unit_tests PRIVATE Threads::Threads)
 endif()
 target_include_directories(logx_unit_tests PRIVATE
-    ${CMAKE_SOURCE_DIR}/../core/include
+    ${CMAKE_SOURCE_DIR}/core/include
+    # C-04 真机用例直接调用 vendored mbedtls C ABI(aesce.c 符号经 logx_core
+    # 静态链接进本测试);include 路径在 logx_core 为 PRIVATE,此处需显式补。
+    ${CMAKE_SOURCE_DIR}/third_party/mbedtls/include
 )
 add_test(NAME logx_unit_tests COMMAND logx_unit_tests)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

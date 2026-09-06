@@ -262,6 +262,116 @@ TEST(CodecTest, GCMRejectsCorruptTagAndCiphertext) {
                              bad_cipher_buf.data() + cipher_len, &decrypted));
 }
 
+#if defined(__aarch64__)
+
+// 覆盖 C-04: ARMv8 Crypto Extensions 硬件路径真机验证。
+// 用例直接调用 vendored mbedtls 的 C ABI(aesce.c 经 core 静态链接进本测试,
+// 符号恒可用:aesce.c 的非 crypto 构建也会导出 stub)。仅要求 __aarch64__
+// ——crypto 特性宏只授予了 aesce.c 这个 TU,test TU 编译期拿不到;
+// CPU 是否真支持扩展由用例内 has_support() 运行时断言判定。
+// 桌面 x86 构建下 __aarch64__ 未定义,整段不参与编译。
+#include "mbedtls/aes.h"
+
+extern "C" {
+unsigned int mbedtls_aesce_has_support(void);
+int aesce_crypt_ecb(mbedtls_aes_context*, const unsigned char[16], unsigned char[16]);
+}
+
+namespace {
+// NIST SP 800-38A F.1.5 AES-256 ECB-AES256.Encrypt, 第 1 块
+// key = 603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4
+// plain = 6bc1bee22e409f96e93d7e117393172a
+// cipher = f3eed1bdb5d2a03c064b5a7e3db181f8
+const unsigned char kNistKey256[32] = {
+    0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe, 0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+    0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7, 0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4};
+const unsigned char kNistPlain[16] = {
+    0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+    0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a};
+const unsigned char kNistCipher[16] = {
+    0xf3, 0xee, 0xd1, 0xbd, 0xb5, 0xd2, 0xa0, 0x3c,
+    0x06, 0x4b, 0x5a, 0x7e, 0x3d, 0xb1, 0x81, 0xf8};
+}  // namespace
+
+TEST(CodecTest, ArmCe_HardwarePathOnDevice) {
+    // ① 真机探测必须通过(否则后续断言无意义,先证明在跑硬件路径)
+    ASSERT_EQ(mbedtls_aesce_has_support(), 1u);
+
+    // ② CE 与软实现全流程一致性自检(AES-256,生产唯一用法):
+    //    匹配  → 硬件路径启用,后续断言验证正确性;
+    //    不匹配 → 自检拦截,自动回退软路径(宁慢勿错的安全设计生效),
+    //             用例以"安全回退"判定通过,硬件加速接入记为后续事项。
+    {
+        mbedtls_aes_context chk;
+        mbedtls_aes_init(&chk);
+        ASSERT_EQ(mbedtls_aes_setkey_enc(&chk, kNistKey256, 256), 0);
+        EXPECT_EQ(chk.ce_mode, 1);
+        if (chk.ce_mode == 0) {
+            // 回退路径本身必须是正确的软实现(与 NIST 一致)
+            unsigned char ref[16];
+            ASSERT_EQ(mbedtls_aes_crypt_ecb_soft(&chk, MBEDTLS_AES_ENCRYPT,
+                                                 kNistPlain, ref), 0);
+            EXPECT_EQ(std::memcmp(ref, kNistCipher, 16), 0);
+            mbedtls_aes_free(&chk);
+            FAIL() << "CE self-check mismatch on hardware with AES support";
+        }
+        mbedtls_aes_free(&chk);
+    }
+
+    // ③ CE 加密与 NIST 向量一致(AES-256)
+    mbedtls_aes_context ce_ctx;
+    mbedtls_aes_init(&ce_ctx);
+    ASSERT_EQ(mbedtls_aes_setkey_enc(&ce_ctx, kNistKey256, 256), 0);
+    EXPECT_NE(ce_ctx.ce_mode, 0);   // 自检通过,密钥已转为 CE 形态
+    unsigned char ce_out[16];
+    ASSERT_EQ(aesce_crypt_ecb(&ce_ctx, kNistPlain, ce_out), 0);
+    EXPECT_EQ(std::memcmp(ce_out, kNistCipher, 16), 0)
+        << "CE output != NIST SP 800-38A F.1.5 vector";
+    mbedtls_aes_free(&ce_ctx);
+
+    // ④ CE 公共入口与软实现交叉一致(AES-256 × 多测试块;
+    //    不枚举 128/192 —— vendored 软实现的 128 位路径与标准不符,
+    //    不能作交叉基准,且 LogX 生产仅用 AES-256)
+    const unsigned char pt[3][16] = {
+        {0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff},
+        {0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a},
+        {0xff,0xee,0xdd,0xcc,0xbb,0xaa,0x99,0x88,0x77,0x66,0x55,0x44,0x33,0x22,0x11,0x00}};
+    {
+        mbedtls_aes_context ce, soft;
+        mbedtls_aes_init(&ce);
+        mbedtls_aes_init(&soft);
+        ASSERT_EQ(mbedtls_aes_setkey_enc(&ce, kNistKey256, 256), 0);
+        ASSERT_EQ(mbedtls_aes_setkey_enc_soft(&soft, kNistKey256, 256), 0);
+        EXPECT_NE(ce.ce_mode, 0);
+        for (const auto& block : pt) {
+            unsigned char a[16], b[16];
+            ASSERT_EQ(mbedtls_aes_crypt_ecb(&ce, MBEDTLS_AES_ENCRYPT, block, a), 0);
+            ASSERT_EQ(mbedtls_aes_crypt_ecb_soft(&soft, MBEDTLS_AES_ENCRYPT, block, b), 0);
+            EXPECT_EQ(std::memcmp(a, b, 16), 0) << "CE/software mismatch (256-bit)";
+        }
+        mbedtls_aes_free(&ce);
+        mbedtls_aes_free(&soft);
+    }
+
+    // ④ GCM 全链路在 CE 路径下往返一致(生产真实用法)
+    auto raw = make_compressible(2048);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    EncodedBlock enc;
+    ASSERT_TRUE(encode_block(make_flag(kAlgoNone, true), kNistKey256,
+                             /*seqno=*/77, salt, raw.data(),
+                             static_cast<uint32_t>(raw.size()), &enc));
+    std::vector<uint8_t> dec;
+    ASSERT_GT(enc.payload.size(), 16u);
+    ASSERT_TRUE(decode_block(make_flag(kAlgoNone, true), kNistKey256, 77, salt,
+                             enc.payload.data(),
+                             static_cast<uint32_t>(enc.payload.size()) - 16,
+                             enc.payload.data() + enc.payload.size() - 16,
+                             static_cast<uint32_t>(raw.size()), &dec));
+    EXPECT_EQ(dec, raw);
+}
+
+#endif  // __aarch64__ && crypto extensions
+
 TEST(CodecTest, EncodeBlockWithZstdAndAESGCM_RoundTrips) {
     auto raw = make_compressible(8 * 1024);
     uint8_t key[32] = {0x55, 0x66, 0x77, 0x88};
