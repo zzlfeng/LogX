@@ -89,11 +89,17 @@
      - 单元测试全部通过（0 失败）；
      - 压力测试全部通过（50 线程高并发压测吞吐达 10.5 万条/秒，50 轮崩溃注入恢复率 100%）。
    6. **热路径优化、官方向量锚定与健壮性加固（2026-09-06）**：
-      - **消除热路径探针与纯无状态设计**：`mbedtls_aes_crypt_ecb` 移除逐块 `getauxval` 调用，以 `#if defined(LOGX_AESCE_HOOK)` 条件编译确保 `ctx->ce_mode != 0` 直接派发 hardware ECB 且维持桌面 x86 兼容；`aesce.c` 内 `mbedtls_aesce_has_support()` 恢复为纯用户态无状态读取，彻底根除跨线程数据竞争隐患（TSan 零告警）；
-      - **GCM 权威官方向量锚点（方案 A+）**：引入 NIST GCM KAT 零密钥边界向量与 McGrew-Viega 附录 B TC13（空块）、TC14（64B 明文）、TC15（64B 明文 + 20B AAD）权威测试，根除对称性错误盲区与跨语言解码互操作隐患；
-      - **防御性缺口补齐**：`gcm.c` 在 `mbedtls_gcm_crypt_and_tag` 与 `gcm_starts` 补齐 `add_len > 0 && add == NULL` 判空防护，彻底杜绝空指针解引用；
-      - **密钥长度全覆盖与注释纠偏**：修正 `test_codec.cpp` 误导性历史注释，放开 128 / 192 / 256 三种密钥长度软硬交叉比对；
-      - **已知取舍归档**：非 Linux/Android 的 aarch64 依赖编译特性宏与自检兜底，符合当前 Android/x64 平台定位。
+      - **消除热路径探针**：`mbedtls_aes_crypt_ecb`（aes.c）移除逐块 `getauxval` 调用，改以 `#if defined(LOGX_AESCE_HOOK)` 条件编译 + `ctx->ce_mode != 0` 单条件派发硬件 ECB——`ce_mode=1` 只能在 `CE_MODE_ENABLED()` 为真且自检通过时置位（aes.c setkey_enc 路径），故 per-context 标志已隐含运行时支持成立，无需二次探测；桌面 x86 下该段整体编译剔除，软路径 100% 兜底；
+      - **探测函数防竞态定型**：`mbedtls_aesce_has_support()` 定型为纯无状态读取（首次实现曾引入函数内 `static int` 惰性缓存，复审判定该缓存的读路径不受 magic static 初始化保护、构成 C++ 数据竞争 UB，与 S-01/E-01 同族，已回退为无状态实现；该函数现仅在 setkey 一次性路径被调用，无缓存必要）；
+      - **GCM 权威官方向量锚点**：`test_codec.cpp` 新增 `GCM_OfficialNistVectors_Anchor`——零密钥基线 2 组（K=0^256/IV=0^96 的空明文与 16B 全零明文边界向量）+ McGrew-Viega 附录 B **TC13**（空明文）、**TC14**（64B 明文）、**TC15**（64B 明文 + 20B AAD，覆盖 AAD 认证路径），全部常量经 vendored gcm.c 实测复现 + OpenSSL 后端 `cryptography` 库交叉验证一致，根除"往返测试对加解密对称性错误"的盲区；
+      - **防御性缺口补齐**：`gcm.c` 的 `gcm_starts` 与 `mbedtls_gcm_crypt_and_tag` 均补齐 `add_len > 0 && add == NULL` 判空防护，`test_codec.cpp` 增加对应防御性断言（安全返回 `MBEDTLS_ERR_GCM_BAD_INPUT` 而非崩溃）；
+      - **密钥长度全覆盖与注释纠偏**：删除 `test_codec.cpp` 中"vendored 软实现 128 位路径与 FIPS-197 C.1 不符"的错误历史注释（经实测 AES-128/192/256 与官方向量逐字节一致，该推断从未成立），CE/软实现交叉比对放开至 128 / 192 / 256 三种密钥长度；
+      - **已知取舍归档**：非 Linux/Android 的 aarch64（无 auxv 平台）`mbedtls_aesce_has_support()` 依赖编译特性宏直接返回 1、由运行时自检兜底；当前 CMake 配置下 Windows 构建不编译 CE 路径，符合 Android/x64 平台定位，未来若需支持 Windows on ARM 再补平台探测。
+   7. **独立复审实测验证（2026-09-06，x86 双重交叉 + Redmi K30 Pro 真机）**：
+      - **独立 harness 全部密码原语从 spec 重新推导**（S-box 由 FIPS-197 定义生成、GF(2^128) 乘法独立实现、AES 参考实现独立编写），消除手抄表与记忆向量的引入误差；
+      - **x86 实测**：镜像 `aesce.c` 轨迹（x86 仿真 AESE/AESMC、读同一份 `ctx->buf`、零转置直铺）在 AES-128/192/256 上全部复现官方向量，实证"零转置直通"结论；vendored 软实现 AES-128 与 FIPS-197 C.1 逐字节一致（"AES-128 不符标准"传闻被驳回）；vendored GCM 与 OpenSSL 后端 `cryptography` 库 3 密钥长度 × 12 明文长度 × 有/无 AAD 共 **72/72 全匹配**；
+      - **真机全量回归（骁龙865，修改后源码重建）**：真实 AESE/AESMC 指令序列四组官方向量全过、`ce_mode==1` 硬件路径激活、GCM 全长度链路与独立实现一致、8 线程 × 20 万次并发 `has_support()` 压测（160 万次读）全对——**ALL CHECKS PASSED**；
+      - **复审驳斥两项外部质疑**（留档防再传播）：①"CE 桥接缺失、需 4x4 转置（含 IMC 密钥形态）"不成立——LE uint32 数组小端铺回内存即 FIPS 列主序，转置/IMC 是上游解密方向设计，与本项目仅加密的用法无关；②"vendored 软实现 AES-128 与 FIPS-197 C.1 不符"不成立——实测一致，该说法源自 test_codec.cpp 已删除的错误注释。
 
 ---
 
@@ -543,7 +549,7 @@
 | **T4.0-2** | §3.1/§4.4 切分序号 2B (uint16_t) | 仍为 `uint8_t split_no` | 单日超 255 分卷停写丢日志 | F-07 |
 | **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | 实现为 A(中间态 CRC)→ B → release fence | 掉电极端窗口内存序轻微偏离 | S-06 |
 | **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | `flusher_loop` 仍为无超时阻塞 `ev_wait`（仅堆降级模式有 5s 超时） | 缺乏低频写定时兜底刷盘机制 | F-10 |
-| **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | ✅ 已落地并闭环：`aesce.c` 移植完成，AESE/AESMC/EOR 标准指令直通，真机（骁龙865）自检与 NIST 向量全绿通过 | — | C-04 |
+| **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | ✅ 已落地并闭环：`aesce.c` 移植完成，AESE/AESMC/EOR 标准指令直通；后续独立复审完成官方向量锚定（McGrew-Viega TC13/14/15 + 零密钥基线，OpenSSL 交叉验证 72/72）、热路径逐块探针消除与防竞态定型，x86 + 真机（骁龙865）双路径全量回归通过 | — | C-04 |
 | **T4.0-6** | §11 运行期每 30s 定时 msync/fdatasync | 定时器未实现；PAL 接口已实现但全库 0 调用 | 掉电下脏页刷盘时机不可控 | F-04 |
 | **T4.0-7** | §9 未对齐访问 / 23:59:59 时钟跳变用例 | ✅ 已通过 T4.5 落地 | — | — |
 | **T4.0-8** | §2/§10 离线解码工具 `logx_decode.py` | 坏块 break、死代码残留、容错性待对齐 | 影响离线日志捞取成功率 | D-01~D-04 |
