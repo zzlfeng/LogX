@@ -19,7 +19,11 @@
 | `15fa92c` | feat(retention): implement automatic log retention cleanup on rollover, flush, and startup |
 | `78a2e3c` | feat(test): complete T4.5 fault injection, unaligned access and crash recovery matrix |
 | `0f963b3` | docs: update specifications, roadmap and changelog for M4 completion |
-| `HEAD` | test(android): 跑通 Android 真机 (Redmi K30 Pro) 全量单元测试与压测矩阵并修复跨平台缺陷 |
+| `a6fa34d` | test(android): 跑通 Android 真机 (Redmi K30 Pro) 全量单元测试与压测矩阵并修复跨平台缺陷 |
+| `d0d157e` | fix(codec): C-01 压缩失败降级后块头 flag 与 payload 实际编码一致 |
+| `e6fe04c` | test(codec): 补齐 logx_open 校验用例与 RAII 测试桩保护并闭环 C-01 文档 |
+| `c976b3d` | fix(codec): C-02 删除压缩/加密 flag 歧义常量并以 helper 收敛手写移位 |
+| `HEAD` | fix(codec): C-03 decode_block 删除冗余 raw 参数并落实长度交叉校验与防御性加固 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -583,6 +587,30 @@ cmake --build build-android -j
 - **压力与故障恢复测试 (`logx_stress_tests`)**: **4/4 100% 全部通过 (耗时 820ms)**
   - **50 线程高并发 + 15ms 强切竞争**: 达到 **85,796 logs/s**，触发文件上限成功轮转 13 个日志分卷，端到端导出 20,924 条日志，**0 损坏、0 丢失、seqno 严格单调递增**。
   - **崩溃自愈压测**: Staging 仅写入强杀自愈通过；磁盘尾部坏块安全截断并通过；50 轮多阶段随机崩溃注入压测，397/397 条日志 100% 挽回。
+
+---
+
+## 编解码缺陷修复与防御性加固 (2026-09-06, C-01 ~ C-03 闭环)
+
+围绕代码审查清单中的编解码与跨端一致性缺陷，完成三次专项重构与防御性加固，双构建矩阵（默认 OFF/OFF 与真库全开 ON/ON）全绿通过：
+
+### 1. [C-01] 压缩降级未更新块头 Flag（毒丸块 P0 缺陷闭环）
+- **核心根因**：原 `encode_block` 压缩失败降级仅修改局部变量，落盘块头仍写 Zstd flag，导致整块日志无法导出（毒丸块）。
+- **落地修复**：`EncodedBlock` 新增 `final_flag` 状态回写；`append_block_raw` 严格使用真实生效的 `final_flag` 写入块头并在降级时派发 `LOGX_EV_DEGRADED` 事件；`logx_open` 增加算法合法性 fail-fast 校验；引入 `ScopedCompressFailInjection` RAII 守卫；新增真实降级解码往返用例。
+
+### 2. [C-02] 压缩/加密 Flag 常量命名歧义与移位收敛闭环
+- **核心根因**：`kFlagCompressZstd = 0x1` 与 `kFlagEncrypted = 0x1` 数值冲突，极易误用按位或导致压缩位丢失；全库充斥手写移位魔数。
+- **落地修复**：彻底废弃 `kFlagCompress*`；引入 `kFlagCompressShift=1`、`kFlagCompressMask=0x06`、`kAlgoMask=0x03` 与 `make_flag` / `flag_algo` / `flag_encrypted` constexpr 零开销内联 helper；全库约 15 处手写移位全部收敛；全栈命名对齐（JNI / Kotlin / Python）；新增 `BlockFlagHelper_BitLayoutAndSemantics` 硬协议位布局防退化单测。
+
+### 3. [C-03] `decode_block` 签名精简与长度交叉校验闭环
+- **核心根因**：签名接收 `raw` / `raw_len` 却以 `(void)` 丢弃，块头 `raw_len` 从未与解码输出做交叉校验，且声明与实现存在 "crc" 校验责任矛盾。
+- **落地修复**：
+  1. 删除从未被有效使用的 `const uint8_t* raw` 指针参数；
+  2. `raw_len` 重构为 `expected_raw_len`，在解压完成后严格校验 `out_raw->size() == expected_raw_len`，不符时清空输出并返回 false（宁丢不脏），拦截畸形解压长度；传 0 跳过校验；
+  3. 生产端 `logx_c.cpp:decode_one_file` 传入块头 `raw_len` 获得长度交叉保护，CRC 预检逻辑保持对称；
+  4. 头文件注释消除 "crc" 矛盾，明确 CRC32 由调用方预检；
+  5. 深度防御加固：`decode_block` 与 `encode_block` 增加指针与 payload 空指针拦截；`flusher.cpp:sum_raw_len_since` 增加 `(0, kSingleRecordMaxRaw]` 边界校验防御畸形块头推进水位（关联 F-05 前置加固）；
+  6. 全库 11 处调用点同步适配；新增 `DecodeBlock_RejectsLengthMismatch`（四分支：基线/偏大/偏小/传 0，以及 `UINT32_MAX` 极值与空指针防御）与真实 Zstd 压缩块长度不符拒绝断言。
 
 ---
 

@@ -752,12 +752,15 @@ bool sum_raw_len_since(Instance* inst, const std::string& target_path,
         if (inst->pal->file_pread(fd, bhdr, 34, off) != 34) break;
         if (get_u32(bhdr) != kMagicBlock) break;   // 撕裂半头:计入后续对账失败,宁丢不脏
         uint32_t seqno = get_u32(bhdr + 6);
+        uint32_t raw_len = get_u32(bhdr + 10);
         uint32_t payload_len = get_u32(bhdr + 14);
         uint8_t flag = bhdr[5];
+        // raw_len 范围防御:必须在 (0, kSingleRecordMaxRaw] 范围内,超限视作块头损坏,终止对账防错误推进水位
+        if (raw_len == 0 || raw_len > kSingleRecordMaxRaw) break;
         uint64_t block_size = 34 + payload_len + (flag_encrypted(flag) ? 16 : 0);
         if (off + block_size > static_cast<uint64_t>(sz)) break;  // 半块尾巴
         if (seqno > upto_seqno) {
-            *out_bytes += get_u32(bhdr + 10);      // raw_len(spec §3.2 对账关键字段)
+            *out_bytes += raw_len;      // raw_len(spec §3.2 对账关键字段)
         }
         *out_last_block_offset = off;
         *out_last_block_end_offset = off + block_size;

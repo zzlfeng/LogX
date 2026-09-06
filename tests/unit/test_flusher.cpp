@@ -231,7 +231,7 @@ TEST(Flush, EncryptedBlockFileWriteAndDecode_Roundtrip) {
     std::vector<uint8_t> decoded_raw;
     ASSERT_TRUE(decode_block(blk_flag, key, 5, salt,
                              payload_buf.data(), payload_len, tag_buf,
-                             nullptr, static_cast<uint32_t>(rec.size()), &decoded_raw));
+                             static_cast<uint32_t>(rec.size()), &decoded_raw));
     EXPECT_EQ(decoded_raw, rec);
 
     // 清理

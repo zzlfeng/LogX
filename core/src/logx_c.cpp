@@ -114,12 +114,12 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
             off += block_size;
             continue;
         }
-        // 解码(raw bytes)
+        // 解码(raw bytes);raw_len 为块头声明长度,decode_block 内做长度交叉校验
         std::vector<uint8_t> raw;
         if (!decode_block(flag, key32, seqno, salt,
                           payload.data(), payload.size(),
                           enc ? tag.data() : nullptr,
-                          nullptr, raw_len, &raw)) {
+                          raw_len, &raw)) {
             char line[128];
             std::snprintf(line, sizeof(line), "[seq=%u decode fail]\n", seqno);
             out_lines->push_back(line);

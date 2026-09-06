@@ -6,6 +6,7 @@
 //     一致,块可正常解码(经 seam 注入 zstd 运行时失败 + kAlgoZlib 未实现路径
 //     两种触发方式验证;加密组合用例在 AESGCM guard 内)
 //   - decode_block 对损坏帧 / 伪造内容大小帧拒绝(宁丢不脏)
+//   - decode_block 长度交叉校验: 输出长度与块头 raw_len 不符拒绝、传 0 跳过
 //   - none 算法恒等往返;未知算法失败
 
 #include "logx_internal.h"
@@ -149,8 +150,16 @@ TEST(CodecTest, EncodeBlockCompressesAndRoundTrips) {
     ASSERT_TRUE(decode_block(make_flag(kAlgoZstd, false), nullptr, 7, salt,
                              enc.payload.data(),
                              static_cast<uint32_t>(enc.payload.size()),
-                             nullptr, nullptr, 0, &out));
+                             nullptr, static_cast<uint32_t>(raw.size()), &out));
     EXPECT_EQ(out, raw);
+
+    // 验证压缩块的 expected_raw_len 交叉校验: 传错误长度拒绝且输出清空
+    std::vector<uint8_t> out_bad;
+    EXPECT_FALSE(decode_block(make_flag(kAlgoZstd, false), nullptr, 7, salt,
+                              enc.payload.data(),
+                              static_cast<uint32_t>(enc.payload.size()),
+                              nullptr, static_cast<uint32_t>(raw.size() + 1), &out_bad));
+    EXPECT_TRUE(out_bad.empty());
 }
 
 #endif  // LOGX_WITH_ZSTD
@@ -274,7 +283,7 @@ TEST(CodecTest, EncodeBlockWithZstdAndAESGCM_RoundTrips) {
     std::vector<uint8_t> out;
     ASSERT_TRUE(decode_block(flag, key, seqno, salt,
                              payload_ptr, payload_len, tag_ptr,
-                             nullptr, static_cast<uint32_t>(raw.size()), &out));
+                             static_cast<uint32_t>(raw.size()), &out));
     EXPECT_EQ(out, raw);
 }
 
@@ -350,7 +359,7 @@ TEST(CodecTest, EncodeBlockMissingKey_DowngradesToPlaintext) {
     std::vector<uint8_t> decoded;
     ASSERT_TRUE(decode_block(bhdr[5], nullptr, 1, salt,
                              payload_buf.data(), payload_len, nullptr,
-                             nullptr, static_cast<uint32_t>(raw.size()), &decoded));
+                             static_cast<uint32_t>(raw.size()), &decoded));
     EXPECT_EQ(decoded, raw);
 
     // 清理
@@ -382,7 +391,7 @@ TEST(CodecTest, EncodeBlock_CompressionFailureDowngradesToNoneAndDecodesSuccessf
     ASSERT_TRUE(decode_block(enc.final_flag, nullptr, 10, salt,
                              enc.payload.data(),
                              static_cast<uint32_t>(enc.payload.size()),
-                             nullptr, nullptr, static_cast<uint32_t>(raw.size()),
+                             nullptr, static_cast<uint32_t>(raw.size()),
                              &decoded));
     EXPECT_EQ(decoded, raw);
 
@@ -391,7 +400,7 @@ TEST(CodecTest, EncodeBlock_CompressionFailureDowngradesToNoneAndDecodesSuccessf
     EXPECT_FALSE(decode_block(flag, nullptr, 10, salt,
                               enc.payload.data(),
                               static_cast<uint32_t>(enc.payload.size()),
-                              nullptr, nullptr, static_cast<uint32_t>(raw.size()),
+                              nullptr, static_cast<uint32_t>(raw.size()),
                               &fail_out));
 }
 
@@ -472,12 +481,71 @@ TEST(CodecTest, Flusher_CompressionFailureDowngradesAndEmitsDegradedEvent) {
     std::vector<uint8_t> decoded;
     ASSERT_TRUE(decode_block(bhdr[5], nullptr, 1, salt,
                              payload_buf.data(), payload_len, nullptr,
-                             nullptr, static_cast<uint32_t>(raw.size()), &decoded));
+                             static_cast<uint32_t>(raw.size()), &decoded));
     EXPECT_EQ(decoded, raw);
 
     // 清理
     pal.file_unlink(path.c_str());
     pal.file_rmdir(dir.c_str());
+}
+
+// 覆盖 C-03: decode_block 长度交叉校验(expected_raw_len)。
+// 块头不在 CRC 覆盖范围内,畸形 raw_len 在此拦截;不依赖 AESGCM/ZSTD 宏。
+TEST(CodecTest, DecodeBlock_RejectsLengthMismatch) {
+    auto raw = make_compressible(512);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint32_t raw_len = static_cast<uint32_t>(raw.size());
+
+    EncodedBlock enc;
+    ASSERT_TRUE(encode_block(make_flag(kAlgoNone, false), nullptr, /*seqno=*/20,
+                             salt, raw.data(), raw_len, &enc));
+
+    // 1) 基线: 传入正确长度,正常解码
+    std::vector<uint8_t> out_ok;
+    ASSERT_TRUE(decode_block(make_flag(kAlgoNone, false), nullptr, 20, salt,
+                             enc.payload.data(),
+                             static_cast<uint32_t>(enc.payload.size()),
+                             nullptr, raw_len, &out_ok));
+    EXPECT_EQ(out_ok, raw);
+
+    // 2) 长度不符(偏大/偏小)必须拒绝,且不得返回半截数据
+    std::vector<uint8_t> out_big;
+    EXPECT_FALSE(decode_block(make_flag(kAlgoNone, false), nullptr, 20, salt,
+                              enc.payload.data(),
+                              static_cast<uint32_t>(enc.payload.size()),
+                              nullptr, raw_len + 1, &out_big));
+    EXPECT_TRUE(out_big.empty());
+
+    std::vector<uint8_t> out_small;
+    EXPECT_FALSE(decode_block(make_flag(kAlgoNone, false), nullptr, 20, salt,
+                              enc.payload.data(),
+                              static_cast<uint32_t>(enc.payload.size()),
+                              nullptr, raw_len - 1, &out_small));
+    EXPECT_TRUE(out_small.empty());
+
+    // 3) 兼容语义: expected_raw_len=0 跳过长度校验
+    std::vector<uint8_t> out_skip;
+    ASSERT_TRUE(decode_block(make_flag(kAlgoNone, false), nullptr, 20, salt,
+                             enc.payload.data(),
+                             static_cast<uint32_t>(enc.payload.size()),
+                             nullptr, 0, &out_skip));
+    EXPECT_EQ(out_skip, raw);
+
+    // 4) 极端边界: expected_raw_len=UINT32_MAX 必须拒绝且输出清空
+    std::vector<uint8_t> out_huge;
+    EXPECT_FALSE(decode_block(make_flag(kAlgoNone, false), nullptr, 20, salt,
+                              enc.payload.data(),
+                              static_cast<uint32_t>(enc.payload.size()),
+                              nullptr, UINT32_MAX, &out_huge));
+    EXPECT_TRUE(out_huge.empty());
+
+    // 5) 空指针防御: out_raw 为空或 payload 为空但 len > 0 必须拒绝
+    EXPECT_FALSE(decode_block(make_flag(kAlgoNone, false), nullptr, 20, salt,
+                              enc.payload.data(),
+                              static_cast<uint32_t>(enc.payload.size()),
+                              nullptr, raw_len, nullptr));
+    EXPECT_FALSE(decode_block(make_flag(kAlgoNone, false), nullptr, 20, salt,
+                              nullptr, 100, nullptr, raw_len, &out_ok));
 }
 
 TEST(CodecTest, LogxOpen_CompressAlgo_FailFast) {
@@ -557,7 +625,7 @@ TEST(CodecTest, EncodeBlock_CompressionDowngradeKeepsEncryption) {
     ASSERT_TRUE(decode_block(enc.final_flag, key, 11, salt,
                              enc.payload.data(), ct_len,
                              enc.payload.data() + ct_len,
-                             nullptr, static_cast<uint32_t>(raw.size()),
+                             static_cast<uint32_t>(raw.size()),
                              &dec));
     EXPECT_EQ(dec, raw);
 }
@@ -588,7 +656,7 @@ TEST(CodecTest, EncodeBlock_ZstdRuntimeFailureDowngradesViaSeam) {
     ASSERT_TRUE(decode_block(enc.final_flag, nullptr, 12, salt,
                              enc.payload.data(),
                              static_cast<uint32_t>(enc.payload.size()),
-                             nullptr, nullptr, static_cast<uint32_t>(raw.size()),
+                             nullptr, static_cast<uint32_t>(raw.size()),
                              &decoded));
     EXPECT_EQ(decoded, raw);
 }
@@ -666,7 +734,7 @@ TEST(CodecTest, Flusher_ZstdRuntimeFailureDowngradesAndEmitsDegradedEventViaSeam
     std::vector<uint8_t> decoded;
     ASSERT_TRUE(decode_block(bhdr[5], nullptr, 1, salt,
                              payload_buf.data(), payload_len, nullptr,
-                             nullptr, static_cast<uint32_t>(raw.size()), &decoded));
+                             static_cast<uint32_t>(raw.size()), &decoded));
     EXPECT_EQ(decoded, raw);
 
     pal.file_unlink(path.c_str());

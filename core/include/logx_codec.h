@@ -83,14 +83,17 @@ bool encode_block(uint8_t flag,
 void set_compress_fail_injection(bool enabled);
 
 // 解码端:输入是"块在文件中的切片",输出 raw 字节。
-// flag 同上;失败原因:crc / gcm / 压缩失败。
+// flag 同上;失败原因:gcm / 压缩失败 / 输出长度与 expected_raw_len 不一致。
+// expected_raw_len 取自块头 raw_len 字段,作为解码输出长度的交叉校验
+// (块头本身不在 CRC 覆盖范围内,畸形 raw_len 在此拦截);传 0 跳过校验。
+// payload 完整性(CRC32)由调用方在调用前校验(见 logx_c.cpp 导出路径)。
 bool decode_block(uint8_t flag,
                   const uint8_t* key32_or_null,
                   uint32_t seqno,
                   const uint8_t salt[8],
                   const uint8_t* payload, uint32_t payload_len,
                   const uint8_t* gcm_tag_or_null,
-                  const uint8_t* raw, uint32_t raw_len,
+                  uint32_t expected_raw_len,
                   std::vector<uint8_t>* out_raw);
 
 }  // namespace logx

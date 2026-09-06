@@ -199,6 +199,8 @@ bool encode_block(uint8_t flag,
                   const uint8_t salt[8],
                   const uint8_t* raw, uint32_t raw_len,
                   EncodedBlock* out) {
+    if (!out) return false;
+    if (raw_len > 0 && !raw) return false;
     uint8_t comp = flag_algo(flag);
     bool enc = flag_encrypted(flag);
     if (enc && !key32_or_null) {
@@ -251,11 +253,10 @@ bool decode_block(uint8_t flag,
                   const uint8_t salt[8],
                   const uint8_t* payload, uint32_t payload_len,
                   const uint8_t* gcm_tag_or_null,
-                  const uint8_t* raw /* raw_len 之前的字节,用于 crc32 校验 */,
-                  uint32_t raw_len,
+                  uint32_t expected_raw_len,
                   std::vector<uint8_t>* out_raw) {
-    (void)raw;  // crc32 校验由调用方在传 payload 前用 raw + raw_len 算;此处只需解出 raw。
-    (void)raw_len;
+    if (!out_raw) return false;
+    if (payload_len > 0 && !payload) return false;
     uint8_t comp = flag_algo(flag);
     bool enc = flag_encrypted(flag);
 
@@ -278,6 +279,13 @@ bool decode_block(uint8_t flag,
 
     // 2) 解压
     if (!decompress_block(comp, plain.data(), static_cast<uint32_t>(plain.size()), out_raw)) {
+        return false;
+    }
+    // 3) 长度交叉校验:块头声明的 raw_len 与实际解出长度必须一致
+    //    (块头不在 CRC 覆盖范围内,畸形 raw_len 在此拦截;0 = 跳过校验)。
+    //    宁丢不脏:校验失败不得返回半截数据。
+    if (expected_raw_len != 0 && out_raw->size() != expected_raw_len) {
+        out_raw->clear();
         return false;
     }
     return true;

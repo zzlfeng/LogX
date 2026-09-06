@@ -61,11 +61,18 @@
   4. `test_codec.cpp` 清理全部手写移位改用 helper，并新增 `BlockFlagHelper_BitLayoutAndSemantics` 位布局防退化测试（全枚举锁定线上格式 + 对称反解 + 越界截断防御）。
   5. 全栈命名对齐：JNI 映射处、Kotlin `Compress` 枚举、Python 解码器常量区补充与 `kAlgo*`/位布局的显式对应注释，Python 新增 `FLAG_COMPRESS_SHIFT` 常量替换裸移位。线上 flag 字节格式不变（bit0=加密、bit1..2=算法），纯编译期重构，无 ABI/行为变化。
 
-### 🟠 [C-03] `decode_block` 的 `raw`/`raw_len` 参数被完全忽略，CRC 校验从未执行
+### ✅ [C-03] `decode_block` 的 `raw`/`raw_len` 参数被完全忽略，CRC 校验从未执行 [已闭环]
 - **来源：** 报告一 BUG-8 ＝ 报告二 R2-中#12
 - **位置：** `core/src/codec.cpp:232`
-- **描述：** 函数签名承诺接收 `raw`/`raw_len` 用于校验，实现中以 `(void)` 忽略。若调用方未做 CRC 校验则数据完整性无保证；`test_codec.cpp` 多处以 `nullptr, 0` 传入，测试完全绕过该路径。
-- **修复建议：** 在函数内部实现输出长度/CRC 校验，或删除参数并在 API 文档中明确调用方责任。
+- **状态：** ✅ **已修复并闭环**（删除无效 raw 参数 + 实现长度交叉校验 + API 契约文档化）
+- **描述：** 函数签名承诺接收 `raw`/`raw_len` 用于校验，实现中以 `(void)` 忽略。若调用方未做 CRC 校验则数据完整性无保证；`test_codec.cpp` 多处以 `nullptr, 0` 传入，测试完全绕过该路径。（修复前核实：生产调用方 `logx_c.cpp:110` 调用前已自行做 payload CRC 校验，实际风险低于报告定级；真实缺口是块头 `raw_len` 与解码输出长度之间无交叉校验——块头本身不在 CRC 覆盖范围内，畸形 raw_len 无人验证；且头文件声称失败原因含 "crc"，与实现自相矛盾。）
+- **修复方案与落地：**
+  1. 删除从未被有效使用的 `raw` 指针参数；`raw_len` 重定义为 `expected_raw_len`（期望解码输出长度，取自块头 raw_len 字段），传 0 跳过校验。
+  2. `decode_block` 内解压完成后追加长度交叉校验：长度不符时清空输出并返回 false（宁丢不脏），畸形块头 raw_len 在解码层被拦截。
+  3. 生产调用方 `logx_c.cpp` 传入块头 `raw_len`，导出路径自动获得长度交叉校验；CRC 预检逻辑保留。
+  4. 头文件注释明确 API 契约："失败原因：gcm / 压缩失败 / 输出长度不一致；payload 完整性（CRC32）由调用方在调用前校验"，消除声明与实现的矛盾。
+  5. 全库 11 处调用点（test_codec 9 处 + test_flusher 1 处 + logx_c 1 处）同步适配；新增 `DecodeBlock_RejectsLengthMismatch` 负向用例（基线通过 / 长度偏大偏小拒绝且输出为空 / 传 0 跳过校验），双构建矩阵全绿通过。
+  6. 防御性深度加固：`decode_block` 与 `encode_block` 补齐输出指针与 payload 空指针前置拦截；`flusher.cpp:sum_raw_len_since` 增加 `(0, kSingleRecordMaxRaw]` 边界校验防畸形块头错误推进水位（前置闭环 F-05 关键路径）；单测追加 `UINT32_MAX` 极值与真实 Zstd 压缩块长度不符拒绝断言。
 
 ### 🟡 [C-04] 缺少 ARMv8 Crypto Extensions 硬件加速（T4.0-5 偏差）
 - **来源：** 报告三 §四 T4.0-5（Spec 偏差）
@@ -582,7 +589,7 @@
 | F-03 | 短写未检测致日志丢失 | F-04 | fsync/同步持久化零接入 |
 | F-05 | 恢复块头校验不足 | F-06 | atc offset uint32 截断 |
 | F-07 | split_no uint8 / 255 停写（T4.0-2） | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
-| C-03 | decode_block 忽略 raw/raw_len | S-02 | AppendTargetCache 非 packed |
+| C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed |
 | FM-01 | tag[64] 越界读 UB | FM-02 | 重同步未清 carry_slice_buf |
 | R-01 | was_truncated 误传播 | R-02 | 丢块统计少计 1 |
 | R-03 | 日期校验不完整 / 多套解析不一致 | E-02 | drop_too_large 统计与错误分类 |
