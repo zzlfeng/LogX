@@ -199,8 +199,8 @@ bool encode_block(uint8_t flag,
                   const uint8_t salt[8],
                   const uint8_t* raw, uint32_t raw_len,
                   EncodedBlock* out) {
-    uint8_t comp = (flag >> 1) & 0x3;
-    bool enc = (flag & kFlagEncrypted) != 0;
+    uint8_t comp = flag_algo(flag);
+    bool enc = flag_encrypted(flag);
     if (enc && !key32_or_null) {
         // 加密请求但密钥缺失:fail-fast;调用方应降级到明文 flag。
         return false;
@@ -235,11 +235,11 @@ bool encode_block(uint8_t flag,
         out->enc_ok = false;
     }
 
-    uint8_t final_flag = flag & ~0x07;
+    uint8_t final_flag = flag & static_cast<uint8_t>(~(kFlagEncrypted | kFlagCompressMask));
     if (out->enc_ok) {
         final_flag |= kFlagEncrypted;
     }
-    final_flag |= static_cast<uint8_t>((comp & 0x03) << 1);
+    final_flag |= static_cast<uint8_t>(comp << kFlagCompressShift);
     out->final_flag = final_flag;
 
     return true;
@@ -256,8 +256,8 @@ bool decode_block(uint8_t flag,
                   std::vector<uint8_t>* out_raw) {
     (void)raw;  // crc32 校验由调用方在传 payload 前用 raw + raw_len 算;此处只需解出 raw。
     (void)raw_len;
-    uint8_t comp = (flag >> 1) & 0x3;
-    bool enc = (flag & kFlagEncrypted) != 0;
+    uint8_t comp = flag_algo(flag);
+    bool enc = flag_encrypted(flag);
 
     // 1) 解密(若启用);密文 = payload,tag = 块末尾 16B。
     std::vector<uint8_t> plain;

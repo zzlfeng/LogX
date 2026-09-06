@@ -31,12 +31,16 @@ MAGIC_BLOCK = b'LGXB'
 MAGIC_ENTRY = b'LG'
 MAGIC_PAD   = b'GP'
 
+# 压缩算法编号,与 C++ core/include/logx_codec.h 的 kAlgoNone/kAlgoZstd/kAlgoZlib
+# 严格一致。块头 flag 字节布局: bit0=加密(FLAG_ENCRYPTED),
+# bit1..2=算法编号左移 FLAG_COMPRESS_SHIFT 位(掩码 COMP_MASK)。
 ALGO_NONE = 0
 ALGO_ZSTD = 1
 ALGO_ZLIB = 2
 
-FLAG_ENCRYPTED = 0x01
-COMP_MASK      = 0x06
+FLAG_ENCRYPTED      = 0x01
+COMP_MASK           = 0x06
+FLAG_COMPRESS_SHIFT = 1
 
 # ---------------- 文件格式 helpers ----------------
 def crc32_update(crc: int, data: bytes) -> int:
@@ -204,7 +208,7 @@ def decode_block_raw(bhdr: bytes, payload: bytes, tag: Optional[bytes],
     if expected_crc != actual_crc:
         return DecodedBlockResult(seqno, raw_len, error=f"crc32 mismatch: expected {expected_crc:#x} != {actual_crc:#x}")
 
-    algo = (flag & COMP_MASK) >> 1
+    algo = (flag & COMP_MASK) >> FLAG_COMPRESS_SHIFT
     enc = bool(flag & FLAG_ENCRYPTED)
     if enc:
         key = kid_keys.get(kid_in_file)

@@ -5,9 +5,11 @@
 //   - 加密:AES-256-GCM(nonce = 8B 文件盐 + 4B seqno);M3 接入 mbedtls
 //
 // 接入真库时,在编译宏 LOGX_WITH_ZSTD / LOGX_WITH_AESGCM 打开分支即可,
-// 函数签名不变。flag 字节定义:
-//   bit0        = 加密(0/1)
-//   bit1..2     = 压缩算法(00=none, 01=zstd, 10=zlib)
+// 函数签名不变。flag 字节定义(与 logx_decode.py 的常量保持一致):
+//   bit0        = 加密(kFlagEncrypted)
+//   bit1..2     = 压缩算法编号 kAlgo* 左移 kFlagCompressShift 位
+//                 (00=none, 01=zstd, 10=zlib),掩码 kFlagCompressMask
+// 组装/解析一律走 make_flag / flag_algo / flag_encrypted,禁止手写移位。
 
 #ifndef LOGX_CODEC_H
 #define LOGX_CODEC_H
@@ -19,14 +21,28 @@
 
 namespace logx {
 
-constexpr uint8_t kFlagCompressNone  = 0x0;
-constexpr uint8_t kFlagCompressZstd  = 0x1;
-constexpr uint8_t kFlagCompressZlib  = 0x2;
-constexpr uint8_t kFlagEncrypted     = 0x1;
+constexpr uint8_t kFlagEncrypted = 0x1;  // bit0: 加密标志
 
+// 压缩算法编号(写入 flag 字节前需左移 kFlagCompressShift 位)。
 constexpr uint8_t kAlgoNone = 0;
 constexpr uint8_t kAlgoZstd = 1;
 constexpr uint8_t kAlgoZlib = 2;
+
+constexpr uint8_t kFlagCompressShift = 1;     // 算法编号在 flag 字节中的移位量 (bit1..2)
+constexpr uint8_t kFlagCompressMask  = 0x06;  // flag 字节中 bit1..2 掩码
+constexpr uint8_t kAlgoMask          = 0x03;  // 解移位后的算法编号掩码
+
+// flag 字节组装/解析的唯一入口,避免手写移位与魔法数。
+inline constexpr uint8_t make_flag(uint8_t algo, bool enc) {
+    return static_cast<uint8_t>(((algo << kFlagCompressShift) & kFlagCompressMask) |
+                                (enc ? kFlagEncrypted : 0));
+}
+inline constexpr uint8_t flag_algo(uint8_t flag) {
+    return static_cast<uint8_t>((flag >> kFlagCompressShift) & kAlgoMask);
+}
+inline constexpr bool flag_encrypted(uint8_t flag) {
+    return (flag & kFlagEncrypted) != 0;
+}
 
 // 压缩:成功返回 true,out 持有压缩结果(可能比 in 大,失败时 out 清空)。
 bool compress_block(uint8_t algo, const uint8_t* in, uint32_t in_len,

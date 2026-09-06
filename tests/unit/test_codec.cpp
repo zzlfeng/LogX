@@ -54,6 +54,37 @@ struct ScopedCompressFailInjection {
 
 }  // namespace
 
+// 覆盖 C-02: flag 字节位布局防退化测试。
+// 锁定 make_flag / flag_algo / flag_encrypted 的线上一致性(bit0=加密,
+// bit1..2=压缩算法),任何常量或移位改动破坏位布局时在此 fail-fast。
+TEST(CodecTest, BlockFlagHelper_BitLayoutAndSemantics) {
+    // 全枚举锁定: 线上 flag 字节格式为硬协议,值必须与 logx_decode.py 常量一致
+    EXPECT_EQ(make_flag(kAlgoNone, false), 0x00);
+    EXPECT_EQ(make_flag(kAlgoNone, true),  0x01);
+    EXPECT_EQ(make_flag(kAlgoZstd, false), 0x02);
+    EXPECT_EQ(make_flag(kAlgoZstd, true),  0x03);
+    EXPECT_EQ(make_flag(kAlgoZlib, false), 0x04);
+    EXPECT_EQ(make_flag(kAlgoZlib, true),  0x05);
+
+    // 对称反解: 组装后经 flag_algo / flag_encrypted 还原
+    for (uint8_t algo = kAlgoNone; algo <= kAlgoZlib; ++algo) {
+        for (bool enc : {false, true}) {
+            uint8_t f = make_flag(algo, enc);
+            EXPECT_EQ(flag_algo(f), algo);
+            EXPECT_EQ(flag_encrypted(f), enc);
+        }
+    }
+
+    // 防御性截断: 超出 2-bit 的算法编号仅低 2 位生效,不会污染 bit3..7
+    EXPECT_EQ(make_flag(0x07, false), kFlagCompressMask);
+    EXPECT_EQ(flag_algo(make_flag(0x07, false)), kAlgoMask);
+    EXPECT_EQ(make_flag(0x07, true), static_cast<uint8_t>(kFlagCompressMask | kFlagEncrypted));
+
+    // 恒等式: make_flag 与手写位运算等价(锁定语义)
+    EXPECT_EQ(make_flag(kAlgoZstd, true),
+              static_cast<uint8_t>((kAlgoZstd << kFlagCompressShift) | kFlagEncrypted));
+}
+
 #if LOGX_WITH_ZSTD
 
 TEST(CodecTest, ZstdRoundTrip_Compressible) {
@@ -108,14 +139,14 @@ TEST(CodecTest, EncodeBlockCompressesAndRoundTrips) {
     auto raw = make_compressible(16 * 1024);
     uint8_t salt[8] = {1,2,3,4,5,6,7,8};
     EncodedBlock enc;
-    ASSERT_TRUE(encode_block(kFlagCompressZstd << 1, nullptr, /*seqno=*/7, salt,
+    ASSERT_TRUE(encode_block(make_flag(kAlgoZstd, false), nullptr, /*seqno=*/7, salt,
                              raw.data(), static_cast<uint32_t>(raw.size()),
                              &enc));
     EXPECT_FALSE(enc.enc_ok);
     EXPECT_LT(enc.payload.size(), raw.size() / 4);
 
     std::vector<uint8_t> out;
-    ASSERT_TRUE(decode_block(kFlagCompressZstd << 1, nullptr, 7, salt,
+    ASSERT_TRUE(decode_block(make_flag(kAlgoZstd, false), nullptr, 7, salt,
                              enc.payload.data(),
                              static_cast<uint32_t>(enc.payload.size()),
                              nullptr, nullptr, 0, &out));
@@ -228,7 +259,7 @@ TEST(CodecTest, EncodeBlockWithZstdAndAESGCM_RoundTrips) {
     uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     uint32_t seqno = 100;
 
-    uint8_t flag = (kFlagCompressZstd << 1) | kFlagEncrypted;
+    uint8_t flag = make_flag(kAlgoZstd, true);
 
     EncodedBlock enc;
     ASSERT_TRUE(encode_block(flag, key, seqno, salt, raw.data(),
@@ -335,7 +366,7 @@ TEST(CodecTest, EncodeBlock_CompressionFailureDowngradesToNoneAndDecodesSuccessf
     // 置于 LOGX_WITH_AESGCM guard 之外,默认构建也参与编译。
     auto raw = make_compressible(1024);
     uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    uint8_t flag = (kAlgoZlib << 1);
+    uint8_t flag = make_flag(kAlgoZlib, false);
 
     EncodedBlock enc;
     // 1) 编码必须平滑降级成功, 绝不阻塞或丢日志
@@ -343,7 +374,7 @@ TEST(CodecTest, EncodeBlock_CompressionFailureDowngradesToNoneAndDecodesSuccessf
                              raw.data(), static_cast<uint32_t>(raw.size()), &enc));
 
     // 2) 验证 final_flag: 压缩位已被清除为 kAlgoNone
-    EXPECT_EQ((enc.final_flag >> 1) & 0x3, kAlgoNone);
+    EXPECT_EQ(flag_algo(enc.final_flag), kAlgoNone);
     EXPECT_EQ(enc.final_flag & kFlagEncrypted, 0);
 
     // 3) 使用 enc.final_flag 能够正常解码还原
@@ -411,7 +442,7 @@ TEST(CodecTest, Flusher_CompressionFailureDowngradesAndEmitsDegradedEvent) {
     ASSERT_EQ(pal.file_write(fd, hdr, 32), 32);
 
     auto raw = make_compressible(512);
-    uint8_t flag = (kAlgoZlib << 1);  // 触发压缩降级
+    uint8_t flag = make_flag(kAlgoZlib, false);  // 触发压缩降级
 
     BlockWriteResult wr = write_and_record(&inst, fd, raw.data(),
                                            static_cast<uint32_t>(raw.size()),
@@ -429,7 +460,7 @@ TEST(CodecTest, Flusher_CompressionFailureDowngradesAndEmitsDegradedEvent) {
     EXPECT_EQ(pal.file_pread(fd, bhdr, 34, 32), 34);
     EXPECT_EQ(get_u32(bhdr), kMagicBlock);
     // 核心验证: 块头 hdr[5] 的压缩位已被清除为 kAlgoNone!
-    EXPECT_EQ((bhdr[5] >> 1) & 0x3, kAlgoNone);
+    EXPECT_EQ(flag_algo(bhdr[5]), kAlgoNone);
 
     uint32_t payload_len = get_u32(bhdr + 14);
     EXPECT_EQ(payload_len, raw.size());
@@ -511,13 +542,13 @@ TEST(CodecTest, EncodeBlock_CompressionDowngradeKeepsEncryption) {
     auto raw = make_compressible(1024);
     uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
     uint8_t key[32] = {0x11, 0x22, 0x33, 0x44};
-    uint8_t flag_enc = (kAlgoZlib << 1) | kFlagEncrypted;
+    uint8_t flag_enc = make_flag(kAlgoZlib, true);
 
     EncodedBlock enc;
     ASSERT_TRUE(encode_block(flag_enc, key, /*seqno=*/11, salt,
                              raw.data(), static_cast<uint32_t>(raw.size()), &enc));
     EXPECT_TRUE(enc.enc_ok);
-    EXPECT_EQ((enc.final_flag >> 1) & 0x3, kAlgoNone);
+    EXPECT_EQ(flag_algo(enc.final_flag), kAlgoNone);
     EXPECT_NE(enc.final_flag & kFlagEncrypted, 0);
 
     ASSERT_GT(enc.payload.size(), 16u);
@@ -541,7 +572,7 @@ TEST(CodecTest, EncodeBlock_ZstdRuntimeFailureDowngradesViaSeam) {
     // 使用 ScopedCompressFailInjection RAII 守卫,确保断言退出时自动清理。
     auto raw = make_compressible(4 * 1024);
     uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
-    uint8_t flag = (kAlgoZstd << 1);
+    uint8_t flag = make_flag(kAlgoZstd, false);
 
     ScopedCompressFailInjection seam_guard(true);
     EncodedBlock enc;
@@ -549,7 +580,7 @@ TEST(CodecTest, EncodeBlock_ZstdRuntimeFailureDowngradesViaSeam) {
                              raw.data(), static_cast<uint32_t>(raw.size()), &enc));
 
     // 降级生效: 压缩位清零, payload 为未压缩原文(非 zstd 帧)
-    EXPECT_EQ((enc.final_flag >> 1) & 0x3, kAlgoNone);
+    EXPECT_EQ(flag_algo(enc.final_flag), kAlgoNone);
     EXPECT_EQ(enc.payload, raw);
 
     // 用降级后 flag 解码完整还原
@@ -605,7 +636,7 @@ TEST(CodecTest, Flusher_ZstdRuntimeFailureDowngradesAndEmitsDegradedEventViaSeam
     ASSERT_EQ(pal.file_write(fd, hdr, 32), 32);
 
     auto raw = make_compressible(2048);
-    uint8_t flag = (kAlgoZstd << 1);
+    uint8_t flag = make_flag(kAlgoZstd, false);
 
     ScopedCompressFailInjection seam_guard(true);
     BlockWriteResult wr = write_and_record(&inst, fd, raw.data(),
@@ -623,7 +654,7 @@ TEST(CodecTest, Flusher_ZstdRuntimeFailureDowngradesAndEmitsDegradedEventViaSeam
     uint8_t bhdr[34];
     EXPECT_EQ(pal.file_pread(fd, bhdr, 34, 32), 34);
     EXPECT_EQ(get_u32(bhdr), kMagicBlock);
-    EXPECT_EQ((bhdr[5] >> 1) & 0x3, kAlgoNone);
+    EXPECT_EQ(flag_algo(bhdr[5]), kAlgoNone);
 
     uint32_t payload_len = get_u32(bhdr + 14);
     EXPECT_EQ(payload_len, raw.size());

@@ -49,11 +49,17 @@
   4. 引入 `ScopedCompressFailInjection` RAII 守卫与测试 Seam，提供多线程无竞争的故障注入与异常安全重置。
   5. 补齐往返解码、反证防退化断言、加密组合及 `logx_open` fail-fast 单元测试，双构建矩阵全绿通过。
 
-### 🟠 [C-02] `kFlagCompressZstd` 与 `kFlagEncrypted` 数值相同（均为 0x1），命名歧义
+### ✅ [C-02] `kFlagCompressZstd` 与 `kFlagEncrypted` 数值相同（均为 0x1），命名歧义 [已闭环]
 - **来源：** 报告一 BUG-2（汇总表列 P0）；报告三 BUG-J1 关联（JNI 端 Compress.ZSTD(1) 映射与 flag 字节布局语义不统一）
 - **位置：** `core/include/logx_codec.h`
-- **描述：** 设计意图为压缩算法编号需左移 1 位写入 bit1~2（`kFlagCompressZstd << 1`），加密标志占 bit0。两常量数值相同且命名前缀均为 `kFlag`，极易混淆。`test_codec.cpp:95` 存在手动 `<< 1` 用法，说明命名已造成实际困惑。
-- **修复建议：** 废弃 `kFlagCompressZstd/kFlagCompressZlib`，统一使用 `kAlgoZstd` 等算法编号；或改为预移位值。
+- **状态：** ✅ **已修复并闭环**（删除歧义常量 + helper 收敛魔法数 + 全栈命名对齐）
+- **描述：** 设计意图为压缩算法编号需左移 1 位写入 bit1~2（`kFlagCompressZstd << 1`），加密标志占 bit0。两常量数值相同且命名前缀均为 `kFlag`，极易混淆。`test_codec.cpp` 存在手动 `<< 1` 用法，说明命名已造成实际困惑。（修复前核实：生产代码已迁移至 `kAlgo*`，仅 `test_codec.cpp` 残留 3 处 `kFlagCompressZstd << 1`，`kFlagCompressNone/Zlib` 为零引用死常量，但歧义常量未废弃。）
+- **修复方案与落地：**
+  1. 删除 `kFlagCompressNone/kFlagCompressZstd/kFlagCompressZlib` 三个歧义常量；保留 `kFlagEncrypted` 与 `kAlgo*` 算法编号。
+  2. 新增 `kFlagCompressShift/kFlagCompressMask/kAlgoMask` 常量与 `make_flag()/flag_algo()/flag_encrypted()` 三个 constexpr helper，作为 flag 字节组装/解析的唯一入口。
+  3. `codec.cpp`（encode/decode 解析、final_flag 重组）、`flusher.cpp`（降级比对、块大小计算、flag 构造）、`logx_c.cpp`（导出判定）中约 15 处手写移位与魔法数（`<< 1`、`(flag >> 1) & 0x3`、`& 0x6`、`~0x07`）全部收敛为 helper 调用。
+  4. `test_codec.cpp` 清理全部手写移位改用 helper，并新增 `BlockFlagHelper_BitLayoutAndSemantics` 位布局防退化测试（全枚举锁定线上格式 + 对称反解 + 越界截断防御）。
+  5. 全栈命名对齐：JNI 映射处、Kotlin `Compress` 枚举、Python 解码器常量区补充与 `kAlgo*`/位布局的显式对应注释，Python 新增 `FLAG_COMPRESS_SHIFT` 常量替换裸移位。线上 flag 字节格式不变（bit0=加密、bit1..2=算法），纯编译期重构，无 ABI/行为变化。
 
 ### 🟠 [C-03] `decode_block` 的 `raw`/`raw_len` 参数被完全忽略，CRC 校验从未执行
 - **来源：** 报告一 BUG-8 ＝ 报告二 R2-中#12
@@ -520,9 +526,11 @@
 | **T4.0-7** | §9 未对齐访问 / 23:59:59 时钟跳变用例 | ✅ 已通过 T4.5 落地 | — | — |
 | **T4.0-8** | §2/§10 离线解码工具 `logx_decode.py` | 坏块 break、死代码残留、容错性待对齐 | 影响离线日志捞取成功率 | D-01~D-04 |
 | **T4.0-9** | §7/§10 Kotlin Facade `LogX.kt` | export 丢弃 native 返回值；runBlocking 嵌套 | 导出状态误判与调度器线程阻塞 | K-01/K-02 |
-| **T4.0-10** | §7/§10 JNI Config 传递与 ErrorHandler | Compress 映射语义混淆；全局错误上下文单例化 | 多实例接入与算法配置异味 | C-02/J-02 |
+| **T4.0-10** | §7/§10 JNI Config 传递与 ErrorHandler | Compress 映射语义混淆 [✅ C-02 部分已闭环]；全局错误上下文单例化 | 多实例接入与算法配置异味 | C-02/J-02 |
 | **T4.0-11** | §4.3/§4.4 恢复后切分序号强制归 0 风险 | `flusher.cpp:447,456` 强制 `current_split = 0` | 覆写历史 `.log.1` 分卷 | F-02 |
 | **T4.0-12** | §10 新建文件父目录 fsync | PAL 接口已实现但全库 0 调用 | 崩溃下可能目录项丢失 | F-04 |
+
+> 注：T4.0-10 中"Compress 映射语义混淆"已随 C-02 闭环（删除歧义常量 + `make_flag()/flag_algo()` 等 helper 全栈命名拉齐，JNI/Kotlin/Python 侧均已显式关联 `kAlgo*` 编号）；该行其余偏差（J-02 全局错误上下文）仍待修复。
 
 ---
 
@@ -573,7 +581,7 @@
 |:---|:---|:---|:---|
 | F-03 | 短写未检测致日志丢失 | F-04 | fsync/同步持久化零接入 |
 | F-05 | 恢复块头校验不足 | F-06 | atc offset uint32 截断 |
-| F-07 | split_no uint8 / 255 停写（T4.0-2） | C-02 | 压缩/加密 flag 命名歧义 |
+| F-07 | split_no uint8 / 255 停写（T4.0-2） | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
 | C-03 | decode_block 忽略 raw/raw_len | S-02 | AppendTargetCache 非 packed |
 | FM-01 | tag[64] 越界读 UB | FM-02 | 重同步未清 carry_slice_buf |
 | R-01 | was_truncated 误传播 | R-02 | 丢块统计少计 1 |

@@ -102,8 +102,8 @@ long append_block_raw(int fd,
         return -1;
     }
     // 若发生压缩降级,通知监控层
-    uint8_t orig_comp = (flag >> 1) & 0x3;
-    uint8_t final_comp = (enc.final_flag >> 1) & 0x3;
+    uint8_t orig_comp = flag_algo(flag);
+    uint8_t final_comp = flag_algo(enc.final_flag);
     if (orig_comp != kAlgoNone && final_comp == kAlgoNone) {
         emit_event(inst, LOGX_EV_DEGRADED, -1, "compression failed; downgrade to none");
     }
@@ -264,7 +264,7 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
         }
         uint32_t payload_len = get_u32(bhdr + 14);
         uint8_t flag = bhdr[5];
-        uint64_t block_size = 34 + payload_len + ((flag & kFlagEncrypted) ? 16 : 0);
+        uint64_t block_size = 34 + payload_len + (flag_encrypted(flag) ? 16 : 0);
         if (off + block_size > static_cast<uint64_t>(sz)) {
             if (repair) inst->pal->file_truncate(fd, off);
             r.truncated = true;
@@ -516,10 +516,8 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     std::vector<PendingBlock> blocks;
     split_impl(scratch.data(), bytes, &blocks);
 
-    // 4) 决定 flag:bit0 = encrypt,bit1-2 = compress
-    uint8_t flag = 0;
-    flag |= (inst->compress_algo << 1) & 0x6;
-    if (inst->encrypt_enable) flag |= kFlagEncrypted;
+    // 4) 决定 flag:bit0 = encrypt,bit1-2 = compress(经 make_flag 组装)
+    uint8_t flag = make_flag(inst->compress_algo, inst->encrypt_enable != 0);
 
     // 5) 逐块:压缩/加密 → write() → 清零该区间 → 提交 Header
     // 关键顺序(spec §4.2 第 4→5→6 步):先落数据,再清零,最后提交。
@@ -756,7 +754,7 @@ bool sum_raw_len_since(Instance* inst, const std::string& target_path,
         uint32_t seqno = get_u32(bhdr + 6);
         uint32_t payload_len = get_u32(bhdr + 14);
         uint8_t flag = bhdr[5];
-        uint64_t block_size = 34 + payload_len + ((flag & kFlagEncrypted) ? 16 : 0);
+        uint64_t block_size = 34 + payload_len + (flag_encrypted(flag) ? 16 : 0);
         if (off + block_size > static_cast<uint64_t>(sz)) break;  // 半块尾巴
         if (seqno > upto_seqno) {
             *out_bytes += get_u32(bhdr + 10);      // raw_len(spec §3.2 对账关键字段)

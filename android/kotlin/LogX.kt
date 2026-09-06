@@ -28,6 +28,12 @@ import kotlinx.coroutines.withContext
  */
 object LogX {
 
+    /**
+     * 压缩算法枚举。序号必须与 C++ core/include/logx_codec.h 的
+     * kAlgoNone/kAlgoZstd/kAlgoZlib 严格一致(NONE=0/ZSTD=1/ZLIB=2),
+     * 经 JNI 直传给 logx_open 校验,落盘时由 make_flag() 写入块头
+     * flag 字节的 bit1..2(加密标志占 bit0)。修改需三端同步。
+     */
     enum class Compress(val algo: Byte) {
         NONE(0), ZSTD(1), ZLIB(2)
     }

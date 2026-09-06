@@ -67,7 +67,7 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
     uint8_t salt[8];
     std::memcpy(salt, hdr + 12, 8);
     const uint8_t* key32 = nullptr;
-    bool file_encrypted = (hdr[5] & kFlagEncrypted) != 0;
+    bool file_encrypted = flag_encrypted(hdr[5]);
     if (file_encrypted) {
         if (!inst->key_provider) {
             emit_event(inst, LOGX_EV_DEGRADED, -1, "export: no key provider for encrypted file");
@@ -96,7 +96,7 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
         uint32_t payload_len = get_u32(bhdr + 14);
         uint32_t crc        = get_u32(bhdr + 18);
         uint8_t  flag       = bhdr[5];
-        bool enc = (flag & kFlagEncrypted) != 0;
+        bool enc = flag_encrypted(flag);
         uint64_t block_size = 34 + payload_len + (enc ? 16 : 0);
         if (off + block_size > end_size) break;
         std::vector<uint8_t> payload(payload_len);
