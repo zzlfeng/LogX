@@ -23,7 +23,10 @@
 | `d0d157e` | fix(codec): C-01 压缩失败降级后块头 flag 与 payload 实际编码一致 |
 | `e6fe04c` | test(codec): 补齐 logx_open 校验用例与 RAII 测试桩保护并闭环 C-01 文档 |
 | `c976b3d` | fix(codec): C-02 删除压缩/加密 flag 歧义常量并以 helper 收敛手写移位 |
-| `HEAD` | fix(codec): C-03 decode_block 删除冗余 raw 参数并落实长度交叉校验与防御性加固 |
+| `9cf709e` | fix(codec): C-03 decode_block 删除冗余 raw 参数并落实长度交叉校验与防御性加固 |
+| `4b0af7b` | feat(crypto): C-04 落地 ARMv8 Crypto Extensions 硬件加速与自检闭环 |
+| `35816bd` | feat(crypto): 消除热路径逐块 auxv 探测、补齐 GCM 权威向量锚点与健壮性校验 |
+| `926e538` | test(codec): 纠正 GCM 官方向量编号标注并补齐 McGrew-Viega TC13 (方案 A+) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -55,7 +58,7 @@
 | 2 | 切分序号升级 2B uint16_t(§3.1/§4.4,P1) | 仍为 uint8_t(`AppendTargetCache.split_no` / `make_log_path`) |
 | 3 | 双 Header:写 A → seq_cst fence → 写 B(§4.2/§10,P0) | 实现为 A(中间态 CRC 保护)→ B → `atomic_thread_fence(release)`,时机与内存序均偏离纪律 |
 | 4 | Flusher 50~100ms Debounce 超时聚合(§4.1,P2) | 未实现:`flusher_loop` 为无超时阻塞 `ev_wait` |
-| 5 | ARMv8 Crypto Extensions 硬件加速(§10,P2) | ✅ 已闭环(2026-09-06,C-04):`aesce.c` 移植并落地标准 AESE/AESMC/EOR 指令直通,消除热路径逐块 getauxval,增加 GCM 官方向量锚点(TC13-TC16)与 add 判空防御,真机(骁龙865)自检与 NIST 校验全绿通过,单测 69/69 与压测 4/4 全通过 |
+| 5 | ARMv8 Crypto Extensions 硬件加速(§10,P2) | ✅ 已闭环(2026-09-06,C-04):`aesce.c` 移植并落地标准 AESE/AESMC/EOR 指令直通,消除热路径逐块 getauxval,落地 GCM 官方向量完整锚定(NIST KAT 零密钥极值基线 + McGrew-Viega 附录 B TC13/14/15 权威锚点,方案 A+)与 add 判空防御,真机(骁龙865)自检与 NIST 校验全绿通过,单测 69/69 与压测 4/4 全通过 |
 | 6 | 每 30s 定时 msync/fdatasync 持久化(§11) | 未实现,当前仅退后台 / 手动路径触发 |
 | 7 | 未对齐访问 / 23:59:59 时钟跳变测试用例(§9,P2) | 39 个用例中不存在 |
 

@@ -265,7 +265,7 @@ TEST(CodecTest, GCMRejectsCorruptTagAndCiphertext) {
 #include "mbedtls/gcm.h"
 
 TEST(CodecTest, GCM_OfficialNistVectors_Anchor) {
-    // 锚定测试 1: NIST SP 800-38D / McGrew-Viega TC13 (空明文, 0 AAD)
+    // 零密钥基线 1: NIST GCM KAT 边界向量 (K=0^256, IV=0^96, 空明文, 0 AAD)
     {
         const uint8_t key[32] = {0};
         const uint8_t iv[12] = {0};
@@ -277,14 +277,14 @@ TEST(CodecTest, GCM_OfficialNistVectors_Anchor) {
         ASSERT_TRUE(encrypt_gcm(key, iv, nullptr, 0, &cipher_and_tag));
         ASSERT_EQ(cipher_and_tag.size(), 16u);
         EXPECT_EQ(std::memcmp(cipher_and_tag.data(), expected_tag, 16), 0)
-            << "TC13 Tag mismatch";
+            << "Zero-Key Empty Plaintext Tag mismatch";
 
         std::vector<uint8_t> dec;
         ASSERT_TRUE(decrypt_gcm(key, iv, nullptr, 0, cipher_and_tag.data(), &dec));
         EXPECT_TRUE(dec.empty());
     }
 
-    // 锚定测试 2: NIST SP 800-38D / McGrew-Viega TC14 (16B 全零明文, 0 AAD)
+    // 零密钥基线 2: NIST GCM KAT 边界向量 (K=0^256, IV=0^96, 16B 全零明文, 0 AAD)
     {
         const uint8_t key[32] = {0};
         const uint8_t iv[12] = {0};
@@ -300,9 +300,9 @@ TEST(CodecTest, GCM_OfficialNistVectors_Anchor) {
         ASSERT_TRUE(encrypt_gcm(key, iv, plain, 16, &cipher_and_tag));
         ASSERT_EQ(cipher_and_tag.size(), 32u);
         EXPECT_EQ(std::memcmp(cipher_and_tag.data(), expected_cipher, 16), 0)
-            << "TC14 Cipher mismatch";
+            << "Zero-Key 16B Plaintext Cipher mismatch";
         EXPECT_EQ(std::memcmp(cipher_and_tag.data() + 16, expected_tag, 16), 0)
-            << "TC14 Tag mismatch";
+            << "Zero-Key 16B Plaintext Tag mismatch";
 
         std::vector<uint8_t> dec;
         ASSERT_TRUE(decrypt_gcm(key, iv, cipher_and_tag.data(), 16,
@@ -311,7 +311,31 @@ TEST(CodecTest, GCM_OfficialNistVectors_Anchor) {
         EXPECT_EQ(std::memcmp(dec.data(), plain, 16), 0);
     }
 
-    // 锚定测试 3: NIST SP 800-38D / McGrew-Viega TC15 (64B 明文, 0 AAD, 非零 Key/IV)
+    // 官方规范锚点 1: McGrew-Viega 附录 B Test Case 13 (AES-256, 空明文, 0 AAD)
+    {
+        const uint8_t key[32] = {
+            0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c,
+            0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08,
+            0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c,
+            0x6d, 0x6a, 0x8f, 0x94, 0x67, 0x30, 0x83, 0x08};
+        const uint8_t iv[12] = {
+            0xca, 0xfe, 0xba, 0xbe, 0xfa, 0xce, 0xdb, 0xad, 0xde, 0xca, 0xf8, 0x88};
+        const uint8_t expected_tag[16] = {
+            0xfd, 0x2c, 0xaa, 0x16, 0xa5, 0x83, 0x2e, 0x76,
+            0xaa, 0x13, 0x2c, 0x14, 0x53, 0xee, 0xda, 0x7e};
+
+        std::vector<uint8_t> cipher_and_tag;
+        ASSERT_TRUE(encrypt_gcm(key, iv, nullptr, 0, &cipher_and_tag));
+        ASSERT_EQ(cipher_and_tag.size(), 16u);
+        EXPECT_EQ(std::memcmp(cipher_and_tag.data(), expected_tag, 16), 0)
+            << "McGrew-Viega TC13 Tag mismatch";
+
+        std::vector<uint8_t> dec;
+        ASSERT_TRUE(decrypt_gcm(key, iv, nullptr, 0, cipher_and_tag.data(), &dec));
+        EXPECT_TRUE(dec.empty());
+    }
+
+    // 官方规范锚点 2: McGrew-Viega 附录 B Test Case 14 (AES-256, 64B 明文, 0 AAD)
     {
         const uint8_t key[32] = {
             0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c,
@@ -346,9 +370,9 @@ TEST(CodecTest, GCM_OfficialNistVectors_Anchor) {
         ASSERT_TRUE(encrypt_gcm(key, iv, plain, 64, &cipher_and_tag));
         ASSERT_EQ(cipher_and_tag.size(), 80u);
         EXPECT_EQ(std::memcmp(cipher_and_tag.data(), expected_cipher, 64), 0)
-            << "TC15 Cipher mismatch";
+            << "McGrew-Viega TC14 Cipher mismatch";
         EXPECT_EQ(std::memcmp(cipher_and_tag.data() + 64, expected_tag, 16), 0)
-            << "TC15 Tag mismatch";
+            << "McGrew-Viega TC14 Tag mismatch";
 
         std::vector<uint8_t> dec;
         ASSERT_TRUE(decrypt_gcm(key, iv, cipher_and_tag.data(), 64,
@@ -357,7 +381,7 @@ TEST(CodecTest, GCM_OfficialNistVectors_Anchor) {
         EXPECT_EQ(std::memcmp(dec.data(), plain, 64), 0);
     }
 
-    // 锚定测试 4: NIST SP 800-38D TC16 (64B 明文 + 20B AAD 认证数据路径)
+    // 官方规范锚点 3: McGrew-Viega 附录 B Test Case 15 (AES-256, 64B 明文 + 20B AAD)
     {
         const uint8_t key[32] = {
             0xfe, 0xff, 0xe9, 0x92, 0x86, 0x65, 0x73, 0x1c,
@@ -402,9 +426,9 @@ TEST(CodecTest, GCM_OfficialNistVectors_Anchor) {
                                             iv, 12, aad, 20,
                                             plain, out_cipher, 16, out_tag), 0);
         EXPECT_EQ(std::memcmp(out_cipher, expected_cipher, 64), 0)
-            << "TC16 Cipher mismatch";
+            << "McGrew-Viega TC15 Cipher mismatch";
         EXPECT_EQ(std::memcmp(out_tag, expected_tag, 16), 0)
-            << "TC16 Tag mismatch";
+            << "McGrew-Viega TC15 Tag mismatch";
 
         uint8_t out_plain[64];
         ASSERT_EQ(mbedtls_gcm_auth_decrypt(&gcm, 64, iv, 12, aad, 20,
