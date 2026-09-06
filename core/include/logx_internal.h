@@ -147,6 +147,7 @@ struct FileScanResult {
     bool     ok = false;
     std::string path;              // 命中文件路径
 };
+FileScanResult scan_one(Instance* inst, const std::string& path, bool repair);
 FileScanResult scan_append_target(Instance* inst, const std::string& hint_path);
 
 // 在 log_dir 下扫描所有日志文件,选"日期最大且尾块 seqno 最大"者作为追加目标;

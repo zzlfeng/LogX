@@ -137,11 +137,19 @@
      - `test_recovery.cpp`：`RecoveryResume_PreservesSplitNoInAppendTargetCache`（T2）与 `RecoveryRebuilt_PreservesSplitNoInAppendTargetCache`（T3），覆盖两种恢复路径下 `atc.split_no == 2` 的正确接管与持久化保持。
   5. 双构建矩阵（全开 ON/ON: 74/74 单测 + 4/4 压测；基础 OFF/OFF: 57/57 单测 + 4/4 压测）及 Android arm64-v8a 交叉编译全绿通过。
 
-### 🟠 [F-03] 短写会造成日志永久丢失
+### 🟢 [F-03] 短写会造成日志永久丢失 [✅ 已修复]
 - **来源：** 报告二 R2-高#3
-- **位置：** `core/src/flusher.cpp:132`（`append_block_raw`）
-- **描述：** 只判断 `file_write()` 是否返回负数，未确认返回值是否等于完整 frame 长度。若 PAL 实现或注入测试返回部分写入，代码仍视为块写入成功，随后清零 staging 原始数据、提交新 flushed 水位，丢失尚未完整落盘的日志。（注：当前两个平台 PAL 实现内部已循环写满，风险主要来自不合规的 PAL 注入。）
-- **修复建议：** 把短写视为失败；必要时由 PAL 保证循环写满并由上层再次校验。
+- **位置：** `core/src/flusher.cpp:138-144`（`append_block_raw`）、`flusher.cpp:163-171`（`write_and_record`）、`flusher.cpp:240-244`（`write_file_header`）
+- **描述：** 只判断 `file_write()` 是否返回负数，未确认返回值是否等于完整 frame 长度。若 PAL 实现或注入测试返回部分写入（短写），代码仍视为块写入成功，随后清零 staging 原始数据、提交新 flushed 水位，丢失尚未完整落盘的日志。且物理文件留下撕裂尾部，污染后续日志块写入。
+- **修复方案与落地：**
+  1. `append_block_raw` 严格校验返回值 `n != static_cast<long>(frame.size())`：任何短写均视为失败并触发 `block_write_errors.fetch_add(1)` 与 `emit_event(inst, LOGX_EV_IO, -1, "block short write")`；
+  2. `write_and_record` 增加物理撕裂尾部回滚截断：在写入失败（短写或返回 -1）后，检测若磁盘文件已增长（`cur_sz > sz`），立即调用 `file_truncate(fd, sz)` 回滚至写前偏移，避免留下撕裂半块污染后续 append；若截断失败尽力而为上报 `LOGX_EV_IO`；
+  3. `write_file_header` 保持契约对称性：当写入非 32B 时，调用 `file_truncate(fd, 0)` 抹除残损头部；
+  4. 单测闭环：在 `tests/unit/test_robustness.cpp` 中新增 `MockShortWritePal` 及 3 组完整鲁棒性测试用例：
+     - `ShortWrite_RollsBackTornBytesAndEmitsEvent` (Case A: 短写被截断回滚至写前偏移、记录错误统计与触发告警事件、`scan_one` 评估健康且 `truncated == false`)；
+     - `ShortWrite_TransientFailureAllowsSubsequentBlocksToResumeCleanly` (Case B: 瞬态短写失败回滚后，后续块正常追加落盘，`logx_export` 正常解码且无任何数据损坏)；
+     - `ShortWrite_MidStreamEnospcTruncatesTornTail` (Case C: 模拟物理写入中途磁盘满返回 -1，验证残留物理尾部被自动回滚截断)。
+  5. 双构建矩阵（全开 ON/ON: 77/77 单测 + 4/4 压测；基础 OFF/OFF: 60/60 单测 + 4/4 压测）及 Android arm64-v8a 交叉编译全绿通过。
 
 ### 🟠 [F-04] 关键写入流程没有调用持久化同步
 - **来源：** 报告二 R2-高#7；T4.0-6 / T4.0-12 关联
@@ -626,7 +634,7 @@
 
 | 编号 | 问题 | 编号 | 问题 |
 |:---|:---|:---|:---|
-| F-03 | 短写未检测致日志丢失 | F-04 | fsync/同步持久化零接入 |
+| F-03 | 短写未检测致日志丢失 [✅ 已修复] | F-04 | fsync/同步持久化零接入 |
 | F-05 | 恢复块头校验不足 | F-06 | atc offset uint32 截断 |
 | F-07 | split_no uint8 / 255 停写（T4.0-2） | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
 | C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed |
@@ -660,6 +668,6 @@
 
 1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → 真实崩溃恢复测试（T-01）
 2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ JNI 关闭顺序与 UAF 防护（J-01）→ Win64 句柄截断修复（P-01）
-3. **P1 协议健壮性与持久化**：短写检测（F-03）→ 持久化同步接入（F-04）→ 恢复校验加强（F-05）→ 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
+3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → 持久化同步接入（F-04）→ 恢复校验加强（F-05）→ 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
 4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
 5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）

@@ -136,8 +136,9 @@ long append_block_raw(int fd,
     }
     // 5) 写盘
     long n = inst->pal->file_write(fd, frame.data(), frame.size());
-    if (n < 0) {
+    if (n != static_cast<long>(frame.size())) {
         inst->block_write_errors.fetch_add(1);
+        emit_event(inst, LOGX_EV_IO, -1, "block short write");
         return -1;
     }
     return n;
@@ -163,6 +164,13 @@ BlockWriteResult write_and_record(Instance* inst, int fd,
     long n = append_block_raw(fd, raw_block, raw_len, seqno, flag, salt,
                               key32_or_null, inst);
     if (n < 0) {
+        // 短写或写入失败后，若物理文件已增长（产生了撕裂尾部），回滚截断至写前偏移
+        int64_t cur_sz = inst->pal->file_size(fd);
+        if (cur_sz > sz) {
+            if (inst->pal->file_truncate(fd, static_cast<uint64_t>(sz)) != 0) {
+                emit_event(inst, LOGX_EV_IO, -1, "truncate torn tail failed");
+            }
+        }
         return r;
     }
     r.end_offset = r.start_offset + static_cast<uint64_t>(n);
@@ -230,7 +238,12 @@ bool write_file_header(Instance* inst, int fd,
     // reserved[8] = 0
     uint32_t crc = crc32_update(0, hdr, 28);
     put_u32_le(hdr + 28, crc);
-    return inst->pal->file_write(fd, hdr, 32) == 32;
+    long n = inst->pal->file_write(fd, hdr, 32);
+    if (n != 32) {
+        inst->pal->file_truncate(fd, 0);
+        return false;
+    }
+    return true;
 }
 
 // 扫描 hint_path;若文件不存在则返回 ok=false 让上层决定创建。
