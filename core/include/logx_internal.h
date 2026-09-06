@@ -111,6 +111,11 @@ inline void put_u32_le(uint8_t* p, uint32_t v) {
 // 生成日志文件路径: split=0 为 dir/YYYYMMDD.log, split>0 为 dir/YYYYMMDD.log.N
 std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint8_t split);
 
+// 解析日志文件路径或文件名: 提取 8 位日期与切分序号 (0..255)。
+// 支持 "YYYYMMDD.log" (split=0) 与 "YYYYMMDD.log.N" (split=N)。
+// 成功返回 true; 其它文件返回 false。
+bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uint8_t* out_split);
+
 // 写一个完整块到日志文件;返回成功与否。
 bool write_block_to_file(Instance* inst,
                          const uint8_t* raw, const PendingBlock& blk,

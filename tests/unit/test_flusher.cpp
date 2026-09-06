@@ -660,6 +660,259 @@ TEST(Flush, FileSizeThreshold_RotatesToSplitFile) {
     pal.file_rmdir(dir.c_str());
 }
 
+TEST(Flush, ParseLogFilename_Comprehensive) {
+    uint32_t date = 0;
+    uint8_t split = 0;
+    EXPECT_TRUE(parse_log_filename("20260907.log", &date, &split));
+    EXPECT_EQ(date, 20260907u);
+    EXPECT_EQ(split, 0);
+
+    EXPECT_TRUE(parse_log_filename("20260907.log.1", &date, &split));
+    EXPECT_EQ(date, 20260907u);
+    EXPECT_EQ(split, 1);
+
+    EXPECT_TRUE(parse_log_filename("20260907.log.255", &date, &split));
+    EXPECT_EQ(date, 20260907u);
+    EXPECT_EQ(split, 255);
+
+    EXPECT_TRUE(parse_log_filename("/var/log/app/20260907.log.42", &date, &split));
+    EXPECT_EQ(date, 20260907u);
+    EXPECT_EQ(split, 42);
+
+    EXPECT_TRUE(parse_log_filename("D:\\Logs\\MyApp\\20260907.log.99", &date, &split));
+    EXPECT_EQ(date, 20260907u);
+    EXPECT_EQ(split, 99);
+
+    EXPECT_FALSE(parse_log_filename("20260907.log.256", &date, &split));
+    EXPECT_FALSE(parse_log_filename("20260907.log.bak", &date, &split));
+    EXPECT_FALSE(parse_log_filename("staging.mmap", &date, &split));
+    EXPECT_FALSE(parse_log_filename("staging.mmap.lock", &date, &split));
+    EXPECT_FALSE(parse_log_filename("short.log", &date, &split));
+    EXPECT_FALSE(parse_log_filename("abcd1234.log", &date, &split));
+    EXPECT_FALSE(parse_log_filename("", &date, &split));
+}
+
+TEST(Flush, FileSizeThreshold_ResumeRotatesToNextSplitWithoutOverwrite) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_split_resume_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 500;  // 500B 阈值，多次切分
+    cfg.flush_threshold = 256;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 阶段 1: 写入 30 条日志(总体积约 1800B)，足以切分出 .log, .log.1, .log.2
+    for (int i = 0; i < 30; ++i) {
+        std::string msg = "phase1_split_test_log_message_index_" + std::to_string(i);
+        ASSERT_EQ(logx_write(inst, 2, "Phase1",
+                             reinterpret_cast<const uint8_t*>(msg.data()),
+                             static_cast<uint32_t>(msg.size())), LOGX_OK);
+        if (i % 3 == 0) logx_flush(inst);
+    }
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+    logx_close(inst);
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    pal.wallclock_date(&yyyymmdd, &hhmmss);
+    std::string path0 = make_log_path(dir, yyyymmdd, 0);
+    std::string path1 = make_log_path(dir, yyyymmdd, 1);
+    std::string path2 = make_log_path(dir, yyyymmdd, 2);
+
+    ASSERT_GT(pal.file_size_path(path0.c_str()), 0);
+    ASSERT_GT(pal.file_size_path(path1.c_str()), 0);
+    ASSERT_GT(pal.file_size_path(path2.c_str()), 0);
+
+    // 抓取重启前 .log, .log.1, .log.2 的完整字节快照
+    auto read_file_bytes = [&](const std::string& path) -> std::vector<uint8_t> {
+        int64_t sz = pal.file_size_path(path.c_str());
+        if (sz <= 0) return {};
+        std::vector<uint8_t> b(static_cast<size_t>(sz));
+        int fd = pal.file_open(path.c_str(), false, false);
+        if (fd >= 0) {
+            pal.file_pread(fd, b.data(), sz, 0);
+            pal.file_close(fd);
+        }
+        return b;
+    };
+
+    std::vector<uint8_t> snap0 = read_file_bytes(path0);
+    std::vector<uint8_t> snap1 = read_file_bytes(path1);
+    std::vector<uint8_t> snap2 = read_file_bytes(path2);
+
+    // 阶段 2: 重新打开实例 (模拟重启/崩溃恢复)，继续向 .log.2 追加并写满
+    inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 写入更多日志，使 .log.2 跨越 500B 触发下一次滚动
+    for (int i = 0; i < 20; ++i) {
+        std::string msg = "phase2_resumed_log_message_index_" + std::to_string(i);
+        ASSERT_EQ(logx_write(inst, 2, "Phase2",
+                             reinterpret_cast<const uint8_t*>(msg.data()),
+                             static_cast<uint32_t>(msg.size())), LOGX_OK);
+        if (i % 3 == 0) logx_flush(inst);
+    }
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+    logx_close(inst);
+
+    std::string path3 = make_log_path(dir, yyyymmdd, 3);
+    // 断言新建了 .log.3 分卷!
+    EXPECT_GT(pal.file_size_path(path3.c_str()), 0);
+
+    // 核心断言 (防覆写反证): .log 与 .log.1 内容必须与重启前 100% 逐字节一致
+    std::vector<uint8_t> curr0 = read_file_bytes(path0);
+    std::vector<uint8_t> curr1 = read_file_bytes(path1);
+    EXPECT_EQ(curr0, snap0);
+    EXPECT_EQ(curr1, snap1);
+
+    // .log.2 必须在原有 snap2 基础上追加写入，前缀与 snap2 严格一致且长度增长
+    std::vector<uint8_t> curr2 = read_file_bytes(path2);
+    ASSERT_GE(curr2.size(), snap2.size());
+    EXPECT_EQ(std::memcmp(curr2.data(), snap2.data(), snap2.size()), 0);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+static void create_valid_test_log(Pal& pal, const std::string& path, uint32_t date, uint32_t seqno, uint32_t target_size) {
+    int fd = pal.file_open(path.c_str(), true, true);
+    if (fd < 0) return;
+    uint8_t fhdr[32];
+    std::memset(fhdr, 0, sizeof(fhdr));
+    put_u32_le(fhdr + 0, kMagicFile);
+    fhdr[4] = 1;
+    fhdr[5] = 0;
+    put_u32_le(fhdr + 6, date);
+    put_u16(fhdr + 10, 0);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::memcpy(fhdr + 12, salt, 8);
+    put_u32_le(fhdr + 28, crc32_update(0, fhdr, 28));
+    pal.file_pwrite(fd, fhdr, 32, 0);
+
+    uint32_t payload_len = (target_size > 66) ? (target_size - 66) : 20;
+    std::vector<uint8_t> payload(payload_len, 0x55);
+    uint32_t payload_crc = crc32_update(0, payload.data(), payload_len);
+
+    uint8_t bhdr[34];
+    std::memset(bhdr, 0, sizeof(bhdr));
+    put_u32_le(bhdr + 0, kMagicBlock);
+    bhdr[4] = 1;
+    bhdr[5] = 0;
+    put_u32_le(bhdr + 6, seqno);
+    put_u32_le(bhdr + 10, payload_len);
+    put_u32_le(bhdr + 14, payload_len);
+    put_u32_le(bhdr + 18, payload_crc);
+    pal.file_pwrite(fd, bhdr, 34, 32);
+    pal.file_pwrite(fd, payload.data(), payload_len, 66);
+    pal.file_close(fd);
+}
+
+TEST(Flush, FileSizeThreshold_DefensiveProbeSkipsExistingSplit) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_split_defensive_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    pal.wallclock_date(&yyyymmdd, &hhmmss);
+
+    std::string path0 = make_log_path(dir, yyyymmdd, 0);
+    std::string path1 = make_log_path(dir, yyyymmdd, 1);
+
+    // 创建已满的 path0 (500B) 与已存在的历史分卷 path1 (300B)
+    create_valid_test_log(pal, path0, yyyymmdd, 1, 500);
+    create_valid_test_log(pal, path1, yyyymmdd, 2, 300);
+
+    // 构造旧版本 Staging 缓存: split_no = 0，指向已满的 path0 (模拟升级窗口)
+    {
+        Staging st_builder(&pal, staging, 8 * 1024);
+        RecoveryState st; bool rec = false;
+        ASSERT_TRUE(st_builder.open(&st, &rec));
+        AppendTargetCache old_atc{};
+        old_atc.date = yyyymmdd;
+        old_atc.split_no = 0;
+        old_atc.last_block_offset = 32;
+        old_atc.last_block_end_offset = 500;
+        st_builder.commit_header_locked(1, 0, 0, &old_atc);
+        st_builder.close();
+    }
+
+    // 记录 path1 的原始字节快照
+    auto read_file_bytes = [&](const std::string& path) -> std::vector<uint8_t> {
+        int64_t sz = pal.file_size_path(path.c_str());
+        if (sz <= 0) return {};
+        std::vector<uint8_t> b(static_cast<size_t>(sz));
+        int fd = pal.file_open(path.c_str(), false, false);
+        if (fd >= 0) {
+            pal.file_pread(fd, b.data(), sz, 0);
+            pal.file_close(fd);
+        }
+        return b;
+    };
+    std::vector<uint8_t> snap1 = read_file_bytes(path1);
+    ASSERT_EQ(snap1.size(), 300u);
+
+    // 配置实例，max_file_size = 500
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 500;
+    cfg.flush_threshold = 256;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 写入日志跨越 500B 触发切分滚动
+    for (int i = 0; i < 15; ++i) {
+        std::string msg = "defensive_probe_test_record_" + std::to_string(i);
+        ASSERT_EQ(logx_write(inst, 2, "Defensive",
+                             reinterpret_cast<const uint8_t*>(msg.data()),
+                             static_cast<uint32_t>(msg.size())), LOGX_OK);
+    }
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+    logx_close(inst);
+
+    // 核心验证:
+    // 1. 历史分卷 .log.1 绝未被碰触或篡改
+    std::vector<uint8_t> curr1(300);
+    int fd1_read = pal.file_open(path1.c_str(), false, false);
+    ASSERT_GE(fd1_read, 0);
+    pal.file_pread(fd1_read, curr1.data(), 300, 0);
+    pal.file_close(fd1_read);
+    EXPECT_EQ(curr1, snap1);
+    EXPECT_EQ(pal.file_size_path(path1.c_str()), 300);
+
+    // 2. 防御层成功跳过已存在的 .log.1，直接滚动到了空闲分卷 .log.2
+    std::string path2 = make_log_path(dir, yyyymmdd, 2);
+    EXPECT_GT(pal.file_size_path(path2.c_str()), 0);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
 TEST(Flush, ExportWithMultipleRecordsAndMissingKey_HandledGracefully) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_exp_multi_") +

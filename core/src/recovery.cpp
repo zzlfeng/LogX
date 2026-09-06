@@ -126,15 +126,7 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
     // 优先用 hint(追加目标缓存)
     std::string hint;
     if (hdr.target.date != 0) {
-        char buf[64];
-        if (hdr.target.split_no == 0) {
-            std::snprintf(buf, sizeof(buf), "%s/%08u.log",
-                          inst->log_dir.c_str(), hdr.target.date);
-        } else {
-            std::snprintf(buf, sizeof(buf), "%s/%08u.log.%u",
-                          inst->log_dir.c_str(), hdr.target.date, hdr.target.split_no);
-        }
-        hint = buf;
+        hint = make_log_path(inst->log_dir, hdr.target.date, hdr.target.split_no);
     }
     FileScanResult sr;
     bool was_truncated = false;
@@ -185,14 +177,9 @@ void run_recovery(Instance* inst) {
             FileScanResult sr = scan_append_target(inst, best);
             if (sr.ok) {
                 hdr.seqno = sr.seqno;
-                size_t base = sr.path.find_last_of("/\\");
-                std::string name = (base == std::string::npos) ? sr.path : sr.path.substr(base + 1);
-                if (name.size() >= 12) {
-                    char* endp = nullptr;
-                    unsigned long d = std::strtoul(name.c_str(), &endp, 10);
-                    atc.date = static_cast<uint32_t>(d);
-                    atc.split_no = 0;
-                }
+                parse_log_filename(sr.path, &atc.date, &atc.split_no);
+                atc.last_block_offset = static_cast<uint32_t>(sr.last_block_offset);
+                atc.last_block_end_offset = static_cast<uint32_t>(sr.last_block_end_offset);
             }
         }
         inst->staging->commit_header_locked(hdr.seqno, 0, 0, &atc);
@@ -306,17 +293,8 @@ void run_recovery(Instance* inst) {
     std::memcpy(&atc, inst->staging->raw_base() + 20, sizeof(atc));
     // 更新追加目标缓存:指向 resume 目标(暂用 hint 或原 cache)
     if (!rec.target_path.empty()) {
-        // 解析 hint path 中的日期 / 切分
-        size_t base = rec.target_path.find_last_of('/');
-        std::string name = (base == std::string::npos)
-            ? rec.target_path : rec.target_path.substr(base + 1);
-        if (name.size() >= 12) {
-            char* endp = nullptr;
-            unsigned long d = std::strtoul(name.c_str(), &endp, 10);
-            atc.date = static_cast<uint32_t>(d);
-            atc.split_no = 0;
-            // last_block_offset 与 last_block_end_offset 由下次 commit 更新
-        }
+        parse_log_filename(rec.target_path, &atc.date, &atc.split_no);
+        // last_block_offset 与 last_block_end_offset 由下次 commit 更新
     }
     // write_pos(环坐标) = (F + valid_end) % size;若 valid_end == raw_bytes 则 = w(原值)
     uint32_t new_w = raw_bytes == valid_end

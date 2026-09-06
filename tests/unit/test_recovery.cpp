@@ -19,7 +19,6 @@ using namespace logx;
 
 namespace {
 constexpr uint32_t kDataSize = 8 * 1024;
-constexpr uint32_t kTotal = kDataSize + kHeaderTotal;
 }
 
 class RecoveryTest : public ::testing::Test {
@@ -461,6 +460,109 @@ TEST_F(RecoveryTest, BothHeadersCorrupt_RebuiltAndTakesOverFileSeqno) {
     EXPECT_EQ(get_u32(base + 12), 0u);  // flushed_len 归零
     EXPECT_EQ(get_u32(base + 16), 0u);  // write_pos 归零
     EXPECT_TRUE(inst->staging->debug_check_invariant(0, 0));
+
+    delete inst->staging;
+    delete inst;
+}
+
+static bool create_test_log_file(Instance* inst, const std::string& path, uint32_t date, uint32_t seqno) {
+    int fd = inst->pal->file_open(path.c_str(), true, true);
+    if (fd < 0) return false;
+    uint8_t fhdr[32];
+    std::memset(fhdr, 0, sizeof(fhdr));
+    put_u32_le(fhdr + 0, kMagicFile);
+    fhdr[4] = 1;
+    fhdr[5] = 0;
+    put_u32_le(fhdr + 6, date);
+    put_u16(fhdr + 10, 0);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::memcpy(fhdr + 12, salt, 8);
+    put_u32_le(fhdr + 28, crc32_update(0, fhdr, 28));
+    if (inst->pal->file_pwrite(fd, fhdr, 32, 0) != 32) {
+        inst->pal->file_close(fd);
+        return false;
+    }
+    std::vector<uint8_t> rec;
+    append_entry_record(&rec, 0x10);
+    BlockWriteResult wr = write_and_record(inst, fd, rec.data(),
+                                           static_cast<uint32_t>(rec.size()),
+                                           seqno, 0, salt, nullptr);
+    inst->pal->file_close(fd);
+    return wr.ok;
+}
+
+TEST_F(RecoveryTest, RecoveryResume_PreservesSplitNoInAppendTargetCache) {
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+
+    // 构造分卷 2 文件 (YYYYMMDD.log.2) 且写入有效块 seqno=10
+    std::string path2 = make_log_path(log_dir_, yyyymmdd, 2);
+    ASSERT_TRUE(create_test_log_file(inst, path2, yyyymmdd, 10));
+
+    // 模拟 Staging Header 中已存在分卷 2 的缓存
+    AppendTargetCache atc{};
+    atc.date = yyyymmdd;
+    atc.split_no = 2;
+    atc.last_block_offset = 32;
+    atc.last_block_end_offset = static_cast<uint32_t>(inst->pal->file_size_path(path2.c_str()));
+    inst->staging->commit_header_locked(10, 0, 0, &atc);
+
+    // 执行恢复
+    run_recovery(inst);
+
+    // 核心断言: 恢复对账后，atc.split_no 必须保持为 2，绝不可被重置为 0
+    AppendTargetCache committed_atc{};
+    std::memcpy(&committed_atc, inst->staging->raw_base() + 20, sizeof(committed_atc));
+    EXPECT_EQ(committed_atc.date, yyyymmdd);
+    EXPECT_EQ(committed_atc.split_no, 2);
+    EXPECT_EQ(get_u32(inst->staging->raw_base() + 8), 10u);
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, RecoveryRebuilt_PreservesSplitNoInAppendTargetCache) {
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+
+    // 构造分卷 2 文件 (YYYYMMDD.log.2) 且写入有效块 seqno=20
+    std::string path2 = make_log_path(log_dir_, yyyymmdd, 2);
+    ASSERT_TRUE(create_test_log_file(inst, path2, yyyymmdd, 20));
+
+    // 模拟双 Header 全部损坏 (填满非零垃圾数据)，强制触发整区重建
+    inst->staging->close();
+    int sfd = inst->pal->file_open(staging_path_.c_str(), false, false);
+    ASSERT_GE(sfd, 0);
+    uint8_t garbage[128];
+    std::memset(garbage, 0xEE, sizeof(garbage));
+    ASSERT_EQ(inst->pal->file_pwrite(sfd, garbage, sizeof(garbage), 0), static_cast<long>(sizeof(garbage)));
+    inst->pal->file_close(sfd);
+
+    // 执行恢复 (触发 rebuilt 路径)
+    run_recovery(inst);
+
+    // 核心断言: 重建路径通过目录扫描选中最新分卷 .log.2 并接管，atc.split_no 必须正确置为 2
+    AppendTargetCache committed_atc{};
+    std::memcpy(&committed_atc, inst->staging->raw_base() + 20, sizeof(committed_atc));
+    EXPECT_EQ(committed_atc.date, yyyymmdd);
+    EXPECT_EQ(committed_atc.split_no, 2);
+    EXPECT_EQ(get_u32(inst->staging->raw_base() + 8), 20u);
 
     delete inst->staging;
     delete inst;

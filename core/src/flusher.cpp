@@ -181,6 +181,40 @@ std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint8_t spl
     return std::string(buf);
 }
 
+bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uint8_t* out_split) {
+    if (path_or_name.empty()) return false;
+    size_t base = path_or_name.find_last_of("/\\");
+    std::string name = (base == std::string::npos) ? path_or_name : path_or_name.substr(base + 1);
+    if (name.size() < 12) return false;
+    if (name.find("staging") != std::string::npos) return false;
+
+    for (int i = 0; i < 8; ++i) {
+        if (name[i] < '0' || name[i] > '9') return false;
+    }
+    char* endp = nullptr;
+    unsigned long d = std::strtoul(name.c_str(), &endp, 10);
+    if (endp != name.c_str() + 8 || d == 0 || d > 99991231u) return false;
+
+    if (name.compare(8, 4, ".log") != 0) return false;
+
+    uint8_t split = 0;
+    if (name.size() == 12) {
+        split = 0;
+    } else if (name.size() > 13 && name[12] == '.') {
+        char* split_end = nullptr;
+        unsigned long s = std::strtoul(name.c_str() + 13, &split_end, 10);
+        if (split_end == name.c_str() + 13 || *split_end != '\0') return false;
+        if (s > 255) return false;
+        split = static_cast<uint8_t>(s);
+    } else {
+        return false;
+    }
+
+    if (out_date) *out_date = static_cast<uint32_t>(d);
+    if (out_split) *out_split = split;
+    return true;
+}
+
 // 写 32B 文件头(magic + ver + flag + date + kid + salt + reserved + crc)。
 // 仅在"新建文件"时调用。
 bool write_file_header(Instance* inst, int fd,
@@ -445,12 +479,11 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
             if (sr.ok && !sr.truncated && sr.last_block_end_offset > 0) {
                 // 命中并校验过
                 c->current_path = hint;
-                size_t base_idx = sr.path.find_last_of("/\\");
-                const char* fn = (base_idx == std::string::npos) ? sr.path.c_str() : (sr.path.c_str() + base_idx + 1);
-                c->current_date = std::strlen(fn) >= 8
-                    ? static_cast<uint32_t>(std::strtoul(fn, nullptr, 10))
-                    : today;
-                c->current_split = 0;
+                if (!parse_log_filename(sr.path, &c->current_date, &c->current_split)) {
+                    c->current_date = today;
+                    c->current_split = 0;
+                }
+                c->current_size = sr.last_block_end_offset;
             }
         }
     }
@@ -464,13 +497,17 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
     }
 
     // 切分序号决策:如果当前 size ≥ max_file_size → split+1 切到新文件。
+    // 增加循环探测:若 make_log_path 目标已存在则持续 +1, 直至空闲分卷或达 255 上限
     if (c->current_size >= inst->max_file_size) {
-        if (c->current_split >= 255) {
-            // 达上限,停写
-            close_current(c, inst->pal);
-            return -1;
-        }
-        c->current_split += 1;
+        do {
+            if (c->current_split >= 255) {
+                // 达上限,停写
+                close_current(c, inst->pal);
+                return -1;
+            }
+            c->current_split += 1;
+        } while (inst->pal->file_size_path(
+            make_log_path(inst->log_dir, c->current_date, c->current_split).c_str()) >= 0);
         c->current_path.clear();
         c->current_size = 0;
         close_current(c, inst->pal);

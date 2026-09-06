@@ -117,12 +117,25 @@
   4. `test_flusher.cpp` 彻底清理假绿：加固 `EndToEndFormattedLog_WriteAndExport`，核验落盘文件头 `hdr[5]` 的 `kFlagEncrypted` 标志与 CRC，并断言导出明文不含 `decode fail` 且包含真实载荷 Hex 特征；新增 `ExportHistoricalEncryptedFileWithUnsetFileHeaderFlag_RecoversSuccessfully`（采用动态墙钟日期 + 超长保留期，根除时效炸弹）验证历史存量 `hdr[5]=0` 文件的向前兼容解密；`EncryptedBlockFileWriteAndDecode_Roundtrip` 补充密文与明文不一致断言（联动 TEST-BUG-8）。
   5. 双构建矩阵（全开 ON/ON: 69/69 单测 + 4/4 压测；基础 OFF/OFF: 52/52 单测 + 4/4 压测）重新编译验证 100% 全绿通过。
 
-### 🔴 [F-02] 恢复后分卷号被强制重置为 0，可能覆写历史分卷文件
+### 🔴 [F-02] 恢复后分卷号被强制重置为 0，可能覆写历史分卷文件 [✅ 已修复]
 - **来源：** 报告二 R2-中#9（列为中等）；报告三 BUG-X2（校准为 P0）；T4.0-11
 - **位置：** `core/src/flusher.cpp:447, 456`（另：`core/src/recovery.cpp:194, 317` 的 `atc.split_no = 0` 为同族问题）
 - **描述：** 命中历史文件（如 `20260904.log.3`）时代码只解析日期并执行 `current_split = 0`。该文件后续写满触发滚动切分时，将生成 `20260904.log.1` 并**直接覆盖/篡改当天已落盘的历史分卷**，造成持久化数据破坏。
 - **测试掩盖原因（报告三）：** 压测从未测试"当天已切分出 `.log.1`/`.log.2`，崩溃后重新打开 `.log.2` 追加并再次写满触发滚动"的场景。
-- **修复建议：** 从命中的文件名后缀严格解析当前分卷号（如 `rfind(".log.")` 后取序号）。
+- **修复措施（已闭环验证）：**
+  1. `core/include/logx_internal.h` 声明、`core/src/flusher.cpp` 实现统一路径解析 helper `parse_log_filename`，跨平台兼容 `/` 与 `\\` 分隔符，严格校验 8 位日期与 `.log` / `.log.N`（`N <= 255`）合法性。
+  2. 彻底修复三处分卷归零点：
+     - `flusher.cpp:ensure_append_target`：命中 hint 后调用 `parse_log_filename` 同步恢复真实 `current_date` 与 `current_split`，并以 `sr.last_block_end_offset` 初始化 `current_size`；
+     - `recovery.cpp:run_recovery`（resume 路径）：从 `rec.target_path` 解析真实分卷号赋值 `atc.split_no`，修复原 `find_last_of('/')` 在 Windows 下失效的问题；
+     - `recovery.cpp:run_recovery`（rebuilt 路径）：从 `best` 目标解析真实分卷号赋值 `atc.split_no` 并记录块偏移；
+     - `recovery.cpp:reconcile`：统一接入 `make_log_path` 生成 hint 路径，消除局部缓冲区溢出隐患。
+  3. 滚动切分增加“绝不覆盖已存在分卷”循环探测安全网（`flusher.cpp:467-477`）：切分时 `current_split += 1` 配合 `pal->file_size_path() >= 0` 循环递增至空闲分卷（或达 255 上限），确保即使升级前磁盘残留 `split_no=0` 的旧 staging Header，也绝对不会覆写已存在历史分卷。
+  4. 补齐四大严密测试用例（T1~T4）：
+     - `test_flusher.cpp`：`FileSizeThreshold_ResumeRotatesToNextSplitWithoutOverwrite`（T1，跨重启追加写满滚动至 `.log.3`，逐字节校验历史 `.log`/`.log.1` 100% 未篡改）；
+     - `test_flusher.cpp`：`FileSizeThreshold_DefensiveProbeSkipsExistingSplit`（T4，手工注入旧 staging split=0 缓存，断言跳过已存在 `.log.1` 并安全写入空闲分卷 `.log.2`，`.log.1` 逐字节无损）；
+     - `test_flusher.cpp`：`ParseLogFilename_Comprehensive`（全边界路径与异常输入合法性校验）；
+     - `test_recovery.cpp`：`RecoveryResume_PreservesSplitNoInAppendTargetCache`（T2）与 `RecoveryRebuilt_PreservesSplitNoInAppendTargetCache`（T3），覆盖两种恢复路径下 `atc.split_no == 2` 的正确接管与持久化保持。
+  5. 双构建矩阵（全开 ON/ON: 71/71 单测 + 4/4 压测；基础 OFF/OFF: 54/54 单测 + 4/4 压测）及 Android arm64-v8a 交叉编译全绿通过。
 
 ### 🟠 [F-03] 短写会造成日志永久丢失
 - **来源：** 报告二 R2-高#3
@@ -561,7 +574,7 @@
 | **T4.0-8** | §2/§10 离线解码工具 `logx_decode.py` | 坏块 break、死代码残留、容错性待对齐 | 影响离线日志捞取成功率 | D-01~D-04 |
 | **T4.0-9** | §7/§10 Kotlin Facade `LogX.kt` | export 丢弃 native 返回值；runBlocking 嵌套 | 导出状态误判与调度器线程阻塞 | K-01/K-02 |
 | **T4.0-10** | §7/§10 JNI Config 传递与 ErrorHandler | Compress 映射语义混淆 [✅ C-02 部分已闭环]；全局错误上下文单例化 | 多实例接入与算法配置异味 | C-02/J-02 |
-| **T4.0-11** | §4.3/§4.4 恢复后切分序号强制归 0 风险 | `flusher.cpp:447,456` 强制 `current_split = 0` | 覆写历史 `.log.1` 分卷 | F-02 |
+| **T4.0-11** | §4.3/§4.4 恢复后切分序号强制归 0 风险 | ✅ 已通过 F-02 落地（严格解析文件名 + 探测安全网） | — | — |
 | **T4.0-12** | §10 新建文件父目录 fsync | PAL 接口已实现但全库 0 调用 | 崩溃下可能目录项丢失 | F-04 |
 
 > 注：T4.0-10 中"Compress 映射语义混淆"已随 C-02 闭环（删除歧义常量 + `make_flag()/flag_algo()` 等 helper 全栈命名拉齐，JNI/Kotlin/Python 侧均已显式关联 `kAlgo*` 编号）；该行其余偏差（J-02 全局错误上下文）仍待修复。
@@ -602,7 +615,7 @@
 |:---|:---|:---|
 | C-01 | 压缩降级未更新块头 flag（毒丸块，解码必失败）[✅ 已修复] | 报告二#2 / 报告三 BUG-C1 |
 | F-01 | 生产路径加密文件头未记录加密标志（加密文件无法导出）[✅ 已修复] | 报告二#1 |
-| F-02 | 恢复后 `current_split` 强制归零，覆写历史分卷 | 报告二#9 / 报告三 BUG-X2（报告二列中等） |
+| F-02 | 恢复后 `current_split` 强制归零，覆写历史分卷 [✅ 已修复] | 报告二#9 / 报告三 BUG-X2（报告二列中等） |
 | J-01 | `nativeClose` 提前释放 kp_ctx，Flusher UAF | 报告二#6 / 报告三 BUG-J5（报告三列 P1） |
 | S-01 | CRC32 表初始化多线程数据竞争（UB） | 报告一 BUG-3 / 报告二#4 |
 | E-01 | 错误回调注册数据竞争（UB） | 报告一 BUG-4 / 报告二#5 |
@@ -645,7 +658,7 @@
 
 ### 修复顺序建议（综合三份报告）
 
-1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → 分卷号恢复（F-02）→ 真实崩溃恢复测试（T-01）
+1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → 真实崩溃恢复测试（T-01）
 2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ JNI 关闭顺序与 UAF 防护（J-01）→ Win64 句柄截断修复（P-01）
 3. **P1 协议健壮性与持久化**：短写检测（F-03）→ 持久化同步接入（F-04）→ 恢复校验加强（F-05）→ 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
 4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
