@@ -135,7 +135,7 @@
      - `test_flusher.cpp`：`FileSizeThreshold_DefensiveProbeSkipsExistingSplit`（T4，手工注入旧 staging split=0 缓存，断言跳过已存在 `.log.1` 并安全写入空闲分卷 `.log.2`，`.log.1` 逐字节无损）；
      - `test_flusher.cpp`：`ParseLogFilename_Comprehensive`（全边界路径与异常输入合法性校验）；
      - `test_recovery.cpp`：`RecoveryResume_PreservesSplitNoInAppendTargetCache`（T2）与 `RecoveryRebuilt_PreservesSplitNoInAppendTargetCache`（T3），覆盖两种恢复路径下 `atc.split_no == 2` 的正确接管与持久化保持。
-  5. 双构建矩阵（全开 ON/ON: 71/71 单测 + 4/4 压测；基础 OFF/OFF: 54/54 单测 + 4/4 压测）及 Android arm64-v8a 交叉编译全绿通过。
+  5. 双构建矩阵（全开 ON/ON: 74/74 单测 + 4/4 压测；基础 OFF/OFF: 57/57 单测 + 4/4 压测）及 Android arm64-v8a 交叉编译全绿通过。
 
 ### 🟠 [F-03] 短写会造成日志永久丢失
 - **来源：** 报告二 R2-高#3
