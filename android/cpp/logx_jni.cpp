@@ -14,6 +14,7 @@
 
 #include "logx_c.h"
 #include "logx_internal.h"
+#include "jni_string_util.h"
 
 #include <cstring>
 #include <string>
@@ -37,22 +38,42 @@ struct JniErrorContext {
     jmethodID mid_on_error = nullptr;
 };
 
-static JniErrorContext g_err_ctx;
+// J-02: 类级常量(jclass/jmethodID)。jclass 持全局引用在进程退出时随 JVM
+// 回收;jmethodID 语义等同 const 指针。仅这两项保留文件级静态 —— 可变状态
+// (jvm 指针、每实例上下文)全部下放实例,多实例互不干扰。
+static jclass g_logx_class = nullptr;
+static jmethodID g_mid_on_error = nullptr;
 
-static void jni_error_trampoline(void* /*user*/, logx_event_kind_e kind, int code, const char* msg) {
-    if (!g_err_ctx.jvm || !g_err_ctx.g_logx_class || !g_err_ctx.mid_on_error) {
+// J-03: 统一经 UTF-16 构造 jstring。NewStringUTF 期望 Modified UTF-8,
+// 标准 UTF-8 输入(如含 emoji/补充平面字符的消息)在个别 JVM 上可能触发
+// 编码异常;先解码为 UTF-16 码元再 NewString,与 JVM 原生表示对齐。
+// 解码逻辑在 jni_string_util.h(纯逻辑,桌面单测覆盖)。
+static jstring make_jstring_utf16(JNIEnv* env, const char* utf8) {
+    if (!utf8) return nullptr;
+    std::vector<uint16_t> units = logx_jni::utf8_to_utf16(utf8, std::strlen(utf8));
+    jstring s = env->NewString(reinterpret_cast<const jchar*>(units.data()),
+                               static_cast<jsize>(units.size()));
+    return s;
+}
+
+// J-02: 错误回调上下文按实例持有(经 cfg.err_user 传入 core,由 emit_event
+// 回传),不再使用全局静态 g_err_ctx —— 多实例场景下任一实例关闭只影响自身,
+// 其余实例的回调路径不受干扰;生命周期与实例严格同步。
+static void jni_error_trampoline(void* user, logx_event_kind_e kind, int code, const char* msg) {
+    auto* ctx = static_cast<const JniErrorContext*>(user);
+    if (!ctx || !ctx->jvm || !ctx->g_logx_class || !ctx->mid_on_error) {
         return;
     }
     JNIEnv* env = nullptr;
     bool need_detach = false;
-    jint getEnvRes = g_err_ctx.jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    jint getEnvRes = ctx->jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
     if (getEnvRes == JNI_EDETACHED) {
 #if defined(__ANDROID__)
-        if (g_err_ctx.jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+        if (ctx->jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
             need_detach = true;
         }
 #else
-        if (g_err_ctx.jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) == JNI_OK) {
+        if (ctx->jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) == JNI_OK) {
             need_detach = true;
         }
 #endif
@@ -61,12 +82,16 @@ static void jni_error_trampoline(void* /*user*/, logx_event_kind_e kind, int cod
     }
 
     if (env) {
-        jstring jMsg = env->NewStringUTF(msg ? msg : "");
-        env->CallStaticVoidMethod(g_err_ctx.g_logx_class, g_err_ctx.mid_on_error,
+        jstring jMsg = make_jstring_utf16(env, msg ? msg : "");
+        if (!jMsg) {
+            // J-03: 构造失败(如 OOM)时降级为空串占位,保证回调链路不中断
+            jMsg = env->NewStringUTF("");
+        }
+        env->CallStaticVoidMethod(ctx->g_logx_class, ctx->mid_on_error,
                                   static_cast<jint>(kind), static_cast<jint>(code), jMsg);
         env->DeleteLocalRef(jMsg);
         if (need_detach) {
-            g_err_ctx.jvm->DetachCurrentThread();
+            ctx->jvm->DetachCurrentThread();
         }
     }
 }
@@ -122,8 +147,10 @@ static int export_trampoline(void* user, const char* date, const char* plaintext
     if (!ctx || !ctx->cb || !ctx->mid) return -1;
 
     JNIEnv* env = ctx->env;
-    jstring jDate = env->NewStringUTF(date ? date : "");
-    jstring jPath = env->NewStringUTF(plaintext_path ? plaintext_path : "");
+    // J-03: 与错误回调一致,统一走 UTF-16 构造;路径含用户自定义 logDir 时
+    // 可能出现非 ASCII 字节,NewStringUTF 的 Modified UTF-8 约束同样构成风险。
+    jstring jDate = make_jstring_utf16(env, date ? date : "");
+    jstring jPath = make_jstring_utf16(env, plaintext_path ? plaintext_path : "");
 
     jint res = env->CallIntMethod(ctx->cb, ctx->mid, jDate, jPath, static_cast<jlong>(size));
 
@@ -156,13 +183,20 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     JavaVM* jvm = nullptr;
     env->GetJavaVM(&jvm);
 
-    if (jvm && !g_err_ctx.g_logx_class) {
-        jclass localLogX = env->FindClass("com/example/logx/LogX");
-        if (localLogX) {
-            g_err_ctx.jvm = jvm;
-            g_err_ctx.g_logx_class = static_cast<jclass>(env->NewGlobalRef(localLogX));
-            g_err_ctx.mid_on_error = env->GetStaticMethodID(localLogX, "onNativeError", "(IILjava/lang/String;)V");
-            env->DeleteLocalRef(localLogX);
+    // J-02: 每实例独立的错误回调上下文。g_logx_class/mid_on_error 是类级
+    // 常量(GetStaticMethodID 结果进程内稳定),在此安全复用;实例间零共享可变状态。
+    JniErrorContext* err_ctx = nullptr;
+    if (jvm) {
+        if (!g_logx_class) {
+            jclass localLogX = env->FindClass("com/example/logx/LogX");
+            if (localLogX) {
+                g_logx_class = static_cast<jclass>(env->NewGlobalRef(localLogX));
+                g_mid_on_error = env->GetStaticMethodID(localLogX, "onNativeError", "(IILjava/lang/String;)V");
+                env->DeleteLocalRef(localLogX);
+            }
+        }
+        if (g_logx_class && g_mid_on_error) {
+            err_ctx = new JniErrorContext{jvm, g_logx_class, g_mid_on_error};
         }
     }
 
@@ -197,7 +231,7 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     cfg.key_provider = kp_ctx ? jni_key_provider_trampoline : nullptr;
     cfg.user = kp_ctx;
     cfg.err_fn = jni_error_trampoline;
-    cfg.err_user = nullptr;
+    cfg.err_user = err_ctx;   // J-02: 逐实例上下文,生命周期与实例同步
 
     logx_instance_t* inst = nullptr;
     logx_status_e rc = logx_open(&cfg, &inst);
@@ -209,6 +243,7 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
             env->DeleteGlobalRef(kp_ctx->g_provider);
             delete kp_ctx;
         }
+        delete err_ctx;   // J-02: 实例创建失败,回收本实例的错误上下文
         return 0;
     }
     return reinterpret_cast<jlong>(inst);
@@ -222,6 +257,8 @@ Java_com_example_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong hand
     // J-01: 只读出 kp_ctx,不释放、不置空 —— close 内部 flush_blocking 的
     // 最后一次 drain 仍需通过它取密钥(否则尾块静默降级明文)。
     auto* kp_ctx = static_cast<JniKeyProviderContext*>(inst->key_user);
+    // J-02: 本实例的错误上下文同样在 close 完成前保持有效(关闭阶段事件不丢)。
+    auto* inst_err_ctx = static_cast<JniErrorContext*>(inst->err_user);
 
     // 1) logx_close: flush_blocking(密钥全程可用) → join Flusher → delete inst
     logx_close(inst);
@@ -234,11 +271,9 @@ Java_com_example_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong hand
         delete kp_ctx;
     }
 
-    // 3) g_err_ctx 同理在 join 后清理(避免吞掉关闭阶段事件)
-    if (g_err_ctx.g_logx_class) {
-        env->DeleteGlobalRef(g_err_ctx.g_logx_class);
-        g_err_ctx = JniErrorContext{};   // 整体清零比逐字段更不易漏
-    }
+    // 3) J-02: 错误上下文随实例释放。g_logx_class 全局引用为类级常量,
+    //    多实例共享,保留至进程退出,不在此清理(否则其余实例回调静默失效)。
+    delete static_cast<JniErrorContext*>(inst_err_ctx);
 }
 
 JNIEXPORT void JNICALL

@@ -1876,4 +1876,73 @@ TEST(Robustness, PalAtomicAdd_AlignedBehaviorContract) {
               static_cast<uint64_t>(kP06AtomicThreads) * kP06AtomicIters);  // 并发累加零丢失
 }
 
+// =========================================================================
+// 10. J 系列回归:JNI 层支持性契约 (J-02 逐实例错误上下文)
+// =========================================================================
+
+// J-02: err_fn/err_user 必须逐实例绑定。JNI 侧已把错误上下文从全局静态
+// g_err_ctx 下放到 inst->err_user;本测试在 C ABI 层验证核心契约:
+//   a) logx_open 拷贝 cfg.err_user 且 emit_event 把它原样回传回调;
+//   b) 两个实例各自注册不同的 user,事件互不串扰 —— 单实例 close 后
+//      其它实例的回调路径不受任何影响(全局态若仍存在则必然失败)。
+TEST(Robustness, ErrUserPerInstance_IsolationAcrossClose) {
+    Pal& pal = default_pal();
+
+    struct Probe { std::atomic<int> hits{0}; int id{0}; };
+    Probe pa; pa.id = 1;
+    Probe pb; pb.id = 2;
+
+    auto make_cfg = [&](const char* dir, const char* staging) {
+        logx_config_t cfg{};
+        cfg.log_dir = dir;
+        cfg.staging_path = staging;
+        cfg.max_log_length = 4096;
+        return cfg;
+    };
+
+    std::string dir_a = "logx_test_j02_a_" + std::to_string(pal.pid());
+    std::string dir_b = "logx_test_j02_b_" + std::to_string(pal.pid());
+    pal.file_mkdirs(dir_a.c_str());
+    pal.file_mkdirs(dir_b.c_str());
+    // staging 路径必须与 cfg 同生命周期(悬垂临时 string 会让 logx_open 读野指针)
+    std::string staging_a = dir_a + "/staging.mmap";
+    std::string staging_b = dir_b + "/staging.mmap";
+
+    logx_config_t cfg_a = make_cfg(dir_a.c_str(), staging_a.c_str());
+    logx_config_t cfg_b = make_cfg(dir_b.c_str(), staging_b.c_str());
+
+    // 与 JNI trampoline 同形:user 承载全部上下文,实例间无共享
+    static constexpr logx_error_fn probe_fn = [](void* user, logx_event_kind_e, int, const char*) {
+        static_cast<Probe*>(user)->hits.fetch_add(1);
+    };
+    cfg_a.err_fn = probe_fn; cfg_a.err_user = &pa;
+    cfg_b.err_fn = probe_fn; cfg_b.err_user = &pb;
+
+    logx_instance_t* ia = nullptr;
+    logx_instance_t* ib = nullptr;
+    ASSERT_EQ(logx_open(&cfg_a, &ia), LOGX_OK);
+    ASSERT_EQ(logx_open(&cfg_b, &ib), LOGX_OK);
+
+    // 两实例各产生一条 DROP 事件(非法 level),事件必须路由到各自的 probe
+    ASSERT_EQ(logx_write(ia, -1, "J02A", nullptr, 0), LOGX_ERR_INVALID_ARG);
+    ASSERT_EQ(logx_write(ib, 7, "J02B", nullptr, 0), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(pa.hits.load(), 1);   // a 的事件只进 a 的 user
+    EXPECT_EQ(pb.hits.load(), 1);   // b 的事件只进 b 的 user
+
+    // 关闭 a:J-02 场景核心 —— 若错误上下文仍存全局,这里清空后 b 将静默失效
+    ASSERT_EQ(logx_close(ia), LOGX_OK);
+    ASSERT_EQ(logx_write(ib, -1, "J02B2", nullptr, 0), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(pb.hits.load(), 2);   // b 的回调路径不受 a 关闭影响
+    EXPECT_EQ(pa.hits.load(), 1);   // a 的 probe 不再增长(实例已销毁)
+
+    ASSERT_EQ(logx_close(ib), LOGX_OK);
+
+    // 运行中逐实例重注册也路由正确(E-01 锁保护路径)
+    // (cleanup)
+    for (const auto& f : pal.file_list(dir_a.c_str())) pal.file_unlink(f.c_str());
+    pal.file_rmdir(dir_a.c_str());
+    for (const auto& f : pal.file_list(dir_b.c_str())) pal.file_unlink(f.c_str());
+    pal.file_rmdir(dir_b.c_str());
+}
+
 } // namespace

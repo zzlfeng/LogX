@@ -544,17 +544,29 @@
 - **描述：** 原实现 `nativeClose` 先 `delete kp_ctx` 再调 `logx_close(inst)`；而 `logx_close` 首先执行 `flush_blocking()`，期间后台 Flusher 仍在运行，可能继续调用 `jni_key_provider_trampoline` 访问已释放的 JNI 上下文（UAF 崩溃）。此外若 `key_user` 被置空或释放，Flusher 取 key 失败将静默把尾块降级为明文，且提前清空 `g_err_ctx` 会导致关闭阶段产生的错误事件丢失。
 - **修复方案：** 调整 `nativeClose` 析构顺序：先调用 `logx_close(inst)` 确保 `flush_blocking` 完成（密钥全程可用）并 `thread_join` Flusher 退出；随后再安全释放 `kp_ctx` 全局引用与对象，最后清理 `g_err_ctx`。不给 `inst->key_user` 赋值避免对已释放 `inst` 的写 UAF。核心契约已在 `tests/unit/test_flusher.cpp:KeyProvider_DrainsEncryptedTailAndNotCalledAfterClose` 严密断言。
 
-### 🟠 [J-02] `g_err_ctx` 全局静态变量多实例无保护
+### ✅ [J-02] `g_err_ctx` 全局静态变量多实例无保护 [已修复并闭环]
 - **来源：** 报告三 BUG-J4
-- **位置：** `android/cpp/logx_jni.cpp:40`
-- **描述：** 多实例环境共享同一 `g_err_ctx`，一个实例关闭时清空全局结构，导致其余实例的错误回调静默失效。
-- **修复建议：** 将错误回调上下文绑定到 `inst->err_user`，由每个实例独立管理生命周期。
+- **位置：** `android/cpp/logx_jni.cpp`（`jni_error_trampoline` / `nativeInit` / `nativeClose`）
+- **状态：** ✅ **已修复并闭环**
+- **描述：** 多实例环境共享同一全局 `g_err_ctx`，一个实例关闭时清空全局结构（`g_err_ctx = JniErrorContext{}`），导致其余实例的错误回调静默失效。
+- **修复方案与落地：**
+  1. 错误上下文按实例持有：`nativeInit` 为每个实例分配独立 `JniErrorContext`（jvm + 类级 jclass/jmethodID 引用），经 `cfg.err_user` 传入 core；`jni_error_trampoline` 从 `user` 参数取上下文，文件级全局 `g_err_ctx` 整体移除；
+  2. 类级常量（`g_logx_class` 全局引用、`g_mid_on_error`）保留文件级静态并注明复用安全性——二者为只读类元数据，进程内稳定，不构成实例间可变共享状态；
+  3. 生命周期与实例严格同步：`nativeClose` 在 `logx_close`（含 flush_blocking 最后一次 drain）完成、Flusher join 后释放本实例上下文，关闭阶段事件不丢；`logx_open` 失败路径同样回收，杜绝泄漏；
+  4. 核心契约回归测试 `Robustness.ErrUserPerInstance_IsolationAcrossClose`：双实例各绑独立 probe，事件精确路由到各自 user；实例 A close 后实例 B 的回调路径照常工作（全局态若残留则必然失败），同时验证 E-01 锁保护下的逐实例重注册路由。
+- **构建验证：** 三重矩阵全绿（build-full 126 测试 / build 108 单测 + 4 压测 / Android arm64 `liblogx.so` 编出含新 JNI 代码）。
 
-### 🟡 [J-03] `NewStringUTF(msg)` 在含非 ASCII 时的 Modified UTF-8 格式风险
+### ✅ [J-03] `NewStringUTF(msg)` 在含非 ASCII 时的 Modified UTF-8 格式风险 [已修复并闭环]
 - **来源：** 报告三 BUG-J6
-- **位置：** `android/cpp/logx_jni.cpp:64`
-- **描述：** C++ 端错误消息若透传非 ASCII 或特殊字节字符串，个别 JVM 实现上可能触发编码异常。
-- **修复建议：** 统一使用 UTF-16 构造。
+- **位置：** `android/cpp/logx_jni.cpp`（`make_jstring_utf16` + 新增 `android/cpp/jni_string_util.h`）
+- **状态：** ✅ **已修复并闭环**
+- **描述：** `NewStringUTF` 期望 Modified UTF-8（CESU-8 变体），C++ 端错误消息透传标准 UTF-8（尤其 4 字节补充平面字符、嵌入 NUL 等）时在个别 JVM 实现上可能触发编码异常。
+- **修复方案与落地：**
+  1. 统一构造路径：新增 `make_jstring_utf16` —— 先将 UTF-8 严格解码为 UTF-16 码元序列，再经 `env->NewString`（UTF-16 原生语义）构造 jstring；错误回调与导出回调（date/path 含用户自定义 logDir 时同样可能非 ASCII）两条链路全部切换；
+  2. 解码器纯逻辑化（`jni_string_util.h`，无 JNI 依赖）：按 RFC 3629 拒绝过长编码/代理区/越界，非法字节产出 U+FFFD 并滑动 1 字节重同步（与核心 `parse_records_stream` 容灾策略一致），绝不崩溃；兼容 Modified UTF-8 的 NUL 编码（C0 80 → U+0000）；
+  3. 构造失败（OOM）降级空串占位，回调链路不中断；
+  4. 回归测试：新增 `tests/unit/test_jni_string.cpp` 共 9 个用例（ASCII 恒等、Modified NUL、2/3 字节 BMP、4 字节 emoji 代理对、过长编码/代理区/U+10FFFF 以上拒绝、截断与乱码重同步不丢后续字符、混合串往返），桌面与 Android 单测同源覆盖；CMakeLists 增补 `android/cpp` include 路径。
+- **构建验证：** 三重矩阵全绿（同 J-02）。
 
 ---
 
@@ -813,7 +825,7 @@
 | E-03 | 导出错误被吞 [✅ 已修复] | E-04 | export 临时文件命名冲突 [✅ 已修复] |
 | E-05 | Windows 路径分隔符 [✅ 已修复] | E-06 | flush_threshold==0 语义 [✅ 已修复] |
 | E-07 | logx_stats_t ABI 兼容 [✅ 已修复] | P-02 | file_size_path 开销 [✅ 已修复] |
-| P-03 | file_rmdir 错误转译 [✅ 已修复] | J-02 | g_err_ctx 多实例互踩 |
+| P-03 | file_rmdir 错误转译 [✅ 已修复] | J-02 | g_err_ctx 多实例互踩 [✅ 已修复] |
 | K-01 | Kotlin export 丢返回值 | K-02 | runBlocking 嵌套 |
 | D-01 | Python cksum break 丢记录 | D-02 | Python 坏块 break 丢文件 |
 | D-03 | GCM 失败策略不一致 | F-10 | 缺少 50~100ms Debounce 聚集刷盘 [✅ 已修复] |
@@ -828,7 +840,7 @@
 | FM-04 | cksum O(n²) 重扫 [✅ 已修复] | F-08 | flush_blocking 无超时 [✅ 已修复] |
 | F-09 | random_bytes 退化低熵 [✅ 已修复] | P-04 | QPF 重复查询 [✅ 已修复] |
 | P-05 | SetFilePointer 冗余 [✅ 已修复] | P-06 | atomic_add 对齐断言 [✅ 已修复] |
-| J-03 | NewStringUTF 编码风险 | K-03 | errorHandler GC 延迟 |
+| J-03 | NewStringUTF 编码风险 [✅ 已修复] | K-03 | errorHandler GC 延迟 |
 | K-04 | setErrorHandler 并发校验 | D-04 | Python 死代码 |
 | D-05 | Python 64MB 解压上限 | C-04 | 缺少 ARMv8 硬件加速（T4.0-5）[✅ 已修复] |
 | S-06 | 双 Header 提交内存序偏离（T4.0-3） | — | — |

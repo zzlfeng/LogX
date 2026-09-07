@@ -29,6 +29,7 @@ add_executable(logx_unit_tests
     test_flusher.cpp
     test_codec.cpp
     test_robustness.cpp
+    test_jni_string.cpp
 )
 target_link_libraries(logx_unit_tests
     PRIVATE
@@ -42,6 +43,8 @@ if(NOT WIN32)
 endif()
 target_include_directories(logx_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
+    # J-03: JNI 纯逻辑头(jni_string_util.h)在 android/cpp,桌面单测直接包含验证
+    ${CMAKE_SOURCE_DIR}/android/cpp
     # C-04 真机用例直接调用 vendored mbedtls C ABI(aesce.c 符号经 logx_core
     # 静态链接进本测试);include 路径在 logx_core 为 PRIVATE,此处需显式补。
     ${CMAKE_SOURCE_DIR}/third_party/mbedtls/include
