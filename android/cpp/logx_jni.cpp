@@ -212,23 +212,28 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
 
 JNIEXPORT void JNICALL
 Java_com_example_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong handle) {
-    if (handle != 0) {
-        auto* inst = reinterpret_cast<logx_instance_t*>(handle);
-        auto* kp_ctx = static_cast<JniKeyProviderContext*>(inst->key_user);
-        if (kp_ctx) {
-            if (kp_ctx->g_provider) {
-                env->DeleteGlobalRef(kp_ctx->g_provider);
-            }
-            delete kp_ctx;
-            inst->key_user = nullptr;
+    if (handle == 0) return;
+    auto* inst = reinterpret_cast<logx_instance_t*>(handle);
+
+    // J-01: 只读出 kp_ctx,不释放、不置空 —— close 内部 flush_blocking 的
+    // 最后一次 drain 仍需通过它取密钥(否则尾块静默降级明文)。
+    auto* kp_ctx = static_cast<JniKeyProviderContext*>(inst->key_user);
+
+    // 1) logx_close: flush_blocking(密钥全程可用) → join Flusher → delete inst
+    logx_close(inst);
+
+    // 2) Flusher 已 join, trampoline 不可能再被调用,现在释放才安全
+    if (kp_ctx) {
+        if (kp_ctx->g_provider) {
+            env->DeleteGlobalRef(kp_ctx->g_provider);
         }
-        if (g_err_ctx.g_logx_class) {
-            env->DeleteGlobalRef(g_err_ctx.g_logx_class);
-            g_err_ctx.g_logx_class = nullptr;
-            g_err_ctx.mid_on_error = nullptr;
-            g_err_ctx.jvm = nullptr;
-        }
-        logx_close(inst);
+        delete kp_ctx;
+    }
+
+    // 3) g_err_ctx 同理在 join 后清理(避免吞掉关闭阶段事件)
+    if (g_err_ctx.g_logx_class) {
+        env->DeleteGlobalRef(g_err_ctx.g_logx_class);
+        g_err_ctx = JniErrorContext{};   // 整体清零比逐字段更不易漏
     }
 }
 

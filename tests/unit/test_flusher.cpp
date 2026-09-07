@@ -9,8 +9,11 @@
 
 #include "logx_internal.h"
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace logx;
@@ -1162,3 +1165,150 @@ TEST(FlusherTest, FileSizeThreshold_ShouldRotateFileSize_Enforces4GiBCapacity) {
     EXPECT_FALSE(should_rotate_file_size(kSingleFileMaxCapacity - 1, UINT64_MAX));
     EXPECT_TRUE(should_rotate_file_size(kSingleFileMaxCapacity, UINT64_MAX));
 }
+
+#if LOGX_WITH_AESGCM
+
+TEST(FlusherTest, KeyProvider_DrainsEncryptedTailAndNotCalledAfterClose) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_j01_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    static const uint8_t s_test_key[32] = {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10
+    };
+
+    struct KeyTrackerContext {
+        std::atomic<int> call_count{0};
+        std::atomic<bool> closed{false};
+        std::atomic<bool> called_after_close{false};
+    } tracker;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 128 * 1024;  // 大阈值确保写入不自动触发落盘
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 1;
+    cfg.kid = 33;
+    cfg.key_provider = [](uint16_t kid, void* user) -> const uint8_t* {
+        auto* ctx = static_cast<KeyTrackerContext*>(user);
+        if (ctx) {
+            ctx->call_count.fetch_add(1, std::memory_order_relaxed);
+            if (ctx->closed.load(std::memory_order_seq_cst)) {
+                ctx->called_after_close.store(true, std::memory_order_seq_cst);
+            }
+        }
+        // 模拟跨语言耗时, 放大并发竞态窗口
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (kid == 33) return s_test_key;
+        return nullptr;
+    };
+    cfg.user = &tracker;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 写入尾块数据 (不主动调用 logx_flush)
+    const char* tag = "J01Tag";
+    const char* msg = "tail_payload_must_be_encrypted_on_close";
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, tag, reinterpret_cast<const uint8_t*>(msg),
+                             static_cast<uint32_t>(strlen(msg))), LOGX_OK);
+    }
+
+    // 关闭实例: 核心验证点
+    // 1. logx_close 内部执行 flush_blocking, 必须在退出前调用 key_provider 完成加密落盘
+    // 2. logx_close 返回时 Flusher 必须已被 join, 不得再有任何 key_provider 调用
+    logx_close(inst);
+    tracker.closed.store(true, std::memory_order_seq_cst);
+
+    // 断言 1: 关闭过程中必须通过 key_provider 完成了尾块加密落盘
+    EXPECT_GE(tracker.call_count.load(), 1);
+
+    // 稍作等待, 确保如果 Flusher 线程未被 join 仍有遗留异步回调, 会被捕捉
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(tracker.called_after_close.load());
+
+    // 断言 2: 验证落盘文件中的尾块确实标记为加密 (杜绝 J-01 降级明文缺陷)
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    pal.wallclock_date(&yyyymmdd, &hhmmss);
+    char date_str[16];
+    std::snprintf(date_str, sizeof(date_str), "%08u", yyyymmdd);
+    std::string log_path = dir + "/" + date_str + ".log";
+
+    int log_fd = pal.file_open(log_path.c_str(), false, false);
+    ASSERT_GE(log_fd, 0);
+    int64_t file_sz = pal.file_size(log_fd);
+    EXPECT_GT(file_sz, 32);  // 至少包含 32B 文件头 + 块
+
+    // 读首个块头 (偏移 32, 长度 34B)
+    uint8_t bhdr[34] = {};
+    ASSERT_EQ(pal.file_pread(log_fd, bhdr, 34, 32), 34);
+    pal.file_close(log_fd);
+    EXPECT_TRUE(flag_encrypted(bhdr[5]));
+
+    // 断言 3: 用新实例导出日志, 验证密文可被正确解密且明文完整无损
+    logx_config_t rcfg{};
+    rcfg.log_dir = dir.c_str();
+    std::string staging2 = dir + "/staging2.mmap";
+    rcfg.staging_path = staging2.c_str();
+    rcfg.max_log_length = 20 * 1024;
+    rcfg.retention_days = 7;
+    rcfg.max_file_size = 10 * 1024 * 1024;
+    rcfg.compress_algo = kAlgoNone;
+    rcfg.encrypt_enable = 1;
+    rcfg.kid = 33;
+    rcfg.key_provider = [](uint16_t kid, void*) -> const uint8_t* {
+        if (kid == 33) return s_test_key;
+        return nullptr;
+    };
+
+    logx_instance_t* rinst = nullptr;
+    ASSERT_EQ(logx_open(&rcfg, &rinst), LOGX_OK);
+
+    struct ExportContext {
+        int count = 0;
+        std::string content;
+        Pal* pal = nullptr;
+    } exp_ctx;
+    exp_ctx.pal = &pal;
+
+    auto export_cb = [](void* user, const char*, const char* path, uint64_t size) -> int {
+        auto* ctx = static_cast<ExportContext*>(user);
+        ctx->count++;
+        int fd = ctx->pal->file_open(path, false, false);
+        if (fd >= 0) {
+            std::vector<char> buf(size);
+            if (ctx->pal->file_pread(fd, buf.data(), size, 0) == static_cast<long>(size)) {
+                ctx->content.append(buf.data(), size);
+            }
+            ctx->pal->file_close(fd);
+        }
+        return 0;
+    };
+
+    EXPECT_EQ(logx_export(rinst, date_str, date_str, export_cb, &exp_ctx), LOGX_OK);
+    EXPECT_GE(exp_ctx.count, 1);
+    EXPECT_EQ(exp_ctx.content.find("decode fail"), std::string::npos);
+    EXPECT_NE(exp_ctx.content.find("seq="), std::string::npos);
+    EXPECT_NE(exp_ctx.content.find("4a3031546167"), std::string::npos);
+
+    logx_close(rinst);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+#endif  // LOGX_WITH_AESGCM

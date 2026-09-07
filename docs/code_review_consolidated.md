@@ -428,11 +428,11 @@
 
 ## 八、JNI 层
 
-### 🔴 [J-01] `nativeClose` 提前释放 KeyProvider 上下文，与 Flusher 线程竞态导致潜在 UAF
+### 🔴 [J-01] `nativeClose` 提前释放 KeyProvider 上下文，与 Flusher 线程竞态导致潜在 UAF [✅ 已修复]
 - **来源：** 报告二 R2-高#6 ＝ 报告三 BUG-J5（报告二列高优先级，报告三列 P1）
-- **位置：** `android/cpp/logx_jni.cpp:210-230`
-- **描述：** `nativeClose` 先 `delete kp_ctx` 再调 `logx_close(inst)`；而 `logx_close` 首先执行 `flush_blocking()`，期间后台 Flusher 仍在运行，可能继续调用 `jni_key_provider_trampoline` 访问已释放的 JNI 上下文（UAF）。
-- **修复建议：** 先完成 `logx_close()` 并确认 Flusher 已 join，再释放 JNI KeyProvider 上下文和 GlobalRef。
+- **位置：** `android/cpp/logx_jni.cpp:213-238`
+- **描述：** 原实现 `nativeClose` 先 `delete kp_ctx` 再调 `logx_close(inst)`；而 `logx_close` 首先执行 `flush_blocking()`，期间后台 Flusher 仍在运行，可能继续调用 `jni_key_provider_trampoline` 访问已释放的 JNI 上下文（UAF 崩溃）。此外若 `key_user` 被置空或释放，Flusher 取 key 失败将静默把尾块降级为明文，且提前清空 `g_err_ctx` 会导致关闭阶段产生的错误事件丢失。
+- **修复方案：** 调整 `nativeClose` 析构顺序：先调用 `logx_close(inst)` 确保 `flush_blocking` 完成（密钥全程可用）并 `thread_join` Flusher 退出；随后再安全释放 `kp_ctx` 全局引用与对象，最后清理 `g_err_ctx`。不给 `inst->key_user` 赋值避免对已释放 `inst` 的写 UAF。核心契约已在 `tests/unit/test_flusher.cpp:KeyProvider_DrainsEncryptedTailAndNotCalledAfterClose` 严密断言。
 
 ### 🟠 [J-02] `g_err_ctx` 全局静态变量多实例无保护
 - **来源：** 报告三 BUG-J4
@@ -681,7 +681,7 @@
 | C-01 | 压缩降级未更新块头 flag（毒丸块，解码必失败）[✅ 已修复] | 报告二#2 / 报告三 BUG-C1 |
 | F-01 | 生产路径加密文件头未记录加密标志（加密文件无法导出）[✅ 已修复] | 报告二#1 |
 | F-02 | 恢复后 `current_split` 强制归零，覆写历史分卷 [✅ 已修复] | 报告二#9 / 报告三 BUG-X2（报告二列中等） |
-| J-01 | `nativeClose` 提前释放 kp_ctx，Flusher UAF | 报告二#6 / 报告三 BUG-J5（报告三列 P1） |
+| J-01 | `nativeClose` 提前释放 kp_ctx，Flusher UAF [✅ 已修复] | 报告二#6 / 报告三 BUG-J5（报告三列 P1） |
 | S-01 | CRC32 表初始化多线程数据竞争（UB） | 报告一 BUG-3 / 报告二#4 |
 | E-01 | 错误回调注册数据竞争（UB） | 报告一 BUG-4 / 报告二#5 |
 | P-01 | Win64 HANDLE → int 截断（报告一列 P0） | 报告一 BUG-5 / 报告二#10（报告二列中等） |
@@ -724,7 +724,7 @@
 ### 修复顺序建议（综合三份报告）
 
 1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → 真实崩溃恢复测试（T-01）
-2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ JNI 关闭顺序与 UAF 防护（J-01）→ Win64 句柄截断修复（P-01）
+2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ [✅ JNI 关闭顺序与 UAF 防护（J-01）] → Win64 句柄截断修复（P-01）
 3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → [✅ 恢复校验加强（F-05）] → 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
 4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
 5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）
