@@ -50,6 +50,7 @@ struct Instance {
 
     Staging*  staging = nullptr;
     Flusher*  flusher = nullptr;
+    std::atomic<int> active_log_fd{-1};
 
     // ---- 错误回调 ----
     logx_error_fn err_fn = nullptr;
@@ -149,6 +150,10 @@ struct FileScanResult {
 };
 FileScanResult scan_one(Instance* inst, const std::string& path, bool repair);
 FileScanResult scan_append_target(Instance* inst, const std::string& hint_path);
+// 显式断电持久化检查点: 同步 staging 脏数据 (MS_SYNC) 与活跃日志文件 (fdatasync) (spec §11)。
+// 成功返回 0, 失败返回 -1 (非致命, 仅打点发事件)。
+// out_sync_time_ms: 可选输出完成同步时的系统时间戳 (毫秒, wallclock ms)。
+int durability_sync(Instance* inst, uint64_t* out_sync_time_ms = nullptr);
 
 // 在 log_dir 下扫描所有日志文件,选"日期最大且尾块 seqno 最大"者作为追加目标;
 // 返回文件路径(空 = 无)。recovery 对账用。

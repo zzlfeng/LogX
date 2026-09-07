@@ -178,6 +178,33 @@ BlockWriteResult write_and_record(Instance* inst, int fd,
     return r;
 }
 
+// spec §11 断电检查点: staging mmap 同步 + 日志文件 fdatasync。
+// 返回 0 表示全部成功; -1 表示至少一项失败(失败不阻塞, 仅打点发事件)。
+// out_sync_time_ms: 可选输出完成同步时的系统时间戳 (毫秒, wallclock ms)。
+int durability_sync(Instance* inst, uint64_t* out_sync_time_ms) {
+    if (!inst) return -1;
+    int ret = 0;
+    // 1. staging mmap 同步
+    if (inst->staging) {
+        if (inst->staging->mmap_sync_now() != 0) {
+            emit_event(inst, LOGX_EV_IO, -1, "durability sync: staging msync failed");
+            ret = -1;
+        }
+    }
+    // 2. 活跃日志文件 fdatasync
+    int fd = inst->active_log_fd.load();
+    if (fd >= 0) {
+        if (inst->pal->file_fsync(fd) != 0) {
+            emit_event(inst, LOGX_EV_IO, -1, "durability sync: file fsync failed");
+            ret = -1;
+        }
+    }
+    if (out_sync_time_ms) {
+        *out_sync_time_ms = inst->pal->wallclock_ms();
+    }
+    return ret;
+}
+
 // ---- §C 文件路径 / 清理 ----
 std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint8_t split) {
     char buf[128];
@@ -380,6 +407,13 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
             inst->pal->file_close(fd); return -1;
         }
         std::memcpy(out_salt, salt, 8);
+        // 新建文件后对文件和父目录 fsync 一次 (spec §10 / T4.0-12)
+        if (inst->pal->file_fsync(fd) != 0) {
+            emit_event(inst, LOGX_EV_IO, -1, "new file fsync failed");
+        }
+        if (inst->pal->file_dir_fsync(inst->log_dir.c_str()) != 0) {
+            emit_event(inst, LOGX_EV_IO, -1, "new file dir fsync failed");
+        }
     } else {
         // 已存在:读头取 salt
         uint8_t hdr[32];
@@ -456,8 +490,14 @@ struct FlusherCtx {
 
 void close_current(FlusherCtx* c, Pal* pal) {
     if (c->current_fd >= 0) {
+        if (pal->file_fsync(c->current_fd) != 0) {
+            if (c->inst) emit_event(c->inst, LOGX_EV_IO, -1, "close file fsync failed");
+        }
         pal->file_close(c->current_fd);
         c->current_fd = -1;
+        if (c->inst) {
+            c->inst->active_log_fd.store(-1);
+        }
     }
 }
 
@@ -532,6 +572,7 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
                                                      &c->current_path,
                                                      c->current_salt);
         if (c->current_fd < 0) return -1;
+        inst->active_log_fd.store(c->current_fd);
         int64_t sz = inst->pal->file_size(c->current_fd);
         c->current_size = sz < 0 ? 0 : static_cast<uint64_t>(sz);
     }
@@ -651,20 +692,27 @@ void drain_once(FlusherCtx* c, Instance* inst) {
 
 void flusher_loop(Instance* inst) {
     FlusherCtx c{};
+    c.inst = inst;
     inst->flusher_running.store(true);
     retention_cleanup_impl(inst);
+    uint64_t last_sync_ms = inst->pal->wallclock_ms();
     while (!inst->flusher_exit.load()) {
         drain_once(&c, inst);
+
+        // 运行期 30s 定时持久化检查点 (spec §11 / T4.0-6)
+        uint64_t now_ms = inst->pal->wallclock_ms();
+        if (now_ms >= last_sync_ms + 30000) {
+            durability_sync(inst, nullptr);
+            last_sync_ms = now_ms;
+        }
+
         if (inst->flush_event) {
-            if (inst->staging && inst->staging->is_degraded()) {
-                // 堆内存降级模式 (spec §2 / §10): 启用 5s (5000ms) 定时兜底落盘
-                inst->pal->ev_wait_timeout(inst->flush_event, 5000);
-            } else {
-                inst->pal->ev_wait(inst->flush_event);
-            }
+            uint32_t timeout_ms = (inst->staging && inst->staging->is_degraded()) ? 5000 : 30000;
+            inst->pal->ev_wait_timeout(inst->flush_event, timeout_ms);
         }
     }
     drain_once(&c, inst);
+    durability_sync(inst, nullptr);
     close_current(&c, inst->pal);
 }
 
@@ -752,6 +800,12 @@ bool append_block(Instance* inst,
         if (!write_file_header(inst, fd, yyyymmdd, inst->kid, salt)) {
             inst->pal->file_close(fd); return false;
         }
+        if (inst->pal->file_fsync(fd) != 0) {
+            emit_event(inst, LOGX_EV_IO, -1, "new file fsync failed");
+        }
+        if (inst->pal->file_dir_fsync(inst->log_dir.c_str()) != 0) {
+            emit_event(inst, LOGX_EV_IO, -1, "new file dir fsync failed");
+        }
     } else {
         if (file_salt) {
             // 用 caller 提供的 salt 校验;不一致则报错(防止调用方用错)
@@ -762,6 +816,9 @@ bool append_block(Instance* inst,
     }
     BlockWriteResult wr = write_and_record(inst, fd, raw_block, raw_len,
                                            seqno, flag, salt, nullptr);
+    if (wr.ok) {
+        inst->pal->file_fsync(fd);
+    }
     inst->pal->file_close(fd);
     if (!wr.ok) return false;
     if (out_block_start_offset) *out_block_start_offset = wr.start_offset;
@@ -840,6 +897,8 @@ void flush_blocking(Instance* inst) {
         inst->pal->ev_signal(inst->flush_event);
         inst->pal->sleep_ms(5);
     }
+    // spec §11 断电检查点: 退后台时执行持久化同步 (fdatasync + msync)
+    durability_sync(inst, nullptr);
     // 退后台落盘完成时, 执行保留期超期清理
     retention_cleanup_impl(inst);
 }

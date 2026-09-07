@@ -139,7 +139,7 @@
 
 ### 🟢 [F-03] 短写会造成日志永久丢失 [✅ 已修复]
 - **来源：** 报告二 R2-高#3
-- **位置：** `core/src/flusher.cpp:138-144`（`append_block_raw`）、`flusher.cpp:163-171`（`write_and_record`）、`flusher.cpp:241-245`（`write_file_header`）
+- **位置：** `core/src/flusher.cpp:138-144`（`append_block_raw`）、`flusher.cpp:163-171`（`write_and_record`）、`flusher.cpp:255-274`（`write_file_header`）
 - **描述：** 只判断 `file_write()` 是否返回负数，未确认返回值是否等于完整 frame 长度。若 PAL 实现或注入测试返回部分写入（短写），代码仍视为块写入成功，随后清零 staging 原始数据、提交新 flushed 水位，丢失尚未完整落盘的日志。且物理文件留下撕裂尾部，污染后续日志块写入。
 - **修复方案与落地：**
   1. `append_block_raw` 严格校验返回值 `n != static_cast<long>(frame.size())`：任何短写均视为失败并触发 `block_write_errors.fetch_add(1)` 与 `emit_event(inst, LOGX_EV_IO, -1, "block short write")`；
@@ -151,11 +151,27 @@
      - `ShortWrite_MidStreamEnospcTruncatesTornTail` (Case C: 模拟物理写入中途磁盘满返回 -1，验证残留物理尾部被自动回滚截断)。
   5. 双构建矩阵（全开 ON/ON: 77/77 单测 + 4/4 压测；基础 OFF/OFF: 60/60 单测 + 4/4 压测）及 Android arm64-v8a 交叉编译全绿通过。
 
-### 🟠 [F-04] 关键写入流程没有调用持久化同步
+### 🟠 [F-04] 关键写入流程没有调用持久化同步 [✅ 已修复]
 - **来源：** 报告二 R2-高#7；T4.0-6 / T4.0-12 关联
 - **位置：** `core/src/staging.cpp:57`（close 时 `mmap_sync(mm_, false)` 异步）；PAL 已实现 `file_fsync()`、`file_dir_fsync()` 但全库 0 调用
 - **描述：** `logx_flush()` 返回后若进程或设备立即断电，文件块、Header 或目录项可能仍未持久化，无法满足强崩溃恢复语义。
-- **修复建议：** 在块落盘、Header 提交、新建文件等关键节点接入文件/目录 fsync 与同步 mmap；实现运行期定时同步。
+- **修复措施与结论（Commit `d6...` 闭环）：**
+  1. **耐久性同步核心抽象**：在 `flusher.cpp` 与 `logx_internal.h` 增加 `durability_sync(Instance* inst, uint64_t* out_sync_time_ms)`，协调 staging 强同步与活跃日志文件 `fdatasync`（`out_sync_time_ms` 输出完成同步时的系统时间戳毫秒）；失败发出 `LOGX_EV_IO` 事件，不阻断前台业务写入。
+  2. **Staging 强同步能力补齐**：在 `logx_staging.h` 与 `staging.cpp` 实现 `Staging::mmap_sync_now()`（普通模式执行 `MS_SYNC` / `FlushViewOfFile` 强同步并刷新 staging 句柄 `file_fsync(fd_)`；堆降级模式写回脏数据并 fsync）；同时将 `Staging::close()` 升级为同步刷盘。
+  3. **新建文件父目录持久化（spec §10 / T4.0-12）**：在 `open_or_create_append_target` 与 `append_block` 中，新创建 `.log` 文件写完 32B 文件头后立即执行 `file_fsync(fd)` 与 `file_dir_fsync(inst->log_dir)`，确保断电下目录项与文件头绝对不丢失。
+  4. **运行期 30s 定时检查点（spec §11 / T4.0-6）**：`flusher_loop` 引入 `last_sync_ms` 时间戳与 `ev_wait_timeout(30000)` 唤醒机制，保证运行期最多每 30 秒主动执行一次强刷盘检查点；退出时执行终态同步。
+  5. **退后台与退出持久化**：`flush_blocking`（退后台）与 `close_current`/`logx_close`（退出）均接入 `durability_sync`。
+  6. **Win32 目录 fsync 权限修复**：修正 `pal_win32.cpp` 中 `file_dir_fsync` 打开目录句柄时遗漏的 `FILE_ADD_FILE` 权限，消除 Windows 下 `FlushFileBuffers` 报 `ERROR_ACCESS_DENIED`（错误码 5）缺陷。
+  7. **单测覆盖（`tests/unit/test_robustness.cpp` 新增 5 组用例）**：
+     - `Persistence_FlushTriggersFileAndStagingFsync`：验证退后台 `logx_flush` 触发活跃日志文件与 staging 的强同步；
+     - `Persistence_DurabilitySyncDirectAndGraceful`：验证直接调用 `durability_sync` 且无 active fd 时优雅返回 0；
+     - `Persistence_NewFileTriggersParentDirFsync`：验证新建文件触发父目录同步且匹配目录路径；
+     - `Persistence_CloseTriggersFinalSync`：验证 `logx_close` 在关闭句柄前触发终态强刷盘；
+     - `Persistence_FsyncFailureEmitsEventWithoutBlocking`：注入 `file_fsync` 失败，验证发出 `LOGX_EV_IO` 且后续写入正常继续。
+  8. **双构建矩阵与交叉编译验证**：
+     - 全开 ON/ON: 82/82 单测 + 4/4 压测全绿通过；
+     - 基础 OFF/OFF: 65/65 单测 + 4/4 压测全绿通过；
+     - Android arm64-v8a NDK Clang Ninja 交叉编译零警告零错误通过。
 
 ### 🟠 [F-05] 恢复扫描对块头字段校验不足
 - **来源：** 报告二 R2-高#8
@@ -537,7 +553,7 @@
 | `logx_c.cpp` export 路径（`export_range`、`decode_one_file`） | 🔴 高 | 报告一 |
 | 真实进程级崩溃窗口（独立子进程强杀） | 🔴 高 | 报告二（掩盖 T-01） |
 | PAL 短写注入（短写截断回滚与中途 ENOSPC 容灾） | ✅ 已补齐 | 报告二（F-03 闭环，Case A/B/C） |
-| PAL fsync 失败和 mmap 同步失败注入 | 🟠 中 | 报告二（F-04 待闭环） |
+| PAL fsync 失败和 mmap 同步失败注入 | ✅ 已补齐 | 报告二（F-04 闭环，MockFsyncPal 5 组用例） |
 | 畸形 `raw_len`、非法版本和非法 flag | 🟠 中 | 报告二 |
 | 分卷恢复及 `.log.N` 目标选择（掩盖 F-02） | ✅ 已补齐 | 报告二/三（F-02 闭环，T1~T4 用例） |
 | 双 Header 双坏（整区重建）路径 | 🟠 中 | 报告一 |
@@ -578,13 +594,13 @@
 | **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | 实现为 A(中间态 CRC)→ B → release fence | 掉电极端窗口内存序轻微偏离 | S-06 |
 | **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | `flusher_loop` 仍为无超时阻塞 `ev_wait`（仅堆降级模式有 5s 超时） | 缺乏低频写定时兜底刷盘机制 | F-10 |
 | **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | ✅ 已落地并闭环：`aesce.c` 移植完成，AESE/AESMC/EOR 标准指令直通；后续独立复审完成官方向量锚定（McGrew-Viega TC13/14/15 + 零密钥基线，OpenSSL 交叉验证 72/72）、热路径逐块探针消除与防竞态定型，x86 + 真机（骁龙865）双路径全量回归通过 | — | C-04 |
-| **T4.0-6** | §11 运行期每 30s 定时 msync/fdatasync | 定时器未实现；PAL 接口已实现但全库 0 调用 | 掉电下脏页刷盘时机不可控 | F-04 |
+| **T4.0-6** | §11 运行期每 30s 定时 msync/fdatasync | ✅ 已通过 F-04 补齐：`flusher_loop` 接入 30s 超时唤醒与 `durability_sync`，落盘 + staging 强刷盘 | — | — |
 | **T4.0-7** | §9 未对齐访问 / 23:59:59 时钟跳变用例 | ✅ 已通过 T4.5 落地 | — | — |
 | **T4.0-8** | §2/§10 离线解码工具 `logx_decode.py` | 坏块 break、死代码残留、容错性待对齐 | 影响离线日志捞取成功率 | D-01~D-04 |
 | **T4.0-9** | §7/§10 Kotlin Facade `LogX.kt` | export 丢弃 native 返回值；runBlocking 嵌套 | 导出状态误判与调度器线程阻塞 | K-01/K-02 |
 | **T4.0-10** | §7/§10 JNI Config 传递与 ErrorHandler | Compress 映射语义混淆 [✅ C-02 部分已闭环]；全局错误上下文单例化 | 多实例接入与算法配置异味 | C-02/J-02 |
 | **T4.0-11** | §4.3/§4.4 恢复后切分序号强制归 0 风险 | ✅ 已通过 F-02 落地（严格解析文件名 + 探测安全网） | — | — |
-| **T4.0-12** | §10 新建文件父目录 fsync | PAL 接口已实现但全库 0 调用 | 崩溃下可能目录项丢失 | F-04 |
+| **T4.0-12** | §10 新建文件父目录 fsync | ✅ 已通过 F-04 补齐：新建日志文件头落盘后执行文件与父目录 `file_dir_fsync` 双同步 | — | — |
 
 > 注：T4.0-10 中"Compress 映射语义混淆"已随 C-02 闭环（删除歧义常量 + `make_flag()/flag_algo()` 等 helper 全栈命名拉齐，JNI/Kotlin/Python 侧均已显式关联 `kAlgo*` 编号）；该行其余偏差（J-02 全局错误上下文）仍待修复。
 
@@ -635,7 +651,7 @@
 
 | 编号 | 问题 | 编号 | 问题 |
 |:---|:---|:---|:---|
-| F-03 | 短写未检测致日志丢失 [✅ 已修复] | F-04 | fsync/同步持久化零接入 |
+| F-03 | 短写未检测致日志丢失 [✅ 已修复] | F-04 | fsync/同步持久化零接入 [✅ 已修复] |
 | F-05 | 恢复块头校验不足 | F-06 | atc offset uint32 截断 |
 | F-07 | split_no uint8 / 255 停写（T4.0-2） | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
 | C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed |
@@ -669,6 +685,6 @@
 
 1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → 真实崩溃恢复测试（T-01）
 2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ JNI 关闭顺序与 UAF 防护（J-01）→ Win64 句柄截断修复（P-01）
-3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → 持久化同步接入（F-04）→ 恢复校验加强（F-05）→ 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
+3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → 恢复校验加强（F-05）→ 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
 4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
 5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）

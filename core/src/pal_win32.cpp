@@ -167,8 +167,8 @@ public:
         return FlushFileBuffers(h) ? 0 : -1;
     }
     int file_dir_fsync(const char* dir_path) override {
-        // 目录句柄 + FlushFileBuffers ≈ 目录项 fsync
-        HANDLE h = CreateFileA(dir_path, FILE_LIST_DIRECTORY,
+        // 目录句柄 + FlushFileBuffers ≈ 目录项 fsync (需包含写入相关权限以合法执行 FlushFileBuffers)
+        HANDLE h = CreateFileA(dir_path, FILE_LIST_DIRECTORY | FILE_ADD_FILE,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
         if (h == INVALID_HANDLE_VALUE) return -1;

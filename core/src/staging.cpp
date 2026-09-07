@@ -54,12 +54,33 @@ Staging::Staging(Pal* pal, const std::string& path, uint32_t data_size)
 
 Staging::~Staging() { close(); }
 
+int Staging::mmap_sync_now() {
+    if (!base_) return 0;
+    if (!is_heap_degraded_) {
+        int r1 = pal_->mmap_sync(mm_, /*synchronous=*/true);
+        int r2 = 0;
+        if (fd_ >= 0) {
+            r2 = pal_->file_fsync(fd_);
+        }
+        return (r1 == 0 && r2 == 0) ? 0 : -1;
+    } else {
+        if (fd_ >= 0) {
+            pal_->file_pwrite(fd_, heap_buf_.data(), heap_buf_.size(), 0);
+            return pal_->file_fsync(fd_);
+        }
+        return 0;
+    }
+}
+
 void Staging::close() {
     if (base_) {
         if (!is_heap_degraded_) {
-            pal_->mmap_sync(mm_, false);  // 退后台时上层会显式 msync(MS_SYNC)
+            pal_->mmap_sync(mm_, /*synchronous=*/true);  // 强同步 MS_SYNC / FlushViewOfFile
             pal_->mmap_close(mm_);
         } else {
+            if (fd_ >= 0) {
+                pal_->file_pwrite(fd_, heap_buf_.data(), heap_buf_.size(), 0);
+            }
             heap_buf_.clear();
             heap_buf_.shrink_to_fit();
         }
@@ -67,6 +88,7 @@ void Staging::close() {
         data_base_ = nullptr;
     }
     if (fd_ >= 0) {
+        pal_->file_fsync(fd_);
         pal_->file_close(fd_);
         fd_ = -1;
     }

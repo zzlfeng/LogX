@@ -122,6 +122,10 @@ public:
     // 关闭并 msync;幂等。
     void close();
 
+    // 显式同步 staging 数据与双 Header 到底层介质 (spec §11 断电检查点: MS_SYNC)。
+    // 成功返回 0, 失败返回 -1。
+    int mmap_sync_now();
+
     // ---- 生产者路径(锁内调用)----
     // 一次写入"一条日志的全部记录"(包含全部分片),临界区约一次 memcpy。
     // 失败原因:空闲不足(staging 满)/单条超上限 / write 失败。
@@ -167,6 +171,7 @@ public:
     uint32_t raw_size() const { return total_size_; }
 
     Pal* pal() { return pal_; }
+    void set_pal(Pal* p) { pal_ = p; }
 
 private:
     bool map_and_validate_locked();

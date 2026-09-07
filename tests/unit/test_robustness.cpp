@@ -1,10 +1,11 @@
-// test_robustness.cpp - 鲁棒性与边界容灾单测: 未对齐内存访问、时钟跳变/回拨仿真与写盘短写容灾。
+// test_robustness.cpp - 鲁棒性与边界容灾单测: 未对齐内存访问、时钟跳变/回拨仿真、写盘短写容灾与持久化同步。
 //
 // 覆盖:
 //   - 未对齐内存读写 (put_u16/32/64, get_u16/32/64, format_record, parse_records_stream)
 //   - 23:59:59 跨日跳变至次日 00:00:01 自动轮转新文件与 seqno 单调衔接
 //   - 时钟大幅回拨至过去日期, 不产生文件覆盖, 数据 100% 安全
 //   - 写盘短写 (0 <= n < size) 与中途 ENOSPC (n < 0 after partial write) 撕裂尾部回滚截断与恢复 (F-03)
+//   - 持久化同步与断电检查点 (file_fsync, file_dir_fsync, mmap_sync, durability_sync) (F-04)
 
 #include "logx_c.h"
 #include "logx_internal.h"
@@ -593,6 +594,405 @@ TEST(Robustness, ShortWrite_MidStreamEnospcTruncatesTornTail) {
     EXPECT_EQ(sr.last_block_end_offset, static_cast<uint64_t>(base_size));
 
     mock_pal.set_mode(MockShortWritePal::MODE_NORMAL);
+    logx_close(inst);
+
+    for (const auto& f : mock_pal.file_list(dir.c_str())) {
+        mock_pal.file_unlink(f.c_str());
+    }
+    mock_pal.file_rmdir(dir.c_str());
+}
+
+// =========================================================================
+// 5. MockFsyncPal: 持久化与断电检查点同步模拟 (F-04)
+// =========================================================================
+
+class MockFsyncPal : public Pal {
+public:
+    explicit MockFsyncPal(Pal* real_pal) : real_(real_pal) {}
+
+    void reset_counts() {
+        file_fsync_count.store(0);
+        file_fsync_success_count.store(0);
+        file_dir_fsync_count.store(0);
+        file_dir_fsync_success_count.store(0);
+        mmap_sync_count.store(0);
+        mmap_sync_success_count.store(0);
+        mmap_sync_sync_count.store(0);
+        mmap_sync_async_count.store(0);
+        {
+            std::lock_guard<std::mutex> lock(dir_mu);
+            synced_dirs.clear();
+        }
+        fail_file_fsync.store(false);
+        fail_dir_fsync.store(false);
+        fail_mmap_sync.store(false);
+    }
+
+    int file_fsync(int fd) override {
+        file_fsync_count.fetch_add(1);
+        if (fail_file_fsync.load()) {
+            return -1;
+        }
+        int rc = real_->file_fsync(fd);
+        if (rc == 0) {
+            file_fsync_success_count.fetch_add(1);
+        }
+        return rc;
+    }
+
+    int file_dir_fsync(const char* p) override {
+        file_dir_fsync_count.fetch_add(1);
+        if (p) {
+            std::lock_guard<std::mutex> lock(dir_mu);
+            synced_dirs.push_back(p);
+        }
+        if (fail_dir_fsync.load()) {
+            return -1;
+        }
+        int rc = real_->file_dir_fsync(p);
+        if (rc == 0) {
+            file_dir_fsync_success_count.fetch_add(1);
+        }
+        return rc;
+    }
+
+    int mmap_sync(const PalMmap& m, bool synchronous) override {
+        mmap_sync_count.fetch_add(1);
+        if (synchronous) {
+            mmap_sync_sync_count.fetch_add(1);
+        } else {
+            mmap_sync_async_count.fetch_add(1);
+        }
+        if (fail_mmap_sync.load()) {
+            return -1;
+        }
+        int rc = real_->mmap_sync(m, synchronous);
+        if (rc == 0) {
+            mmap_sync_success_count.fetch_add(1);
+        }
+        return rc;
+    }
+
+    // 基础代理接口
+    void wallclock_date(uint32_t* yyyymmdd, uint32_t* hhmmss) override { real_->wallclock_date(yyyymmdd, hhmmss); }
+    uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
+    uint64_t monotonic_ns() override { return real_->monotonic_ns(); }
+    void     sleep_ms(uint32_t ms) override { real_->sleep_ms(ms); }
+
+    int      file_open(const char* p, bool w, bool c) override { return real_->file_open(p, w, c); }
+    int      file_close(int fd) override { return real_->file_close(fd); }
+    int64_t  file_size(int fd) override { return real_->file_size(fd); }
+    int64_t  file_size_path(const char* p) override { return real_->file_size_path(p); }
+    long     file_pread(int fd, void* b, size_t n, uint64_t o) override { return real_->file_pread(fd, b, n, o); }
+    long     file_pwrite(int fd, const void* b, size_t n, uint64_t o) override { return real_->file_pwrite(fd, b, n, o); }
+    long     file_write(int fd, const void* b, size_t n) override { return real_->file_write(fd, b, n); }
+    int      file_truncate(int fd, uint64_t sz) override { return real_->file_truncate(fd, sz); }
+    int      file_unlink(const char* p) override { return real_->file_unlink(p); }
+    int      file_mkdirs(const char* p) override { return real_->file_mkdirs(p); }
+    int      file_rmdir(const char* p) override { return real_->file_rmdir(p); }
+    std::vector<std::string> file_list(const char* dir) override { return real_->file_list(dir); }
+
+    PalMmap  mmap_open(int fd, size_t sz, bool mut) override { return real_->mmap_open(fd, sz, mut); }
+    int      mmap_close(const PalMmap& m) override { return real_->mmap_close(m); }
+
+    uint32_t pid() override { return real_->pid(); }
+    uint64_t tid() override { return real_->tid(); }
+    void     random_bytes(void* b, size_t n) override { real_->random_bytes(b, n); }
+    void     debug_log(const char* s) override { real_->debug_log(s); }
+
+    int      threading_init() override { return real_->threading_init(); }
+    void*    mutex_create() override { return real_->mutex_create(); }
+    void     mutex_lock(void* m) override { return real_->mutex_lock(m); }
+    void     mutex_unlock(void* m) override { return real_->mutex_unlock(m); }
+    void     mutex_destroy(void* m) override { return real_->mutex_destroy(m); }
+
+    void*    ev_create() override { return real_->ev_create(); }
+    void     ev_signal(void* e) override { return real_->ev_signal(e); }
+    void     ev_wait(void* e) override { return real_->ev_wait(e); }
+    bool     ev_wait_timeout(void* e, uint32_t ms) override { return real_->ev_wait_timeout(e, ms); }
+    void     ev_destroy(void* e) override { return real_->ev_destroy(e); }
+
+    int      thread_start(void* (*fn)(void*), void* a, void** out_t) override { return real_->thread_start(fn, a, out_t); }
+    int      thread_join(void* t) override { return real_->thread_join(t); }
+
+    uint64_t atomic_add(uint64_t* p, int64_t delta) override { return real_->atomic_add(p, delta); }
+    uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
+
+    std::atomic<int> file_fsync_count{0};
+    std::atomic<int> file_fsync_success_count{0};
+    std::atomic<int> file_dir_fsync_count{0};
+    std::atomic<int> file_dir_fsync_success_count{0};
+    std::atomic<int> mmap_sync_count{0};
+    std::atomic<int> mmap_sync_success_count{0};
+    std::atomic<int> mmap_sync_sync_count{0};
+    std::atomic<int> mmap_sync_async_count{0};
+
+    std::mutex dir_mu;
+    std::vector<std::string> synced_dirs;
+
+    std::atomic<bool> fail_file_fsync{false};
+    std::atomic<bool> fail_dir_fsync{false};
+    std::atomic<bool> fail_mmap_sync{false};
+
+private:
+    Pal* real_ = nullptr;
+};
+
+// 1. 退后台 logx_flush 触发日志文件与 staging 的强同步
+TEST(Robustness, Persistence_FlushTriggersFileAndStagingFsync) {
+    MockFsyncPal mock_pal(&default_pal());
+    std::string dir = std::string("logx_test_fsync_flush_") +
+                      std::to_string(mock_pal.pid()) + "_" +
+                      std::to_string(rand());
+    mock_pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    auto* internal_inst = static_cast<Instance*>(inst);
+    internal_inst->pal = &mock_pal;
+    if (internal_inst->staging) {
+        internal_inst->staging->set_pal(&mock_pal);
+    }
+
+    mock_pal.reset_counts();
+
+    // 写入日志并触发退后台 flush
+    ASSERT_EQ(logx_write(inst, 2, "FSYNC", (const uint8_t*)"test_flush_fsync_payload", 24), LOGX_OK);
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 验证:
+    // 1) 日志文件被 fsync (file_fsync_count >= 1 且底层系统调用成功)
+    EXPECT_GE(mock_pal.file_fsync_count.load(), 1);
+    EXPECT_GE(mock_pal.file_fsync_success_count.load(), 1);
+    // 2) staging 环形缓冲区被显式强同步 (mmap_sync_sync_count >= 1 且底层系统调用成功)
+    EXPECT_GE(mock_pal.mmap_sync_sync_count.load(), 1);
+    EXPECT_GE(mock_pal.mmap_sync_success_count.load(), 1);
+
+    logx_close(inst);
+
+    for (const auto& f : mock_pal.file_list(dir.c_str())) {
+        mock_pal.file_unlink(f.c_str());
+    }
+    mock_pal.file_rmdir(dir.c_str());
+}
+
+// 2. durability_sync 直接调用与无 active fd 时的优雅处理
+TEST(Robustness, Persistence_DurabilitySyncDirectAndGraceful) {
+    MockFsyncPal mock_pal(&default_pal());
+    std::string dir = std::string("logx_test_durability_direct_") +
+                      std::to_string(mock_pal.pid()) + "_" +
+                      std::to_string(rand());
+    mock_pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    auto* internal_inst = static_cast<Instance*>(inst);
+    internal_inst->pal = &mock_pal;
+    if (internal_inst->staging) {
+        internal_inst->staging->set_pal(&mock_pal);
+    }
+
+    mock_pal.reset_counts();
+
+    // 1. 无日志写入时直接调用 durability_sync: 必须优雅返回 0 (无 active fd 也不应报错)
+    uint64_t sync_ms = 0;
+    int rc = durability_sync(internal_inst, &sync_ms);
+    EXPECT_EQ(rc, 0);
+    EXPECT_GT(sync_ms, 0u);
+    EXPECT_GE(mock_pal.mmap_sync_sync_count.load(), 1);
+    EXPECT_GE(mock_pal.mmap_sync_success_count.load(), 1);
+
+    // 2. 写入日志并 flush，使 active_log_fd 成功建立
+    ASSERT_EQ(logx_write(inst, 2, "DIRECT", (const uint8_t*)"durability_direct_payload", 25), LOGX_OK);
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    mock_pal.reset_counts();
+    sync_ms = 0;
+    rc = durability_sync(internal_inst, &sync_ms);
+    EXPECT_EQ(rc, 0);
+    EXPECT_GT(sync_ms, 0u);
+    EXPECT_GE(mock_pal.file_fsync_count.load(), 1);
+    EXPECT_GE(mock_pal.file_fsync_success_count.load(), 1);
+    EXPECT_GE(mock_pal.mmap_sync_sync_count.load(), 1);
+    EXPECT_GE(mock_pal.mmap_sync_success_count.load(), 1);
+
+    logx_close(inst);
+
+    for (const auto& f : mock_pal.file_list(dir.c_str())) {
+        mock_pal.file_unlink(f.c_str());
+    }
+    mock_pal.file_rmdir(dir.c_str());
+}
+
+// 3. 新建日志文件必须同步父目录 (spec §10 / T4.0-12)
+TEST(Robustness, Persistence_NewFileTriggersParentDirFsync) {
+    MockFsyncPal mock_pal(&default_pal());
+    std::string dir = std::string("logx_test_fsync_dir_") +
+                      std::to_string(mock_pal.pid()) + "_" +
+                      std::to_string(rand());
+    mock_pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    auto* internal_inst = static_cast<Instance*>(inst);
+    internal_inst->pal = &mock_pal;
+    if (internal_inst->staging) {
+        internal_inst->staging->set_pal(&mock_pal);
+    }
+
+    mock_pal.reset_counts();
+
+    // 写入第一条日志，触发 open_or_create_append_target (新建 32B 文件头) 并落盘
+    ASSERT_EQ(logx_write(inst, 2, "DIR_SYNC", (const uint8_t*)"test_dir_sync_content", 21), LOGX_OK);
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 验证:
+    // 1) 目录同步函数必须至少被调用 1 次 (spec §10 / T4.0-12)
+    EXPECT_GE(mock_pal.file_dir_fsync_count.load(), 1);
+    // 2) 目录同步必须真正执行成功 (验证底层 FlushFileBuffers / fsync 成功且权限无 ACCESS_DENIED)
+    EXPECT_GE(mock_pal.file_dir_fsync_success_count.load(), 1);
+
+    // 3) 同步的目录路径必须与 log_dir 一致
+    bool found_dir = false;
+    {
+        std::lock_guard<std::mutex> lock(mock_pal.dir_mu);
+        for (const auto& d : mock_pal.synced_dirs) {
+            if (d.find(dir) != std::string::npos) {
+                found_dir = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(found_dir);
+
+    logx_close(inst);
+
+    for (const auto& f : mock_pal.file_list(dir.c_str())) {
+        mock_pal.file_unlink(f.c_str());
+    }
+    mock_pal.file_rmdir(dir.c_str());
+}
+
+// 4. logx_close 触发终态持久化同步 (spec §11)
+TEST(Robustness, Persistence_CloseTriggersFinalSync) {
+    MockFsyncPal mock_pal(&default_pal());
+    std::string dir = std::string("logx_test_fsync_close_") +
+                      std::to_string(mock_pal.pid()) + "_" +
+                      std::to_string(rand());
+    mock_pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    auto* internal_inst = static_cast<Instance*>(inst);
+    internal_inst->pal = &mock_pal;
+    if (internal_inst->staging) {
+        internal_inst->staging->set_pal(&mock_pal);
+    }
+
+    // 写入日志并刷新，使活跃句柄建立
+    ASSERT_EQ(logx_write(inst, 2, "CLOSE", (const uint8_t*)"test_close_sync_payload", 23), LOGX_OK);
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    mock_pal.reset_counts();
+
+    // 调用 logx_close，必须在关闭 fd 与 staging 前触发终态持久化同步 (spec §11)
+    logx_close(inst);
+
+    EXPECT_GE(mock_pal.file_fsync_count.load(), 1);
+    EXPECT_GE(mock_pal.file_fsync_success_count.load(), 1);
+    EXPECT_GE(mock_pal.mmap_sync_sync_count.load(), 1);
+    EXPECT_GE(mock_pal.mmap_sync_success_count.load(), 1);
+
+    for (const auto& f : mock_pal.file_list(dir.c_str())) {
+        mock_pal.file_unlink(f.c_str());
+    }
+    mock_pal.file_rmdir(dir.c_str());
+}
+
+// 5. fsync 失败时发出 LOGX_EV_IO 告警且不阻断后续正常写入 (非致命容灾)
+TEST(Robustness, Persistence_FsyncFailureEmitsEventWithoutBlocking) {
+    MockFsyncPal mock_pal(&default_pal());
+    std::string dir = std::string("logx_test_fsync_fail_") +
+                      std::to_string(mock_pal.pid()) + "_" +
+                      std::to_string(rand());
+    mock_pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    EventCtx ev_ctx;
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+    cfg.err_user = &ev_ctx;
+    cfg.err_fn = [](void* user, logx_event_kind_e kind, int code, const char* msg) {
+        auto* ctx = static_cast<EventCtx*>(user);
+        std::lock_guard<std::mutex> lock(ctx->mu);
+        ctx->events.push_back({kind, code, msg ? msg : ""});
+    };
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    auto* internal_inst = static_cast<Instance*>(inst);
+    internal_inst->pal = &mock_pal;
+    if (internal_inst->staging) {
+        internal_inst->staging->set_pal(&mock_pal);
+    }
+
+    // 建立 active_log_fd
+    ASSERT_EQ(logx_write(inst, 2, "BASE", (const uint8_t*)"base_fsync_data", 15), LOGX_OK);
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 开启 fsync 失败注入
+    mock_pal.fail_file_fsync.store(true);
+
+    // 执行 durability_sync
+    uint64_t sync_ms = 0;
+    int rc = durability_sync(internal_inst, &sync_ms);
+    EXPECT_EQ(rc, -1);
+
+    // 验证发出 LOGX_EV_IO 告警且包含 "durability sync" 或 "fsync"
+    bool found_fsync_err_ev = false;
+    {
+        std::lock_guard<std::mutex> lock(ev_ctx.mu);
+        for (const auto& ev : ev_ctx.events) {
+            if (ev.kind == LOGX_EV_IO && (ev.msg.find("durability sync") != std::string::npos ||
+                                          ev.msg.find("fsync") != std::string::npos)) {
+                found_fsync_err_ev = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(found_fsync_err_ev);
+
+    // 验证随后的正常写入不受阻断 (非致命容灾)
+    EXPECT_EQ(logx_write(inst, 2, "NEXT", (const uint8_t*)"after_fsync_failure", 19), LOGX_OK);
+
+    // 恢复正常以安全关闭
+    mock_pal.fail_file_fsync.store(false);
     logx_close(inst);
 
     for (const auto& f : mock_pal.file_list(dir.c_str())) {
