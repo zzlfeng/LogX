@@ -35,6 +35,7 @@ typedef enum {
     LOGX_ERR_NOMEM           = -7,
     LOGX_ERR_NOT_FOUND       = -8,   /* export 时段无文件 */
     LOGX_ERR_INTERNAL        = -9,
+    LOGX_ERR_TIMEOUT         = -10,  /* F-08: flush 等待超时 */
 } logx_status_e;
 
 /* ===== 错误类型(供回调分类) ===== */

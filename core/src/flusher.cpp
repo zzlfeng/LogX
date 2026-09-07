@@ -703,6 +703,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
             inst->staging->commit_header_locked(get_u32(inst->staging->raw_base() + 8),
                                                 new_f, latest_w, &atc);
             inst->pal->mutex_unlock(inst->mu);
+            inst->flushed_bytes_total.fetch_add(blk.raw_len, std::memory_order_relaxed);
             cur_f = new_f;
             continue;
         }
@@ -724,6 +725,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
             uint32_t latest_w = get_u32(inst->staging->raw_base() + 16);
             inst->staging->commit_header_locked(cur_seqno, new_f, latest_w, &atc);
             inst->pal->mutex_unlock(inst->mu);
+            inst->flushed_bytes_total.fetch_add(blk.raw_len, std::memory_order_relaxed);
             cur_f = new_f;
             continue;
         }
@@ -743,6 +745,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         inst->pal->mutex_unlock(inst->mu);
 
         c->current_size = wr.end_offset;
+        inst->flushed_bytes_total.fetch_add(blk.raw_len, std::memory_order_relaxed);
         cur_f = new_f;
     }
 }
@@ -771,6 +774,7 @@ void flusher_loop(Instance* inst) {
     drain_once(&c, inst);
     durability_sync(inst, nullptr);
     close_current(&c, inst->pal);
+    inst->flusher_running.store(false, std::memory_order_release);
 }
 
 // 在 log_dir 下扫描所有日志文件,选"日期最大且尾块 seqno 最大"者作为追加目标。
@@ -968,24 +972,31 @@ void* flusher_main(void* arg) {
     return nullptr;
 }
 
-void flush_blocking(Instance* inst) {
-    if (!inst) return;
-    // 唤醒 + 等 Flusher 追上:写一个 dummy(其实不需要)— 只要把 event 触发并等
-    // 到 staging 空。
+bool flush_blocking(Instance* inst) {
+    if (!inst) return true;
+    if (inst->mu) inst->pal->mutex_lock(inst->mu);
+    uint64_t target = inst->staged_bytes_total.load(std::memory_order_relaxed);
+    if (inst->mu) inst->pal->mutex_unlock(inst->mu);
+
+    uint64_t start_ms = inst->pal->wallclock_ms();
     if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
-    // 简易同步:自旋到 staging 空。最坏几十毫秒。
-    uint32_t f, snap;
-    while (true) {
-        uint32_t bytes = inst->staging->snapshot_pending(&f, &snap);
-        if (bytes == 0) break;
-        // 主动再 wake 一次
-        inst->pal->ev_signal(inst->flush_event);
+
+    while (inst->flushed_bytes_total.load(std::memory_order_relaxed) < target) {
+        if (!inst->flusher_running.load(std::memory_order_acquire)) {
+            emit_event(inst, LOGX_EV_IO, -1, "flush skipped: flusher not running");
+            return false;
+        }
+        if (inst->pal->wallclock_ms() >= start_ms + kFlushBlockingTimeoutMs) {
+            emit_event(inst, LOGX_EV_IO, -1, "flush timeout: flusher stalled; data may be pending");
+            return false;
+        }
+        if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
         inst->pal->sleep_ms(5);
     }
-    // spec §11 断电检查点: 退后台时执行持久化同步 (fdatasync + msync)
+
     durability_sync(inst, nullptr);
-    // 退后台落盘完成时, 执行保留期超期清理
     retention_cleanup_impl(inst);
+    return true;
 }
 
 }  // namespace logx

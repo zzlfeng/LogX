@@ -161,7 +161,7 @@ public:
         kFull,
         kTooLarge,
     };
-    WriteStatus write_records(const uint8_t* recs, uint32_t total);
+    WriteStatus write_records(const uint8_t* recs, uint32_t total, uint32_t* out_consumed_bytes = nullptr);
 
     // ---- Flusher 路径 ----
     // 锁内取快照:(f, snap = write_pos),返回期间需要拷出的字节数。

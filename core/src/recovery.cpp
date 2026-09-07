@@ -312,6 +312,13 @@ void run_recovery(Instance* inst) {
         ? w
         : (f + valid_end) % size;
     inst->staging->commit_header_locked(resume_seqno, f, new_w, &atc);
+
+    // 恢复完成后若 staging 仍有遗留未落盘日志，将 staged_bytes_total 对齐待刷字节数 (F-08 水位线闭环)
+    uint32_t rem_f, rem_snap;
+    uint32_t pending = inst->staging->snapshot_pending(&rem_f, &rem_snap);
+    if (pending > 0) {
+        inst->staged_bytes_total.store(pending, std::memory_order_relaxed);
+    }
 }
 
 }  // namespace logx

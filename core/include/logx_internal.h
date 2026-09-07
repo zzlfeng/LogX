@@ -56,6 +56,10 @@ struct Instance {
     logx_error_fn err_fn = nullptr;
     void* err_user = nullptr;
 
+    // ---- 水位线与超时 (F-08 / T4.0-1) ----
+    std::atomic<uint64_t> staged_bytes_total{0};
+    std::atomic<uint64_t> flushed_bytes_total{0};
+
     // ---- 统计 ----
     logx_stats_t stats{};
     std::atomic<uint64_t> drop_no_space{0};
@@ -64,6 +68,8 @@ struct Instance {
     std::atomic<uint64_t> block_write_errors{0};
     std::atomic<uint64_t> truncated_blocks{0};
 };
+
+constexpr uint32_t kFlushBlockingTimeoutMs = 5000;
 
 // 触发回调的便捷函数;忽略 null 回调。
 inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char* msg) {
@@ -212,7 +218,7 @@ std::string current_log_path(Instance* inst, uint32_t yyyymmdd, uint16_t split_n
 void retention_cleanup(Instance* inst);
 
 // flush 同步:阻塞至当前 staging 全部落块提交。
-void flush_blocking(Instance* inst);
+bool flush_blocking(Instance* inst);
 
 // Flusher 线程入口。
 void* flusher_main(void* arg);

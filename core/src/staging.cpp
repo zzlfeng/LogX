@@ -275,7 +275,8 @@ void Staging::wipe_all_locked() {
     put_u32(base_ + kHeaderASize + 60, crc);
 }
 
-Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total) {
+Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total, uint32_t* out_consumed_bytes) {
+    if (out_consumed_bytes) *out_consumed_bytes = 0;
     if (total == 0) return WriteStatus::kOk;
     if (total > data_size_ - 1) return WriteStatus::kTooLarge;
 
@@ -284,10 +285,12 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total)
     uint32_t f = get_u32(base_ + 12);  // flushed_len
     uint32_t w = get_u32(base_ + 16);  // write_pos
     uint32_t free = (f + data_size_ - w - 1) % data_size_;
+    uint32_t consumed = total;
 
     if (w + total > data_size_) {
         // 尾部不足:垫 PAD 后回绕到 0;pad < 6B 留零回绕。
         uint32_t pad = data_size_ - w;  // 距环尾的字节数(1..data_size_-1)
+        consumed = pad + total;
         // 检查空闲是否够放下 PAD + 本条
         if (free < pad + total) return WriteStatus::kFull;
         if (pad >= 6) {
@@ -337,6 +340,7 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total)
     }
     // 写完回写 write_pos(尚未提交,本块还在飞行中)
     put_u32(base_ + 16, w);
+    if (out_consumed_bytes) *out_consumed_bytes = consumed;
     return WriteStatus::kOk;
 }
 

@@ -246,11 +246,27 @@
      - 全开构建（ON/ON）：95/95 单测 + 4/4 压测 100% 通过；
      - Android arm64-v8a：交叉编译 0 警告 0 错误通过。
 
-### 🟡 [F-08] `flush_blocking` 自旋等待无超时上界
-- **来源：** 报告一 WARN-3；T4.0-1 关联（水位线 target_seqno 防饥饿未实现）
-- **位置：** `core/src/flusher.cpp:772-785`
-- **描述：** 若 Flusher 线程挂起或死锁，`flush_blocking` 将永久阻塞；高并发写入下轮询 + 5ms sleep 也容易饥饿。
-- **修复建议：** 增加超时上界；按 spec §7 实现 target_seqno 水位线。
+### 🟡 [F-08] `flush_blocking` 自旋等待无超时上界 [✅ 已修复]
+- **来源：** 报告一 WARN-3；T4.0-1 关联（Spec §7 水位线 target_seqno 防饥饿未实现，列为 P0 级偏差）
+- **位置：** `core/src/flusher.cpp:974-999`、`core/src/logx_c.cpp:380-401`、`core/include/logx_c.h:38`、`core/include/logx_internal.h:56-68, 221`、`core/src/staging.cpp:278-340`、`core/src/recovery.cpp:314-318`
+- **状态：** ✅ **已修复并全矩阵闭环验证**（字节水位线 + 环回绕 PAD 跨度补偿 + 5000ms 超时熔断 + Flusher 存活检查 + `LOGX_ERR_TIMEOUT`）
+- **核心决策与技术机制：**
+  1. **规避 Spec 字面 `target_seqno` 缺陷，改用等价字节水位线**：Spec 字面的 Block `seqno` 水位线在块丢弃路径（目标文件打开失败、短写失败）存在严重语义冲突——Header 语义为“已落盘块数”，丢弃块依法不能递增 seqno，若按块预测 seqno 会导致任何一次丢弃使 committed 永远追不上 target 而死等 5 秒。本实现采用物理等价的单调字节水位线：
+     - 进入时锁内记录目标水位 `target = staged_bytes_total`（uint64）；
+     - `drain_once` 无论写入成功还是两条丢弃路径，只要推进 `cur_f` 均执行 `flushed_bytes_total.fetch_add(blk.raw_len)`；
+     - 等待谓词收敛为 `flushed_bytes_total >= target`，单调 O(1) 判定，进入时的全部日志落盘或明确丢弃即刻返回，彻底根除高并发写入持续饥饿。
+  2. **Staging 环形回绕 PAD 跨度补偿**：针对 Staging 环尾垫入 `LGXP PAD` 导致 Flusher 块 `raw_len` 包含 PAD 从而造成出入环计数累积漂移的问题，重构 `Staging::write_records` 输出真实占用的物理跨度（`pad + total`），`logx_write` 严格累加实际占用跨度，保证流入 Staging 与流出 Staging 字节数 100% 绝对 1:1 对齐。
+  3. **双级熔断与存活检查（WARN-3）**：循环内检测 `!flusher_running`，若 Flusher 线程未运行则立即派发 `"flush skipped: flusher not running"` 并返回 false；超过 `kFlushBlockingTimeoutMs = 5000` 则派发 `LOGX_EV_IO` 报警 `"flush timeout: flusher stalled; data may be pending"` 并熔断退出，杜绝永久阻塞与 Android 主线程 ANR 隐患。
+  4. **ABI 安全错误码**：在 `logx_status_e` 末尾追加 `LOGX_ERR_TIMEOUT = -10`，`logx_flush` 失败时明确返回超时错误码，`logx_close` 与 `export` 路径尽力而为。
+  5. **崩溃恢复待刷对齐**：`run_recovery` 恢复出未落盘日志时，自动将 `staged_bytes_total` 初始化为 `pending` 字节数，保证恢复后立即 flush 不会空过。
+  6. **单测闭环（`tests/unit/test_flusher.cpp` 新增 3 组针对性用例）**：
+     - `Flush.WatermarkReturnsUnderSustainedWrites`：后台线程持续密集写，主线程调用 flush 在 <3000ms（实测 ~350ms）内准时返回 `LOGX_OK`，抗饥饿验证通过；
+     - `Flush.TimeoutWhenFlusherStalled_EmitsEventAndReturns`：PAL 装饰器注入 `file_write` 挂起，验证 `logx_flush` 在 ~5000ms（实测 5121ms）精准超时返回 `LOGX_ERR_TIMEOUT`，解除挂起后日志完整导出无污染；
+     - `Flush.DiscardPathDoesNotStall`：构造 65535 分卷上限丢弃环境，验证 `logx_flush` 快速返回 `LOGX_OK`（实测 30ms），不误触发超时，直接实证字节水位线优于 seqno 方案。
+  7. **三构建矩阵全绿验证**：
+     - 基础构建（OFF/OFF）：80/80 单测 + 4/4 压测 + 3/3 强杀恢复 100% 通过；
+     - 全开构建（ON/ON）：98/98 单测 + 4/4 压测 + 3/3 强杀恢复 100% 通过；
+     - Android arm64-v8a：交叉编译 0 警告 0 错误通过。
 
 ### 🟡 [F-09] `random_bytes` 退化路径熵极低
 - **来源：** 报告一 WARN-5
@@ -651,7 +667,7 @@
 
 | T4.0 编号 | Spec 规定 | 当前代码状态 | 影响与风险 | 关联问题 |
 |:---|:---|:---|:---|:---|
-| **T4.0-1** | §7 `flush()` 水位线 `target_seqno` 防饥饿 | `flush_blocking` 仍为轮询 staging 空 + 5ms sleep | 高并发下 flush 容易饥饿阻塞 | F-08 |
+| **T4.0-1** | §7 `flush()` 水位线 `target_seqno` 防饥饿 | ✅ 已通过 F-08 闭环（累计字节水位线 + PAD 跨度补偿 + 5000ms 超时熔断 + LOGX_ERR_TIMEOUT） | — | F-08 |
 | **T4.0-2** | §3.1/§4.4 切分序号 2B (uint16_t) | ✅ 已通过 F-07 闭环（16B 自然对齐 + 历史恒零扩宽至 uint16_t + 达上限明确告警与去重） | — | F-07 |
 | **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | 实现为 A(中间态 CRC)→ B → release fence | 掉电极端窗口内存序轻微偏离 | S-06 |
 | **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | `flusher_loop` 仍为无超时阻塞 `ev_wait`（仅堆降级模式有 5s 超时） | 缺乏低频写定时兜底刷盘机制 | F-10 |
@@ -735,7 +751,7 @@
 |:---|:---|:---|:---|
 | S-03 | kBlockHeaderSize 注释 32B→34B | S-04 | max_log_length 默认值注释 |
 | S-05 | staging 指针未置 null | FM-03 | 64KB 栈数组溢出风险 |
-| FM-04 | cksum O(n²) 重扫 | F-08 | flush_blocking 无超时 |
+| FM-04 | cksum O(n²) 重扫 | F-08 | flush_blocking 无超时 [✅ 已修复] |
 | F-09 | random_bytes 退化低熵 | P-04 | QPF 重复查询 |
 | P-05 | SetFilePointer 冗余 | P-06 | atomic_add 对齐断言 |
 | J-03 | NewStringUTF 编码风险 | K-03 | errorHandler GC 延迟 |

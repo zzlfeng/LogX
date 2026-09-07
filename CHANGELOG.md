@@ -55,7 +55,7 @@
 
 | # | spec/CHANGELOG 声称(v5) | 代码实际(2026-09-03) |
 |---|---|---|
-| 1 | `flush()` 水位线 `target_seqno` 防饥饿(§7,P0) | 未实现:`flush_blocking` 自旋等待 staging 全空 + 5ms sleep,持续高频写入存在饥饿风险 |
+| 1 | `flush()` 水位线 `target_seqno` 防饥饿(§7,P0) | ✅ 已闭环(2026-09-07,F-08):改用物理等价且规避丢弃路径 seqno 冲突的累计字节水位线(staged_bytes_total vs flushed_bytes_total), 结合环回绕 PAD 跨度补偿严格对齐出入环; 引入 5000ms 超时上界与 Flusher 存活检查双级熔断, 追加 LOGX_ERR_TIMEOUT ABI 安全错误码; 单测覆盖持续写抗饥饿、5s 挂死超时与恢复、65535 丢弃路径快速返回, 三构建矩阵全绿通过 |
 | 2 | 切分序号升级 2B uint16_t(§3.1/§4.4,P1) | ✅ 已闭环(2026-09-07,F-07):保留 ATC 物理 16B 脚印并利用历史恒零填充位无缝扩宽为 uint16_t(Plan B),全链路函数与 FlusherCtx.current_split 升级为 uint16_t,单日分卷上限提升至 65535;达到上限发射 LOGX_EV_IO 明确告警并去重;单测覆盖跨越 255、65535 上限停写、历史 staging 布局向下兼容解析与边界校验,三构建矩阵全绿通过 |
 | 3 | 双 Header:写 A → seq_cst fence → 写 B(§4.2/§10,P0) | 实现为 A(中间态 CRC 保护)→ B → `atomic_thread_fence(release)`,时机与内存序均偏离纪律 |
 | 4 | Flusher 50~100ms Debounce 超时聚合(§4.1,P2) | 未实现:`flusher_loop` 为无超时阻塞 `ev_wait` |

@@ -335,6 +335,7 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
         delete inst;
         return LOGX_ERR_STATE;
     }
+    inst->flusher_running.store(true, std::memory_order_release);
 
     *out_inst = inst;
     return LOGX_OK;
@@ -377,9 +378,11 @@ logx_status_e logx_write(logx_instance_t* h, int level,
 
     // 2) 锁内写入 staging
     inst->pal->mutex_lock(inst->mu);
-    auto st = inst->staging->write_records(buf, total);
+    uint32_t consumed = 0;
+    auto st = inst->staging->write_records(buf, total, &consumed);
     bool need_wake = false;
     if (st == Staging::WriteStatus::kOk) {
+        inst->staged_bytes_total.fetch_add(consumed, std::memory_order_relaxed);
         uint32_t f, snap;
         uint32_t pending = inst->staging->snapshot_pending(&f, &snap);
         need_wake = pending >= inst->flush_threshold;
@@ -396,8 +399,7 @@ logx_status_e logx_write(logx_instance_t* h, int level,
 logx_status_e logx_flush(logx_instance_t* h) {
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return LOGX_ERR_STATE;
-    flush_blocking(inst);
-    return LOGX_OK;
+    return flush_blocking(inst) ? LOGX_OK : LOGX_ERR_TIMEOUT;
 }
 
 logx_status_e logx_export(logx_instance_t* h, const char* from, const char* to,

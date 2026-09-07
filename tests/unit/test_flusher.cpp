@@ -11,7 +11,9 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1403,6 +1405,305 @@ TEST(Flush, AppendTargetCache_HistoricalStagingLayoutCompatibility) {
 
     int64_t after_sz = pal.file_size_path(path3.c_str());
     EXPECT_GT(after_sz, before_sz);  // 成功追加到 .log.3
+
+    logx_close(inst);
+
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+// =========================================================================
+// F-08: 水位线防饥饿与超时机制验证 (T4.0-1 / WARN-3)
+// =========================================================================
+
+TEST(Flush, WatermarkReturnsUnderSustainedWrites) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_f08_starve_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 4096;
+    cfg.flush_threshold = 512;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;
+
+    struct ErrorCounter {
+        std::atomic<int> drop_count{0};
+    } err_ctx;
+
+    cfg.err_fn = [](void* user, logx_event_kind_e kind, int code, const char* msg) {
+        (void)code; (void)msg;
+        if (kind == LOGX_EV_DROP) {
+            static_cast<ErrorCounter*>(user)->drop_count.fetch_add(1);
+        }
+    };
+    cfg.err_user = &err_ctx;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    std::atomic<bool> stop_writer{false};
+    std::atomic<uint64_t> total_written{0};
+
+    // 启动后台持续写入线程
+    std::thread writer([&]() {
+        for (int i = 0; !stop_writer.load(std::memory_order_relaxed); ++i) {
+            std::string msg = "sustained_log_" + std::to_string(i);
+            if (logx_write(inst, 2, "SUSTAIN",
+                           reinterpret_cast<const uint8_t*>(msg.data()),
+                           static_cast<uint32_t>(msg.size())) == LOGX_OK) {
+                total_written.fetch_add(1, std::memory_order_relaxed);
+            }
+            pal.sleep_ms(1);
+        }
+    });
+
+    // 等待写线程产出一定量日志
+    while (total_written.load(std::memory_order_relaxed) < 20) {
+        pal.sleep_ms(2);
+    }
+
+    // 主线程在写入持续进行时调用 flush，必须迅速准时返回（修复前会因 staging 永不为空而饥饿死等）
+    auto t0 = std::chrono::steady_clock::now();
+    logx_status_e rc = logx_flush(inst);
+    auto cost_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    EXPECT_EQ(rc, LOGX_OK);
+    EXPECT_LT(cost_ms, 3000);
+
+    // 停止写线程
+    stop_writer.store(true, std::memory_order_relaxed);
+    writer.join();
+
+    logx_close(inst);
+
+    EXPECT_EQ(err_ctx.drop_count.load(), 0);
+
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+class StallFileWritePal : public Pal {
+public:
+    explicit StallFileWritePal(Pal* real_pal) : real_(real_pal) {}
+
+    std::atomic<bool> stall_write{false};
+    std::atomic<bool> entered_stall{false};
+    std::condition_variable stall_cv;
+    std::mutex stall_mu;
+
+    int file_open(const char* p, bool c, bool a) override { return real_->file_open(p, c, a); }
+    int file_close(int fd) override { return real_->file_close(fd); }
+    int file_truncate(int fd, uint64_t len) override { return real_->file_truncate(fd, len); }
+    int64_t file_size(int fd) override { return real_->file_size(fd); }
+    int64_t file_size_path(const char* p) override { return real_->file_size_path(p); }
+    long file_pread(int fd, void* b, size_t n, uint64_t o) override { return real_->file_pread(fd, b, n, o); }
+    
+    long file_write(int fd, const void* b, size_t n) override {
+        if (stall_write.load(std::memory_order_acquire)) {
+            entered_stall.store(true, std::memory_order_release);
+            std::unique_lock<std::mutex> lock(stall_mu);
+            stall_cv.wait(lock, [&]() { return !stall_write.load(std::memory_order_acquire); });
+        }
+        return real_->file_write(fd, b, n);
+    }
+    long file_pwrite(int fd, const void* b, size_t n, uint64_t o) override {
+        if (stall_write.load(std::memory_order_acquire)) {
+            entered_stall.store(true, std::memory_order_release);
+            std::unique_lock<std::mutex> lock(stall_mu);
+            stall_cv.wait(lock, [&]() { return !stall_write.load(std::memory_order_acquire); });
+        }
+        return real_->file_pwrite(fd, b, n, o);
+    }
+    int file_fsync(int fd) override { return real_->file_fsync(fd); }
+    int file_dir_fsync(const char* p) override { return real_->file_dir_fsync(p); }
+    int file_unlink(const char* p) override { return real_->file_unlink(p); }
+    int file_mkdirs(const char* p) override { return real_->file_mkdirs(p); }
+    int file_rmdir(const char* p) override { return real_->file_rmdir(p); }
+    std::vector<std::string> file_list(const char* d) override { return real_->file_list(d); }
+    PalMmap mmap_open(int fd, size_t len, bool w) override { return real_->mmap_open(fd, len, w); }
+    int mmap_sync(const PalMmap& m, bool s) override { return real_->mmap_sync(m, s); }
+    int mmap_close(const PalMmap& m) override { return real_->mmap_close(m); }
+    void* mutex_create() override { return real_->mutex_create(); }
+    void  mutex_destroy(void* h) override { real_->mutex_destroy(h); }
+    void  mutex_lock(void* h) override { real_->mutex_lock(h); }
+    void  mutex_unlock(void* h) override { real_->mutex_unlock(h); }
+    int   threading_init() override { return real_->threading_init(); }
+    int   thread_start(void* (*fn)(void*), void* a, void** out_h) override { return real_->thread_start(fn, a, out_h); }
+    int   thread_join(void* h) override { return real_->thread_join(h); }
+    void* ev_create() override { return real_->ev_create(); }
+    void  ev_destroy(void* h) override { real_->ev_destroy(h); }
+    void  ev_signal(void* h) override { real_->ev_signal(h); }
+    void  ev_wait(void* h) override { real_->ev_wait(h); }
+    bool  ev_wait_timeout(void* h, uint32_t ms) override { return real_->ev_wait_timeout(h, ms); }
+    uint64_t atomic_add(uint64_t* p, int64_t d) override { return real_->atomic_add(p, d); }
+    uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
+    uint64_t monotonic_ns() override { return real_->monotonic_ns(); }
+    uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
+    void     wallclock_date(uint32_t* y, uint32_t* h) override { real_->wallclock_date(y, h); }
+    void     sleep_ms(uint32_t ms) override { real_->sleep_ms(ms); }
+    uint32_t pid() override { return real_->pid(); }
+    uint64_t tid() override { return real_->tid(); }
+    void     random_bytes(void* b, size_t l) override { real_->random_bytes(b, l); }
+    void     debug_log(const char* s) override { real_->debug_log(s); }
+private:
+    Pal* real_ = nullptr;
+};
+
+TEST(Flush, TimeoutWhenFlusherStalled_EmitsEventAndReturns) {
+    Pal& real_pal = default_pal();
+    StallFileWritePal stall_pal(&real_pal);
+
+    std::string dir = std::string("logx_test_f08_stall_") +
+                      std::to_string(real_pal.pid()) + "_" +
+                      std::to_string(rand());
+    real_pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    struct TimeoutEventTracker {
+        std::atomic<bool> timeout_seen{false};
+        std::string timeout_msg;
+        std::mutex mu;
+    } tracker;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 4096;
+    cfg.flush_threshold = 256;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;
+    cfg.err_fn = [](void* user, logx_event_kind_e kind, int code, const char* msg) {
+        (void)code;
+        if (kind == LOGX_EV_IO && msg && std::strstr(msg, "flush timeout")) {
+            auto* t = static_cast<TimeoutEventTracker*>(user);
+            t->timeout_seen.store(true);
+            std::lock_guard<std::mutex> lk(t->mu);
+            t->timeout_msg = msg;
+        }
+    };
+    cfg.err_user = &tracker;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    auto* internal_inst = static_cast<Instance*>(inst);
+    internal_inst->pal = &stall_pal;
+
+    // 启用写入挂起注入
+    stall_pal.stall_write.store(true, std::memory_order_release);
+
+    // 写入一条日志，触发 Flusher 尝试写盘并卡在 file_write 中
+    const char* msg = "stalled_log_entry";
+    ASSERT_EQ(logx_write(inst, 2, "STALL", reinterpret_cast<const uint8_t*>(msg),
+                         static_cast<uint32_t>(std::strlen(msg))), LOGX_OK);
+
+    // 等待 Flusher 线程真正进入写挂起状态
+    while (!stall_pal.entered_stall.load(std::memory_order_acquire)) {
+        real_pal.sleep_ms(2);
+    }
+
+    // 调用 logx_flush，必须在 ~5000ms 超时后返回 LOGX_ERR_TIMEOUT
+    auto t0 = std::chrono::steady_clock::now();
+    logx_status_e rc = logx_flush(inst);
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    EXPECT_EQ(rc, LOGX_ERR_TIMEOUT);
+    EXPECT_GE(elapsed_ms, 4800);
+    EXPECT_LE(elapsed_ms, 7000);
+    EXPECT_TRUE(tracker.timeout_seen.load());
+
+    // 解除挂起，使 Flusher 完成正常落盘
+    {
+        std::lock_guard<std::mutex> lk(stall_pal.stall_mu);
+        stall_pal.stall_write.store(false, std::memory_order_release);
+    }
+    stall_pal.stall_cv.notify_all();
+
+    // 恢复原生 PAL 并关闭实例
+    internal_inst->pal = &real_pal;
+    logx_close(inst);
+
+    for (const auto& f : real_pal.file_list(dir.c_str())) {
+        real_pal.file_unlink(f.c_str());
+    }
+    real_pal.file_rmdir(dir.c_str());
+}
+
+TEST(Flush, DiscardPathDoesNotStall) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_f08_discard_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    pal.wallclock_date(&yyyymmdd, &hhmmss);
+
+    // 预先构造 split=65535 的日志文件 (已满 500B)
+    std::string path65535 = make_log_path(dir, yyyymmdd, 65535);
+    create_valid_test_log(pal, path65535, yyyymmdd, 100, 500);
+
+    // 构造 Staging 缓存: split_no = 65535 (已满)
+    {
+        Staging st_builder(&pal, staging, 8 * 1024);
+        RecoveryState st; bool rec = false;
+        ASSERT_TRUE(st_builder.open(&st, &rec));
+        AppendTargetCache atc{};
+        atc.date = yyyymmdd;
+        atc_set_split(&atc, 65535);
+        atc.last_block_offset = 32;
+        atc.last_block_end_offset = 500;
+        st_builder.commit_header_locked(100, 0, 0, &atc);
+        st_builder.close();
+    }
+
+    struct TimeoutCheckTracker {
+        std::atomic<bool> timeout_seen{false};
+    } tracker;
+
+    logx_config_t cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.max_file_size = 300;  // 阈值 300B，已有 500B 必定触发切分到达 65535 上限并走丢弃路径
+    cfg.err_fn = [](void* user, logx_event_kind_e kind, int code, const char* msg) {
+        (void)code;
+        if (kind == LOGX_EV_IO && msg && std::strstr(msg, "flush timeout")) {
+            static_cast<TimeoutCheckTracker*>(user)->timeout_seen.store(true);
+        }
+    };
+    cfg.err_user = &tracker;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 写入日志, 此时 Flusher 将进入 65535 上限丢弃路径
+    const char* msg = "discard_path_entry";
+    ASSERT_EQ(logx_write(inst, 2, "DISC", reinterpret_cast<const uint8_t*>(msg),
+                         static_cast<uint32_t>(std::strlen(msg))), LOGX_OK);
+
+    // 字节水位线必须随丢弃块推进，flush 应当快速返回 LOGX_OK（远小于 5000ms 超时）
+    auto t0 = std::chrono::steady_clock::now();
+    logx_status_e rc = logx_flush(inst);
+    auto cost_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    EXPECT_EQ(rc, LOGX_OK);
+    EXPECT_LT(cost_ms, 1000);
+    EXPECT_FALSE(tracker.timeout_seen.load());
 
     logx_close(inst);
 
