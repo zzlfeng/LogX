@@ -1,10 +1,12 @@
-// test_crash_recovery.cpp - 故障注入与进程崩溃恢复自愈压测套件。
+// test_crash_recovery.cpp - 优雅拆毁与磁盘坏块自愈恢复测试套件。
+//
+// 注: 真正操作系统级突然强杀 (Abrupt Process Termination / kill -9) 由
+//     test_crash_fork.cpp (logx_crash_fork_tests) 通过跨进程测试覆盖 (解决 T-01)。
 //
 // 覆盖:
-//   - Staging 仅写入未刷盘强杀 → 启动恢复自动补刷落盘 (零丢失)
-//   - 磁盘块写出但 Header 尚未提交强杀 (飞行中崩溃) → 启动恢复精确回溯与 seqno 单调衔接
+//   - GracefulTeardown 模式下未显式 flush 的 staging 数据恢复
 //   - 磁盘尾部写出撕裂坏块 → 启动恢复自动截断自愈并打点 LOGX_EV_RECOVERY
-//   - 50 轮随机阶段崩溃与恢复自愈压力循环 → 零死锁、零状态错乱、数据 100% 一致
+//   - 50 轮多模式拆毁与重启恢复压力循环 → 零死锁、零状态错乱、数据 100% 一致
 
 #include "logx_c.h"
 #include "logx_internal.h"
@@ -23,15 +25,21 @@ using namespace logx;
 
 namespace {
 
+static std::atomic<uint64_t> s_recovery_dir_seq{0};
+
+static std::string make_recovery_test_dir(Pal& pal, const char* prefix) {
+    uint64_t seq = s_recovery_dir_seq.fetch_add(1, std::memory_order_relaxed);
+    return std::string(prefix) + "_" + std::to_string(pal.pid()) + "_" +
+           std::to_string(pal.monotonic_ns()) + "_" + std::to_string(seq);
+}
+
 // =========================================================================
-// 1. Staging 仅写入未落盘强杀 → 重启恢复自动补刷落盘
+// 1. Staging 仅写入未落盘优雅拆毁 → 重启恢复自动补刷落盘
 // =========================================================================
 
-TEST(CrashRecovery, StagingWrittenNotFlushed_RebuiltAndFlushed) {
+TEST(CrashRecovery, GracefulTeardown_StagingDataRecovered) {
     Pal& pal = default_pal();
-    std::string dir = std::string("logx_crash_dir_") +
-                      std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+    std::string dir = make_recovery_test_dir(pal, "logx_teardown_dir");
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -115,9 +123,7 @@ TEST(CrashRecovery, StagingWrittenNotFlushed_RebuiltAndFlushed) {
 
 TEST(CrashRecovery, TornBlockAtDiskTail_TruncatedSafelyAndCapturesEvent) {
     Pal& pal = default_pal();
-    std::string dir = std::string("logx_torn_dir_") +
-                      std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+    std::string dir = make_recovery_test_dir(pal, "logx_torn_dir");
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -200,14 +206,12 @@ TEST(CrashRecovery, TornBlockAtDiskTail_TruncatedSafelyAndCapturesEvent) {
 }
 
 // =========================================================================
-// 3. 50 轮随机阶段崩溃与恢复自愈压力循环
+// 3. 50 轮随机阶段拆毁与恢复自愈压力循环
 // =========================================================================
 
-TEST(CrashRecovery, FiftyCycles_RandomCrashAndRecoveryLoop) {
+TEST(CrashRecovery, FiftyCycles_RandomTeardownAndRecoveryLoop) {
     Pal& pal = default_pal();
-    std::string dir = std::string("logx_loop_dir_") +
-                      std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+    std::string dir = make_recovery_test_dir(pal, "logx_loop_dir");
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 

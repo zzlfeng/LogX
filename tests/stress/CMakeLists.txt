@@ -44,3 +44,28 @@ add_test(NAME logx_stress_tests COMMAND logx_stress_tests)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(logx_stress_tests PRIVATE -Wall -Wextra)
 endif()
+
+# T-01: 独立子进程强杀测试 (进程级真正崩溃与恢复)
+add_executable(logx_crash_fork_tests
+    test_crash_fork.cpp
+)
+
+target_link_libraries(logx_crash_fork_tests
+    PRIVATE
+    logx_core
+    GTest::gtest
+)
+
+if(NOT WIN32)
+    target_link_libraries(logx_crash_fork_tests PRIVATE Threads::Threads)
+endif()
+
+target_include_directories(logx_crash_fork_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/core/include
+)
+
+add_test(NAME logx_crash_fork_tests COMMAND logx_crash_fork_tests)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(logx_crash_fork_tests PRIVATE -Wall -Wextra)
+endif()
+
