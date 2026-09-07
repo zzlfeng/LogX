@@ -498,35 +498,41 @@
   4. `thread_join` 增加判空前置条件 `if (!handle || handle == INVALID_HANDLE_VALUE) return -1;` 并直接 `reinterpret_cast<HANDLE>(handle)`；
   5. 在 `tests/unit/test_robustness.cpp` 中增加高 32 位非零虚拟句柄数学往返验证、32 轮并发线程 Spawn & Join 压力循环、及 Staging 多轮生命周期验证。
 
-### 🟠 [P-02] Windows `file_size_path` 频繁打开关闭句柄开销过高
+### ✅ [P-02] Windows `file_size_path` 频繁打开关闭句柄开销过高 [已修复并闭环]
 - **来源：** 报告三 BUG-P2
-- **位置：** `core/src/pal_win32.cpp:154-163`
+- **位置：** `core/src/pal_win32.cpp`（`file_size_path`）
+- **状态：** ✅ **已修复并闭环**
 - **描述：** 每次查询文件大小均执行 `CreateFileA + CloseHandle`，扫盘调用频繁时 IO 开销偏大。
-- **修复建议：** 改用 `GetFileAttributesExA`。
+- **修复方案与落地：** 改用 `GetFileAttributesExA` 直接读 `WIN32_FILE_ATTRIBUTE_DATA`，零内核句柄往返；64 位大小由 `nFileSizeHigh/Low` 显式拼接。复核确认两处调用方语义兼容：flusher 分卷探测以 `>= 0` 判"路径已占用"、快照统计以 `< 0` 剔除——`GetFileAttributesExA` 对存在路径（含目录）返回成功，错误态契约（不存在 → -1）不变；新增回归测试 `Robustness.PalFileSizePath_AttributesBased_SemanticsPreserved`（精确大小、与 fd 版 `file_size` 一致、不存在 → -1、目录可查询）。
 
-### 🟠 [P-03] `file_rmdir` 无明确错误转译
+### ✅ [P-03] `file_rmdir`/`file_unlink` 失败无明确错误转译 [已修复并闭环]
 - **来源：** 报告三 BUG-P3
-- **位置：** `core/src/pal_posix.cpp:162`、`core/src/pal_win32.cpp:182`
-- **描述：** `rmdir` 失败直接返回 -1，缺乏对 EEXIST/ENOTEMPTY 等具体错误码的区分与透传。
-- **修复建议：** 增加错误码转译。
+- **位置：** `core/src/pal_win32.cpp`（`file_unlink`/`file_rmdir` + `win32_error_to_errno`/`translate_win32`）；`pal_posix.cpp` 的 rmdir/unlink 原生透传 errno，无需改动
+- **状态：** ✅ **已修复并闭环**
+- **描述：** Windows 侧 rmdir/unlink 失败直接返回 -1 且不设置 errno，调用方无法区分"目录非空"与"目录不存在"等语义；POSIX 侧原生透传，两侧行为不对称。
+- **修复方案与落地：** 新增 `win32_error_to_errno` 转译表（ERROR_FILE/PATH_NOT_FOUND → ENOENT、ERROR_DIR_NOT_EMPTY → ENOTEMPTY、SHARING/LOCK_VIOLATION → EBUSY、ACCESS_DENIED → EACCES、WRITE_PROTECT → EROFS、其余保守归 EIO 不丢错误态），`file_unlink`/`file_rmdir` 统一经 `translate_win32` 置 errno 后返回 -1，与 POSIX 语义对齐；新增回归测试 `Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing`（重复 rmdir → ENOENT、目录非空 → ENOTEMPTY、重复 unlink → ENOENT，POSIX/Win32 双侧断言一致）。
 
-### 🟡 [P-04] `monotonic_ns` 每次调用都查询性能计数器频率
-- **来源：** 报告一 WARN-2
-- **位置：** `core/src/pal_win32.cpp:317-323`
-- **描述：** `QueryPerformanceFrequency` 结果在系统运行期间固定不变，应初始化时缓存。
-- **修复建议：** 缓存频率值。
+### ✅ [P-04] `monotonic_ns` 每次调用都查询性能计数器频率 [已修复并闭环（含溢出缺陷追加修复）]
+- **来源：** 报告一 WARN-2；2026-09-07 修复复核追加发现乘法溢出回绕缺陷
+- **位置：** `core/src/pal_win32.cpp`（`monotonic_ns`）
+- **状态：** ✅ **已修复并闭环**
+- **描述：** `QueryPerformanceFrequency` 结果在系统运行期间固定不变，却每次调用都查询，纯属高频内核开销。
+- **复核追加发现（原实现叠加缺陷）：** 旧代码 `now.QuadPart * 1000000000ULL / freq` 先乘后除，QPC 典型频率 10MHz 下开机约 31 分钟 `now*1e9` 即溢出 uint64 回绕，单调时钟发生跳变——flush 同步自旋、测试耗时轮询等依赖单调性的逻辑会失效。
+- **修复方案与落地：** ① QPF 用 C++11 magic static 进程内仅查询一次并缓存（线程安全）；② 换算改为先除后乘两段式 `(ticks/freq)*1e9 + (ticks%freq)*1e9/freq`，余数 < freq 时余数项距 2^64 有数倍裕度，彻底消除溢出回绕；新增回归测试 `Robustness.PalMonotonic_NonDecreasingSaneUnits`（单调不回退、sleep 15ms 后推进量落在 [15ms, 5s] 的量纲与跳变双断言）。
 
-### 🟡 [P-05] `file_open` 中 `SetFilePointer` 设置末尾是冗余的
+### ✅ [P-05] `file_open` 中 `SetFilePointer` 设置末尾是冗余的 [已修复并闭环]
 - **来源：** 报告一 WARN-6
-- **位置：** `core/src/pal_win32.cpp:82`
-- **描述：** `O_APPEND` 已通过 `_open_osfhandle` 保证原子 append，open 时的指针移动冗余无害，易误导维护者。
-- **修复建议：** 删除冗余调用。
+- **位置：** `core/src/pal_win32.cpp`（`file_open`）
+- **状态：** ✅ **已修复并闭环**
+- **描述：** `O_APPEND` 已通过 `_open_osfhandle` 保证原子 append，open 时的指针移动冗余无害，易误导维护者以为 append 语义由该调用提供。
+- **修复方案与落地：** 删除 `SetFilePointer(h, 0, nullptr, FILE_END)` 冗余调用，原位注释固化"append 语义由 `_O_APPEND` 每次写原子保证"契约；全量单测（含 append 写、切分、恢复各路径）通过验证语义无损。
 
-### 🟡 [P-06] Windows `atomic_add` 缺少 64 位对齐前置检查
+### ✅ [P-06] Windows `atomic_add`/`atomic_load` 缺少 64 位对齐前置检查 [已修复并闭环]
 - **来源：** 报告三 BUG-P4
-- **位置：** `core/src/pal_win32.cpp:307-310`
-- **描述：** `InterlockedExchangeAdd64` 要求 64 位对齐，建议 Debug 模式下对输入指针施加对齐断言。
-- **修复建议：** 增加 `assert((uintptr_t(p) & 7) == 0)`。
+- **位置：** `core/src/pal_win32.cpp`（`atomic_add`/`atomic_load`）
+- **状态：** ✅ **已修复并闭环**
+- **描述：** `InterlockedExchangeAdd64`/`InterlockedCompareExchange64` 要求目标 8 字节对齐，错位访问触发硬件异常且无提示。
+- **修复方案与落地：** 两函数入口均增加 `assert((reinterpret_cast<uintptr_t>(p) & 7) == 0)` Debug 断言并注释说明 Release 依赖（Instance 内计数器均为独立对齐成员）；新增回归测试 `Robustness.PalAtomicAdd_AlignedBehaviorContract`（旧值返回、负增量、4 线程 × 10000 次并发累加零丢失）。
 
 ---
 
@@ -806,8 +812,8 @@
 | R-03 | 日期校验不完整 / 多套解析不一致 [✅ 已修复] | E-02 | drop_too_large 统计与错误分类 [✅ 已修复] |
 | E-03 | 导出错误被吞 [✅ 已修复] | E-04 | export 临时文件命名冲突 [✅ 已修复] |
 | E-05 | Windows 路径分隔符 [✅ 已修复] | E-06 | flush_threshold==0 语义 [✅ 已修复] |
-| E-07 | logx_stats_t ABI 兼容 [✅ 已修复] | P-02 | file_size_path 开销 |
-| P-03 | file_rmdir 错误转译 | J-02 | g_err_ctx 多实例互踩 |
+| E-07 | logx_stats_t ABI 兼容 [✅ 已修复] | P-02 | file_size_path 开销 [✅ 已修复] |
+| P-03 | file_rmdir 错误转译 [✅ 已修复] | J-02 | g_err_ctx 多实例互踩 |
 | K-01 | Kotlin export 丢返回值 | K-02 | runBlocking 嵌套 |
 | D-01 | Python cksum break 丢记录 | D-02 | Python 坏块 break 丢文件 |
 | D-03 | GCM 失败策略不一致 | F-10 | 缺少 50~100ms Debounce 聚集刷盘 [✅ 已修复] |
@@ -820,8 +826,8 @@
 | S-03 | kBlockHeaderSize 注释 32B→34B [✅ 已修复] | S-04 | max_log_length 默认值注释 [✅ 已修复] |
 | S-05 | staging 指针未置 null [✅ 已修复] | FM-03 | 64KB 栈数组溢出风险 [✅ 已修复] |
 | FM-04 | cksum O(n²) 重扫 [✅ 已修复] | F-08 | flush_blocking 无超时 [✅ 已修复] |
-| F-09 | random_bytes 退化低熵 [✅ 已修复] | P-04 | QPF 重复查询 |
-| P-05 | SetFilePointer 冗余 | P-06 | atomic_add 对齐断言 |
+| F-09 | random_bytes 退化低熵 [✅ 已修复] | P-04 | QPF 重复查询 [✅ 已修复] |
+| P-05 | SetFilePointer 冗余 [✅ 已修复] | P-06 | atomic_add 对齐断言 [✅ 已修复] |
 | J-03 | NewStringUTF 编码风险 | K-03 | errorHandler GC 延迟 |
 | K-04 | setErrorHandler 并发校验 | D-04 | Python 死代码 |
 | D-05 | Python 64MB 解压上限 | C-04 | 缺少 ARMv8 硬件加速（T4.0-5）[✅ 已修复] |

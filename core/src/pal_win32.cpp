@@ -24,6 +24,8 @@
 #include <process.h> // _beginthreadex
 #include <stdlib.h>  // rand_s
 
+#include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -39,6 +41,36 @@ namespace {
 
 // P-01: Win32 HANDLE 为 64 位指针宽度(void*),必须经 intptr_t / void* 无损往返,
 // 禁止窄化截断进 32 位整型类型。
+
+// P-03: Win32 错误 → errno 转译,file_unlink/file_rmdir 失败时供调用方区分
+// "路径不存在"(ENOENT)与"目录非空"(ENOTEMPTY)等语义,而非一律 -1。
+static int win32_error_to_errno(DWORD e) {
+    switch (e) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+            return ENOENT;
+        case ERROR_DIR_NOT_EMPTY:
+            return ENOTEMPTY;
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+            return EBUSY;
+        case ERROR_ACCESS_DENIED:
+            return EACCES;
+        case ERROR_WRITE_PROTECT:
+            return EROFS;
+        case ERROR_NOT_READY:
+            return EIO;
+        default:
+            return EIO;  // 未知错误:保守归入通用 IO 错误,而非丢失错误态
+    }
+}
+
+// P-03: 失败时置 errno 并统一返回 -1;成功返回 0。
+static int translate_win32(BOOL ok) {
+    if (ok) return 0;
+    errno = win32_error_to_errno(GetLastError());
+    return -1;
+}
 
 class WinMutex {
 public:
@@ -74,10 +106,8 @@ public:
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, disp, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) return -1;
-        if (append) {
-            // O_APPEND 语义:后续写从文件尾开始
-            SetFilePointer(h, 0, nullptr, FILE_END);
-        }
+        // P-05: 此处不再 SetFilePointer(FILE_END)——下方 _O_APPEND 已由 CRT 保证
+        // 每次写操作原子性地从文件尾开始,open 时的指针移动既冗余也会误导维护者。
         int flags = _O_RDWR | _O_BINARY;
         if (append) flags |= _O_APPEND;
         int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), flags);
@@ -149,14 +179,14 @@ public:
         return static_cast<int64_t>(sz.QuadPart);
     }
     int64_t file_size_path(const char* path) override {
-        HANDLE h = CreateFileA(path, GENERIC_READ,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return -1;
-        LARGE_INTEGER sz;
-        BOOL ok = GetFileSizeEx(h, &sz);
-        CloseHandle(h);
-        return ok ? static_cast<int64_t>(sz.QuadPart) : -1;
+        // P-02: 改用 GetFileAttributesExA 读取 WIN32_FILE_ATTRIBUTE_DATA,
+        // 不再为一次大小查询付出 CreateFile/CloseHandle 的内核句柄往返;
+        // 该路径在 retention 扫盘与快照统计中高频调用。
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return -1;
+        // 64 位拼接低/高 32 位(避免经 LARGE_INTEGER 中转的符号歧义)
+        return (static_cast<int64_t>(fad.nFileSizeHigh) << 32) |
+               static_cast<int64_t>(fad.nFileSizeLow);
     }
     int file_fsync(int fd) override {
         HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
@@ -174,10 +204,12 @@ public:
         return ok ? 0 : -1;
     }
     int file_unlink(const char* path) override {
-        return DeleteFileA(path) ? 0 : -1;
+        // P-03: 失败转译 errno(ENOENT/EBUSY/EACCES...),调用方语义与 POSIX 对齐
+        return translate_win32(DeleteFileA(path));
     }
     int file_rmdir(const char* dir_path) override {
-        return RemoveDirectoryA(dir_path) ? 0 : -1;
+        // P-03: 失败转译 errno;目录非空 → ENOTEMPTY,不存在 → ENOENT
+        return translate_win32(RemoveDirectoryA(dir_path));
     }
     int file_mkdirs(const char* dir_path) override {
         std::string s(dir_path ? dir_path : "");
@@ -302,21 +334,36 @@ public:
 
     // ---- 原子 ----
     uint64_t atomic_add(uint64_t* p, int64_t delta) override {
+        // P-06: Interlocked*64 家族要求目标 8 字节对齐,错位访问会触发硬件异常;
+        // Debug 构建断言拦截,Release 依赖调用方(Instance 内计数器均为独立对齐成员)。
+        assert((reinterpret_cast<uintptr_t>(p) & 7) == 0 &&
+               "atomic_add64 requires 8-byte alignment");
         return static_cast<uint64_t>(InterlockedExchangeAdd64(
             reinterpret_cast<volatile LONG64*>(p), static_cast<LONG64>(delta)));
     }
     uint64_t atomic_load(uint64_t* p) override {
+        assert((reinterpret_cast<uintptr_t>(p) & 7) == 0 &&
+               "atomic_load64 requires 8-byte alignment");
         return static_cast<uint64_t>(InterlockedCompareExchange64(
             reinterpret_cast<volatile LONG64*>(p), 0, 0));
     }
 
     // ---- 时间 ----
     uint64_t monotonic_ns() override {
-        LARGE_INTEGER freq, now;
-        QueryPerformanceFrequency(&freq);
+        // P-04: QPF 在系统运行期固定不变,仅进程内首次调用查询一次并缓存
+        // (C++11 magic static 保证线程安全),省去每次调用的高频内核查询。
+        static const uint64_t freq = [] {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            return static_cast<uint64_t>(f.QuadPart);
+        }();
+        LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
-        return static_cast<uint64_t>(now.QuadPart) * 1000000000ULL /
-               static_cast<uint64_t>(freq.QuadPart);
+        // 先除后乘:旧实现 now*1e9 在 QPC=10MHz 时开机约 31 分钟即溢出 uint64
+        // 回绕,单调时钟跳变会让耗时轮询永假;拆分为整秒 + 余数两段消除溢出
+        // (余数 < freq,余数*1e9 距 2^64 上限有数倍裕度)。
+        uint64_t ticks = static_cast<uint64_t>(now.QuadPart);
+        return (ticks / freq) * 1000000000ULL + (ticks % freq) * 1000000000ULL / freq;
     }
     uint64_t wallclock_ms() override {
         FILETIME ft;

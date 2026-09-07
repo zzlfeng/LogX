@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -1746,6 +1747,133 @@ TEST(Robustness, StatsReservedZeroContract) {
         pal.file_unlink(f.c_str());
     }
     pal.file_rmdir(dir.c_str());
+}
+
+// =========================================================================
+// 9. P 系列: PAL 实现质量回归 (P-02 size_path / P-03 rmdir errno / P-04 时钟 / P-06 原子对齐)
+// =========================================================================
+
+// P-03: rmdir 错误码必须区分"目录非空"与"目录不存在",不得一律 -1 丢语义。
+// Windows 侧经 win32_error_to_errno 转译,POSIX 侧 rmdir 原生 errno;两侧语义对齐。
+TEST(Robustness, PalRmdirErrnoDistinction_NotEmptyVsMissing) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_p03_rmdir_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(pal.monotonic_ns() % 1000000);
+    ASSERT_EQ(pal.file_mkdirs(dir.c_str()), 0);
+
+    errno = 0;
+    EXPECT_EQ(pal.file_rmdir(dir.c_str()), 0);  // 空目录删除成功
+
+    errno = 0;
+    EXPECT_EQ(pal.file_rmdir(dir.c_str()), -1);  // 再删:目录已不存在
+    EXPECT_EQ(errno, ENOENT);
+
+    // 非空目录:放入一个文件后 rmdir 必须失败且 errno 为 ENOTEMPTY(POSIX)
+    // 或等效错误(Windows 转译 ERROR_DIR_NOT_EMPTY → ENOTEMPTY)
+    std::string dir2 = dir + "_ne";
+    ASSERT_EQ(pal.file_mkdirs(dir2.c_str()), 0);
+    std::string fpath = dir2 + "/occupied.bin";
+    int fd = pal.file_open(fpath.c_str(), true, false);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(pal.file_write(fd, "x", 1), 1);
+    ASSERT_EQ(pal.file_close(fd), 0);
+
+    errno = 0;
+    EXPECT_EQ(pal.file_rmdir(dir2.c_str()), -1);
+    EXPECT_EQ(errno, ENOTEMPTY);
+
+    // 目录内文件 unlink 后 errno 语义:再 unlink 同路径 → ENOENT
+    errno = 0;
+    EXPECT_EQ(pal.file_unlink(fpath.c_str()), 0);
+    errno = 0;
+    EXPECT_EQ(pal.file_unlink(fpath.c_str()), -1);
+    EXPECT_EQ(errno, ENOENT);
+
+    EXPECT_EQ(pal.file_rmdir(dir2.c_str()), 0);
+}
+
+// P-02: file_size_path 语义回归——普通文件精确大小、与 fd 版 file_size 一致、
+// 不存在路径返回 -1、目录返回非负(GetFileAttributesExA 对目录返回属性数据,
+// 大小字段为目录元数据大小;消费方只对 >= 0 做"路径存在"判断,不读目录大小)。
+TEST(Robustness, PalFileSizePath_AttributesBased_SemanticsPreserved) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_p02_size_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(pal.monotonic_ns() % 1000000);
+    ASSERT_EQ(pal.file_mkdirs(dir.c_str()), 0);
+    std::string fpath = dir + "/sized.bin";
+
+    // 精确大小:写入 3 块共 3000 字节(跨 1KB 页边界,避免整页巧合)
+    int fd = pal.file_open(fpath.c_str(), true, false);
+    ASSERT_GE(fd, 0);
+    uint8_t buf[1000];
+    std::memset(buf, 0xA5, sizeof(buf));
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(pal.file_write(fd, buf, sizeof(buf)), 1000);
+    ASSERT_EQ(pal.file_close(fd), 0);
+
+    int64_t by_path = pal.file_size_path(fpath.c_str());
+    EXPECT_EQ(by_path, 3000);
+
+    // 与 fd 版一致性(fd open 时不加 append,避免 O_APPEND 改变语义)
+    int fd2 = pal.file_open(fpath.c_str(), false, false);
+    ASSERT_GE(fd2, 0);
+    EXPECT_EQ(pal.file_size(fd2), by_path);
+    pal.file_close(fd2);
+
+    // 不存在路径必须返回 -1(错误态契约不变)
+    EXPECT_LT(pal.file_size_path((dir + "/no_such_file.bin").c_str()), 0);
+
+    // 目录路径:存在即可查询成功(非负),大小值不参与任何决策
+    EXPECT_GE(pal.file_size_path(dir.c_str()), 0);
+
+    pal.file_unlink(fpath.c_str());
+    pal.file_rmdir(dir.c_str());
+}
+
+// P-06 并发参数:命名空间级常量,lambda 内直接可见无需捕获
+// (MSVC 要求显式捕获而 clang 会报 unused-capture,放作用域常量两端皆净)
+constexpr int kP06AtomicThreads = 4;
+constexpr int kP06AtomicIters = 10000;
+
+// P-04 + 基本时钟契约:单调性(不回退)、量纲合理(ns 级、1ms 睡眠 ≥ 1ms)、
+// 连续两次查询间隔为小正值(防回绕/防跳变回归锚点)。
+TEST(Robustness, PalMonotonic_NonDecreasingSaneUnits) {
+    Pal& pal = default_pal();
+    uint64_t t0 = pal.monotonic_ns();
+    uint64_t t1 = pal.monotonic_ns();
+    EXPECT_GE(t1, t0);
+
+    pal.sleep_ms(15);
+    uint64_t t2 = pal.monotonic_ns();
+    // 睡 15ms 后时钟推进量必须 ≥ 15ms(量纲错误如把 ms 当 ns 会在此暴露),
+    // 且 ≤ 5s(排除病态跳变)。
+    uint64_t delta = t2 - t0;
+    EXPECT_GE(delta, 15ULL * 1000000ULL);
+    EXPECT_LE(delta, 5000ULL * 1000000ULL);
+}
+
+// P-06: 8 字节对齐指针上的 atomic_add/load 语义正确性(对齐断言在 Debug 构建
+// 生效;本测试同时验证对齐路径的行为契约——累加、负增量、并发无丢失)。
+TEST(Robustness, PalAtomicAdd_AlignedBehaviorContract) {
+    Pal& pal = default_pal();
+    alignas(8) uint64_t v = 100;
+    EXPECT_EQ(pal.atomic_add(&v, 5), 100u);   // 返回旧值
+    EXPECT_EQ(v, 105u);
+    EXPECT_EQ(pal.atomic_add(&v, -30), 105u); // 负增量
+    EXPECT_EQ(v, 75u);
+    EXPECT_EQ(pal.atomic_load(&v), 75u);
+
+    alignas(8) uint64_t shared = 0;
+    std::vector<std::thread> ths;
+    for (int i = 0; i < kP06AtomicThreads; ++i) {
+        ths.emplace_back([&pal, &shared] {
+            for (int j = 0; j < kP06AtomicIters; ++j) pal.atomic_add(&shared, 1);
+        });
+    }
+    for (auto& t : ths) t.join();
+    EXPECT_EQ(pal.atomic_load(&shared),
+              static_cast<uint64_t>(kP06AtomicThreads) * kP06AtomicIters);  // 并发累加零丢失
 }
 
 } // namespace
