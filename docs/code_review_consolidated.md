@@ -139,7 +139,7 @@
 
 ### 🟢 [F-03] 短写会造成日志永久丢失 [✅ 已修复]
 - **来源：** 报告二 R2-高#3
-- **位置：** `core/src/flusher.cpp:138-144`（`append_block_raw`）、`flusher.cpp:163-171`（`write_and_record`）、`flusher.cpp:240-244`（`write_file_header`）
+- **位置：** `core/src/flusher.cpp:138-144`（`append_block_raw`）、`flusher.cpp:163-171`（`write_and_record`）、`flusher.cpp:241-245`（`write_file_header`）
 - **描述：** 只判断 `file_write()` 是否返回负数，未确认返回值是否等于完整 frame 长度。若 PAL 实现或注入测试返回部分写入（短写），代码仍视为块写入成功，随后清零 staging 原始数据、提交新 flushed 水位，丢失尚未完整落盘的日志。且物理文件留下撕裂尾部，污染后续日志块写入。
 - **修复方案与落地：**
   1. `append_block_raw` 严格校验返回值 `n != static_cast<long>(frame.size())`：任何短写均视为失败并触发 `block_write_errors.fetch_add(1)` 与 `emit_event(inst, LOGX_EV_IO, -1, "block short write")`；
@@ -536,9 +536,10 @@
 | 生产路径加密文件创建和导出（端到端） | 🔴 高 | 报告二（掩盖 F-01） |
 | `logx_c.cpp` export 路径（`export_range`、`decode_one_file`） | 🔴 高 | 报告一 |
 | 真实进程级崩溃窗口（独立子进程强杀） | 🔴 高 | 报告二（掩盖 T-01） |
-| PAL 短写、fsync 失败和 mmap 同步失败注入 | 🟠 中 | 报告二 |
+| PAL 短写注入（短写截断回滚与中途 ENOSPC 容灾） | ✅ 已补齐 | 报告二（F-03 闭环，Case A/B/C） |
+| PAL fsync 失败和 mmap 同步失败注入 | 🟠 中 | 报告二（F-04 待闭环） |
 | 畸形 `raw_len`、非法版本和非法 flag | 🟠 中 | 报告二 |
-| 分卷恢复及 `.log.N` 目标选择（掩盖 F-02） | 🟠 中 | 报告二/三 |
+| 分卷恢复及 `.log.N` 目标选择（掩盖 F-02） | ✅ 已补齐 | 报告二/三（F-02 闭环，T1~T4 用例） |
 | 双 Header 双坏（整区重建）路径 | 🟠 中 | 报告一 |
 | 双 Header 容错（B 损坏，A 接管）反向场景 | 🟠 中 | 报告一 |
 | `copy_pending` 跨回绕拷贝 | 🟠 中 | 报告一 |
