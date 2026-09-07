@@ -93,7 +93,9 @@ public:
     virtual uint64_t tid() = 0;
 
     /* ---- 随机(文件盐、nonce 高位) ---- */
-    virtual void     random_bytes(void* buf, size_t len) = 0;
+    /* 获取密码学安全随机字节; 成功返回 true; CSPRNG 源失效返回 false。
+     * 严禁在失败时退化为低熵伪随机数, 调用方必须拒绝继续, 避免破坏加密安全性。 */
+    virtual bool     random_bytes(void* buf, size_t len) = 0;
 
     /* ---- 日志(仅供内部调试,生产构建应禁用) ---- */
     virtual void     debug_log(const char* s) = 0;

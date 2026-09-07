@@ -618,6 +618,18 @@ cmake --build build-android -j
 
 ---
 
+## random_bytes 密码学安全升级与低熵拦截 (2026-09-07, F-09 闭环)
+
+针对报告一 WARN-5 指出的底层 CSPRNG 失败时退化为极低熵伪随机数（单调时间与栈地址周期异或）引发 Nonce 碰撞与离线预测的重大密码学隐患，完成接口与双端系统加固：
+
+1. **PAL 契约显式错误化**：`Pal::random_bytes` 返回值由 `void` 升级为 `bool`，严禁在底层 CSPRNG 失效时伪装成功；
+2. **POSIX 免 fd 优先采集**：Linux / Android 平台优先通过 `getrandom(2)` 系统调用直接从内核 CSPRNG 提取随机数（免疫进程 `EMFILE`/`ENFILE` 文件描述符耗尽），回退 `/dev/urandom`，两路均失败清零并显式返回 false，彻底移除 `(t ^ addr)` 伪随机回退逻辑；
+3. **Windows 适配与清零**：MSVC 下保持 CRT `rand_s`（直连系统 `RtlGenRandom`）单路径，失败清零并显式返回 false，彻底移除伪随机回退逻辑；
+4. **生产端拒绝服务与报警**：`open_append_target` 与 `append_block` 在获取文件盐失败时，发射 `LOGX_EV_IO`（"secure random unavailable..."）明确报警，关闭文件句柄并拒绝创建低熵文件；
+5. **单元测试与全矩阵验证**：在 `test_robustness.cpp` 新增 `RandomBytesFailure_RefusesNewFileCreation`（故障注入验证拒绝建文件与报警）与 `RandomBytesSuccess_ProducesNonTrivialSalt`（正常路径验证 8B 盐非全零非全同）。
+
+---
+
 ## 附:构建命令速查
 
 ### Windows(桌面,MSVC)

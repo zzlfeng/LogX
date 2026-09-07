@@ -23,6 +23,18 @@
 #include <unistd.h>
 #include <vector>
 
+#if defined(__linux__) || defined(__ANDROID__)
+#  if defined(__has_include)
+     // Android 上 getrandom() 声明受 __ANDROID_API__ >= 28 守卫, 低 API 级别仅头文件
+     // 存在而函数声明缺失, 必须一并探测(否则走 SYS_getrandom 直调分支)。
+#    if __has_include(<sys/random.h>) && \
+        (!defined(__ANDROID__) || (defined(__ANDROID_API__) && __ANDROID_API__ >= 28))
+#      include <sys/random.h>
+#      define LOGX_HAS_SYS_RANDOM 1
+#    endif
+#  endif
+#endif
+
 namespace logx {
 
 namespace {
@@ -323,11 +335,37 @@ public:
 #endif
     }
 
-    void random_bytes(void* buf, size_t len) override {
-        // Linux/Android 上 /dev/urandom 总是可用;getrandom 是首选但非必需。
+    bool random_bytes(void* buf, size_t len) override {
+        if (!buf && len > 0) return false;
+        size_t off = 0;
+
+#if defined(__linux__) || defined(__ANDROID__)
+        // 优先路径: getrandom(2) 系统调用(免占用 fd, 免疫 EMFILE/ENFILE 耗尽)
+        bool getrandom_failed = false;
+        while (off < len) {
+#if defined(LOGX_HAS_SYS_RANDOM)
+            ssize_t n = ::getrandom(static_cast<uint8_t*>(buf) + off, len - off, 0);
+#elif defined(SYS_getrandom)
+            ssize_t n = ::syscall(SYS_getrandom, static_cast<uint8_t*>(buf) + off, len - off, 0);
+#else
+            ssize_t n = -1;
+            errno = ENOSYS;
+#endif
+            if (n > 0) {
+                off += static_cast<size_t>(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            // 内核不支持(ENOSYS)或其他异常, 转入 /dev/urandom 回退
+            getrandom_failed = true;
+            break;
+        }
+        if (!getrandom_failed && off == len) return true;
+#endif
+
+        // 回退路径: 打开 /dev/urandom 循环读取
         int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
         if (fd >= 0) {
-            size_t off = 0;
             while (off < len) {
                 ssize_t n = ::read(fd, static_cast<uint8_t*>(buf) + off, len - off);
                 if (n > 0) { off += static_cast<size_t>(n); continue; }
@@ -335,14 +373,12 @@ public:
                 break;
             }
             ::close(fd);
-            if (off == len) return;
+            if (off == len) return true;
         }
-        // 退化:用 monotonic 时间 + 地址做填充(仅测试用)
-        uint64_t t = monotonic_ns();
-        uint64_t addr = reinterpret_cast<uint64_t>(buf);
-        for (size_t i = 0; i < len; ++i) {
-            static_cast<uint8_t*>(buf)[i] = static_cast<uint8_t>((t >> (i % 8 * 8)) ^ (addr >> (i % 8 * 8)));
-        }
+
+        // 两路均失败: 清零缓冲区, 拒绝服务, 严禁低熵伪随机回退
+        std::memset(buf, 0, len);
+        return false;
     }
 
     void debug_log(const char* s) override {

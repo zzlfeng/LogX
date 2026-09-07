@@ -453,7 +453,12 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
     if (sz == 0) {
         // 新建:写 32B 头
         uint8_t salt[8];
-        inst->pal->random_bytes(salt, 8);
+        if (!inst->pal->random_bytes(salt, 8)) {
+            emit_event(inst, LOGX_EV_IO, -1,
+                       "secure random unavailable; refusing to create log file with low-entropy salt");
+            inst->pal->file_close(fd);
+            return -1;
+        }
         if (!write_file_header(inst, fd, date, inst->kid, salt)) {
             inst->pal->file_close(fd); return -1;
         }
@@ -856,7 +861,16 @@ bool append_block(Instance* inst,
     int64_t sz = inst->pal->file_size(fd);
     if (sz < 0) { inst->pal->file_close(fd); return false; }
     uint8_t salt[8];
-    if (file_salt) std::memcpy(salt, file_salt, 8);
+    if (file_salt) {
+        std::memcpy(salt, file_salt, 8);
+    } else if (sz == 0) {
+        if (!inst->pal->random_bytes(salt, 8)) {
+            emit_event(inst, LOGX_EV_IO, -1,
+                       "secure random unavailable; refusing to create log file with low-entropy salt");
+            inst->pal->file_close(fd);
+            return false;
+        }
+    }
     if (sz == 0) {
         if (!write_file_header(inst, fd, yyyymmdd, inst->kid, salt)) {
             inst->pal->file_close(fd); return false;

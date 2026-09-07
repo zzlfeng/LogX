@@ -346,24 +346,22 @@ public:
     uint32_t pid() override { return static_cast<uint32_t>(GetCurrentProcessId()); }
     uint64_t tid() override { return static_cast<uint64_t>(GetCurrentThreadId()); }
 
-    void random_bytes(void* buf, size_t len) override {
-        // rand_s 走系统 RNG(CryptGenRandom);失败退化为时间+地址填充。
+    bool random_bytes(void* buf, size_t len) override {
+        // rand_s 走系统 RNG (CryptGenRandom/RtlGenRandom)。
+        if (!buf && len > 0) return false;
         uint8_t* p = static_cast<uint8_t*>(buf);
         size_t off = 0;
         while (off < len) {
             unsigned int v = 0;
-            if (rand_s(&v) != 0) break;
+            if (rand_s(&v) != 0) {
+                std::memset(buf, 0, len);
+                return false;
+            }
             size_t n = (len - off < 4) ? (len - off) : 4;
             std::memcpy(p + off, &v, n);
             off += n;
         }
-        if (off < len) {
-            uint64_t t = monotonic_ns();
-            uint64_t addr = reinterpret_cast<uint64_t>(buf);
-            for (size_t i = off; i < len; ++i) {
-                p[i] = static_cast<uint8_t>((t >> (i % 8 * 8)) ^ (addr >> (i % 8 * 8)));
-            }
-        }
+        return true;
     }
 
     void debug_log(const char* s) override {

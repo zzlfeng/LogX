@@ -268,11 +268,16 @@
      - 全开构建（ON/ON）：98/98 单测 + 4/4 压测 + 3/3 强杀恢复 100% 通过；
      - Android arm64-v8a：交叉编译 0 警告 0 错误通过。
 
-### 🟡 [F-09] `random_bytes` 退化路径熵极低
+### 🟡 [F-09] `random_bytes` 退化路径熵极低 [✅ 已修复]
 - **来源：** 报告一 WARN-5
-- **位置：** `core/src/pal_posix.cpp`、`core/src/pal_win32.cpp`
-- **描述：** `/dev/urandom` 或 `BCryptGenRandom`/`rand_s` 失败时的退化路径按时间+地址周期性填充，熵极低；若生产路径触发将影响加密 nonce 与盐值安全。
-- **修复建议：** 退化路径失败应报错/拒绝服务，而非静默生成低熵随机数。
+- **位置：** `core/src/pal_posix.cpp`、`core/src/pal_win32.cpp`、`core/include/logx_pal.h`、`core/src/flusher.cpp`
+- **描述：** 原实现当 `/dev/urandom` 或 `rand_s` 失败时，退化路径按时间+地址周期性填充伪随机数，熵极低；若在生产路径触发将导致日志分卷文件盐值低熵，进而引发 AES-GCM / Poly1305 Nonce 空间碰撞与复用风险。
+- **闭环方案：**
+  1. **PAL 契约升级**：`Pal::random_bytes` 返回类型升级为 `bool`（失败明确返回 false，严禁自行伪装退化）；
+  2. **POSIX 加固**：新增免文件描述符开销的 `getrandom()` 系统调用优先路径（免疫 `EMFILE`/`ENFILE` 耗尽），回退 `/dev/urandom`，两路均失败清零并返回 false；
+  3. **Windows 适配**：保留 CRT `rand_s`，失败清零并返回 false；
+  4. **生产端拒绝服务**：`flusher.cpp:open_append_target` 与 `append_block` 检查返回值，获取安全盐失败发射 `LOGX_EV_IO`（"secure random unavailable..."）明确报警，关闭文件并拒绝创建低熵密文文件；
+  5. **单测覆盖**：在 `test_robustness.cpp` 新增 `RandomBytesFailure_RefusesNewFileCreation`（验证 CSPRNG 失败拒绝建文件、发射报警且不卡死）与 `RandomBytesSuccess_ProducesNonTrivialSalt`（验证 8B 盐非全零非全同）。
 
 ### 🟠 [F-10] 缺少 50~100ms Debounce 聚集刷盘机制（T4.0-4 偏差）
 - **来源：** 报告三 §四 T4.0-4（Spec 偏差）
@@ -752,7 +757,7 @@
 | S-03 | kBlockHeaderSize 注释 32B→34B | S-04 | max_log_length 默认值注释 |
 | S-05 | staging 指针未置 null | FM-03 | 64KB 栈数组溢出风险 |
 | FM-04 | cksum O(n²) 重扫 | F-08 | flush_blocking 无超时 [✅ 已修复] |
-| F-09 | random_bytes 退化低熵 | P-04 | QPF 重复查询 |
+| F-09 | random_bytes 退化低熵 [✅ 已修复] | P-04 | QPF 重复查询 |
 | P-05 | SetFilePointer 冗余 | P-06 | atomic_add 对齐断言 |
 | J-03 | NewStringUTF 编码风险 | K-03 | errorHandler GC 延迟 |
 | K-04 | setErrorHandler 并发校验 | D-04 | Python 死代码 |

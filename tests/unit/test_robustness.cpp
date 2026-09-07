@@ -136,7 +136,7 @@ public:
 
     uint32_t pid() override { return real_->pid(); }
     uint64_t tid() override { return real_->tid(); }
-    void     random_bytes(void* b, size_t n) override { real_->random_bytes(b, n); }
+    bool     random_bytes(void* b, size_t n) override { return real_->random_bytes(b, n); }
     void     debug_log(const char* s) override { real_->debug_log(s); }
 
     int      threading_init() override { return real_->threading_init(); }
@@ -342,7 +342,7 @@ public:
 
     uint32_t pid() override { return real_->pid(); }
     uint64_t tid() override { return real_->tid(); }
-    void     random_bytes(void* b, size_t n) override { real_->random_bytes(b, n); }
+    bool     random_bytes(void* b, size_t n) override { return real_->random_bytes(b, n); }
     void     debug_log(const char* s) override { real_->debug_log(s); }
 
     int      threading_init() override { return real_->threading_init(); }
@@ -701,7 +701,7 @@ public:
 
     uint32_t pid() override { return real_->pid(); }
     uint64_t tid() override { return real_->tid(); }
-    void     random_bytes(void* b, size_t n) override { real_->random_bytes(b, n); }
+    bool     random_bytes(void* b, size_t n) override { return real_->random_bytes(b, n); }
     void     debug_log(const char* s) override { real_->debug_log(s); }
 
     int      threading_init() override { return real_->threading_init(); }
@@ -1058,6 +1058,202 @@ TEST(Robustness, Win64HandleTruncation_PalMmapAndThreadHandle64BitSafe) {
         EXPECT_EQ(st.mmap_sync_now(), 0);
         st.close();
     }
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+// =========================================================================
+// 8. F-09 random_bytes 故障注入与熵质量验证
+// =========================================================================
+
+class FailingRandomPal : public Pal {
+public:
+    explicit FailingRandomPal(Pal* real) : real_(real) {}
+
+    int  file_open(const char* p, bool c, bool a) override { return real_->file_open(p, c, a); }
+    int  file_close(int fd) override { return real_->file_close(fd); }
+    int  file_truncate(int fd, uint64_t l) override { return real_->file_truncate(fd, l); }
+    long file_write(int fd, const void* b, size_t l) override { return real_->file_write(fd, b, l); }
+    long file_pwrite(int fd, const void* b, size_t l, uint64_t o) override { return real_->file_pwrite(fd, b, l, o); }
+    long file_pread(int fd, void* b, size_t l, uint64_t o) override { return real_->file_pread(fd, b, l, o); }
+    int64_t file_size(int fd) override { return real_->file_size(fd); }
+    int64_t file_size_path(const char* p) override { return real_->file_size_path(p); }
+    int  file_fsync(int fd) override { return real_->file_fsync(fd); }
+    int  file_dir_fsync(const char* d) override { return real_->file_dir_fsync(d); }
+    int  file_unlink(const char* p) override { return real_->file_unlink(p); }
+    int  file_mkdirs(const char* d) override { return real_->file_mkdirs(d); }
+    int  file_rmdir(const char* d) override { return real_->file_rmdir(d); }
+    std::vector<std::string> file_list(const char* d) override { return real_->file_list(d); }
+
+    PalMmap mmap_open(int fd, size_t l, bool w) override { return real_->mmap_open(fd, l, w); }
+    int     mmap_sync(const PalMmap& m, bool a) override { return real_->mmap_sync(m, a); }
+    int     mmap_close(const PalMmap& m) override { return real_->mmap_close(m); }
+
+    void* mutex_create() override { return real_->mutex_create(); }
+    void  mutex_destroy(void* h) override { real_->mutex_destroy(h); }
+    void  mutex_lock(void* h) override { return real_->mutex_lock(h); }
+    void  mutex_unlock(void* h) override { return real_->mutex_unlock(h); }
+
+    int  threading_init() override { return real_->threading_init(); }
+    int  thread_start(void* (*fn)(void*), void* arg, void** out) override { return real_->thread_start(fn, arg, out); }
+    int  thread_join(void* h) override { return real_->thread_join(h); }
+
+    void* ev_create() override { return real_->ev_create(); }
+    void  ev_destroy(void* h) override { real_->ev_destroy(h); }
+    void  ev_signal(void* h) override { return real_->ev_signal(h); }
+    void  ev_wait(void* h) override { return real_->ev_wait(h); }
+    bool  ev_wait_timeout(void* h, uint32_t ms) override { return real_->ev_wait_timeout(h, ms); }
+
+    uint64_t atomic_add(uint64_t* p, int64_t d) override { return real_->atomic_add(p, d); }
+    uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
+
+    uint64_t monotonic_ns() override { return real_->monotonic_ns(); }
+    uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
+    void     wallclock_date(uint32_t* y, uint32_t* h) override { real_->wallclock_date(y, h); }
+    void     sleep_ms(uint32_t ms) override { real_->sleep_ms(ms); }
+
+    uint32_t pid() override { return real_->pid(); }
+    uint64_t tid() override { return real_->tid(); }
+
+    bool random_bytes(void* buf, size_t len) override {
+        if (fail_random_) {
+            std::memset(buf, 0, len);
+            return false;
+        }
+        return real_->random_bytes(buf, len);
+    }
+
+    void debug_log(const char* s) override { real_->debug_log(s); }
+
+    void set_fail_random(bool f) { fail_random_ = f; }
+
+private:
+    Pal* real_;
+    bool fail_random_ = true;
+};
+
+// 验证 CSPRNG 失败时拒绝创建新文件、发射 LOGX_EV_IO 明确报警、不卡死且拒绝低熵服务
+TEST(PalRobustness, RandomBytesFailure_RefusesNewFileCreation) {
+    Pal& real_pal = default_pal();
+    FailingRandomPal failing_pal(&real_pal);
+    failing_pal.set_fail_random(true);
+
+    std::string dir = std::string("logx_test_rand_fail_") +
+                      std::to_string(real_pal.pid()) + "_" +
+                      std::to_string(rand());
+    real_pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    std::atomic<bool> saw_event{false};
+    std::string event_msg;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+    cfg.err_fn = [](void* user, logx_event_kind_e kind, int code, const char* msg) {
+        (void)code;
+        if (kind == LOGX_EV_IO && msg && std::strstr(msg, "secure random unavailable")) {
+            auto* p = static_cast<std::pair<std::atomic<bool>*, std::string*>*>(user);
+            p->first->store(true);
+            *p->second = msg;
+        }
+    };
+    std::pair<std::atomic<bool>*, std::string*> arg_pair{&saw_event, &event_msg};
+    cfg.err_user = &arg_pair;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    // 注入 failing_pal
+    static_cast<Instance*>(inst)->pal = &failing_pal;
+
+    // 写入日志: 正常入 staging
+    const char* line = "test log while secure random unavailable";
+    EXPECT_EQ(logx_write(inst, 1, "TAG", reinterpret_cast<const uint8_t*>(line),
+                         static_cast<uint32_t>(std::strlen(line))), LOGX_OK);
+
+    // flush: 触发 Flusher 尝试建文件写盘, 因无法获取安全盐拒绝建文件, 走块丢弃路径推进水位快速返回
+    EXPECT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 验证捕获到明确的告警事件
+    EXPECT_TRUE(saw_event.load());
+    EXPECT_FALSE(event_msg.empty());
+
+    // 验证目录中没有生成非零字节的 .log 文件 (拒绝创建低熵密文文件)
+    auto files = real_pal.file_list(dir.c_str());
+    for (const auto& f : files) {
+        if (f.find(".log") != std::string::npos) {
+            EXPECT_EQ(real_pal.file_size_path(f.c_str()), 0);
+        }
+    }
+
+    logx_close(inst);
+
+    // 清理
+    for (const auto& f : real_pal.file_list(dir.c_str())) {
+        real_pal.file_unlink(f.c_str());
+    }
+    real_pal.file_rmdir(dir.c_str());
+}
+
+// 验证正常路径下成功生成的 8B 文件盐非全零且非全同 (防退化填充漏网)
+TEST(PalRobustness, RandomBytesSuccess_ProducesNonTrivialSalt) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_rand_succ_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    const char* line = "hello secure salt";
+    EXPECT_EQ(logx_write(inst, 1, "TAG", reinterpret_cast<const uint8_t*>(line),
+                         static_cast<uint32_t>(std::strlen(line))), LOGX_OK);
+    EXPECT_EQ(logx_flush(inst), LOGX_OK);
+    logx_close(inst);
+
+    // 找到生成的 .log 文件
+    auto files = pal.file_list(dir.c_str());
+    std::string log_file;
+    for (const auto& f : files) {
+        if (f.find(".log") != std::string::npos && pal.file_size_path(f.c_str()) >= 32) {
+            log_file = f;
+            break;
+        }
+    }
+    ASSERT_FALSE(log_file.empty());
+
+    // 读 32B 文件头
+    int fd = pal.file_open(log_file.c_str(), false, false);
+    ASSERT_GE(fd, 0);
+    uint8_t hdr[32];
+    ASSERT_EQ(pal.file_pread(fd, hdr, 32, 0), 32);
+    pal.file_close(fd);
+
+    // 提取 salt (hdr[12..19])
+    uint8_t salt[8];
+    std::memcpy(salt, hdr + 12, 8);
+
+    // 验证盐非全零且非全同字节
+    bool all_zero = true;
+    bool all_same = true;
+    for (int i = 0; i < 8; ++i) {
+        if (salt[i] != 0) all_zero = false;
+        if (salt[i] != salt[0]) all_same = false;
+    }
+    EXPECT_FALSE(all_zero);
+    EXPECT_FALSE(all_same);
 
     // 清理
     for (const auto& f : pal.file_list(dir.c_str())) {

@@ -198,7 +198,7 @@ public:
     void sleep_ms(uint32_t ms) override { real_->sleep_ms(ms); }
     uint32_t pid() override { return real_->pid(); }
     uint64_t tid() override { return real_->tid(); }
-    void random_bytes(void* buf, size_t len) override { real_->random_bytes(buf, len); }
+    bool random_bytes(void* buf, size_t len) override { return real_->random_bytes(buf, len); }
     void debug_log(const char* s) override { real_->debug_log(s); }
 private:
     Pal* real_;
