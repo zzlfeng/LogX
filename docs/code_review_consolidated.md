@@ -299,11 +299,11 @@
 - **描述：** `crc32_table_init` 原为普通 `bool`（非 atomic），多个业务写线程（`logx_write`）或 Flusher 线程并发首次触发 CRC 时产生数据竞争，属 C++ 未定义行为（UB），TSan 会报竞争；且可能导致半初始化脏读。
 - **闭环方案：** 基于 C++17 `constexpr` 将 CRC32 表在编译期直接计算完成并生成进只读数据段（`constexpr Crc32Table kCrc32Table{}`），彻底消除运行时初始化，物理实现 Data Race-Free；同时热路径免去初始化检查与分支；配以 `static_assert` 编译期校验特征项及 `test_staging.cpp` 标准测试向量单测。
 
-### 🟠 [S-02] `AppendTargetCache` 缺少 packed 属性，实际大小 16B 而非 13B
+### 🟠 [S-02] `AppendTargetCache` 缺少 packed 属性，实际大小 16B 而非 13B [✅ 已解决]
 - **来源：** 报告一 BUG-1（经交叉复核校准为 P1）＝ 报告二 R2-中#15
-- **位置：** `core/include/logx_staging.h:65`
-- **描述：** 结构体缺 packed（实测 `sizeof=16`），`split_no` 后插入 3B 填充。当前单一 C++ 运行时内写入与读取均按 `sizeof(AppendTargetCache)` 做 `memcpy`，闭环内不发生错位；但破坏了跨语言/离线解码器规范中 `reserved[0..12]` 的 13 字节二进制布局（字段后移 3 字节），属二进制协议契约破坏。
-- **闭环方案（随 F-07 协同落地）：** 放弃破坏性的强制 packed 方案（否则会导致历史 staging 文件 offset 偏移错位）；转而正式将 `AppendTargetCache` 物理对齐大小锁定为 16B（`static_assert(sizeof == 16)` 且断言 `last_block_offset` 在 offset 8），将 `split_no` 扩宽至历史恒为 0 的填充位 `reserved[5]`，有效载荷升至 14B，`reserved[6..7]` 显式填充，实现 100% 物理与逻辑二进制自洽兼容。
+- **位置：** `core/include/logx_staging.h:59-86`
+- **描述：** 早期结构体缺 packed（实测 `sizeof=16`），`split_no` 后插入 3B 填充。当前单一 C++ 运行时内写入与读取均按 `sizeof(AppendTargetCache)` 做 `memcpy`，闭环内不发生错位；但与早期注释声称的 13 字节布局存在歧义。
+- **闭环方案（已随 F-07/F-06 协同落地）：** 放弃破坏性的强制 packed 方案（避免导致历史 staging 文件物理 offset 偏移错位 3B）；转而正式将 `AppendTargetCache` 物理对齐大小锁定为 16B（`static_assert(sizeof == 16)` 且硬断言 `last_block_offset` 在 offset 8），将 `split_no` 扩宽至历史恒为 0 的填充位 `reserved[5]`，有效载荷升至 14B，`reserved[6..7]` 显式填充，实现 100% 物理与逻辑二进制自洽兼容；已通过 `Flush.AppendTargetCache_HistoricalStagingLayoutCompatibility` 与 `RecoveryTest.AppendTargetCache_ContractAndSafeOffsetAssignment` 双重验证。
 
 ### 🟡 [S-03] `kBlockHeaderSize` 注释与实际求值不符（32B vs 34B）
 - **来源：** 报告一 BUG-12（经交叉复核校准为 P2）
