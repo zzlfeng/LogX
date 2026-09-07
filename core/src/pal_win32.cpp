@@ -32,16 +32,13 @@
 
 namespace logx {
 
+static_assert(sizeof(void*) == sizeof(intptr_t),
+              "HANDLE roundtrip requires pointer-width storage");
+
 namespace {
 
-// Win32 HANDLE 实际只用低 32 位;存入 int 槽可无损往返(PalMmap.out_handle /
-// thread handle)。
-inline int handle_to_int(HANDLE h) {
-    return static_cast<int>(reinterpret_cast<intptr_t>(h));
-}
-inline HANDLE int_to_handle(int v) {
-    return reinterpret_cast<HANDLE>(static_cast<intptr_t>(v));
-}
+// P-01: Win32 HANDLE 为 64 位指针宽度(void*),必须经 intptr_t / void* 无损往返,
+// 禁止窄化截断进 32 位整型类型。
 
 class WinMutex {
 public:
@@ -243,7 +240,7 @@ public:
         void* base = MapViewOfFile(map, access, 0, 0, 0);
         if (!base) { CloseHandle(map); return m; }
         m.base = base;
-        m.out_handle = handle_to_int(map);
+        m.out_handle = reinterpret_cast<intptr_t>(map);
         return m;
     }
     int mmap_sync(const PalMmap& m, bool synchronous) override {
@@ -255,8 +252,8 @@ public:
     int mmap_close(const PalMmap& m) override {
         if (!m.base) return -1;
         BOOL ok1 = UnmapViewOfFile(m.base);
-        HANDLE map = int_to_handle(m.out_handle);
-        BOOL ok2 = (map && map != INVALID_HANDLE_VALUE) ? CloseHandle(map) : TRUE;
+        HANDLE map = reinterpret_cast<HANDLE>(m.out_handle);
+        BOOL ok2 = (map != nullptr && map != INVALID_HANDLE_VALUE) ? CloseHandle(map) : TRUE;
         return (ok1 && ok2) ? 0 : -1;
     }
 
@@ -288,8 +285,8 @@ public:
         return 0;
     }
     int thread_join(void* handle) override {
-        HANDLE h = int_to_handle(static_cast<int>(reinterpret_cast<intptr_t>(handle)));
-        if (!h) return -1;
+        if (!handle || handle == INVALID_HANDLE_VALUE) return -1;
+        HANDLE h = reinterpret_cast<HANDLE>(handle);
         WaitForSingleObject(h, INFINITE);
         CloseHandle(h);  // 线程句柄一次性;join 后释放
         return 0;

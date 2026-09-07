@@ -18,6 +18,10 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 using namespace logx;
 
 namespace {
@@ -999,6 +1003,67 @@ TEST(Robustness, Persistence_FsyncFailureEmitsEventWithoutBlocking) {
         mock_pal.file_unlink(f.c_str());
     }
     mock_pal.file_rmdir(dir.c_str());
+}
+
+TEST(Robustness, Win64HandleTruncation_PalMmapAndThreadHandle64BitSafe) {
+    // 1. 结构宽度断言: PalMmap.out_handle 必须严格具备指针宽度 (P-01 核心契约)
+    EXPECT_EQ(sizeof(PalMmap::out_handle), sizeof(void*));
+
+    Pal& pal = default_pal();
+
+#if defined(_WIN32)
+    // 2. 纯值往返数学验证: 构造高 32 位非零的 64 位 HANDLE (验证无 32 位截断)
+    const uintptr_t kHighVal = 0xFFFFFFFF87654321ULL;
+    void* raw_ptr = reinterpret_cast<void*>(kHighVal);
+    HANDLE h_test = reinterpret_cast<HANDLE>(raw_ptr);
+    intptr_t stored = reinterpret_cast<intptr_t>(h_test);
+    HANDLE h_restored = reinterpret_cast<HANDLE>(stored);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(h_restored), kHighVal);
+
+    // 异常参数边界校验
+    EXPECT_EQ(pal.thread_join(nullptr), -1);
+    EXPECT_EQ(pal.thread_join(INVALID_HANDLE_VALUE), -1);
+#else
+    EXPECT_EQ(pal.thread_join(nullptr), -1);
+#endif
+
+    // 3. 32 轮并发线程 Spawn & Join 压力循环 (验证句柄表分配增长与释放无误)
+    for (int i = 0; i < 32; ++i) {
+        struct ThreadCtx {
+            std::atomic<bool> done{false};
+        } tc;
+        void* th = nullptr;
+        ASSERT_EQ(pal.thread_start([](void* p) -> void* {
+            auto* c = static_cast<ThreadCtx*>(p);
+            c->done.store(true);
+            return nullptr;
+        }, &tc, &th), 0);
+        ASSERT_NE(th, nullptr);
+        EXPECT_EQ(pal.thread_join(th), 0);
+        EXPECT_TRUE(tc.done.load());
+    }
+
+    // 4. Staging 多轮 Open -> Sync -> Close -> Reopen 生命周期循环 (验证 mapping HANDLE 正确关闭)
+    std::string dir = std::string("logx_test_p01_mmap_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string staging_path = dir + "/staging.mmap";
+
+    for (int iter = 0; iter < 5; ++iter) {
+        Staging st(&pal, staging_path, 64 * 1024);
+        RecoveryState rstate{};
+        bool recovered = false;
+        ASSERT_TRUE(st.open(&rstate, &recovered));
+        EXPECT_EQ(st.mmap_sync_now(), 0);
+        st.close();
+    }
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
 }
 
 } // namespace

@@ -16,9 +16,9 @@ namespace logx {
 /* mmap 描述。addr_hint 可选(NULL = 由系统选);len = 文件大小(已 ftruncate);
  * writable = true 表示 MAP_SHARED + PROT_WRITE;失败时 out_handle = -1。 */
 struct PalMmap {
-    void*  base = nullptr;
-    int    out_handle = -1;  /* 句柄以便 msync/close */
-    size_t len = 0;
+    void*     base = nullptr;
+    intptr_t  out_handle = -1;  /* 句柄以便 msync/close (POSIX 存 fd, Win32 存 HANDLE) */
+    size_t    len = 0;
 };
 
 class Pal {

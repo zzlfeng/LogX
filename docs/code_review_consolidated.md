@@ -388,11 +388,16 @@
 
 ## 七、PAL 跨平台抽象层
 
-###  [P-01] Windows `HANDLE` → `int` 转换在 64 位 Windows 上截断高 32 位
+### 🔴 [P-01] Windows `HANDLE` → `int` 转换在 64 位 Windows 上截断高 32 位 [✅ 已修复]
 - **来源：** 报告一 BUG-5（列 P0）＝ 报告二 R2-中#10（综合定级 P0）
-- **位置：** `core/src/pal_win32.cpp:39-44`（`handle_to_int`）、`PalMmap.out_handle`、`thread_join`（报告一"风险-5"同根）
-- **描述：** HANDLE 为 8 字节，强转 `int`（4 字节）截断高 32 位；还原的 HANDLE 可能错误，导致关闭错误句柄或资源泄漏。
-- **修复建议：** 将 `PalMmap.out_handle` 及相关存储类型改为 `intptr_t` 或直接用 `HANDLE`。
+- **位置：** `core/src/pal_win32.cpp`（原 `handle_to_int`/`int_to_handle`）、`PalMmap.out_handle`、`thread_join`（报告一"风险-5"同根）
+- **描述：** 原实现把 64 位 `HANDLE` 强转为 32 位 `int`（`handle_to_int`），存入 `PalMmap.out_handle`；且在 `thread_join` 中对传入的 64 位线程句柄同样执行了强转 `int` 窄化。64 位 Windows 进程中 HANDLE 为 8 字节指针宽度，高 32 位非零是常态，还原出错误句柄会导致 `WaitForSingleObject` 等错对象、`CloseHandle` 句柄泄漏或越权误关他人句柄。原代码注释声称“HANDLE 实际只用低 32 位”系错误断言。
+- **修复方案：** 
+  1. 将 `core/include/logx_pal.h` 中 `PalMmap.out_handle` 由 `int` 改为 `intptr_t`（POSIX 存 `fd` 无损提升，Win32 存 64 位 `HANDLE` 无损）；
+  2. 彻底删除 `pal_win32.cpp` 中 `handle_to_int` 与 `int_to_handle` helper 函数及错误注释，在 `pal_win32.cpp` 顶部增加 `static_assert(sizeof(void*) == sizeof(intptr_t))` 编译期不变量检查；
+  3. `mmap_open` 与 `mmap_close` 直接使用 `reinterpret_cast` 往返，并在 `mmap_close` 中增加 `(map != nullptr && map != INVALID_HANDLE_VALUE)` 严格合法性判断；
+  4. `thread_join` 增加判空前置条件 `if (!handle || handle == INVALID_HANDLE_VALUE) return -1;` 并直接 `reinterpret_cast<HANDLE>(handle)`；
+  5. 在 `tests/unit/test_robustness.cpp` 中增加高 32 位非零虚拟句柄数学往返验证、32 轮并发线程 Spawn & Join 压力循环、及 Staging 多轮生命周期验证。
 
 ### 🟠 [P-02] Windows `file_size_path` 频繁打开关闭句柄开销过高
 - **来源：** 报告三 BUG-P2
@@ -684,7 +689,7 @@
 | J-01 | `nativeClose` 提前释放 kp_ctx，Flusher UAF [✅ 已修复] | 报告二#6 / 报告三 BUG-J5（报告三列 P1） |
 | S-01 | CRC32 表初始化多线程数据竞争（UB） | 报告一 BUG-3 / 报告二#4 |
 | E-01 | 错误回调注册数据竞争（UB） | 报告一 BUG-4 / 报告二#5 |
-| P-01 | Win64 HANDLE → int 截断（报告一列 P0） | 报告一 BUG-5 / 报告二#10（报告二列中等） |
+| P-01 | Win64 HANDLE → int 截断（报告一列 P0） [✅ 已修复] | 报告一 BUG-5 / 报告二#10（报告二列中等） |
 | T-01 | "强杀恢复"测试未真正模拟强杀（恢复路径零覆盖） | 报告二测#1 |
 
 ### 🟠 P1 —— 功能 / 并发 / 协议 / 容错缺陷
@@ -724,7 +729,7 @@
 ### 修复顺序建议（综合三份报告）
 
 1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → 真实崩溃恢复测试（T-01）
-2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ [✅ JNI 关闭顺序与 UAF 防护（J-01）] → Win64 句柄截断修复（P-01）
+2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ [✅ JNI 关闭顺序与 UAF 防护（J-01）] → [✅ Win64 句柄截断修复（P-01）]
 3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → [✅ 恢复校验加强（F-05）] → 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
 4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
 5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）
