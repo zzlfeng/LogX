@@ -28,6 +28,8 @@
 | `35816bd` | feat(crypto): 消除热路径逐块 auxv 探测、补齐 GCM 权威向量锚点与健壮性校验 |
 | `74c55d3` | test(codec): 纠偏 GCM 官方向量编号并补齐 McGrew-Viega TC13 权威锚点 (方案 A+) |
 | `5aa713d` | fix(crypto): 移除 aesce 探针静态缓存恢复无状态纯读，根除并发数据竞争 (方案 A) |
+| `1943f1f` | fix(flusher): implement 75ms debounce aggregation flush for low-frequency writes (F-10) |
+| `7c1ee7c` | fix(staging): constexpr compile-time CRC32 table eliminating multi-thread data race (S-01) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -58,7 +60,7 @@
 | 1 | `flush()` 水位线 `target_seqno` 防饥饿(§7,P0) | ✅ 已闭环(2026-09-07,F-08):改用物理等价且规避丢弃路径 seqno 冲突的累计字节水位线(staged_bytes_total vs flushed_bytes_total), 结合环回绕 PAD 跨度补偿严格对齐出入环; 引入 5000ms 超时上界与 Flusher 存活检查双级熔断, 追加 LOGX_ERR_TIMEOUT ABI 安全错误码; 单测覆盖持续写抗饥饿、5s 挂死超时与恢复、65535 丢弃路径快速返回, 三构建矩阵全绿通过 |
 | 2 | 切分序号升级 2B uint16_t(§3.1/§4.4,P1) | ✅ 已闭环(2026-09-07,F-07):保留 ATC 物理 16B 脚印并利用历史恒零填充位无缝扩宽为 uint16_t(Plan B),全链路函数与 FlusherCtx.current_split 升级为 uint16_t,单日分卷上限提升至 65535;达到上限发射 LOGX_EV_IO 明确告警并去重;单测覆盖跨越 255、65535 上限停写、历史 staging 布局向下兼容解析与边界校验,三构建矩阵全绿通过 |
 | 3 | 双 Header:写 A → seq_cst fence → 写 B(§4.2/§10,P0) | 实现为 A(中间态 CRC 保护)→ B → `atomic_thread_fence(release)`,时机与内存序均偏离纪律 |
-| 4 | Flusher 50~100ms Debounce 超时聚合(§4.1,P2) | 未实现:`flusher_loop` 为无超时阻塞 `ev_wait` |
+| 4 | Flusher 50~100ms Debounce 超时聚合(§4.1,P2) | ✅ 已闭环(2026-09-07,F-10):定型 75ms Debounce 防抖窗口中值(kFlushDebounceMs = 75),flusher_loop 等待超时从 30000ms 重构为 75ms,彻底消除低频零散写入长达 30 秒滞留风险;单测覆盖小写入兜底落盘与突发聚集 |
 | 5 | ARMv8 Crypto Extensions 硬件加速(§10,P2) | ✅ 已闭环(2026-09-06,C-04):`aesce.c` 移植并落地标准 AESE/AESMC/EOR 指令直通,消除热路径逐块 getauxval 并恢复探针为无状态纯读(彻底根除数据竞争),落地 GCM 官方向量完整锚定(NIST KAT 零密钥极值基线 + McGrew-Viega 附录 B TC13/14/15 权威锚点,方案 A+)与 add 判空防御,真机(骁龙865)自检与 NIST 校验全绿通过,单测 69/69 与压测 4/4 全通过 |
 | 6 | 每 30s 定时 msync/fdatasync 持久化(§11) | 未实现,当前仅退后台 / 手动路径触发 |
 | 7 | 未对齐访问 / 23:59:59 时钟跳变测试用例(§9,P2) | 39 个用例中不存在 |

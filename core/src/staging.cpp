@@ -21,27 +21,33 @@ namespace logx {
 namespace {
 
 // 标准 CRC32(IEEE 802.3),多项式 0xedb88320。
-uint32_t crc32_table[256];
-bool crc32_table_init = false;
-void init_crc32_table() {
-    if (crc32_table_init) return;
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t c = i;
-        for (int j = 0; j < 8; ++j) {
-            c = (c & 1) ? (0xedb88320u ^ (c >> 1)) : (c >> 1);
+// 编译期生成查表(S-01):无运行时初始化即无数据竞争,热路径亦免去初始化检查分支。
+struct Crc32Table {
+    uint32_t v[256];
+    constexpr Crc32Table() : v{} {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j) {
+                c = (c & 1) ? (0xedb88320u ^ (c >> 1)) : (c >> 1);
+            }
+            v[i] = c;
         }
-        crc32_table[i] = c;
     }
-    crc32_table_init = true;
-}
+};
+
+constexpr Crc32Table kCrc32Table{};
+
+// 编译期静态断言: 校验关键特征项, 防止多项式或生成算法意外变更
+static_assert(kCrc32Table.v[0] == 0x00000000u, "CRC32 table[0] mismatch");
+static_assert(kCrc32Table.v[1] == 0x77073096u, "CRC32 table[1] mismatch");
+static_assert(kCrc32Table.v[255] == 0x2d02ef8du, "CRC32 table[255] mismatch");
 
 }  // namespace
 
 uint32_t crc32_update(uint32_t crc, const uint8_t* p, size_t len) {
-    init_crc32_table();
     crc = ~crc;
     for (size_t i = 0; i < len; ++i) {
-        crc = (crc >> 8) ^ crc32_table[(crc ^ p[i]) & 0xff];
+        crc = (crc >> 8) ^ kCrc32Table.v[(crc ^ p[i]) & 0xff];
     }
     return ~crc;
 }

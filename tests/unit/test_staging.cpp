@@ -237,3 +237,17 @@ TEST_F(StagingTest, MmapFailure_DegradesToHeapMemory) {
     s.close();
     EXPECT_FALSE(s.is_degraded());
 }
+
+TEST_F(StagingTest, Crc32_StandardTestVectors) {
+    // S-01: 校验 IEEE 802.3 标准向量 (RFC 3720 / POSIX)
+    // "123456789" 的 CRC32 严格等于 0xcbf43926
+    const uint8_t standard_input[] = "123456789";
+    EXPECT_EQ(crc32_update(0, standard_input, 9), 0xcbf43926u);
+
+    // 单字节已知向量覆盖 (对应 table 特征项)
+    const uint8_t b1 = 0x01;
+    EXPECT_EQ(crc32_update(0, &b1, 1), 0xa505df1bu);
+
+    const uint8_t b_zero = 0x00;
+    EXPECT_EQ(crc32_update(0, &b_zero, 1), 0xd202ef8du);
+}
