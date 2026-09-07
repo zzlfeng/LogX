@@ -369,22 +369,38 @@
 
 ## 五、恢复模块
 
-### 🟠 [R-01] hint 文件不可读时 `was_truncated` 状态被错误传播给 best 文件
+### ✅ [R-01] hint 文件不可读时 `was_truncated` 状态被错误传播给 best 文件 [已修复并闭环]
 - **来源：** 报告一 BUG-10（报告三 §1.2 将其列为"确认准确"）
-- **位置：** `core/src/recovery.cpp:139-160`
-- **描述：** 若 hint 文件有截断且不可读（`ok=false`），`was_truncated=true` 会被误传给重新扫描的 best 文件，导致 truncated 状态误判。
+- **位置：** `core/src/recovery.cpp`（`reconcile`）
+- **状态：** ✅ **已修复并闭环**（truncated 严格跟随实际命中的扫描结果 + 回归测试锁定）
+- **描述：** `reconcile` 中 `was_truncated` 从 hint 扫描取值后跨文件残留，回退扫描 best 文件后以 `sr.truncated || was_truncated` 合并，hint 文件的截断状态会被误传给另一个文件，导致续写 seqno 凭空跳 1 空隙。（修复前核实：属"休眠但脆弱"隐患——当前 `scan_one` 的 `ok=false` 路径恰好不置 `truncated`，报告的字面场景暂不可触发，但跨文件变量残留模式一旦 `scan_one` 失败路径语义微调即会真实触发。）
+- **修复方案与落地：**
+  1. 重构 `reconcile`：删除跨文件残留变量 `was_truncated`，`r.file_truncated` 只取最终命中那次扫描的 `sr.truncated`；hint 不可读回退 best 时，hint 的整个扫描结果（含 truncated）整体作废；
+  2. 新增回归测试 `RecoveryTest.HintUnreadable_FallsBackToBest_TruncatedNotPropagated`：构造 hint（带撕裂尾块后删除，触发回退）与 best（干净完整文件），断言恢复后 seqno 接管为 best 的 S_file（不凭空跳空隙）且追加目标缓存回退指向 best；
+  3. 双构建矩阵全绿通过。
 
-### 🟠 [R-02] `S_hdr > S_file && truncated` 时丢块统计少计一次
+### ✅ [R-02] `S_hdr > S_file && truncated` 时丢块统计少计一次 [已复核校准并闭环]
 - **来源：** 报告一 BUG-11
-- **位置：** `core/src/recovery.cpp:245-254`
-- **描述：** 文件中有被截断的撕裂块且 `S_hdr > S_file` 同时成立时，被截断的那个块本身也是丢失块，统计少计 1，应为 `S_hdr - seqno_file + 1`。
-- **修复建议：** 修正计数逻辑。
+- **位置：** `core/src/recovery.cpp`（丢块打点分支）
+- **状态：** ✅ **已复核校准：报告断言不成立，现行实现正确；已通过语义注释 + 回归测试固化，防止按报告建议误改引入重复计数**
+- **描述（原报告）：** 报告认为文件中被截断的撕裂块本身也是丢失块，统计少计 1，应为 `S_hdr - seqno_file + 1`。
+- **复核结论（校准）：** 块提交纪律是"整块写入成功后才 `commit_header_locked`"。撕裂尾块（文件中第 S_file+1 号块）若其 Header 提交已持久化，则 S_hdr ≥ S_file + 1，该块天然落在差值区间 (S_file, S_hdr] 内，`lost = S_hdr - S_file` 已覆盖；若其提交未持久化，则 S_hdr == S_file，走独立 `else if (truncated)` 分支单独 +1。两种情况均恰好计数一次，报告建议的再 +1 反而会对撕裂块重复计数。
+- **固化措施：**
+  1. 在打点分支补齐语义注释，锁定"只记差值、不 +1"的完整推导依据；
+  2. 新增回归测试 `RecoveryTest.TornTailWithHeaderAhead_LostCountEqualsSeqnoDiffExactly`：构造块 1..3 + 撕裂第 4 块 + Header 提交至 seqno=4（S_hdr=4 > S_file=3 且 truncated），断言 `truncated_blocks == 1`（恰好一次，若按报告建议 +1 则为 2）且续写 seqno 按 max+1 跳空隙、文件截断修复至块 3 末尾；
+  3. 双构建矩阵全绿通过。
 
-### 🟠 [R-03] 日期解析不验证真实日历日期，多套解析逻辑不一致
+### ✅ [R-03] 日期解析不验证真实日历日期，多套解析逻辑不一致 [已修复并闭环]
 - **来源：** 报告二 R2-中#14 ＋ 报告一 WARN-7
-- **位置：** `core/src/logx_c.cpp:33`（`parse_yyyymmdd`）、`core/src/recovery.cpp`、`core/src/flusher.cpp`（`strtoul` 直接解析）
-- **描述：** `parse_yyyymmdd()` 只检查 8 位数字和数值范围，会接受 `20261399`、`20260231` 等非法日期；`recovery.cpp` 文件名日期解析未复用 `parse_yyyymmdd` 做范围校验，安全级别不一致。
-- **修复建议：** 统一日期解析与校验入口。
+- **位置：** `core/src/logx_c.cpp`（`parse_yyyymmdd`）、`core/src/flusher.cpp`（`parse_log_filename` / `retention_cleanup_impl` / `scan_dir_for_target`）、`core/src/logx_c.cpp`（`take_snapshot` / export 临时文件名）、`core/include/logx_internal.h`
+- **状态：** ✅ **已修复并闭环**（统一日历校验入口 `valid_yyyymmdd` + 5 处内联解析全部收敛）
+- **描述：** `parse_yyyymmdd()` 只检查 8 位数字和数值范围，会接受 `20261399`、`20260231` 等数值合法但日历不存在的日期；除两套命名解析外，retention 清理、目录扫描、导出快照排序（含 `atoi` 解析分卷号）与导出临时文件命名共 5 处各自内联 `strtoul`/`atoi` 解析，安全级别不一致。
+- **修复方案与落地：**
+  1. `logx_internal.h` 新增 `inline bool valid_yyyymmdd(uint32_t)` 真实日历校验：年 ≥ 1、月 1..12、按月天数与闰年规则校验日（含 2000/1900 类世纪闰年边界），作为全库唯一日期合法性入口；
+  2. `parse_log_filename`（文件名日期）与 `parse_yyyymmdd`（export 范围）均接入 `valid_yyyymmdd`，`20261399`/`20260231`/平年 `20260229` 等一律拒绝；
+  3. 内联解析全量收敛：`retention_cleanup_impl`、`scan_dir_for_target`、`take_snapshot`（含排序 key）统一改走 `parse_log_filename`；export 临时文件名与回调日期字串改由已校验的日期统一格式化，消除最后一处裸 `strtoul`；recovery 侧经 F-02 修复后已复用 `parse_log_filename`，自此全库仅剩单一解析实现；
+  4. 单测闭环：`ParseLogFilename_Comprehensive` 扩充非法日历日期拒绝断言（`20261399`/`20260231`/`20260229` 平年/0 月/0 日/0 年）与闰年边界放行（`20240229`/`20000229`，拒绝 `19000229`），并追加 `valid_yyyymmdd` 直接断言；
+  5. 双构建矩阵全绿通过（全开 ON/ON: 105/105 单测 + 4/4 压测 + 3/3 强杀恢复；基础 OFF/OFF: 87/87 单测 + 4/4 压测 + 3/3 强杀恢复）。
 
 ---
 
@@ -751,8 +767,8 @@
 | F-07 | split_no uint8 / 255 停写（T4.0-2） [✅ 已修复] | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
 | C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed [✅ 已解决] |
 | FM-01 | tag[64] 越界读 UB [✅ 已修复] | FM-02 | 重同步未清 carry_slice_buf [✅ 已修复] |
-| R-01 | was_truncated 误传播 | R-02 | 丢块统计少计 1 |
-| R-03 | 日期校验不完整 / 多套解析不一致 | E-02 | drop_too_large 统计与错误分类 |
+| R-01 | was_truncated 误传播 [✅ 已修复] | R-02 | 丢块统计少计 1 [✅ 已复核校准：报告不成立，实现正确，已固化] |
+| R-03 | 日期校验不完整 / 多套解析不一致 [✅ 已修复] | E-02 | drop_too_large 统计与错误分类 |
 | E-03 | 导出错误被吞 | E-04 | export 临时文件命名冲突 |
 | E-05 | Windows 路径分隔符 | E-06 | flush_threshold==0 语义 |
 | E-07 | logx_stats_t ABI 兼容 | P-02 | file_size_path 开销 |
@@ -781,5 +797,5 @@
 1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → [✅ 真实崩溃恢复测试（T-01）]
 2. **P0 并发安全与内存生命周期**：[✅ CRC 表 constexpr 编译期无竞争（S-01）] → 错误回调保护（E-01）→ [✅ JNI 关闭顺序与 UAF 防护（J-01）] → [✅ Win64 句柄截断修复（P-01）]
 3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → [✅ 恢复校验加强（F-05）] → [✅ 分卷序号 uint16_t 与上限告警（F-07）] → [✅ 50~100ms Debounce 聚集刷盘（F-10）]
-4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
+4. **P2 API、测试质量与工具链**：tag 边界、~~日期校验~~ [✅ R-03 已闭环]、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
 5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）

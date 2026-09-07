@@ -129,10 +129,11 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
         hint = make_log_path(inst->log_dir, hdr.target.date, atc_split(hdr.target));
     }
     FileScanResult sr;
-    bool was_truncated = false;
+    // R-01: truncated 状态只来自"实际命中的那次扫描结果"。
+    // hint 不可读而回退 best 文件时,hint 的扫描(含其 truncated)必须整体作废;
+    // 否则 hint 文件的截断状态会被误传播给另一个文件,污染续写 seqno 跳空隙决策。
     if (!hint.empty()) {
         sr = scan_append_target(inst, hint);
-        if (sr.truncated) was_truncated = true;
         if (!sr.ok) {
             // 缓存指向文件不存在或不可读;扩展到全保留文件扫描
             std::string best = scan_dir_for_target(inst);
@@ -149,7 +150,7 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
         return r;
     }
     r.S_file = sr.seqno;
-    r.file_truncated = sr.truncated || was_truncated;
+    r.file_truncated = sr.truncated;
     r.target_path = sr.path;
     return r;
 }
@@ -237,7 +238,14 @@ void run_recovery(Instance* inst) {
 
     // 文件尾被截断(S_file < S_hdr):无论文件尾是否"干净"(断电丢块时
     // fdatasync 缺席,文件以完整块结尾、无撕裂痕迹),丢失都必须打点;
-    // 只有 truncated(撕裂半块被截)时才额外 +1 兜底计数。
+    // 只有 truncated(撕裂半块被截)时才额外发事件。
+    //
+    // R-02 语义锁定:truncated_blocks 只记 lost = S_hdr - seqno_file,
+    // 不再 +1。理由:块提交纪律是"整块写入成功后才 commit_header_locked",
+    // 撕裂尾块(文件中第 S_file+1 块)若其 Header 提交已持久化,则
+    // S_hdr ≥ S_file + 1,该块天然落在差值区间 (S_file, S_hdr] 内;
+    // 若其提交未持久化,则 S_hdr == S_file,走下方 else 分支单独 +1。
+    // 两种情况均恰好计数一次,按报告原建议再 +1 反而会对撕裂块重复计数。
     if (S_hdr > seqno_file) {
         uint32_t lost = S_hdr - seqno_file;
         inst->truncated_blocks.fetch_add(lost);

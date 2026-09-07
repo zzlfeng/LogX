@@ -229,6 +229,7 @@ bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uin
     char* endp = nullptr;
     unsigned long d = std::strtoul(name.c_str(), &endp, 10);
     if (endp != name.c_str() + 8 || d == 0 || d > 99991231u) return false;
+    if (!valid_yyyymmdd(static_cast<uint32_t>(d))) return false;  // R-03 日历合法性
 
     if (name.compare(8, 4, ".log") != 0) return false;
 
@@ -483,18 +484,9 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
 void retention_cleanup_impl(Instance* inst) {
     auto files = inst->pal->file_list(inst->log_dir.c_str());
     std::sort(files.begin(), files.end());
+    // R-03: 统一走 parse_log_filename(含日历合法性校验),不再内联 strtoul。
     auto parse_date = [](const std::string& path, uint32_t* out_date) -> bool {
-        size_t pos = path.find_last_of("/\\");
-        std::string name = (pos == std::string::npos) ? path : path.substr(pos + 1);
-        if (name.find("staging") != std::string::npos) return false;
-        if (name.size() < 12) return false;
-        if (name.compare(name.size() - 4, 4, ".log") != 0 &&
-            name.find(".log.") == std::string::npos) return false;
-        char* endp = nullptr;
-        unsigned long d = std::strtoul(name.c_str(), &endp, 10);
-        if (endp == name.c_str() || d == 0 || d > 99991231u) return false;
-        *out_date = static_cast<uint32_t>(d);
-        return true;
+        return parse_log_filename(path, out_date, nullptr);
     };
     uint32_t yyyymmdd_now = 0, hhmmss_now = 0;
     inst->pal->wallclock_date(&yyyymmdd_now, &hhmmss_now);
@@ -793,15 +785,10 @@ std::string scan_dir_for_target(Instance* inst) {
     uint32_t best_date = 0;
     uint32_t best_seqno = 0;
     for (const auto& f : files) {
-        size_t pos = f.find_last_of("/\\");
-        std::string name = (pos == std::string::npos) ? f : f.substr(pos + 1);
-        if (name.size() < 12) continue;
-        if (name.compare(name.size() - 4, 4, ".log") != 0 &&
-            name.find(".log.") == std::string::npos) continue;
-        char* endp = nullptr;
-        unsigned long d = std::strtoul(name.c_str(), &endp, 10);
-        if (endp == name.c_str() || d == 0) continue;
-        uint32_t date = static_cast<uint32_t>(d);
+        // R-03: 统一走 parse_log_filename(含日历合法性校验)
+        uint32_t date = 0;
+        uint16_t split = 0;
+        if (!parse_log_filename(f, &date, &split)) continue;
         FileScanResult r = scan_one(inst, f, /*repair=*/false);  // 只评估,不修复
         if (!r.ok) continue;
         if (date > best_date || (date == best_date && r.seqno > best_seqno)) {

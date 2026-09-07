@@ -121,11 +121,26 @@ inline void put_u32_le(uint8_t* p, uint32_t v) {
 // 追加目标已达单日最大分卷上限 (65535) 内部返回哨兵码 (F-07 / WARN-4)
 constexpr int kAppendTargetSplitExhausted = -2;
 
+// R-03: 校验 yyyymmdd 数值是否为真实存在的日历日期 (含闰年规则)。
+// 拒绝 20261399 / 20260231 / 00000000 等非法日期;是所有日期解析入口
+// (parse_yyyymmdd / parse_log_filename) 的统一合法性校验。
+constexpr inline bool valid_yyyymmdd(uint32_t v) {
+    uint32_t y = v / 10000;
+    uint32_t m = (v / 100) % 100;
+    uint32_t d = v % 100;
+    if (y == 0 || m < 1 || m > 12 || d < 1) return false;
+    constexpr uint8_t md[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    uint32_t dim = (m == 2 && leap) ? 29u : md[m - 1];
+    return d <= dim;
+}
+
 // 生成日志文件路径: split=0 为 dir/YYYYMMDD.log, split>0 为 dir/YYYYMMDD.log.N (N <= 65535)
 std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint16_t split);
 
 // 解析日志文件路径或文件名: 提取 8 位日期与切分序号 (0..65535)。
 // 支持 "YYYYMMDD.log" (split=0) 与 "YYYYMMDD.log.N" (split=N)。
+// 日期必须通过 valid_yyyymmdd 日历合法性校验 (R-03)。
 // 成功返回 true; 其它文件返回 false。
 bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uint16_t* out_split);
 

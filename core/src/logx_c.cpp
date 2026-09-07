@@ -30,12 +30,15 @@ namespace {
 // M1/M2 阶段:解密走 codec stub(codec.cpp LOGX_WITH_AESGCM=0 时直接失败),
 // 因此 export 在加密文件上只能写"无法解密的标记行";M3 接入后即恢复。
 
+// R-03: export 日期范围解析。与 parse_log_filename / valid_yyyymmdd 共用同一套
+// 日历合法性校验,拒绝 20261399 / 20260231 等数值合法但日历不存在的日期。
 bool parse_yyyymmdd(const char* s, uint32_t* out) {
     if (!s || std::strlen(s) != 8) return false;
     for (int i = 0; i < 8; ++i) if (s[i] < '0' || s[i] > '9') return false;
     char* endp = nullptr;
     unsigned long v = std::strtoul(s, &endp, 10);
     if (endp != s + 8 || v == 0 || v > 99991231u) return false;
+    if (!valid_yyyymmdd(static_cast<uint32_t>(v))) return false;
     *out = static_cast<uint32_t>(v);
     return true;
 }
@@ -170,28 +173,21 @@ struct FileSnapshot {
 std::vector<FileSnapshot> take_snapshot(Instance* inst,
                                        uint32_t from_date, uint32_t to_date) {
     auto files = inst->pal->file_list(inst->log_dir.c_str());
+    // R-03: 统一走 parse_log_filename(含日历合法性校验),不再各自为政。
     auto parse_key = [](const std::string& f) -> std::pair<uint32_t, int> {
-        size_t base = f.find_last_of("/\\");
-        std::string name = (base == std::string::npos) ? f : f.substr(base + 1);
-        uint32_t d = static_cast<uint32_t>(std::strtoul(name.c_str(), nullptr, 10));
-        auto p = name.rfind(".log.");
-        int s = (p == std::string::npos) ? 0 : std::atoi(name.c_str() + p + 5);
-        return {d, s};
+        uint32_t d = 0;
+        uint16_t s = 0;
+        if (!parse_log_filename(f, &d, &s)) return {0, -1};
+        return {d, static_cast<int>(s)};
     };
     std::sort(files.begin(), files.end(), [&](const std::string& a, const std::string& b) {
         return parse_key(a) < parse_key(b);
     });
     std::vector<FileSnapshot> snaps;
     for (const auto& f : files) {
-        size_t base = f.find_last_of("/\\");
-        std::string name = (base == std::string::npos) ? f : f.substr(base + 1);
-        if (name.size() < 12) continue;
-        if (name.compare(name.size() - 4, 4, ".log") != 0 &&
-            name.find(".log.") == std::string::npos) continue;
-        char* endp = nullptr;
-        unsigned long d = std::strtoul(name.c_str(), &endp, 10);
-        if (endp == name.c_str() || d == 0) continue;
-        uint32_t date = static_cast<uint32_t>(d);
+        uint32_t date = 0;
+        uint16_t split = 0;
+        if (!parse_log_filename(f, &date, &split)) continue;
         if (date < from_date || date > to_date) continue;
         int64_t sz = inst->pal->file_size_path(f.c_str());
         if (sz < 0) continue;
@@ -224,10 +220,11 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
             emit_event(inst, LOGX_EV_IO, -1, "decode file failed");
             continue;
         }
-        size_t last_slash = s.path.find_last_of("/\\");
-        const char* fname = (last_slash == std::string::npos) ? s.path.c_str() : (s.path.c_str() + last_slash + 1);
-        std::string tmp = make_tmp_path(inst->log_dir,
-                                        static_cast<uint32_t>(std::strtoul(fname, nullptr, 10)));
+        // R-03: 快照文件已通过 parse_log_filename 校验;临时文件名日期统一走同一入口
+        uint32_t tmp_date = 0;
+        uint16_t tmp_split = 0;
+        if (!parse_log_filename(s.path, &tmp_date, &tmp_split)) continue;
+        std::string tmp = make_tmp_path(inst->log_dir, tmp_date);
         // O_CREAT | O_TRUNC:先创建,再截断到 0
         int fd = inst->pal->file_open(tmp.c_str(), true, false);
         if (fd < 0) continue;
@@ -235,10 +232,11 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
         write_all_lines(inst, fd, lines);
         int64_t tmp_size = inst->pal->file_size(fd);
         inst->pal->file_close(fd);
-        // 解析日期字串 (8 字符)
-        std::string date(fname, fname + 8);
+        // 回调日期字串:由已校验的 tmp_date 统一格式化 (R-03)
+        char date_str[16];
+        std::snprintf(date_str, sizeof(date_str), "%08u", static_cast<unsigned>(tmp_date));
         uint64_t export_size = tmp_size > 0 ? static_cast<uint64_t>(tmp_size) : 0;
-        if (req.cb) req.cb(req.cb_user, date.c_str(), tmp.c_str(), export_size);
+        if (req.cb) req.cb(req.cb_user, date_str, tmp.c_str(), export_size);
         inst->pal->file_unlink(tmp.c_str());
     }
     return LOGX_OK;

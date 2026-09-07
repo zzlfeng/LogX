@@ -711,6 +711,38 @@ TEST(Flush, ParseLogFilename_Comprehensive) {
     EXPECT_FALSE(parse_log_filename("abcd1234.log", &date, &split));
     EXPECT_FALSE(parse_log_filename("", &date, &split));
 
+    // R-03: 数值合法但日历不存在的日期必须被拒绝
+    EXPECT_FALSE(parse_log_filename("20261399.log", &date, &split));  // 13 月 99 日
+    EXPECT_FALSE(parse_log_filename("20260231.log", &date, &split));  // 2 月 31 日
+    EXPECT_FALSE(parse_log_filename("20260229.log", &date, &split));  // 非闰年 2/29
+    EXPECT_FALSE(parse_log_filename("20260010.log", &date, &split));  // 0 月
+    EXPECT_FALSE(parse_log_filename("20260100.log", &date, &split));  // 0 日
+    EXPECT_FALSE(parse_log_filename("00000101.log", &date, &split));  // 0 年
+    // 闰年边界:2000/2400 是闰年(400 倍数),1900 不是(100 倍数非 400 倍数)
+    EXPECT_TRUE(parse_log_filename("20240229.log", &date, &split));
+    EXPECT_EQ(date, 20240229u);
+    EXPECT_TRUE(parse_log_filename("20000229.log", &date, &split));
+    EXPECT_FALSE(parse_log_filename("19000229.log", &date, &split));
+
+    // R-03: valid_yyyymmdd 直接断言
+    EXPECT_TRUE(valid_yyyymmdd(20260907u));
+    EXPECT_TRUE(valid_yyyymmdd(20000229u));   // 400 倍数闰年
+    EXPECT_TRUE(valid_yyyymmdd(20241231u));
+    EXPECT_FALSE(valid_yyyymmdd(20261399u));
+    EXPECT_FALSE(valid_yyyymmdd(20260231u));
+    EXPECT_FALSE(valid_yyyymmdd(20260229u));  // 平年
+    EXPECT_FALSE(valid_yyyymmdd(19000229u));  // 100 倍数非 400 倍数
+    EXPECT_FALSE(valid_yyyymmdd(0u));
+    EXPECT_FALSE(valid_yyyymmdd(20260000u));
+    EXPECT_FALSE(valid_yyyymmdd(20260431u));  // 4 月 31 日
+
+    // R-03: static_assert 编译期常量断言
+    static_assert(valid_yyyymmdd(20260907u), "valid date");
+    static_assert(valid_yyyymmdd(20000229u), "leap year 400");
+    static_assert(!valid_yyyymmdd(19000229u), "century non-leap 100");
+    static_assert(!valid_yyyymmdd(20260231u), "feb 31 invalid");
+    static_assert(!valid_yyyymmdd(20261399u), "month 13 invalid");
+
     // make_log_path <-> parse_log_filename 往返一致性
     const std::string dummy_dir = "logs";
     for (uint16_t s : {uint16_t(0), uint16_t(1), uint16_t(42), uint16_t(255),
@@ -2022,4 +2054,52 @@ TEST(Flush, Debounce_BurstAggregatesIntoFewBlocks) {
         pal.file_unlink(f.c_str());
     }
     pal.file_rmdir(dir.c_str());
+}
+
+TEST(Flush, Export_RejectsInvalidCalendarDates) {
+    // R-03 回归: logx_export 对输入 from/to 日期做严格日历合法性校验,
+    // 拒绝数值合法但日历不存在的日期(如 20260231、20261399、平年 20260229 等)。
+    Pal& pal = default_pal();
+    std::string dir = "test_export_invalid_dates_dir";
+    std::string staging = "test_export_invalid_dates.staging";
+    for (const auto& f : pal.file_list(dir.c_str())) pal.file_unlink(f.c_str());
+    pal.file_rmdir(dir.c_str());
+    pal.file_unlink(staging.c_str());
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.flush_threshold = 8 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_log_length = 64 * 1024;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    ASSERT_NE(inst, nullptr);
+
+    auto dummy_cb = [](void*, const char*, const char*, uint64_t) -> int { return 0; };
+
+    // 1. 日历不存在的非法日期 -> LOGX_ERR_INVALID_ARG
+    EXPECT_EQ(logx_export(inst, "20260231", "20260231", dummy_cb, nullptr), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(logx_export(inst, "20261399", "20261399", dummy_cb, nullptr), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(logx_export(inst, "20260229", "20260229", dummy_cb, nullptr), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(logx_export(inst, "19000229", "19000229", dummy_cb, nullptr), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(logx_export(inst, "20260431", "20260431", dummy_cb, nullptr), LOGX_ERR_INVALID_ARG);
+
+    // 2. 格式不合法的日期 -> LOGX_ERR_INVALID_ARG
+    EXPECT_EQ(logx_export(inst, "bad_date", "20260907", dummy_cb, nullptr), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(logx_export(inst, "20260907", "bad_date", dummy_cb, nullptr), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(logx_export(inst, "202697", "20260907", dummy_cb, nullptr), LOGX_ERR_INVALID_ARG);
+
+    // 3. to < from 逆序范围 -> LOGX_ERR_INVALID_ARG
+    EXPECT_EQ(logx_export(inst, "20260907", "20260905", dummy_cb, nullptr), LOGX_ERR_INVALID_ARG);
+
+    // 4. 合法日历范围 (无日志文件时正常返回 NOT_FOUND, 证明已通过参数解析)
+    EXPECT_EQ(logx_export(inst, "20260901", "20260907", dummy_cb, nullptr), LOGX_ERR_NOT_FOUND);
+
+    logx_close(inst);
+
+    for (const auto& f : pal.file_list(dir.c_str())) pal.file_unlink(f.c_str());
+    pal.file_rmdir(dir.c_str());
+    pal.file_unlink(staging.c_str());
 }

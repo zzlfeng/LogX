@@ -910,3 +910,121 @@ TEST_F(RecoveryTest, AppendTargetCache_ContractAndSafeOffsetAssignment) {
     EXPECT_EQ(split_atc.last_block_offset, 12345678u);
     EXPECT_EQ(split_atc.last_block_end_offset, 87654321u);
 }
+
+TEST_F(RecoveryTest, HintUnreadable_FallsBackToBest_TruncatedNotPropagated) {
+    // R-01 回归:hint 文件不可读,回退扫描 best 文件时,
+    // hint 的扫描结果(含 truncated)不得传播给 best——否则 best 会被错误"跳 1 空隙"续写。
+    // 构造:
+    //   hint  = 20260902.log  → 块 1 (seqno=1) 后追加撕裂半块,
+    //                           再把文件删除 → hint 扫描失败(ok=false),触发回退;
+    //   best  = 20260901.log  → 干净完整文件 (seqno=1, 无截断)。
+    //   Staging Header 缓存指向 hint(date=20260902)。
+    // 期望:恢复后 seqno = best 的 S_file = 1(下一块序号,首块将取 2),
+    // 而非 truncated 误传播下的 max+1 = 2(首块取 3,凭空跳空隙);
+    // 且追加目标缓存指向 best。
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    Pal& pal = default_pal();
+
+    // best:干净完整文件 (seqno=1, 无截断)
+    std::string best_path = log_dir_ + "/" + "20260901.log";
+    ASSERT_TRUE(create_test_log_file(inst, best_path, 20260901u, 1));
+
+    // hint:带撕裂尾块的文件,先构造再删除 → hint 扫描必然 ok=false
+    std::string hint_path = log_dir_ + "/" + "20260902.log";
+    ASSERT_TRUE(create_test_log_file(inst, hint_path, 20260902u, 1));
+    int hfd = pal.file_open(hint_path.c_str(), true, true);  // append 模式,写到文件尾
+    ASSERT_GE(hfd, 0);
+    uint8_t tear[10] = {0};  // 半块(头 34B 只写 10B)
+    ASSERT_EQ(pal.file_write(hfd, tear, sizeof(tear)), static_cast<long>(sizeof(tear)));
+    pal.file_close(hfd);
+    // 先验证构造有效:hint 扫描会标记 truncated
+    {
+        FileScanResult pre = scan_one(inst, hint_path, /*repair=*/false);
+        EXPECT_TRUE(pre.ok);
+        EXPECT_TRUE(pre.truncated);
+    }
+    ASSERT_EQ(pal.file_unlink(hint_path.c_str()), 0);
+
+    // Staging Header:seqno=1,缓存指向 hint(date=20260902, split=0)
+    AppendTargetCache atc{};
+    atc.date = 20260902u;
+    inst->staging->commit_header_locked(1, 0, 0, &atc);
+
+    run_recovery(inst);
+
+    // 核心断言 1:seqno 接管为 best 的 S_file=1(下一块首块取 2,不跳空隙)。
+    // 若 was_truncated 误传播,resume = max(1,1)+1 = 2(首块取 3)。
+    EXPECT_EQ(get_u32(inst->staging->raw_base() + 8), 1u);
+    // 核心断言 2:追加目标缓存回退指向 best 文件
+    AppendTargetCache committed_atc{};
+    std::memcpy(&committed_atc, inst->staging->raw_base() + 20, sizeof(committed_atc));
+    EXPECT_EQ(committed_atc.date, 20260901u);
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, TornTailWithHeaderAhead_LostCountEqualsSeqnoDiffExactly) {
+    // R-02 回归:撕裂尾块本身就是第 S_file+1 号块,其丢失已由 S_hdr - S_file
+    // 差值覆盖,不得再 +1 重复计数。
+    // 构造:文件含块 1..3 (seqno=1,2,3),块 3 之后追加撕裂半块;
+    // Staging Header 提交至 seqno=4(即块 4 的 commit 已持久化,但块 4 数据
+    // 只写了半截 → 文件扫描截到块 3,S_file=3,且 truncated=true)。
+    // 期望:truncated_blocks == 4 - 3 == 1(恰好一次;若按老建议 +1 则为 2);
+    // resume = max(4,3)+1 = 5(Header 存 5? 否——resume 是"下一块序号",
+    // 存 max+1 = 4 + 1? 见实现:resume = max+1,首块 = resume+1 = max+2,跳 1 空隙)。
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+    std::string path = make_log_path(log_dir_, yyyymmdd, 0);
+
+    ASSERT_TRUE(create_test_log_file(inst, path, yyyymmdd, 1));   // 块 1
+    ASSERT_TRUE(append_test_block(inst, path, 2, 0x20));          // 块 2
+    uint64_t blk3_off = 0;
+    ASSERT_TRUE(append_test_block(inst, path, 3, 0x30, &blk3_off));
+    int64_t sz_after_3 = inst->pal->file_size_path(path.c_str());
+
+    // 追加撕裂半块(第 4 块只写了 10B)
+    int fd = inst->pal->file_open(path.c_str(), true, true);  // append 模式,写到文件尾
+    ASSERT_GE(fd, 0);
+    uint8_t tear[10] = {0};
+    ASSERT_EQ(inst->pal->file_write(fd, tear, sizeof(tear)), static_cast<long>(sizeof(tear)));
+    inst->pal->file_close(fd);
+
+    // 文件扫描:截到块 3 末尾,truncated = true,S_file = 3
+    FileScanResult sr = scan_one(inst, path, /*repair=*/false);
+    ASSERT_TRUE(sr.ok);
+    ASSERT_TRUE(sr.truncated);
+    ASSERT_EQ(sr.seqno, 3u);
+
+    // Staging Header 提交至 seqno=4(S_hdr=4 > S_file=3)
+    AppendTargetCache atc{};
+    atc.date = yyyymmdd;
+    inst->staging->commit_header_locked(4, 0, 0, &atc);
+
+    run_recovery(inst);
+
+    // 核心断言:丢失计数 = S_hdr - S_file = 1,恰好一次(R-02:不得 +1 变 2)
+    EXPECT_EQ(inst->truncated_blocks.load(), 1u);
+    // 续写 seqno 跳 1 空隙:Header 存 max(4,3)+1 = 5(Flusher 首块取 6)
+    EXPECT_EQ(get_u32(inst->staging->raw_base() + 8), 5u);
+    // 文件被截断修复至块 3 末尾
+    EXPECT_EQ(inst->pal->file_size_path(path.c_str()), sz_after_3);
+
+    delete inst->staging;
+    delete inst;
+}
