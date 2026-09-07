@@ -15,6 +15,7 @@
 #ifndef LOGX_STAGING_H
 #define LOGX_STAGING_H
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -40,8 +41,8 @@ constexpr uint32_t kMagicStaging = 0x5358474c;  // 'LGXS' 小端
 //   [8, 12)  seqno(已落盘块数)
 //   [12, 16) flushed_len
 //   [16, 20) write_pos(诊断用)
-//   [20, 60) reserved(40B,其中 13B 是追加目标缓存:日期 4B + 切分序号 1B +
-//                    最近提交块起/止偏移各 4B)
+//   [20, 60) reserved(40B,其中 14B 逻辑 / 16B 物理是追加目标缓存:日期 4B + 切分序号 2B +
+//                    最近提交块起/止偏移各 4B + 2B pad)
 //   [60, 64) header_crc(覆盖前 60B)
 struct alignas(8) Header {
     uint32_t magic;       // 'LGXS'
@@ -55,25 +56,43 @@ struct alignas(8) Header {
 };
 static_assert(sizeof(Header) == 64, "Header must be 64B");
 
-// 追加目标缓存(reserved[0..12],共 13B):
+// 追加目标缓存(reserved[0..15], 14B 逻辑载荷 + 16B 物理对齐脚印, spec §3.1 / T4.0-2 / F-07):
 //   reserved[0..3]   date(本机 yyyyMMdd)
-//   reserved[4]      split_no(切分序号 .1/.2 ...)
-//   reserved[5..8]   last_block_offset(最近已提交块在文件中的字节偏移)
-//   reserved[9..12]  last_block_end_offset
+//   reserved[4]      split_no_lo(切分序号低字节)
+//   reserved[5]      split_no_hi(切分序号高字节，历史文件中零初始化恒为 0，零成本向下兼容)
+//   reserved[6..7]   pad[2](自然 4 字节对齐填充)
+//   reserved[8..11]  last_block_offset(最近已提交块在文件中的字节偏移)
+//   reserved[12..15] last_block_end_offset
 //
-// 契约说明 (F-06 / S-02):
-//   此结构体为 13B 固定二进制契约(仅为诊断缓存, 恢复决策由 scan_one 保证);
+// 契约说明 (F-06 / F-07 / S-02):
+//   此结构体物理大小保持 16B 自然对齐不变，last_block_offset/end_offset 绝对物理偏移原地不动；
+//   利用历史全零初始化的 reserved[5] 填充字节将 split_no 扩宽为 16 位 (上限 65535, 支持 655GB/天)；
+//   旧版本落盘的 staging 文件由于 reserved[5]==0，新版直接读取出 split_no <= 255 完全等价；
 //   uint32_t 偏移上限 4GiB 由写入端强制切分防线 (should_rotate_file_size) 与
 //   越界哨兵置 0 守卫保证不会静默溢出;
 //   offset=0 表示未知/越界哨兵值，非真实偏移(首块真实偏移恒 >= 32B 文件头)。
 struct AppendTargetCache {
     uint32_t date;
-    uint8_t  split_no;
+    uint8_t  split_no_lo;
+    uint8_t  split_no_hi;
+    uint8_t  pad[2];
     uint32_t last_block_offset;
     uint32_t last_block_end_offset;
 };
+static_assert(sizeof(AppendTargetCache) == 16, "AppendTargetCache must be 16B");
+static_assert(offsetof(AppendTargetCache, last_block_offset) == 8, "last_block_offset must be at offset 8");
+static_assert(offsetof(AppendTargetCache, last_block_end_offset) == 12, "last_block_end_offset must be at offset 12");
 static_assert(sizeof(AppendTargetCache::last_block_offset) == 4, "last_block_offset must be 4B uint32");
 static_assert(sizeof(AppendTargetCache::last_block_end_offset) == 4, "last_block_end_offset must be 4B uint32");
+
+inline uint16_t atc_split(const AppendTargetCache& c) {
+    return static_cast<uint16_t>(c.split_no_lo | (static_cast<uint16_t>(c.split_no_hi) << 8));
+}
+
+inline void atc_set_split(AppendTargetCache* c, uint16_t split) {
+    c->split_no_lo = static_cast<uint8_t>(split & 0xFF);
+    c->split_no_hi = static_cast<uint8_t>((split >> 8) & 0xFF);
+}
 
 // 启动时读到的"恢复上下文":recovery.cpp 用其驱动对账。
 struct RecoveryState {

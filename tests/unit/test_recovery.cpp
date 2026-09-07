@@ -400,7 +400,7 @@ TEST_F(RecoveryTest, AppendTargetCache_HitFastPath) {
     // 构造有效 ATC 缓存写入 Header
     AppendTargetCache atc{};
     atc.date = yyyymmdd;
-    atc.split_no = 0;
+    atc_set_split(&atc, 0);
     atc.last_block_offset = static_cast<uint32_t>(b1_start);
     atc.last_block_end_offset = static_cast<uint32_t>(b1_end);
     inst->staging->commit_header_locked(1, 14, 14, &atc);
@@ -559,7 +559,7 @@ TEST_F(RecoveryTest, RecoveryResume_PreservesSplitNoInAppendTargetCache) {
     // 模拟 Staging Header 中已存在分卷 2 的缓存
     AppendTargetCache atc{};
     atc.date = yyyymmdd;
-    atc.split_no = 2;
+    atc_set_split(&atc, 2);
     atc.last_block_offset = 32;
     atc.last_block_end_offset = static_cast<uint32_t>(inst->pal->file_size_path(path2.c_str()));
     inst->staging->commit_header_locked(10, 0, 0, &atc);
@@ -571,7 +571,7 @@ TEST_F(RecoveryTest, RecoveryResume_PreservesSplitNoInAppendTargetCache) {
     AppendTargetCache committed_atc{};
     std::memcpy(&committed_atc, inst->staging->raw_base() + 20, sizeof(committed_atc));
     EXPECT_EQ(committed_atc.date, yyyymmdd);
-    EXPECT_EQ(committed_atc.split_no, 2);
+    EXPECT_EQ(atc_split(committed_atc), 2);
     EXPECT_EQ(get_u32(inst->staging->raw_base() + 8), 10u);
 
     delete inst->staging;
@@ -610,7 +610,7 @@ TEST_F(RecoveryTest, RecoveryRebuilt_PreservesSplitNoInAppendTargetCache) {
     AppendTargetCache committed_atc{};
     std::memcpy(&committed_atc, inst->staging->raw_base() + 20, sizeof(committed_atc));
     EXPECT_EQ(committed_atc.date, yyyymmdd);
-    EXPECT_EQ(committed_atc.split_no, 2);
+    EXPECT_EQ(atc_split(committed_atc), 2);
     EXPECT_EQ(get_u32(inst->staging->raw_base() + 8), 20u);
 
     delete inst->staging;
@@ -828,7 +828,7 @@ TEST_F(RecoveryTest, Recovery_SumRawLenExceedsCapacity_DoesNotCorruptStaging) {
     // 2. 模拟 staging 初始状态: S_hdr = 0, F = 0, w = 0
     AppendTargetCache atc{};
     atc.date = yyyymmdd;
-    atc.split_no = 0;
+    atc_set_split(&atc, 0);
     inst->staging->commit_header_locked(0, 0, 0, &atc);
 
     // 3. 执行恢复: 触发 S_file (2) > S_hdr (0) 回推链路
@@ -846,7 +846,10 @@ TEST_F(RecoveryTest, Recovery_SumRawLenExceedsCapacity_DoesNotCorruptStaging) {
 }
 
 TEST_F(RecoveryTest, AppendTargetCache_ContractAndSafeOffsetAssignment) {
-    // 1. 契约锁定: 验证 AppendTargetCache 字段大小为 4 字节 (F-06 方案 D)
+    // 1. 契约锁定: 验证 AppendTargetCache 物理大小为 16 字节自然对齐且字段大小为 4 字节 (F-06 / F-07)
+    static_assert(sizeof(AppendTargetCache) == 16, "AppendTargetCache must be 16B");
+    static_assert(offsetof(AppendTargetCache, last_block_offset) == 8, "last_block_offset must be at offset 8");
+    static_assert(offsetof(AppendTargetCache, last_block_end_offset) == 12, "last_block_end_offset must be at offset 12");
     static_assert(sizeof(AppendTargetCache::last_block_offset) == 4, "last_block_offset must be 4B uint32");
     static_assert(sizeof(AppendTargetCache::last_block_end_offset) == 4, "last_block_end_offset must be 4B uint32");
 
@@ -876,4 +879,34 @@ TEST_F(RecoveryTest, AppendTargetCache_ContractAndSafeOffsetAssignment) {
     EXPECT_FALSE(safe_assign_atc_offsets(huge_100gb, huge_100gb + 4096, &out_start, &out_end));
     EXPECT_EQ(out_start, 0u);
     EXPECT_EQ(out_end, 0u);
+
+    // 6. 16 位切分序号契约与 helper 验证 (F-07 / Plan B)
+    AppendTargetCache split_atc{};
+    atc_set_split(&split_atc, 0);
+    EXPECT_EQ(atc_split(split_atc), 0u);
+    EXPECT_EQ(split_atc.split_no_lo, 0u);
+    EXPECT_EQ(split_atc.split_no_hi, 0u);
+
+    atc_set_split(&split_atc, 255);
+    EXPECT_EQ(atc_split(split_atc), 255u);
+    EXPECT_EQ(split_atc.split_no_lo, 255u);
+    EXPECT_EQ(split_atc.split_no_hi, 0u);
+
+    atc_set_split(&split_atc, 256);
+    EXPECT_EQ(atc_split(split_atc), 256u);
+    EXPECT_EQ(split_atc.split_no_lo, 0u);
+    EXPECT_EQ(split_atc.split_no_hi, 1u);
+
+    atc_set_split(&split_atc, 65535);
+    EXPECT_EQ(atc_split(split_atc), 65535u);
+    EXPECT_EQ(split_atc.split_no_lo, 0xFF);
+    EXPECT_EQ(split_atc.split_no_hi, 0xFF);
+
+    // 验证高字节写入完全不影响后置 offset 字段
+    split_atc.last_block_offset = 12345678u;
+    split_atc.last_block_end_offset = 87654321u;
+    atc_set_split(&split_atc, 65535);
+    EXPECT_EQ(atc_split(split_atc), 65535u);
+    EXPECT_EQ(split_atc.last_block_offset, 12345678u);
+    EXPECT_EQ(split_atc.last_block_end_offset, 87654321u);
 }

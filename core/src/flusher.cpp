@@ -206,17 +206,17 @@ int durability_sync(Instance* inst, uint64_t* out_sync_time_ms) {
 }
 
 // ---- §C 文件路径 / 清理 ----
-std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint8_t split) {
+std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint16_t split) {
     char buf[128];
     if (split == 0) {
         std::snprintf(buf, sizeof(buf), "%s/%08u.log", dir.c_str(), yyyymmdd);
     } else {
-        std::snprintf(buf, sizeof(buf), "%s/%08u.log.%u", dir.c_str(), yyyymmdd, split);
+        std::snprintf(buf, sizeof(buf), "%s/%08u.log.%u", dir.c_str(), yyyymmdd, static_cast<unsigned>(split));
     }
     return std::string(buf);
 }
 
-bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uint8_t* out_split) {
+bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uint16_t* out_split) {
     if (path_or_name.empty()) return false;
     size_t base = path_or_name.find_last_of("/\\");
     std::string name = (base == std::string::npos) ? path_or_name : path_or_name.substr(base + 1);
@@ -232,15 +232,16 @@ bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uin
 
     if (name.compare(8, 4, ".log") != 0) return false;
 
-    uint8_t split = 0;
+    uint16_t split = 0;
     if (name.size() == 12) {
         split = 0;
     } else if (name.size() > 13 && name[12] == '.') {
+        if (name[13] < '0' || name[13] > '9') return false;
         char* split_end = nullptr;
         unsigned long s = std::strtoul(name.c_str() + 13, &split_end, 10);
         if (split_end == name.c_str() + 13 || *split_end != '\0') return false;
-        if (s > 255) return false;
-        split = static_cast<uint8_t>(s);
+        if (s > 65535u) return false;
+        split = static_cast<uint16_t>(s);
     } else {
         return false;
     }
@@ -439,7 +440,7 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
 // 打开/创建追加目标文件;返回 fd;失败 -1。
 // *out_path / *out_salt 由调用方在 retry 时复用。
 int open_or_create_append_target(Instance* inst, const std::string& hint_path,
-                                 uint32_t date, uint8_t split_no,
+                                 uint32_t date, uint16_t split_no,
                                  std::string* out_path,
                                  uint8_t out_salt[8]) {
     std::string path = hint_path.empty()
@@ -531,7 +532,7 @@ struct FlusherCtx {
     Instance* inst = nullptr;
     std::string current_path;     // 当前活跃文件路径
     uint32_t current_date = 0;
-    uint8_t  current_split = 0;
+    uint16_t current_split = 0;
     uint8_t  current_salt[8] = {0};
     int      current_fd = -1;
     uint64_t current_size = 0;
@@ -565,12 +566,12 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
         // 优先用 hint(追加目标缓存)
         std::string hint;
         if (inst->staging) {
-            // 从 staging Header reserved[0..12] 读 cache
+            // 从 staging Header reserved[0..15] 读 cache
             const uint8_t* base = inst->staging->raw_base();
             AppendTargetCache tc;
             std::memcpy(&tc, base + 20, sizeof(tc));
             if (tc.date != 0) {
-                hint = make_log_path(inst->log_dir, tc.date, tc.split_no);
+                hint = make_log_path(inst->log_dir, tc.date, atc_split(tc));
             }
         }
         if (hint.empty()) {
@@ -600,13 +601,15 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
     }
 
     // 切分序号决策:如果当前 size 满足切分条件 (≥ max_file_size 或达到 4GiB 物理上限) → split+1 切到新文件。
-    // 增加循环探测:若 make_log_path 目标已存在则持续 +1, 直至空闲分卷或达 255 上限
+    // 增加循环探测:若 make_log_path 目标已存在则持续 +1, 直至空闲分卷或达 65535 上限 (F-07 / WARN-4)
     if (should_rotate_file_size(c->current_size, inst->max_file_size)) {
         do {
-            if (c->current_split >= 255) {
-                // 达上限,停写
+            if (c->current_split >= 65535u) {
+                // 达上限 65535, 停写并明确报警 (WARN-4 / F-07)
                 close_current(c, inst->pal);
-                return -1;
+                emit_event(inst, LOGX_EV_IO, -1,
+                           "daily split limit (65535) exhausted; writes suspended until date rollover");
+                return kAppendTargetSplitExhausted;
             }
             c->current_split += 1;
         } while (inst->pal->file_size_path(
@@ -664,7 +667,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     // 关键顺序(spec §4.2 第 4→5→6 步):先落数据,再清零,最后提交。
     AppendTargetCache atc{};
     atc.date = c->current_date;
-    atc.split_no = c->current_split;
+    atc_set_split(&atc, c->current_split);
 
     // 当前写指针;清零 [f, f+raw_len) 后需要推进;按块依次 commit。
     uint32_t cur_f = f;
@@ -687,9 +690,11 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         // 5.1 决定追加目标文件(跨天/切分)
         int fd = ensure_append_target(c, yyyymmdd, inst);
         atc.date = c->current_date;
-        atc.split_no = c->current_split;
+        atc_set_split(&atc, c->current_split);
         if (fd < 0) {
-            emit_event(inst, LOGX_EV_IO, -1, "append target open failed");
+            if (fd != kAppendTargetSplitExhausted) {
+                emit_event(inst, LOGX_EV_IO, -1, "append target open failed");
+            }
             // 不再尝试,清零 cur_f..(cur_f+blk.raw_len) 以维持不变量
             inst->pal->mutex_lock(inst->mu);
             inst->staging->zero_range_locked(cur_f, blk.raw_len);
@@ -878,7 +883,7 @@ bool append_block(Instance* inst,
     return true;
 }
 
-std::string current_log_path(Instance* inst, uint32_t yyyymmdd, uint8_t split_no) {
+std::string current_log_path(Instance* inst, uint32_t yyyymmdd, uint16_t split_no) {
     return make_log_path(inst->log_dir, yyyymmdd, split_no);
 }
 

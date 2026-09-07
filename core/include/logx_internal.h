@@ -109,13 +109,16 @@ inline void put_u32_le(uint8_t* p, uint32_t v) {
     p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff;
 }
 
-// 生成日志文件路径: split=0 为 dir/YYYYMMDD.log, split>0 为 dir/YYYYMMDD.log.N
-std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint8_t split);
+// 追加目标已达单日最大分卷上限 (65535) 内部返回哨兵码 (F-07 / WARN-4)
+constexpr int kAppendTargetSplitExhausted = -2;
 
-// 解析日志文件路径或文件名: 提取 8 位日期与切分序号 (0..255)。
+// 生成日志文件路径: split=0 为 dir/YYYYMMDD.log, split>0 为 dir/YYYYMMDD.log.N (N <= 65535)
+std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint16_t split);
+
+// 解析日志文件路径或文件名: 提取 8 位日期与切分序号 (0..65535)。
 // 支持 "YYYYMMDD.log" (split=0) 与 "YYYYMMDD.log.N" (split=N)。
 // 成功返回 true; 其它文件返回 false。
-bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uint8_t* out_split);
+bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uint16_t* out_split);
 
 // 单日志文件物理容量硬上限 (4GiB - 16MB 安全余量, 保证即使加上最后一块也不会溢出 uint32_t) (F-06 方案 D)
 constexpr uint64_t kSingleFileMaxCapacity = 0xFFFFFFFFULL - (16 * 1024 * 1024ULL);
@@ -203,7 +206,7 @@ bool sum_raw_len_since(Instance* inst, const std::string& target_path,
                        uint64_t* out_last_block_end_offset);
 
 // 当前活跃日志文件的路径;按当天日期 + split_no 计算。
-std::string current_log_path(Instance* inst, uint32_t yyyymmdd, uint8_t split_no);
+std::string current_log_path(Instance* inst, uint32_t yyyymmdd, uint16_t split_no);
 
 // 启动/退出时按保留期清理过期文件。
 void retention_cleanup(Instance* inst);

@@ -126,7 +126,7 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
     // 优先用 hint(追加目标缓存)
     std::string hint;
     if (hdr.target.date != 0) {
-        hint = make_log_path(inst->log_dir, hdr.target.date, hdr.target.split_no);
+        hint = make_log_path(inst->log_dir, hdr.target.date, atc_split(hdr.target));
     }
     FileScanResult sr;
     bool was_truncated = false;
@@ -177,7 +177,9 @@ void run_recovery(Instance* inst) {
             FileScanResult sr = scan_append_target(inst, best);
             if (sr.ok) {
                 hdr.seqno = sr.seqno;
-                parse_log_filename(sr.path, &atc.date, &atc.split_no);
+                uint16_t split = 0;
+                parse_log_filename(sr.path, &atc.date, &split);
+                atc_set_split(&atc, split);
                 if (!safe_assign_atc_offsets(sr.last_block_offset, sr.last_block_end_offset,
                                              &atc.last_block_offset, &atc.last_block_end_offset)) {
                     emit_event(inst, LOGX_EV_IO, -1, "scan offset exceeds atc capacity");
@@ -300,7 +302,9 @@ void run_recovery(Instance* inst) {
     std::memcpy(&atc, inst->staging->raw_base() + 20, sizeof(atc));
     // 更新追加目标缓存:指向 resume 目标(暂用 hint 或原 cache)
     if (!rec.target_path.empty()) {
-        parse_log_filename(rec.target_path, &atc.date, &atc.split_no);
+        uint16_t split = 0;
+        parse_log_filename(rec.target_path, &atc.date, &split);
+        atc_set_split(&atc, split);
         // last_block_offset 与 last_block_end_offset 由下次 commit 更新
     }
     // write_pos(环坐标) = (F + valid_end) % size;若 valid_end == raw_bytes 则 = w(原值)

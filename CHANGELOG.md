@@ -56,7 +56,7 @@
 | # | spec/CHANGELOG 声称(v5) | 代码实际(2026-09-03) |
 |---|---|---|
 | 1 | `flush()` 水位线 `target_seqno` 防饥饿(§7,P0) | 未实现:`flush_blocking` 自旋等待 staging 全空 + 5ms sleep,持续高频写入存在饥饿风险 |
-| 2 | 切分序号升级 2B uint16_t(§3.1/§4.4,P1) | 仍为 uint8_t(`AppendTargetCache.split_no` / `make_log_path`) |
+| 2 | 切分序号升级 2B uint16_t(§3.1/§4.4,P1) | ✅ 已闭环(2026-09-07,F-07):保留 ATC 物理 16B 脚印并利用历史恒零填充位无缝扩宽为 uint16_t(Plan B),全链路函数与 FlusherCtx.current_split 升级为 uint16_t,单日分卷上限提升至 65535;达到上限发射 LOGX_EV_IO 明确告警并去重;单测覆盖跨越 255、65535 上限停写、历史 staging 布局向下兼容解析与边界校验,三构建矩阵全绿通过 |
 | 3 | 双 Header:写 A → seq_cst fence → 写 B(§4.2/§10,P0) | 实现为 A(中间态 CRC 保护)→ B → `atomic_thread_fence(release)`,时机与内存序均偏离纪律 |
 | 4 | Flusher 50~100ms Debounce 超时聚合(§4.1,P2) | 未实现:`flusher_loop` 为无超时阻塞 `ev_wait` |
 | 5 | ARMv8 Crypto Extensions 硬件加速(§10,P2) | ✅ 已闭环(2026-09-06,C-04):`aesce.c` 移植并落地标准 AESE/AESMC/EOR 指令直通,消除热路径逐块 getauxval 并恢复探针为无状态纯读(彻底根除数据竞争),落地 GCM 官方向量完整锚定(NIST KAT 零密钥极值基线 + McGrew-Viega 附录 B TC13/14/15 权威锚点,方案 A+)与 add 判空防御,真机(骁龙865)自检与 NIST 校验全绿通过,单测 69/69 与压测 4/4 全通过 |

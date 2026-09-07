@@ -225,11 +225,26 @@
      - 全开构建（ON/ON）：90/90 单测 + 4/4 压测 100% 通过；
      - Android arm64-v8a：交叉编译 0 警告 0 错误通过。
 
-### 🟠 [F-07] 切分序号 `split_no` 为 `uint8_t`，达到 255 后静默停写
+### 🟠 [F-07] 切分序号 `split_no` 为 `uint8_t`，达到 255 后静默停写 [✅ 已修复]
 - **来源：** 报告一 WARN-4（无报警部分）＋ 报告三 BUG-X1（T4.0-2 未落地，列为 P1）
-- **位置：** `core/include/logx_staging.h:65`、`core/src/flusher.cpp:462`
+- **位置：** `core/include/logx_staging.h:59-95`、`core/include/logx_internal.h:112-120, 206`、`core/src/flusher.cpp:209-251, 440-444, 530-539, 574, 606-618, 668-705, 883`、`core/src/recovery.cpp:129, 178-185, 302-306`
+- **状态：** ✅ **已修复并全矩阵闭环验证**（Plan B：ATC 物理对齐保持 + 历史恒零填充位扩宽 + 达上限明确报警与去重）
 - **描述：** 单日高吞吐下切分超过 255 个分卷后 Flusher 停写并丢弃后续日志；spec §3.1 要求升级为 `uint16_t`，偏差未落地。报告一同时指出停写时未触发 `emit_event`（注：`drain_once` 失败分支会发 LOGX_EV_IO 事件，但文案未说明停写原因）。
-- **修复建议：** `split_no` 升级为 `uint16_t`；停写时发明确事件。
+- **修复方案与落地：**
+  1. **ATC 物理脚印锁定与零成本向下兼容扩宽**（`logx_staging.h`）：放弃破坏性的前移字段 packed 方案，保留 16B 自然对齐不变（`[8..15]` 块起止偏移物理位置毫厘不差）；利用历史 Staging 全零初始化写入中 `reserved[5]` 填充位恒为 `0` 的天然事实，将 `split_no` 拆为 `split_no_lo`（`[4]`）与 `split_no_hi`（`[5]`），配合 `pad[2]`（`[6..7]`）自然对齐。旧版落盘的 Staging 读入时 `split_no_hi == 0`，数值完全保真，实现 100% 零成本向下兼容与无缝冷启动恢复。
+  2. **强类型编译期守护与 Helper 接入**（`logx_staging.h` / `recovery.cpp` / `flusher.cpp`）：提供 `atc_split(c)` 与 `atc_set_split(c, split)` 内联辅助函数；原字段名作废使编译器成为最强重构安全网，强制全工程彻底消除所有裸成员直接读写，杜绝隐式截断。补充 `sizeof(AppendTargetCache) == 16` 与成员偏移 `offsetof == 8 / 12` 静态硬断言。
+  3. **全链路类型升级与严格路径解析**（`logx_internal.h` / `flusher.cpp`）：`make_log_path`、`parse_log_filename`、`current_log_path`、`FlusherCtx.current_split` 全量升级为 `uint16_t`；`parse_log_filename` 上限调整至 65535 并增加 `name[13]` 数字合法性严检。
+  4. **达上限明确报警与双事件去重**（`flusher.cpp`）：引入内部哨兵常量 `kAppendTargetSplitExhausted = -2`；达 65535 物理上限时主动发射明确事件 `emit_event(inst, LOGX_EV_IO, -1, "daily split limit (65535) exhausted; writes suspended until date rollover")` 并返回 `-2`；`drain_once` 捕获 `-2` 抑制重复冗余的 `"append target open failed"`，确保报警语义纯净精确。
+  5. **单测全闭环**：
+     - `test_flusher.cpp`：`ParseLogFilename_Comprehensive` 扩充 256/9999/65535 合法测试与 65536/99999 非法测试及往返一致性；
+     - `test_flusher.cpp`：新增 `FileSizeThreshold_RotatesBeyond255_Succeeds`，验证分卷成功越过 255 并生成 `.log.256` 正常写入；
+     - `test_flusher.cpp`：新增 `FileSizeThreshold_SplitLimit65535_EmitsEventAndSuspends`，验证达 65535 边界时停写并发出专有告警且抑制双事件；
+     - `test_flusher.cpp`：新增 `AppendTargetCache_HistoricalStagingLayoutCompatibility`，手工构造旧布局 staging 双 Header（`reserved[4]=3, reserved[5]=0`），验证新版本无缝读取接管并追加至 `.log.3`；
+     - `test_recovery.cpp`：更新 `AppendTargetCache_ContractAndSafeOffsetAssignment`，断言 16B 脚印、偏移不变性及 65535 存取独立性。
+  6. **三构建矩阵全绿验证**：
+     - 基础构建（OFF/OFF）：77/77 单测 + 4/4 压测 100% 通过；
+     - 全开构建（ON/ON）：95/95 单测 + 4/4 压测 100% 通过；
+     - Android arm64-v8a：交叉编译 0 警告 0 错误通过。
 
 ### 🟡 [F-08] `flush_blocking` 自旋等待无超时上界
 - **来源：** 报告一 WARN-3；T4.0-1 关联（水位线 target_seqno 防饥饿未实现）
@@ -263,7 +278,7 @@
 - **来源：** 报告一 BUG-1（经交叉复核校准为 P1）＝ 报告二 R2-中#15
 - **位置：** `core/include/logx_staging.h:65`
 - **描述：** 结构体缺 packed（实测 `sizeof=16`），`split_no` 后插入 3B 填充。当前单一 C++ 运行时内写入与读取均按 `sizeof(AppendTargetCache)` 做 `memcpy`，闭环内不发生错位；但破坏了跨语言/离线解码器规范中 `reserved[0..12]` 的 13 字节二进制布局（字段后移 3 字节），属二进制协议契约破坏。
-- **修复建议：** 添加 `LOGX_PACKED_ATTR`（与 `FileHeader` 同方式），或用 `put_u32`/`get_u32` 手动序列化。
+- **闭环方案（随 F-07 协同落地）：** 放弃破坏性的强制 packed 方案（否则会导致历史 staging 文件 offset 偏移错位）；转而正式将 `AppendTargetCache` 物理对齐大小锁定为 16B（`static_assert(sizeof == 16)` 且断言 `last_block_offset` 在 offset 8），将 `split_no` 扩宽至历史恒为 0 的填充位 `reserved[5]`，有效载荷升至 14B，`reserved[6..7]` 显式填充，实现 100% 物理与逻辑二进制自洽兼容。
 
 ### 🟡 [S-03] `kBlockHeaderSize` 注释与实际求值不符（32B vs 34B）
 - **来源：** 报告一 BUG-12（经交叉复核校准为 P2）
@@ -637,7 +652,7 @@
 | T4.0 编号 | Spec 规定 | 当前代码状态 | 影响与风险 | 关联问题 |
 |:---|:---|:---|:---|:---|
 | **T4.0-1** | §7 `flush()` 水位线 `target_seqno` 防饥饿 | `flush_blocking` 仍为轮询 staging 空 + 5ms sleep | 高并发下 flush 容易饥饿阻塞 | F-08 |
-| **T4.0-2** | §3.1/§4.4 切分序号 2B (uint16_t) | 仍为 `uint8_t split_no` | 单日超 255 分卷停写丢日志 | F-07 |
+| **T4.0-2** | §3.1/§4.4 切分序号 2B (uint16_t) | ✅ 已通过 F-07 闭环（16B 自然对齐 + 历史恒零扩宽至 uint16_t + 达上限明确告警与去重） | — | F-07 |
 | **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | 实现为 A(中间态 CRC)→ B → release fence | 掉电极端窗口内存序轻微偏离 | S-06 |
 | **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | `flusher_loop` 仍为无超时阻塞 `ev_wait`（仅堆降级模式有 5s 超时） | 缺乏低频写定时兜底刷盘机制 | F-10 |
 | **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | ✅ 已落地并闭环：`aesce.c` 移植完成，AESE/AESMC/EOR 标准指令直通；后续独立复审完成官方向量锚定（McGrew-Viega TC13/14/15 + 零密钥基线，OpenSSL 交叉验证 72/72）、热路径逐块探针消除与防竞态定型，x86 + 真机（骁龙865）双路径全量回归通过 | — | C-04 |
@@ -700,8 +715,8 @@
 |:---|:---|:---|:---|
 | F-03 | 短写未检测致日志丢失 [✅ 已修复] | F-04 | fsync/同步持久化零接入 [✅ 已修复] |
 | F-05 | 恢复块头校验不足 [✅ 已修复] | F-06 | atc offset uint32 截断 [✅ 已修复] |
-| F-07 | split_no uint8 / 255 停写（T4.0-2） | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
-| C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed |
+| F-07 | split_no uint8 / 255 停写（T4.0-2） [✅ 已修复] | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
+| C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed [✅ 已解决] |
 | FM-01 | tag[64] 越界读 UB | FM-02 | 重同步未清 carry_slice_buf |
 | R-01 | was_truncated 误传播 | R-02 | 丢块统计少计 1 |
 | R-03 | 日期校验不完整 / 多套解析不一致 | E-02 | drop_too_large 统计与错误分类 |
@@ -732,6 +747,6 @@
 
 1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → [✅ 真实崩溃恢复测试（T-01）]
 2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ [✅ JNI 关闭顺序与 UAF 防护（J-01）] → [✅ Win64 句柄截断修复（P-01）]
-3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → [✅ 恢复校验加强（F-05）] → 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
+3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → [✅ 恢复校验加强（F-05）] → [✅ 分卷序号 uint16_t 与上限告警（F-07）] → 50~100ms Debounce 聚集刷盘（F-10）
 4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
 5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）
