@@ -53,8 +53,13 @@ struct Instance {
     std::atomic<int> active_log_fd{-1};
 
     // ---- 错误回调 ----
+    // E-01: err_fn/err_user 由 err_mu 串行化——logx_set_error_handler(写)与后台
+    // Flusher/写线程 emit_event(读)并发访问,裸指针构成数据竞争(UB)。
+    // 不复用 inst->mu(PAL 互斥量):logx_write 在持有 inst->mu 时也会 emit_event
+    // ("staging full"),非递归锁会死锁;err_mu 为独立小锁,锁序恒为 inst->mu → err_mu。
     logx_error_fn err_fn = nullptr;
     void* err_user = nullptr;
+    ::std::mutex err_mu;
 
     // ---- 水位线与超时 (F-08 / T4.0-1) ----
     std::atomic<uint64_t> staged_bytes_total{0};
@@ -75,18 +80,29 @@ constexpr uint32_t kFlushBlockingTimeoutMs = 5000;
 constexpr uint32_t kFlushDebounceMs = 75;
 
 // 触发回调的便捷函数;忽略 null 回调。
+// E-01: 快照读取 err_fn/err_user 在 err_mu 保护下完成,消除与
+// logx_set_error_handler 并发注册的数据竞争;回调本身在锁外执行,
+// 避免回调内再注册 handler 或再打事件造成死锁。
 inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char* msg) {
-    if (inst->err_fn) {
-        inst->err_fn(inst->err_user, k, code, msg ? msg : "");
+    inst->err_mu.lock();
+    logx_error_fn fn = inst->err_fn;
+    void* user = inst->err_user;
+    inst->err_mu.unlock();
+    if (fn) {
+        fn(user, k, code, msg ? msg : "");
     }
 }
 
 // 格式化一个外部 level(0..5)/tag/payload 为 staging 记录字节序列;
-// 失败原因:level 非法 / 超 max_log_length。
+// 失败原因:level 非法 / tag 非法 / 超 max_log_length。
 // out_buf 由调用方提供(kMaxRecordTotal)。
-bool build_records(Instance* inst, int level, const char* tag,
-                   const uint8_t* payload, uint32_t payload_len,
-                   uint8_t* out_buf, uint32_t* out_total_bytes);
+// E-02: 返回码区分失败类别,便于上层区分"输入非法"与"内容超长":
+//   0 = 成功;> 0 = 格式化后总字节数(超长判定由调用方完成);
+//   < 0 = 格式化失败(输入非法:level 越界 / tag 为空或超长)。
+constexpr int kBuildRecordsInvalidInput = -1;
+int build_records(Instance* inst, int level, const char* tag,
+                  const uint8_t* payload, uint32_t payload_len,
+                  uint8_t* out_buf, uint32_t* out_total_bytes);
 
 // 把一段连续的"拷出流"按记录边界切成多个块(每块 raw ≤ kBlockMaxNormal,
 // 单条 16KB..20KB+6B 头独占一块);返回块数。

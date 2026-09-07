@@ -59,6 +59,8 @@ object LogX {
         val retentionDays: Int = 7,
         val maxFileSize: Long = 10L * 1024 * 1024,
         val maxLogLength: Int = 64 * 1024,
+        // E-06: 0 = 禁用按阈值自动唤醒(纯手动 flush 控制);-1 = 取默认 8KB;
+        // 其它值 = 字节阈值。JNI 层以 -1 映射 C ABI 的 UINT32_MAX 默认哨兵。
         val flushThreshold: Int = 8 * 1024,
         val compress: Compress = Compress.NONE,
         val encrypt: Boolean = false,

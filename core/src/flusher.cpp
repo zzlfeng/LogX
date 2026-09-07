@@ -805,24 +805,20 @@ uint32_t split_into_blocks(const uint8_t* raw, uint32_t total,
     return split_impl(raw, total, out);
 }
 
-bool build_records(Instance* inst, int level, const char* tag,
-                   const uint8_t* payload, uint32_t payload_len,
-                   uint8_t* out_buf, uint32_t* out_total_bytes) {
-    if (!inst) return false;
-    if (level < 0 || level > 5) return false;
+int build_records(Instance* inst, int level, const char* tag,
+                  const uint8_t* payload, uint32_t payload_len,
+                  uint8_t* out_buf, uint32_t* out_total_bytes) {
+    if (!inst) return kBuildRecordsInvalidInput;
+    if (level < 0 || level > 5) return kBuildRecordsInvalidInput;
     uint64_t ts_ms = inst->pal->wallclock_ms();
     uint32_t pid_v = inst->pal->pid();
     uint64_t tid_v = inst->pal->tid();
     if (!format_record(static_cast<uint8_t>(level), tag, payload, payload_len,
                        ts_ms, pid_v, tid_v,
                        out_buf, kMaxRecordTotal, out_total_bytes)) {
-        return false;
+        return kBuildRecordsInvalidInput;  // E-02: 输入非法(空 tag 等),非超长
     }
-    if (*out_total_bytes > inst->max_log_length) {
-        inst->drop_too_large.fetch_add(1);
-        return false;
-    }
-    return true;
+    return static_cast<int>(*out_total_bytes);
 }
 
 bool write_block_to_file(Instance*, const uint8_t*, const PendingBlock&,

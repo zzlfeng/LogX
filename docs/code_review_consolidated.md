@@ -406,47 +406,82 @@
 
 ## 六、C ABI 与导出
 
-###  [E-01] 错误回调注册无并发保护（`err_fn`/`err_user` 数据竞争）
+### ✅ [E-01] 错误回调注册无并发保护（`err_fn`/`err_user` 数据竞争）[已修复并闭环]
 - **来源：** 报告一 BUG-4 ＝ 报告二 R2-高#5（均定为 P0/高优先级）
-- **位置：** `core/src/logx_c.cpp:379-385`；并发读方 `logx_internal.h` 的 `emit_event`
+- **位置：** `core/src/logx_c.cpp`（`logx_set_error_handler`）；并发读方 `logx_internal.h` 的 `emit_event`
+- **状态：** ✅ **已修复并闭环**（实例级 `err_mu` 互斥量 + 锁外回调执行 + 并发回归测试）
 - **描述：** `logx_set_error_handler` 无锁写 `err_fn`/`err_user`，后台 Flusher 在 `emit_event` 中并发读取，构成数据竞争；头文件注释声明"可被任意线程调用"，风险更高。
-- **修复建议：** 读写均加 `inst->mu` 保护，或改用 `std::atomic<logx_error_fn>` + `std::atomic<void*>`。
+- **修复方案与落地：**
+  1. `Instance` 新增独立 `std::mutex err_mu`（不复用 `inst->mu`：`logx_write` 持 `inst->mu` 期间也会 `emit_event("staging full")`，非递归锁会死锁；锁序恒为 `inst->mu → err_mu`，无反转）；
+  2. `logx_set_error_handler` 写入与 `emit_event` 快照读取均在 `err_mu` 保护下完成；回调本身在锁外执行，回调内再注册 handler 或再打事件不会自锁；
+  3. 新增回归测试 `Robustness.ErrorHandler_ConcurrentReregistrationNoRace`：后台线程高频注册/注销回调 + 主线程持续写入驱动 Flusher 产生并发事件读，全程无崩溃无脏指针回调；
+  4. 双构建矩阵 + Android 交叉编译全绿通过。
 
-### 🟠 [E-02] `logx_write` 中 `build_records` 失败路径 `drop_too_large` 统计与错误分类不准确
+### ✅ [E-02] `logx_write` 中 `build_records` 失败路径 `drop_too_large` 统计与错误分类不准确 [已修复并闭环]
 - **来源：** 报告一 BUG-9 ＋ 报告二 R2-中#16（合并）
-- **位置：** `core/src/logx_c.cpp:328-360`、`core/src/flusher.cpp:651-669`
-- **描述：** 报告一：`build_records` 失败或超限时返回 `LOGX_ERR_TOO_LARGE`，`drop_too_large` 计数没有递增（注：超限分支在 `build_records` 内部有 `fetch_add`，格式化失败分支没有）。报告二补充：`format_record` 因非法 level、空 tag 等失败时，`logx_write` 仍报告 "log too large"，错误输入与超长输入被混淆，错误回调和统计信息均不准确。
-- **修复建议：** 区分格式化失败与超长两种错误码；统一 `drop_too_large` 递增点。
+- **位置：** `core/src/logx_c.cpp`（`logx_write`）、`core/src/flusher.cpp`（`build_records`）
+- **状态：** ✅ **已修复并闭环**（三态返回码 + 递增点统一至超长分支 + INVALID_ARG 分类）
+- **描述：** `build_records` 格式化失败（非法 level/空 tag 等）与内容超长混在一起，`logx_write` 统一报 `LOGX_ERR_TOO_LARGE`/"log too large"；`drop_too_large` 递增点分散且格式化失败分支不递增，统计与错误回调均不准确。
+- **修复方案与落地：**
+  1. `build_records` 返回码三态化：`< 0`（`kBuildRecordsInvalidInput`）= 输入非法；`> 0` = 格式化总字节数；超长判定职责上移至调用方；
+  2. `logx_write` 区分两类失败：非法输入返回 `LOGX_ERR_INVALID_ARG` 并发 `"invalid log input"` 事件；超长才返回 `LOGX_ERR_TOO_LARGE` 且在唯一超长分支递增 `drop_too_large`；
+  3. 核实澄清：空 tag 是 `format_record` 的合法输入（`tag_len=0` 允许），并非报告所述非法分类场景；非法分类的真实输入为 level 越界（< 0 / > 5）与超 64B tag；
+  4. 新增回归测试 `Robustness.WriteInvalidLevel_ClassifiedAsInvalidArg`：level 越界 → `INVALID_ARG` 且不影响超长计数；空 tag → 正常写入；超长 → `TOO_LARGE` 且 `drop_too_large` 恰好 +1；
+  5. 双构建矩阵 + Android 交叉编译全绿通过。
 
-### 🟠 [E-03] 导出错误被吞掉
+### ✅ [E-03] 导出错误被吞掉 [已修复并闭环]
 - **来源：** 报告二 R2-中#13
-- **位置：** `core/src/logx_c.cpp:224, 230`
-- **描述：** 导出过程忽略临时文件写入错误（`write_all_lines` 中 `(void)n`），也忽略回调返回值，最后仍可能返回 `LOGX_OK`。上层误以为导出成功，但文件可能没写完整，或业务回调已报告失败。
-- **修复建议：** 传播临时文件写入错误与回调返回值。
+- **位置：** `core/src/logx_c.cpp`（`write_all_lines`、`export_range`）
+- **状态：** ✅ **已修复并闭环**（写错误传播 + 回调返回值传播 + 失败文件清理）
+- **描述：** 导出过程忽略临时文件写入错误（`write_all_lines` 中 `(void)n`），也忽略回调返回值，最后仍返回 `LOGX_OK`。上层误以为导出成功，但文件可能没写完整，或业务回调已报告失败。
+- **修复方案与落地：**
+  1. `write_all_lines` 改为 `bool`：任一写入返回值 ≠ 行长度即整体失败，杜绝短写静默；
+  2. `export_range` 引入 `final_status`：解码失败 / 临时文件创建或截断或写出失败 → `LOGX_ERR_IO`；业务回调返回非 0 → `LOGX_ERR_CODEC` 并发事件打点；任一失败均如实向上传播，不再恒返 `LOGX_OK`；
+  3. 失败路径完整性：写失败 / 截断失败时删除残留临时文件，回调失败后临时文件仍按契约删除；
+  4. 新增回归测试 `Robustness.ExportErrorPropagation_WriteFailAndCallbackFail`：装饰 PAL 对非 append 打开的 fd（导出临时文件）注入写失败 → `LOGX_ERR_IO` 且回调零调用；回调返回 7 → `LOGX_ERR_CODEC`；
+  5. 双构建矩阵 + Android 交叉编译全绿通过。
 
-### 🟠 [E-04] `logx_export` 临时文件在同一天多分卷场景下固定命名覆盖冲突
+### ✅ [E-04] `logx_export` 临时文件在同一天多分卷场景下固定命名覆盖冲突 [已修复并闭环]
 - **来源：** 报告一 WARN-8 ＝ 报告三 BUG-E1
-- **位置：** `core/src/logx_c.cpp:198-220`（`make_tmp_path`）
+- **位置：** `core/src/logx_c.cpp`（`make_tmp_path`）
+- **状态：** ✅ **已修复并闭环**（日期 + PID + CSPRNG 随机数命名）
 - **描述：** 临时明文文件按日期命名（`.tmp_export_%u`）。同一天多个分卷文件或多次调用 export 共用同一路径；前次回调处理缓慢或并发导出时，临时文件会被后一次处理强行覆盖或截断。
-- **修复建议：** 临时文件名引入进程 PID + 随机数或分卷序号。
+- **修复方案与落地：**
+  1. `make_tmp_path` 改为 `.tmp_export_<日期>_<PID>_<8hex 随机数>`：随机数经 `Pal::random_bytes`（CSPRNG，F-09 契约）获取，失败退化用毫秒时钟；
+  2. 同一天多分卷 / 多次导出 / 并发导出各自持有独立临时文件，`O_TRUNC` 互踩根除；
+  3. 新增回归测试 `Robustness.ExportTmpPath_UniquePerCallAndCleaned`：同日连续 5 次导出，5 个回调路径两两互异、含 `.tmp_export_` 前缀，导出完成后全部清理；
+  4. 双构建矩阵 + Android 交叉编译全绿通过。
 
-### 🟠 [E-05] Windows 路径分隔符仅查找 `'/'`，不兼容 `'\\'`
+### ✅ [E-05] Windows 路径分隔符仅查找 `'/'`，不兼容 `'\\'` [已修复并闭环]
 - **来源：** 报告一 BUG-17
-- **位置：** `core/src/logx_c.cpp:280`
+- **位置：** `core/src/logx_c.cpp`（`logx_open` staging 目录解析）
+- **状态：** ✅ **已修复并闭环**
 - **描述：** `logx_open` 中 staging 目录解析只 `find_last_of('/')`，Windows 下 `\` 路径找不到分隔符，导致 `dir = "."`，staging 目录创建失败。
-- **修复建议：** 改为 `find_last_of("/\\")`。
+- **修复方案与落地：** 改为 `find_last_of("/\\")`，与 F-02 修复后 `parse_log_filename` 的跨平台分隔符语义对齐；双构建矩阵 + Android 交叉编译全绿通过。
 
-### 🟠 [E-06] `flush_threshold == 0` 语义模糊
-- **来源：** 报告三 BUG-A1
-- **位置：** `core/include/logx_c.h:62`、`core/src/logx_c.cpp:260`
+### ✅ [E-06] `flush_threshold == 0` 语义模糊 [已修复并闭环（含复审修正）]
+- **来源：** 报告三 BUG-A1；2026-09-07 复审追加发现核心唤醒判定语义反转 P0 缺陷
+- **位置：** `core/include/logx_c.h`（`logx_config_t.flush_threshold`）、`core/src/logx_c.cpp`（`logx_open` / `logx_write` 唤醒判定）、`android/cpp/logx_jni.cpp`、`android/kotlin/LogX.kt`
+- **状态：** ✅ **已修复并闭环**（0 = 显式禁用 / UINT32_MAX = 显式默认 + 复审发现的唤醒判定反转 P0 修正 + ev_signal 计数确定性测试）
 - **描述：** 配置传入 0 被静默替换为默认 8KB。若业务意图是"彻底关闭自动刷盘、完全由手动 flush 控制"，该意图被吞。
-- **修复建议：** 定义显式常量（如 `UINT32_MAX`）表示禁用。
+- **复审追加发现（🔴 P0，首版修复引入）：** 首版修复只改了 `logx_open` 的配置接收逻辑，遗漏了 `logx_write` 中的核心唤醒判定 `need_wake = pending >= inst->flush_threshold`——阈值 0 时因 `pending >= 0` 恒真，每条写入均立即 `ev_signal` 唤醒 Flusher，"禁用自动唤醒"被精确反转为"每写必醒"。且首版测试断言 `flushed_bytes_total == 0` 依赖与 Flusher 75ms debounce 的竞态抢跑，属偶发假绿。
+- **修复方案与落地：**
+  1. C ABI 语义显式化：`flush_threshold = 0` → 禁用按阈值自动唤醒（纯手动 `logx_flush` 控制）；`UINT32_MAX` → 取默认 8KB；其它值 → 按字节阈值；头文件契约注释同步；
+  2. **唤醒判定守卫（复审修正）**：`logx_write` 改为 `need_wake = flush_threshold > 0 && pending >= flush_threshold`。守卫必须放在阈值上而非 pending 上——写入成功后 pending 恒 > 0，对 pending 加前置条件是死代码（首版 `pending > 0 &&` 即犯此错，被复审测试当场拦截）；阈值 0 时落盘节奏由 Flusher 自身 `kFlushDebounceMs` 轮询兜底，数据不丢；
+  3. 全栈对齐：JNI 层约定 `flushThreshold == -1` 映射 `UINT32_MAX` 哨兵（Kotlin Int 无法表达），0 直传 core 表示禁用；Kotlin `Config.flushThreshold` 注释同步更新；
+  4. **确定性测试（根除假绿）**：`Robustness.FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault` 重写为 `CountingEvSignalPal` 装饰器直接计数 `ev_signal`：阈值 0 时写入 10 条零 signal（反转回归锚点）→ 手动 flush 后 signal 增加（`flush_blocking` 轮询语义为 ≥ +1）且数据落盘；默认阈值下小写入零 signal；阈值 1 时单条写入恰好 +1（自动唤醒正路径）；三段覆盖正/反/边界，无任何时序依赖；
+  5. 双构建矩阵 + Android 交叉编译全绿通过。
 
-### 🟠 [E-07] `logx_stats_t` 结构体按值返回缺乏 ABI 向前兼容能力
+### ✅ [E-07] `logx_stats_t` 结构体按值返回缺乏 ABI 向前兼容能力 [已修复并闭环]
 - **来源：** 报告三 BUG-A2
-- **位置：** `core/include/logx_c.h:130-136`
+- **位置：** `core/include/logx_c.h`（`logx_stats_t`）、`core/src/logx_c.cpp`（`logx_get_stats`）
+- **状态：** ✅ **已修复并闭环**（reserved[4] 版本化预留 + 零值契约）
 - **描述：** 结构体定义暴露在 C 头中按值拷贝，未来新增统计指标会破坏既有二进制符号兼容性。
-- **修复建议：** 预留保留字段或改为出参指针 + 版本长度。
+- **修复方案与落地：**
+  1. `logx_stats_t` 末尾追加 `uint64_t reserved[4]`：未来新增统计指标一律占用 reserved 位并同步递减数量，现有字段永不重排/删除；头文件注释固化追加纪律（老调用方按旧 sizeof 分配的缓冲不会被新实现越界写）；
+  2. `logx_get_stats` 对 reserved 区保持全零输出契约；
+  3. 新增回归测试 `Robustness.StatsReservedZeroContract`：脏值预填结构体后调用 `logx_get_stats`，断言 reserved 区全零；
+  4. 双构建矩阵 + Android 交叉编译全绿通过。
 
 ---
 
@@ -754,7 +789,7 @@
 | F-02 | 恢复后 `current_split` 强制归零，覆写历史分卷 [✅ 已修复] | 报告二#9 / 报告三 BUG-X2（报告二列中等） |
 | J-01 | `nativeClose` 提前释放 kp_ctx，Flusher UAF [✅ 已修复] | 报告二#6 / 报告三 BUG-J5（报告三列 P1） |
 | S-01 | CRC32 表初始化多线程数据竞争（UB） [✅ 已修复] | 报告一 BUG-3 / 报告二#4 |
-| E-01 | 错误回调注册数据竞争（UB） | 报告一 BUG-4 / 报告二#5 |
+| E-01 | 错误回调注册数据竞争（UB）[✅ 已修复] | 报告一 BUG-4 / 报告二#5 |
 | P-01 | Win64 HANDLE → int 截断（报告一列 P0） [✅ 已修复] | 报告一 BUG-5 / 报告二#10（报告二列中等） |
 | T-01 | "强杀恢复"测试未真正模拟强杀（恢复路径零覆盖） [✅ 已修复] | 报告二测#1 |
 
@@ -768,10 +803,10 @@
 | C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed [✅ 已解决] |
 | FM-01 | tag[64] 越界读 UB [✅ 已修复] | FM-02 | 重同步未清 carry_slice_buf [✅ 已修复] |
 | R-01 | was_truncated 误传播 [✅ 已修复] | R-02 | 丢块统计少计 1 [✅ 已复核校准：报告不成立，实现正确，已固化] |
-| R-03 | 日期校验不完整 / 多套解析不一致 [✅ 已修复] | E-02 | drop_too_large 统计与错误分类 |
-| E-03 | 导出错误被吞 | E-04 | export 临时文件命名冲突 |
-| E-05 | Windows 路径分隔符 | E-06 | flush_threshold==0 语义 |
-| E-07 | logx_stats_t ABI 兼容 | P-02 | file_size_path 开销 |
+| R-03 | 日期校验不完整 / 多套解析不一致 [✅ 已修复] | E-02 | drop_too_large 统计与错误分类 [✅ 已修复] |
+| E-03 | 导出错误被吞 [✅ 已修复] | E-04 | export 临时文件命名冲突 [✅ 已修复] |
+| E-05 | Windows 路径分隔符 [✅ 已修复] | E-06 | flush_threshold==0 语义 [✅ 已修复] |
+| E-07 | logx_stats_t ABI 兼容 [✅ 已修复] | P-02 | file_size_path 开销 |
 | P-03 | file_rmdir 错误转译 | J-02 | g_err_ctx 多实例互踩 |
 | K-01 | Kotlin export 丢返回值 | K-02 | runBlocking 嵌套 |
 | D-01 | Python cksum break 丢记录 | D-02 | Python 坏块 break 丢文件 |
@@ -795,7 +830,7 @@
 ### 修复顺序建议（综合三份报告）
 
 1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → [✅ 真实崩溃恢复测试（T-01）]
-2. **P0 并发安全与内存生命周期**：[✅ CRC 表 constexpr 编译期无竞争（S-01）] → 错误回调保护（E-01）→ [✅ JNI 关闭顺序与 UAF 防护（J-01）] → [✅ Win64 句柄截断修复（P-01）]
+2. **P0 并发安全与内存生命周期**：[✅ CRC 表 constexpr 编译期无竞争（S-01）] → [✅ 错误回调保护（E-01）] → [✅ JNI 关闭顺序与 UAF 防护（J-01）] → [✅ Win64 句柄截断修复（P-01）]
 3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → [✅ 恢复校验加强（F-05）] → [✅ 分卷序号 uint16_t 与上限告警（F-07）] → [✅ 50~100ms Debounce 聚集刷盘（F-10）]
 4. **P2 API、测试质量与工具链**：tag 边界、~~日期校验~~ [✅ R-03 已闭环]、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
 5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）

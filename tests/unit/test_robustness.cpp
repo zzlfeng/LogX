@@ -15,7 +15,9 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -1256,6 +1258,490 @@ TEST(PalRobustness, RandomBytesSuccess_ProducesNonTrivialSalt) {
     EXPECT_FALSE(all_same);
 
     // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+// =========================================================================
+// 9. E 系列:C ABI 与导出模块回归
+// =========================================================================
+
+// E-01: logx_set_error_handler 与后台 Flusher emit_event 并发——注册/注销
+// 高频切换期间持续产生事件,验证无崩溃、无脏指针回调(数据竞争回归)。
+TEST(Robustness, ErrorHandler_ConcurrentReregistrationNoRace) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_e01_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> callback_calls{0};
+    // 后台线程高频注册/注销错误回调(模拟任意线程注册契约)
+    std::thread churn([&inst, &stop, &callback_calls]() {
+        int i = 0;
+        while (!stop.load()) {
+            if (i % 2 == 0) {
+                logx_set_error_handler(inst, [](void* user, logx_event_kind_e,
+                                                int, const char*) {
+                    static_cast<std::atomic<int>*>(user)->fetch_add(1);
+                }, &callback_calls);
+            } else {
+                logx_set_error_handler(inst, nullptr, nullptr);
+            }
+            ++i;
+        }
+    });
+
+    // 主线程持续写入小日志,驱动 Flusher 产生 emit_event 并发读
+    const uint8_t payload[] = "e01_race_probe";
+    for (int i = 0; i < 2000; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, "E01", payload, sizeof(payload) - 1), LOGX_OK);
+        if (i % 200 == 0) logx_flush(inst);
+    }
+    logx_flush(inst);
+
+    stop.store(true);
+    churn.join();
+    EXPECT_GE(callback_calls.load(), 0);  // 存活即通过;计数仅防优化
+
+    logx_close(inst);
+
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+// E-02: 非法输入(level 越界)不再被误分类为 TOO_LARGE,
+// 且 drop_too_large 不递增;真正的超长输入仍走 TOO_LARGE 路径。
+TEST(Robustness, WriteInvalidLevel_ClassifiedAsInvalidArg) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_e02_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 500;
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    auto* ii = static_cast<Instance*>(inst);
+    uint64_t too_large_before = ii->drop_too_large.load();
+
+    const uint8_t payload[] = "payload";
+
+    // level 越界(负值与 > 5):INVALID_ARG,且不影响超长计数
+    EXPECT_EQ(logx_write(inst, -1, "E02", payload, sizeof(payload) - 1),
+              LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(logx_write(inst, 6, "E02", payload, sizeof(payload) - 1),
+              LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(ii->drop_too_large.load(), too_large_before);
+
+    // 空 tag 是合法输入(format_record 允许 tag_len=0),正常写入
+    EXPECT_EQ(logx_write(inst, 2, "", payload, sizeof(payload) - 1), LOGX_OK);
+    EXPECT_EQ(ii->drop_too_large.load(), too_large_before);
+
+    // 真正超长:仍为 TOO_LARGE,drop_too_large 递增
+    std::string large(600, 'L');
+    EXPECT_EQ(logx_write(inst, 2, "E02",
+                         reinterpret_cast<const uint8_t*>(large.data()),
+                         static_cast<uint32_t>(large.size())),
+              LOGX_ERR_TOO_LARGE);
+    EXPECT_EQ(ii->drop_too_large.load(), too_large_before + 1);
+
+    logx_close(inst);
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+// E-03: 导出临时文件写失败 → LOGX_ERR_IO 且不调用回调;
+// 业务回调返回非 0 → 状态如实传播为失败。
+TEST(Robustness, ExportErrorPropagation_WriteFailAndCallbackFail) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_e03_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    // Case A: 临时文件写失败(装饰器对"非 append 模式打开的文件"即导出临时文件
+    // 返回写失败;日志文件以 append 模式打开,不受影响)
+    class MockExportWritePal : public Pal {
+    public:
+        explicit MockExportWritePal(Pal* real) : real_(real) {}
+        int  file_open(const char* p, bool c, bool a) override {
+            int fd = real_->file_open(p, c, a);
+            if (fd >= 0 && !a) {
+                // 导出临时文件: O_CREAT 但非 O_APPEND
+                std::lock_guard<std::mutex> lock(mu_);
+                no_append_fds_.insert(fd);
+            }
+            return fd;
+        }
+        int  file_close(int fd) override {
+            std::lock_guard<std::mutex> lock(mu_);
+            no_append_fds_.erase(fd);
+            return real_->file_close(fd);
+        }
+        long file_write(int fd, const void* b, size_t n) override {
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (no_append_fds_.count(fd)) return -1;  // E-03: 导出临时文件写失败
+            }
+            return real_->file_write(fd, b, n);
+        }
+        // 其余接口全部直通真实 PAL
+        int  file_truncate(int fd, uint64_t len) override { return real_->file_truncate(fd, len); }
+        long file_pwrite(int fd, const void* b, size_t n, uint64_t o) override { return real_->file_pwrite(fd, b, n, o); }
+        long file_pread(int fd, void* b, size_t n, uint64_t o) override { return real_->file_pread(fd, b, n, o); }
+        int64_t file_size(int fd) override { return real_->file_size(fd); }
+        int64_t file_size_path(const char* p) override { return real_->file_size_path(p); }
+        int  file_fsync(int fd) override { return real_->file_fsync(fd); }
+        int  file_dir_fsync(const char* p) override { return real_->file_dir_fsync(p); }
+        int  file_unlink(const char* p) override { return real_->file_unlink(p); }
+        int  file_mkdirs(const char* p) override { return real_->file_mkdirs(p); }
+        int  file_rmdir(const char* p) override { return real_->file_rmdir(p); }
+        std::vector<std::string> file_list(const char* p) override { return real_->file_list(p); }
+        PalMmap mmap_open(int fd, size_t len, bool w) override { return real_->mmap_open(fd, len, w); }
+        int  mmap_sync(const PalMmap& m, bool s) override { return real_->mmap_sync(m, s); }
+        int  mmap_close(const PalMmap& m) override { return real_->mmap_close(m); }
+        void* mutex_create() override { return real_->mutex_create(); }
+        void  mutex_destroy(void* h) override { return real_->mutex_destroy(h); }
+        void  mutex_lock(void* h) override { return real_->mutex_lock(h); }
+        void  mutex_unlock(void* h) override { return real_->mutex_unlock(h); }
+        int  threading_init() override { return real_->threading_init(); }
+        int  thread_start(void* (*fn)(void*), void* arg, void** out_handle) override { return real_->thread_start(fn, arg, out_handle); }
+        int  thread_join(void* handle) override { return real_->thread_join(handle); }
+        void* ev_create() override { return real_->ev_create(); }
+        void  ev_destroy(void* h) override { return real_->ev_destroy(h); }
+        void  ev_signal(void* h) override { return real_->ev_signal(h); }
+        void  ev_wait(void* h) override { return real_->ev_wait(h); }
+        bool  ev_wait_timeout(void* h, uint32_t ms) override { return real_->ev_wait_timeout(h, ms); }
+        uint64_t atomic_add(uint64_t* p, int64_t delta) override { return real_->atomic_add(p, delta); }
+        uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
+        uint64_t monotonic_ns() override { return real_->monotonic_ns(); }
+        void  sleep_ms(uint32_t ms) override { return real_->sleep_ms(ms); }
+        void  debug_log(const char* s) override { return real_->debug_log(s); }
+        uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
+        void  wallclock_date(uint32_t* d, uint32_t* t) override { return real_->wallclock_date(d, t); }
+        uint32_t pid() override { return real_->pid(); }
+        uint64_t tid() override { return real_->tid(); }
+        bool  random_bytes(void* b, size_t n) override { return real_->random_bytes(b, n); }
+        Pal* real_;
+        std::mutex mu_;
+        std::set<int> no_append_fds_;
+    };
+    MockExportWritePal mock(&pal);
+    {
+        logx_config_t cfg{};
+        cfg.log_dir = dir.c_str();
+        cfg.staging_path = st_path.c_str();
+        cfg.max_log_length = 4096;
+        logx_instance_t* inst = nullptr;
+        ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+        static_cast<Instance*>(inst)->pal = &mock;
+
+        ASSERT_EQ(logx_write(inst, 2, "E03", (const uint8_t*)"export_err", 10), LOGX_OK);
+        ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+        uint32_t ymd = 0, hms = 0;
+        pal.wallclock_date(&ymd, &hms);
+        char date_str[16];
+        std::snprintf(date_str, sizeof(date_str), "%08u", ymd);
+
+        int cb_called = 0;
+        auto cb = [](void* user, const char*, const char*, uint64_t) -> int {
+            (*static_cast<int*>(user))++;
+            return 0;
+        };
+        logx_status_e st = logx_export(inst, date_str, date_str, cb, &cb_called);
+        EXPECT_EQ(st, LOGX_ERR_IO);   // E-03: 写失败不再吞成 OK
+        EXPECT_EQ(cb_called, 0);      // 文件没写完整,不回调
+        logx_close(inst);
+    }
+
+    // Case B: 业务回调返回非 0 → LOGX_ERR_CODEC
+    {
+        logx_config_t cfg{};
+        cfg.log_dir = dir.c_str();
+        cfg.staging_path = st_path.c_str();
+        cfg.max_log_length = 4096;
+        logx_instance_t* inst = nullptr;
+        ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+        ASSERT_EQ(logx_write(inst, 2, "E03", (const uint8_t*)"cb_fail", 7), LOGX_OK);
+        ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+        uint32_t ymd = 0, hms = 0;
+        pal.wallclock_date(&ymd, &hms);
+        char date_str[16];
+        std::snprintf(date_str, sizeof(date_str), "%08u", ymd);
+
+        auto cb_fail = [](void*, const char*, const char*, uint64_t) -> int { return 7; };
+        EXPECT_EQ(logx_export(inst, date_str, date_str, cb_fail, nullptr),
+                  LOGX_ERR_CODEC);      // E-03: 回调失败如实上报
+        logx_close(inst);
+    }
+
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+// E-04: 同一天多次导出,临时文件名各自独立,不互相覆盖截断;
+// 导出完成后临时文件被清理。
+TEST(Robustness, ExportTmpPath_UniquePerCallAndCleaned) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_e04_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    ASSERT_EQ(logx_write(inst, 2, "E04", (const uint8_t*)"tmp_unique", 10), LOGX_OK);
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    uint32_t ymd = 0, hms = 0;
+    pal.wallclock_date(&ymd, &hms);
+    char date_str[16];
+    std::snprintf(date_str, sizeof(date_str), "%08u", ymd);
+
+    std::mutex paths_mu;
+    std::vector<std::string> seen_paths;
+    struct Ctx {
+        std::mutex* mu;
+        std::vector<std::string>* paths;
+    } ctx{&paths_mu, &seen_paths};
+    auto cb = [](void* user, const char*, const char* plaintext_path, uint64_t) -> int {
+        auto* c = static_cast<Ctx*>(user);
+        std::lock_guard<std::mutex> lock(*c->mu);
+        c->paths->push_back(plaintext_path);
+        return 0;
+    };
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_EQ(logx_export(inst, date_str, date_str, cb, &ctx), LOGX_OK);
+    }
+
+    // 5 次导出回调各拿到独立临时路径(E-04: 不互踩)
+    std::lock_guard<std::mutex> lock(paths_mu);
+    ASSERT_EQ(seen_paths.size(), 5u);
+    for (size_t i = 0; i < seen_paths.size(); ++i) {
+        for (size_t j = i + 1; j < seen_paths.size(); ++j) {
+            EXPECT_NE(seen_paths[i], seen_paths[j]);
+        }
+        // 命名仍以 .tmp_export_ 前缀并含 PID 与日期
+        EXPECT_NE(seen_paths[i].find(".tmp_export_"), std::string::npos);
+    }
+
+    logx_close(inst);
+    // 导出完成后临时文件全部清理(回调后被 unlink)
+    for (const auto& p : seen_paths) {
+        EXPECT_LT(pal.file_size_path(p.c_str()), 0);
+    }
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+// E-06: flush_threshold 显式语义——0 = 禁用阈值自动唤醒(写入不主动 signal,
+// 仅手动 flush 落盘);UINT32_MAX = 显式取默认 8KB。
+// 复审加固:旧断言 flushed_bytes_total == 0 依赖与 Flusher 75ms debounce
+// 抢跑,属偶发假绿。现以 CountingEvSignalPal 直接计数 ev_signal 调用:
+// 阈值 0 时写入路径零 signal(语义反转回归),阈值 8KB 时首条写入即 signal。
+TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_e06_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    // 装饰 PAL:统计 ev_signal 次数,其余全部直通
+    class CountingEvSignalPal : public Pal {
+    public:
+        explicit CountingEvSignalPal(Pal* real) : real_(real) {}
+        void ev_signal(void* h) override {
+            ev_signal_count_.fetch_add(1);
+            return real_->ev_signal(h);
+        }
+        int  file_open(const char* p, bool c, bool a) override { return real_->file_open(p, c, a); }
+        int  file_close(int fd) override { return real_->file_close(fd); }
+        int  file_truncate(int fd, uint64_t len) override { return real_->file_truncate(fd, len); }
+        long file_write(int fd, const void* b, size_t n) override { return real_->file_write(fd, b, n); }
+        long file_pwrite(int fd, const void* b, size_t n, uint64_t o) override { return real_->file_pwrite(fd, b, n, o); }
+        long file_pread(int fd, void* b, size_t n, uint64_t o) override { return real_->file_pread(fd, b, n, o); }
+        int64_t file_size(int fd) override { return real_->file_size(fd); }
+        int64_t file_size_path(const char* p) override { return real_->file_size_path(p); }
+        int  file_fsync(int fd) override { return real_->file_fsync(fd); }
+        int  file_dir_fsync(const char* p) override { return real_->file_dir_fsync(p); }
+        int  file_unlink(const char* p) override { return real_->file_unlink(p); }
+        int  file_mkdirs(const char* p) override { return real_->file_mkdirs(p); }
+        int  file_rmdir(const char* p) override { return real_->file_rmdir(p); }
+        std::vector<std::string> file_list(const char* p) override { return real_->file_list(p); }
+        PalMmap mmap_open(int fd, size_t len, bool w) override { return real_->mmap_open(fd, len, w); }
+        int  mmap_sync(const PalMmap& m, bool s) override { return real_->mmap_sync(m, s); }
+        int  mmap_close(const PalMmap& m) override { return real_->mmap_close(m); }
+        void* mutex_create() override { return real_->mutex_create(); }
+        void  mutex_destroy(void* h) override { return real_->mutex_destroy(h); }
+        void  mutex_lock(void* h) override { return real_->mutex_lock(h); }
+        void  mutex_unlock(void* h) override { return real_->mutex_unlock(h); }
+        int  threading_init() override { return real_->threading_init(); }
+        int  thread_start(void* (*fn)(void*), void* arg, void** out_handle) override { return real_->thread_start(fn, arg, out_handle); }
+        int  thread_join(void* handle) override { return real_->thread_join(handle); }
+        void* ev_create() override { return real_->ev_create(); }
+        void  ev_destroy(void* h) override { return real_->ev_destroy(h); }
+        void  ev_wait(void* h) override { return real_->ev_wait(h); }
+        bool  ev_wait_timeout(void* h, uint32_t ms) override { return real_->ev_wait_timeout(h, ms); }
+        uint64_t atomic_add(uint64_t* p, int64_t delta) override { return real_->atomic_add(p, delta); }
+        uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
+        uint64_t monotonic_ns() override { return real_->monotonic_ns(); }
+        void  sleep_ms(uint32_t ms) override { return real_->sleep_ms(ms); }
+        void  debug_log(const char* s) override { return real_->debug_log(s); }
+        uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
+        void  wallclock_date(uint32_t* d, uint32_t* t) override { return real_->wallclock_date(d, t); }
+        uint32_t pid() override { return real_->pid(); }
+        uint64_t tid() override { return real_->tid(); }
+        bool  random_bytes(void* b, size_t n) override { return real_->random_bytes(b, n); }
+        Pal* real_;
+        std::atomic<int> ev_signal_count_{0};
+    };
+    CountingEvSignalPal mock(&pal);
+
+    // Case A: 0 = 禁用自动唤醒
+    {
+        logx_config_t cfg{};
+        cfg.log_dir = dir.c_str();
+        cfg.staging_path = st_path.c_str();
+        cfg.max_log_length = 4096;
+        cfg.flush_threshold = 0;   // E-06: 显式禁用,不再被静默替换为 8KB
+        logx_instance_t* inst = nullptr;
+        ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+        auto* ii = static_cast<Instance*>(inst);
+        ii->pal = &mock;  // 注入计数装饰器(logx_open 之后替换,仅影响写入路径 signal 计数)
+        EXPECT_EQ(ii->flush_threshold, 0u);
+
+        // 确定性断言:阈值 0 下写入路径不触发任何 ev_signal(语义反转回归:
+        // 旧实现 pending >= 0 恒真,每条写入均唤醒 Flusher)
+        int before = mock.ev_signal_count_.load();
+        const uint8_t payload[] = "held";
+        for (int i = 0; i < 10; ++i) {
+            ASSERT_EQ(logx_write(inst, 2, "E06", payload, sizeof(payload) - 1), LOGX_OK);
+        }
+        EXPECT_EQ(mock.ev_signal_count_.load(), before);   // 零 signal
+        EXPECT_GT(ii->staged_bytes_total.load(), 0u);      // 数据已入 staging
+
+        // 手动 flush:flush_blocking 发出信号并轮询等待水位推进(设计内每 5ms
+        // 重复 signal 直至落盘,故断言 ≥ +1 而非恰 +1),数据必须落盘
+        ASSERT_EQ(logx_flush(inst), LOGX_OK);
+        EXPECT_GE(mock.ev_signal_count_.load(), before + 1);
+        EXPECT_GT(ii->flushed_bytes_total.load(), 0u);
+
+        ii->pal = &pal;  // 恢复真实 PAL 再关闭
+        logx_close(inst);
+    }
+
+    mock.ev_signal_count_.store(0);
+
+    // Case B: UINT32_MAX = 显式默认 8KB
+    {
+        logx_config_t cfg{};
+        cfg.log_dir = dir.c_str();
+        cfg.staging_path = st_path.c_str();
+        cfg.max_log_length = 4096;
+        cfg.flush_threshold = UINT32_MAX;   // E-06: 显式默认哨兵
+        logx_instance_t* inst = nullptr;
+        ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+        auto* ii = static_cast<Instance*>(inst);
+        ii->pal = &mock;
+        EXPECT_EQ(ii->flush_threshold, 8u * 1024);
+
+        // 默认阈值 8KB:小写入 pending < 8KB 不应唤醒 → 零 signal
+        int before = mock.ev_signal_count_.load();
+        const uint8_t payload[] = "small";
+        ASSERT_EQ(logx_write(inst, 2, "E06", payload, sizeof(payload) - 1), LOGX_OK);
+        EXPECT_EQ(mock.ev_signal_count_.load(), before);   // 小写入未达阈值,零 signal
+
+        logx_close(inst);
+    }
+
+    // Case C: 阈值极小(1B)时,单条写入立即越过阈值 → 写入路径 signal 恰好 +1
+    {
+        logx_config_t cfg{};
+        cfg.log_dir = dir.c_str();
+        cfg.staging_path = st_path.c_str();
+        cfg.max_log_length = 4096;
+        cfg.flush_threshold = 1;   // 任意写入都会 pending >= 1
+        logx_instance_t* inst = nullptr;
+        ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+        auto* ii = static_cast<Instance*>(inst);
+        ii->pal = &mock;
+
+        int before = mock.ev_signal_count_.load();
+        ASSERT_EQ(logx_write(inst, 2, "E06", (const uint8_t*)"x", 1), LOGX_OK);
+        EXPECT_EQ(mock.ev_signal_count_.load(), before + 1);  // 自动唤醒生效
+
+        ii->pal = &pal;
+        logx_close(inst);
+    }
+
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+// E-07: logx_stats_t 预留区零值契约(未来字段向前兼容)
+TEST(Robustness, StatsReservedZeroContract) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_e07_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    ASSERT_EQ(logx_write(inst, 2, "E07", (const uint8_t*)"stats", 5), LOGX_OK);
+
+    logx_stats_t st;
+    std::memset(&st, 0xAB, sizeof(st));  // 预填脏值,验证 get_stats 全量覆写
+    logx_get_stats(inst, &st);
+    for (size_t i = 0; i < sizeof(st.reserved) / sizeof(st.reserved[0]); ++i) {
+        EXPECT_EQ(st.reserved[i], 0u);
+    }
+
+    logx_close(inst);
     for (const auto& f : pal.file_list(dir.c_str())) {
         pal.file_unlink(f.c_str());
     }

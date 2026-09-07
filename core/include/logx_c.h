@@ -60,7 +60,9 @@ typedef struct logx_config {
     uint32_t max_log_length;     /* 单条日志上限(格式化后);init 校验 < 数据区 - 1 */
     uint32_t retention_days;     /* 保留期,过期文件在启动/退后台时清理 */
     uint64_t max_file_size;      /* 单文件上限,默认 10MB,切分决策在 flush 轮次边界 */
-    uint32_t flush_threshold;    /* staging 待刷阈值,默认 8KB */
+    /* E-06: staging 待刷阈值。0 = 禁用按阈值自动唤醒(纯手动 logx_flush 控制);
+     * UINT32_MAX = 取默认 8KB;其它值 = 配置字节阈值。 */
+    uint32_t flush_threshold;
 
     /* 编解码:0=none / 1=zstd / 2=zlib */
     uint8_t compress_algo;
@@ -132,11 +134,15 @@ logx_status_e logx_set_error_handler(logx_instance_t* inst,
 
 /* ===== 诊断 ===== */
 typedef struct logx_stats {
+    /* E-07: ABI 向前兼容。结构体按值经出参拷贝,新增统计指标只能追加在
+     * reserved 区,替换保留位会破坏既有二进制(老调用方按旧 sizeof 分配的
+     * 缓冲被新实现越界写)。新增字段一律占用 reserved 并同步递减其数量。 */
     uint64_t drop_no_space;      /* staging 空闲不足丢弃 */
     uint64_t drop_too_large;     /* 单条超 maxLogLength 丢弃 */
     uint64_t truncated_blocks;    /* 启动恢复截尾块计数 */
     uint64_t pad_records;        /* 回绕垫 PAD 数 */
     uint64_t block_write_errors; /* write 短写/IO 错误计数 */
+    uint64_t reserved[4];        /* 预留给未来统计指标,必须保持全 0 */
 } logx_stats_t;
 
 void logx_get_stats(logx_instance_t* inst, logx_stats_t* out);

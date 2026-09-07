@@ -183,7 +183,11 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     cfg.max_log_length = maxLogLength > 0 ? static_cast<uint32_t>(maxLogLength) : (64 * 1024);
     cfg.retention_days = retentionDays > 0 ? static_cast<uint32_t>(retentionDays) : 7;
     cfg.max_file_size = maxFileSize > 0 ? static_cast<uint64_t>(maxFileSize) : (10ULL * 1024 * 1024);
-    cfg.flush_threshold = flushThreshold > 0 ? static_cast<uint32_t>(flushThreshold) : (8 * 1024);
+    // E-06: Kotlin Int 无法表达 C ABI 的 UINT32_MAX 哨兵,JNI 层约定
+    // flushThreshold == -1 表示"取默认 8KB";0 直传 core = 禁用阈值自动唤醒。
+    cfg.flush_threshold = (flushThreshold == -1)
+        ? UINT32_MAX
+        : static_cast<uint32_t>(flushThreshold);
     // compressAlgo 直传:Kotlin Compress 枚举(NONE=0/ZSTD=1/ZLIB=2)与 core 的
     // logx::kAlgoNone/kAlgoZstd/kAlgoZlib 严格一一对应,logx_open 内 fail-fast 校验;
     // 落盘时由 make_flag() 写入块头 flag 字节 bit1..2。

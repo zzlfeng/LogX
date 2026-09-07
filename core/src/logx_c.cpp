@@ -43,17 +43,27 @@ bool parse_yyyymmdd(const char* s, uint32_t* out) {
     return true;
 }
 
-void write_all_lines(Instance* inst, int fd, const std::vector<std::string>& lines) {
+// E-03: 写出全部行并校验每次写入结果;任一短写/失败即整体失败,
+// 上层据此放弃回调并上报,杜绝"临时文件没写完整仍返回 OK"。
+bool write_all_lines(Instance* inst, int fd, const std::vector<std::string>& lines) {
     for (const auto& l : lines) {
         if (l.empty()) continue;
         long n = inst->pal->file_write(fd, l.data(), l.size());
-        (void)n;
+        if (n != static_cast<long>(l.size())) return false;
     }
+    return true;
 }
 
+// E-04: 临时明文文件按 日期 + PID + 随机数 命名——同一天多分卷/多次导出/
+// 并发导出各自持有独立临时文件,消除 O_TRUNC 互踩覆盖。
 std::string make_tmp_path(const std::string& log_dir, uint32_t date) {
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "%s/.tmp_export_%u", log_dir.c_str(), date);
+    Pal& pal = default_pal();
+    uint32_t rnd = 0;
+    if (!pal.random_bytes(&rnd, sizeof(rnd))) rnd = static_cast<uint32_t>(pal.wallclock_ms());
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "%s/.tmp_export_%u_%lu_%08x",
+                  log_dir.c_str(), date,
+                  static_cast<unsigned long>(pal.pid()), rnd);
     return std::string(buf);
 }
 
@@ -213,11 +223,15 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
     if (snaps.empty()) return LOGX_ERR_NOT_FOUND;
 
     // 3) 写每个文件到一个临时明文文件;callback 后删除
+    // E-03: 临时文件写失败与回调失败均计入最终返回码(任一失败 → LOGX_ERR_IO /
+    // LOGX_ERR_CODEC),业务侧不再把"部分失败"误判为整体成功。
     inst->pal->file_mkdirs(inst->log_dir.c_str());
+    logx_status_e final_status = LOGX_OK;
     for (const auto& s : snaps) {
         std::vector<std::string> lines;
         if (!decode_one_file(inst, s.path, s.size, &lines)) {
             emit_event(inst, LOGX_EV_IO, -1, "decode file failed");
+            final_status = LOGX_ERR_IO;
             continue;
         }
         // R-03: 快照文件已通过 parse_log_filename 校验;临时文件名日期统一走同一入口
@@ -227,19 +241,42 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
         std::string tmp = make_tmp_path(inst->log_dir, tmp_date);
         // O_CREAT | O_TRUNC:先创建,再截断到 0
         int fd = inst->pal->file_open(tmp.c_str(), true, false);
-        if (fd < 0) continue;
-        if (inst->pal->file_truncate(fd, 0) != 0) { inst->pal->file_close(fd); continue; }
-        write_all_lines(inst, fd, lines);
+        if (fd < 0) {
+            emit_event(inst, LOGX_EV_IO, -1, "export tmp create failed");
+            final_status = LOGX_ERR_IO;
+            continue;
+        }
+        if (inst->pal->file_truncate(fd, 0) != 0) {
+            inst->pal->file_close(fd);
+            inst->pal->file_unlink(tmp.c_str());
+            emit_event(inst, LOGX_EV_IO, -1, "export tmp truncate failed");
+            final_status = LOGX_ERR_IO;
+            continue;
+        }
+        bool write_ok = write_all_lines(inst, fd, lines);
         int64_t tmp_size = inst->pal->file_size(fd);
         inst->pal->file_close(fd);
+        if (!write_ok) {
+            inst->pal->file_unlink(tmp.c_str());
+            emit_event(inst, LOGX_EV_IO, -1, "export tmp write failed");
+            final_status = LOGX_ERR_IO;
+            continue;
+        }
         // 回调日期字串:由已校验的 tmp_date 统一格式化 (R-03)
         char date_str[16];
         std::snprintf(date_str, sizeof(date_str), "%08u", static_cast<unsigned>(tmp_date));
         uint64_t export_size = tmp_size > 0 ? static_cast<uint64_t>(tmp_size) : 0;
-        if (req.cb) req.cb(req.cb_user, date_str, tmp.c_str(), export_size);
+        if (req.cb) {
+            int cb_ret = req.cb(req.cb_user, date_str, tmp.c_str(), export_size);
+            if (cb_ret != 0) {
+                // E-03: 业务回调报告失败(返回非 0)时如实向上传播
+                emit_event(inst, LOGX_EV_IO, cb_ret, "export callback failed");
+                final_status = LOGX_ERR_CODEC;
+            }
+        }
         inst->pal->file_unlink(tmp.c_str());
     }
-    return LOGX_OK;
+    return final_status;
 }
 
 // ---- C ABI 实现 ----
@@ -289,7 +326,14 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->max_log_length = cfg->max_log_length;
     inst->retention_days = cfg->retention_days ? cfg->retention_days : 7;
     inst->max_file_size  = cfg->max_file_size ? cfg->max_file_size : (10ULL * 1024 * 1024);
-    inst->flush_threshold = cfg->flush_threshold ? cfg->flush_threshold : (8 * 1024);
+    // E-06: flush_threshold 语义显式化——
+    //   0          = 禁用按阈值自动唤醒(完全由 logx_flush 手动控制落盘节奏);
+    //   UINT32_MAX = 取默认 8KB;
+    //   其它值     = 按配置字节阈值。
+    // 旧版把 0 静默替换为 8KB,吞掉了"彻底关闭自动刷盘"的业务意图。
+    inst->flush_threshold = (cfg->flush_threshold == UINT32_MAX)
+        ? (8 * 1024)
+        : cfg->flush_threshold;
     inst->compress_algo = cfg->compress_algo;
     inst->encrypt_enable = (cfg->encrypt_enable != 0);
     inst->kid = cfg->kid;
@@ -308,8 +352,9 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     }
 
     // 创建 staging 文件目录
+    // E-05: 同 day 兼容 '/' 与 '\\' 分隔符,Windows 反斜杠路径不再误判为纯文件名
     {
-        size_t pos = inst->staging_path.find_last_of('/');
+        size_t pos = inst->staging_path.find_last_of("/\\");
         std::string dir = (pos == std::string::npos) ? std::string(".")
                                                     : inst->staging_path.substr(0, pos);
         inst->pal->file_mkdirs(dir.c_str());
@@ -367,10 +412,17 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     if (!tag) return LOGX_ERR_INVALID_ARG;
 
     // 1) 锁外格式化(包含校验和计算)
+    // E-02: 区分"输入非法"与"内容超长"两类失败——非法输入按 INVALID_ARG 上报,
+    // 不再误入 TOO_LARGE 分支;drop_too_large 只在真正的超长路径递增。
     uint8_t buf[kMaxRecordTotal];
     uint32_t total = 0;
-    if (!build_records(inst, level, tag, payload, payload_len, buf, &total) ||
-        total > inst->max_log_length) {
+    int br = build_records(inst, level, tag, payload, payload_len, buf, &total);
+    if (br == kBuildRecordsInvalidInput) {
+        emit_event(inst, LOGX_EV_DROP, -1, "invalid log input");
+        return LOGX_ERR_INVALID_ARG;
+    }
+    if (total > inst->max_log_length) {
+        inst->drop_too_large.fetch_add(1);
         emit_event(inst, LOGX_EV_DROP, -1, "log too large");
         return LOGX_ERR_TOO_LARGE;
     }
@@ -384,7 +436,13 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         inst->staged_bytes_total.fetch_add(consumed, std::memory_order_relaxed);
         uint32_t f, snap;
         uint32_t pending = inst->staging->snapshot_pending(&f, &snap);
-        need_wake = pending >= inst->flush_threshold;
+        // E-06 复审修正:flush_threshold == 0 表示"禁用按阈值自动唤醒"。
+        // 旧判定 pending >= flush_threshold 在阈值 0 时因 pending >= 0 恒真,
+        // 退化为每条写入均唤醒 Flusher——语义精确反转。
+        // 守卫必须放在阈值上(threshold > 0)而非 pending 上:写入成功后
+        // pending 恒 > 0,对 pending 加前置条件是死代码,拦不住恒真分支。
+        // 阈值 0 时的落盘节奏由 Flusher 自身的 kFlushDebounceMs 轮询兜底。
+        need_wake = inst->flush_threshold > 0 && pending >= inst->flush_threshold;
     } else if (st == Staging::WriteStatus::kFull) {
         inst->drop_no_space.fetch_add(1);
         emit_event(inst, LOGX_EV_DROP, -1, "staging full");
@@ -414,8 +472,12 @@ logx_status_e logx_export(logx_instance_t* h, const char* from, const char* to,
 logx_status_e logx_set_error_handler(logx_instance_t* h, logx_error_fn fn, void* user) {
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return LOGX_ERR_STATE;
+    // E-01: 与 emit_event 的读取路径经 err_mu 串行化,消除数据竞争;
+    // 回调注册可被任意线程调用(见 logx_c.h 线程模型)。
+    inst->err_mu.lock();
     inst->err_fn = fn;
     inst->err_user = user;
+    inst->err_mu.unlock();
     return LOGX_OK;
 }
 
@@ -427,6 +489,10 @@ void logx_get_stats(logx_instance_t* h, logx_stats_t* out) {
     out->truncated_blocks = inst->truncated_blocks.load();
     out->pad_records      = inst->pad_records.load();
     out->block_write_errors = inst->block_write_errors.load();
+    // E-07: 预留位保持零值契约(未来字段占用前必须为零初始化输出)
+    for (size_t i = 0; i < sizeof(out->reserved) / sizeof(out->reserved[0]); ++i) {
+        out->reserved[i] = 0;
+    }
 }
 
 }  // extern "C"
