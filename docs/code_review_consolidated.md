@@ -206,11 +206,24 @@
      - 全开构建（ON/ON）：88/88 单测 + 4/4 压测 100% 通过（含 50 线程高并发压测 10 轮连续跑全过）；
      - Android arm64-v8a：交叉编译 0 警告 0 错误通过。
 
-### 🟠 [F-06] `atc.last_block_offset` 将 `uint64_t` 截断为 `uint32_t`
+### 🟠 [F-06] `atc.last_block_offset` 将 `uint64_t` 截断为 `uint32_t` [✅ 已修复]
 - **来源：** 报告一 BUG-13
-- **位置：** `core/src/flusher.cpp:586-587`
-- **描述：** 当前 `max_file_size` 默认 10MB 不会触发截断，但 `FileScanResult` 中同名字段为 `uint64_t`，类型不一致是设计隐患。
-- **修复建议：** 统一为 64 位类型（与 F-02 修复联动）。
+- **位置：** `core/include/logx_staging.h:63-68`、`core/include/logx_internal.h:120-136`、`core/src/flusher.cpp:558, 604, 731-735`、`core/src/recovery.cpp:181-185`
+- **状态：** ✅ **已修复并全矩阵闭环验证**（方案 D：契约锁定 + 4GiB 强制切分防线 + 越界哨兵守卫）
+- **事实核验与风险定级校准：**
+  1. 真实消费链核实（`recovery.cpp:128-130`、`flusher.cpp:570-574`）：恢复与追加决策仅从 `AppendTargetCache` 取 `date` 与 `split_no` 组装 `hint` 路径，随后一律调用 `scan_one` 从头扫描文件重算真实偏移；`atc.last_block_offset` 与 `end_offset` 本质上为纯诊断字段，无任何业务逻辑消费，即使截断也不破坏恢复正确性；
+  2. 默认 10MB 切分下，单文件累积到 4GiB 在现实路径中完全不可达；若直接盲目将字段升为 `uint64_t` 会破坏 Spec §3.1 原生的 `13B (reserved[0..12])` 二进制契约，并与 S-02（13B packed）产生直接冲突。
+- **修复措施（方案 D 落地）：**
+  1. **契约锁定与静态校验**（`logx_staging.h`）：保持 13B 二进制布局与 `uint32_t` 类型不变，增补静态断言 `sizeof(atc.last_block_offset) == 4` 与详细契约注释；
+  2. **单文件 4GiB 物理容量硬切分防线**（`logx_internal.h` / `flusher.cpp`）：引入 `kSingleFileMaxCapacity = 4GiB - 16MB` 与 `should_rotate_file_size` 纯函数，无论上层配置多大的 `max_file_size`，单文件达到 4GiB 均强制切分滚动，从源头物理杜绝单文件超 4GiB；
+  3. **越界哨兵置 0 守卫**（`logx_internal.h` / `flusher.cpp` / `recovery.cpp`）：引入 `safe_assign_atc_offsets` 守卫，偏移 $\ge$ `UINT32_MAX` 时将 `atc` 偏移置 `0` 哨兵值并派发 `LOGX_EV_IO` 报警事件，彻底杜绝静默高位截断环绕；
+  4. **单测闭环**：
+     - `tests/unit/test_flusher.cpp`：新增 `FileSizeThreshold_ShouldRotateFileSize_Enforces4GiBCapacity`，覆盖正常阈值、100GB/UINT64_MAX 超大配置下 4GiB 强制切分拦截；
+     - `tests/unit/test_recovery.cpp`：新增 `AppendTargetCache_ContractAndSafeOffsetAssignment`，覆盖静态断言、边界赋值与 $\ge$ `UINT32_MAX` 越界置 0 哨兵机制。
+  5. **全矩阵编译与回归通过**：
+     - 基础构建（OFF/OFF）：73/73 单测 + 4/4 压测 100% 通过；
+     - 全开构建（ON/ON）：90/90 单测 + 4/4 压测 100% 通过；
+     - Android arm64-v8a：交叉编译 0 警告 0 错误通过。
 
 ### 🟠 [F-07] 切分序号 `split_no` 为 `uint8_t`，达到 255 后静默停写
 - **来源：** 报告一 WARN-4（无报警部分）＋ 报告三 BUG-X1（T4.0-2 未落地，列为 P1）
@@ -679,7 +692,7 @@
 | 编号 | 问题 | 编号 | 问题 |
 |:---|:---|:---|:---|
 | F-03 | 短写未检测致日志丢失 [✅ 已修复] | F-04 | fsync/同步持久化零接入 [✅ 已修复] |
-| F-05 | 恢复块头校验不足 [✅ 已修复] | F-06 | atc offset uint32 截断 |
+| F-05 | 恢复块头校验不足 [✅ 已修复] | F-06 | atc offset uint32 截断 [✅ 已修复] |
 | F-07 | split_no uint8 / 255 停写（T4.0-2） | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
 | C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed |
 | FM-01 | tag[64] 越界读 UB | FM-02 | 重同步未清 carry_slice_buf |

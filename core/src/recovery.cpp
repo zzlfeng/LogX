@@ -178,8 +178,10 @@ void run_recovery(Instance* inst) {
             if (sr.ok) {
                 hdr.seqno = sr.seqno;
                 parse_log_filename(sr.path, &atc.date, &atc.split_no);
-                atc.last_block_offset = static_cast<uint32_t>(sr.last_block_offset);
-                atc.last_block_end_offset = static_cast<uint32_t>(sr.last_block_end_offset);
+                if (!safe_assign_atc_offsets(sr.last_block_offset, sr.last_block_end_offset,
+                                             &atc.last_block_offset, &atc.last_block_end_offset)) {
+                    emit_event(inst, LOGX_EV_IO, -1, "scan offset exceeds atc capacity");
+                }
             }
         }
         inst->staging->commit_header_locked(hdr.seqno, 0, 0, &atc);

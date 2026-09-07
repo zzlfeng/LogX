@@ -555,7 +555,7 @@ void close_current(FlusherCtx* c, Pal* pal) {
 // 返回 fd;失败 -1。*out_salt 写到调用方缓冲。
 int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
     if (!c->date_changed && c->current_fd >= 0) {
-        if (c->current_size < inst->max_file_size) {
+        if (!should_rotate_file_size(c->current_size, inst->max_file_size)) {
             return c->current_fd;
         }
     }
@@ -599,9 +599,9 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
         retention_cleanup_impl(inst);
     }
 
-    // 切分序号决策:如果当前 size ≥ max_file_size → split+1 切到新文件。
+    // 切分序号决策:如果当前 size 满足切分条件 (≥ max_file_size 或达到 4GiB 物理上限) → split+1 切到新文件。
     // 增加循环探测:若 make_log_path 目标已存在则持续 +1, 直至空闲分卷或达 255 上限
-    if (c->current_size >= inst->max_file_size) {
+    if (should_rotate_file_size(c->current_size, inst->max_file_size)) {
         do {
             if (c->current_split >= 255) {
                 // 达上限,停写
@@ -728,8 +728,10 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         inst->staging->zero_range_locked(cur_f, blk.raw_len);
 
         uint32_t new_seqno = cur_seqno + 1;
-        atc.last_block_offset = static_cast<uint32_t>(wr.start_offset);
-        atc.last_block_end_offset = static_cast<uint32_t>(wr.end_offset);
+        if (!safe_assign_atc_offsets(wr.start_offset, wr.end_offset,
+                                     &atc.last_block_offset, &atc.last_block_end_offset)) {
+            emit_event(inst, LOGX_EV_IO, -1, "block offset exceeds atc capacity");
+        }
         uint32_t new_f = (cur_f + blk.raw_len) % inst->staging->data_size();
         uint32_t latest_w = get_u32(inst->staging->raw_base() + 16);
         inst->staging->commit_header_locked(new_seqno, new_f, latest_w, &atc);

@@ -1134,3 +1134,31 @@ TEST(ErrorMonitoring, InitStageEventsCapturedViaConfig) {
     pal.file_rmdir(bad_staging_path.c_str());
     pal.file_rmdir(dir.c_str());
 }
+
+TEST(FlusherTest, FileSizeThreshold_ShouldRotateFileSize_Enforces4GiBCapacity) {
+    // 验证切分决策 pure function (F-06 方案 D)
+    const uint64_t default_10mb = 10 * 1024 * 1024ULL;
+
+    // 1. 常规配置: 未达上限不切分, 达到上限切分
+    EXPECT_FALSE(should_rotate_file_size(0, default_10mb));
+    EXPECT_FALSE(should_rotate_file_size(default_10mb - 1, default_10mb));
+    EXPECT_TRUE(should_rotate_file_size(default_10mb, default_10mb));
+    EXPECT_TRUE(should_rotate_file_size(default_10mb + 100, default_10mb));
+
+    // 2. 超大配置 (例如用户配置 100GB 或 UINT64_MAX)
+    const uint64_t huge_limit = 100ULL * 1024 * 1024 * 1024;
+    EXPECT_FALSE(should_rotate_file_size(1ULL * 1024 * 1024 * 1024, huge_limit));
+    EXPECT_FALSE(should_rotate_file_size(3ULL * 1024 * 1024 * 1024, huge_limit));
+
+    // 3. 4GiB 物理安全防线强制切分 (kSingleFileMaxCapacity = 4GiB - 16MB)
+    // 即使配置了 100GB 或 UINT64_MAX, 达到 kSingleFileMaxCapacity 也会强制切分, 杜绝单文件溢出 4GiB
+    EXPECT_FALSE(should_rotate_file_size(kSingleFileMaxCapacity - 1, huge_limit));
+    EXPECT_TRUE(should_rotate_file_size(kSingleFileMaxCapacity, huge_limit));
+    EXPECT_TRUE(should_rotate_file_size(kSingleFileMaxCapacity + 1, huge_limit));
+    EXPECT_TRUE(should_rotate_file_size(0xFFFFFFFFULL, huge_limit));
+    EXPECT_TRUE(should_rotate_file_size(0xFFFFFFFFULL + 100, huge_limit));
+
+    // 4. UINT64_MAX 极端场景
+    EXPECT_FALSE(should_rotate_file_size(kSingleFileMaxCapacity - 1, UINT64_MAX));
+    EXPECT_TRUE(should_rotate_file_size(kSingleFileMaxCapacity, UINT64_MAX));
+}

@@ -117,6 +117,29 @@ std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint8_t spl
 // 成功返回 true; 其它文件返回 false。
 bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uint8_t* out_split);
 
+// 单日志文件物理容量硬上限 (4GiB - 16MB 安全余量, 保证即使加上最后一块也不会溢出 uint32_t) (F-06 方案 D)
+constexpr uint64_t kSingleFileMaxCapacity = 0xFFFFFFFFULL - (16 * 1024 * 1024ULL);
+
+// 判定是否应触发日志文件切分滚动 (同时满足配置阈值与 4GiB 物理安全防线)
+inline bool should_rotate_file_size(uint64_t current_size, uint64_t max_file_size) {
+    return current_size >= max_file_size || current_size >= kSingleFileMaxCapacity;
+}
+
+// 写入 AppendTargetCache 时的 32 位安全防线 (F-06 方案 D):
+// 若偏移溢出 uint32_t (>= UINT32_MAX), 置 0 哨兵值并返回 false (指示已溢出);
+// 否则安全收窄至 uint32_t 并返回 true.
+inline bool safe_assign_atc_offsets(uint64_t start_offset, uint64_t end_offset,
+                                    uint32_t* out_start, uint32_t* out_end) {
+    if (start_offset >= UINT32_MAX || end_offset >= UINT32_MAX) {
+        *out_start = 0;
+        *out_end = 0;
+        return false;
+    }
+    *out_start = static_cast<uint32_t>(start_offset);
+    *out_end = static_cast<uint32_t>(end_offset);
+    return true;
+}
+
 // 写一个完整块到日志文件;返回成功与否。
 bool write_block_to_file(Instance* inst,
                          const uint8_t* raw, const PendingBlock& blk,

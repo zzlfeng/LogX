@@ -60,12 +60,20 @@ static_assert(sizeof(Header) == 64, "Header must be 64B");
 //   reserved[4]      split_no(切分序号 .1/.2 ...)
 //   reserved[5..8]   last_block_offset(最近已提交块在文件中的字节偏移)
 //   reserved[9..12]  last_block_end_offset
+//
+// 契约说明 (F-06 / S-02):
+//   此结构体为 13B 固定二进制契约(仅为诊断缓存, 恢复决策由 scan_one 保证);
+//   uint32_t 偏移上限 4GiB 由写入端强制切分防线 (should_rotate_file_size) 与
+//   越界哨兵置 0 守卫保证不会静默溢出;
+//   offset=0 表示未知/越界哨兵值，非真实偏移(首块真实偏移恒 >= 32B 文件头)。
 struct AppendTargetCache {
     uint32_t date;
     uint8_t  split_no;
     uint32_t last_block_offset;
     uint32_t last_block_end_offset;
 };
+static_assert(sizeof(AppendTargetCache::last_block_offset) == 4, "last_block_offset must be 4B uint32");
+static_assert(sizeof(AppendTargetCache::last_block_end_offset) == 4, "last_block_end_offset must be 4B uint32");
 
 // 启动时读到的"恢复上下文":recovery.cpp 用其驱动对账。
 struct RecoveryState {

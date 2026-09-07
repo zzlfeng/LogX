@@ -844,3 +844,36 @@ TEST_F(RecoveryTest, Recovery_SumRawLenExceedsCapacity_DoesNotCorruptStaging) {
     delete inst->staging;
     delete inst;
 }
+
+TEST_F(RecoveryTest, AppendTargetCache_ContractAndSafeOffsetAssignment) {
+    // 1. 契约锁定: 验证 AppendTargetCache 字段大小为 4 字节 (F-06 方案 D)
+    static_assert(sizeof(AppendTargetCache::last_block_offset) == 4, "last_block_offset must be 4B uint32");
+    static_assert(sizeof(AppendTargetCache::last_block_end_offset) == 4, "last_block_end_offset must be 4B uint32");
+
+    uint32_t out_start = 0xFFFFFFFF, out_end = 0xFFFFFFFF;
+
+    // 2. 常规边界 (< UINT32_MAX): 正常赋值返回 true
+    EXPECT_TRUE(safe_assign_atc_offsets(0, 100, &out_start, &out_end));
+    EXPECT_EQ(out_start, 0u);
+    EXPECT_EQ(out_end, 100u);
+
+    EXPECT_TRUE(safe_assign_atc_offsets(UINT32_MAX - 2, UINT32_MAX - 1, &out_start, &out_end));
+    EXPECT_EQ(out_start, UINT32_MAX - 2);
+    EXPECT_EQ(out_end, UINT32_MAX - 1);
+
+    // 3. 越界边界 1: start_offset 达到或超过 UINT32_MAX
+    EXPECT_FALSE(safe_assign_atc_offsets(UINT32_MAX, 100, &out_start, &out_end));
+    EXPECT_EQ(out_start, 0u);
+    EXPECT_EQ(out_end, 0u);
+
+    // 4. 越界边界 2: end_offset 达到或超过 UINT32_MAX
+    EXPECT_FALSE(safe_assign_atc_offsets(100, UINT32_MAX, &out_start, &out_end));
+    EXPECT_EQ(out_start, 0u);
+    EXPECT_EQ(out_end, 0u);
+
+    // 5. 越界边界 3: 两者均远远超过 4GiB (如 100GB 偏移)
+    const uint64_t huge_100gb = 100ULL * 1024 * 1024 * 1024;
+    EXPECT_FALSE(safe_assign_atc_offsets(huge_100gb, huge_100gb + 4096, &out_start, &out_end));
+    EXPECT_EQ(out_start, 0u);
+    EXPECT_EQ(out_end, 0u);
+}
