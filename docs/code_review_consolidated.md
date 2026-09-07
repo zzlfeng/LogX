@@ -305,29 +305,33 @@
 - **描述：** 早期结构体缺 packed（实测 `sizeof=16`），`split_no` 后插入 3B 填充。当前单一 C++ 运行时内写入与读取均按 `sizeof(AppendTargetCache)` 做 `memcpy`，闭环内不发生错位；但与早期注释声称的 13 字节布局存在歧义。
 - **闭环方案（已随 F-07/F-06 协同落地）：** 放弃破坏性的强制 packed 方案（避免导致历史 staging 文件物理 offset 偏移错位 3B）；转而正式将 `AppendTargetCache` 物理对齐大小锁定为 16B（`static_assert(sizeof == 16)` 且硬断言 `last_block_offset` 在 offset 8），将 `split_no` 扩宽至历史恒为 0 的填充位 `reserved[5]`，有效载荷升至 14B，`reserved[6..7]` 显式填充，实现 100% 物理与逻辑二进制自洽兼容；已通过 `Flush.AppendTargetCache_HistoricalStagingLayoutCompatibility` 与 `RecoveryTest.AppendTargetCache_ContractAndSafeOffsetAssignment` 双重验证。
 
-### 🟡 [S-03] `kBlockHeaderSize` 注释与实际求值不符（32B vs 34B）
+### 🟡 [S-03] `kBlockHeaderSize` 注释与实际求值不符（32B vs 34B）[✅ 已修复]
 - **来源：** 报告一 BUG-12（经交叉复核校准为 P2）
-- **位置：** `core/include/logx_staging.h:194`
+- **位置：** `core/include/logx_staging.h:226`
 - **描述：** 常量实际求值 `4+1+1+4+4+4+4+12 = 34`，末尾注释误写为 `= 32B`。nonce 布局本身（`hdr[22..29]` salt + `hdr[30..33]` seqno 大端）实现正确。
 - **修复建议：** 修正注释为 34B。
+- **状态：** ✅ 已修复——注释更正为 `= 34B (S-03)`，与实际求值及读盘/测试代码中的 34B 块头处理一致。
 
-### 🟡 [S-04] `max_log_length` 注释与默认值不一致
+### 🟡 [S-04] `max_log_length` 注释与默认值不一致 [✅ 已修复]
 - **来源：** 报告一 BUG-15（经交叉复核校准）
 - **位置：** `core/include/logx_internal.h:33`
 - **描述：** `max_log_length = 0` 时 `logx_open`（`logx_c.cpp:244-246`）会主动拦截返回 `LOGX_ERR_INVALID_ARG`，正常使用下不会发生静默丢弃；核心问题是配置结构体默认值未与注释"64KB 默认"对齐。
 - **修复建议：** 在配置默认值中显式赋 64KB。
+- **状态：** ✅ 已修复——`Instance::max_log_length` 默认值改为 `64 * 1024`，与注释、Kotlin `LogX.Config.maxLogLength = 64*1024` 及 JNI 层兜底值三层对齐；C ABI 层显式传 0 的拦截逻辑保持不变（防御不受影响）。
 
-### 🟡 [S-05] `logx_open` 失败路径 staging 已 delete 但指针未置 nullptr
+### 🟡 [S-05] `logx_open` 失败路径 staging 已 delete 但指针未置 nullptr [✅ 已修复]
 - **来源：** 报告一 WARN-10
-- **位置：** `core/src/logx_c.cpp:297-302`
+- **位置：** `core/src/logx_c.cpp:331-337`
 - **描述：** 防御性编程缺失，若未来析构函数引用 `staging` 指针会引发 double-free。
 - **修复建议：** delete 后置 nullptr。
+- **状态：** ✅ 已修复——`thread_start` 失败路径 `delete inst->staging` 后追加 `inst->staging = nullptr`，与 `logx_close` 成功路径（delete 后置空）纪律拉齐。
 
-### 🟡 [S-06] 双 Header 提交内存序轻微偏离 Spec（T4.0-3 偏差）
+### 🟡 [S-06] 双 Header 提交内存序轻微偏离 Spec（T4.0-3 偏差）[✅ 已修复]
 - **来源：** 报告三 §四 T4.0-3（Spec 偏差）
-- **位置：** `core/src/staging.cpp:180-205`
-- **描述：** spec §4.2/§10 规定双 Header 写入应为“写 Header A → seq_cst 内存屏障 → 写 Header B”；当前实现为 A(中间态 CRC) → B → release fence，在极端掉电窗口下内存序存在轻微偏离。
+- **位置：** `core/src/staging.cpp:244-272`
+- **描述：** spec §4.2/§10 规定双 Header 写入应为"写 Header A → seq_cst 内存屏障 → 写 Header B"；原实现为 A(中间态 CRC) → B → release fence，在极端掉电窗口下内存序存在轻微偏离。
 - **修复建议：** 严格按照 Spec 要求在 Header A 与 B 的提交之间插入完整顺序一致性屏障（或显式同步语义）。
+- **状态：** ✅ 已修复——`commit_header_locked` 改为"写 A 完整（含最终 CRC）→ `atomic_thread_fence(seq_cst)` → 写 B 完整 → release fence"纪律：seq_cst 屏障保证 A 的全部字节先于 B 的任意字节全局可见，读者只会观察到 (A新,B旧)/(A新,B新)/(A旧,B旧) 三种组合，永不出现 (A旧,B新) 逆序窗口；掉电场景下 pick_header 取 CRC 完整且 seqno 较新者，"半新半旧"窗口被压缩到单个 Header 内部（由 CRC 把关）。T4.0-3 规格偏差随之闭环。
 
 ---
 
@@ -678,7 +682,7 @@
 |:---|:---|:---|:---|:---|
 | **T4.0-1** | §7 `flush()` 水位线 `target_seqno` 防饥饿 | ✅ 已通过 F-08 闭环（累计字节水位线 + PAD 跨度补偿 + 5000ms 超时熔断 + LOGX_ERR_TIMEOUT） | — | F-08 |
 | **T4.0-2** | §3.1/§4.4 切分序号 2B (uint16_t) | ✅ 已通过 F-07 闭环（16B 自然对齐 + 历史恒零扩宽至 uint16_t + 达上限明确告警与去重） | — | F-07 |
-| **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | 实现为 A(中间态 CRC)→ B → release fence | 掉电极端窗口内存序轻微偏离 | S-06 |
+| **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | ✅ 已通过 S-06 闭环（写 A 完整 → seq_cst fence → 写 B 完整 → release fence，杜绝 (A旧,B新) 逆序窗口） | — | S-06 |
 | **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | ✅ 已通过 F-10 闭环（定型 75ms 聚集窗口 + 常态化防抖轮询，零散小写入自然聚集落盘） | — | F-10 |
 | **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | ✅ 已落地并闭环：`aesce.c` 移植完成，AESE/AESMC/EOR 标准指令直通；后续独立复审完成官方向量锚定（McGrew-Viega TC13/14/15 + 零密钥基线，OpenSSL 交叉验证 72/72）、热路径逐块探针消除与防竞态定型，x86 + 真机（骁龙865）双路径全量回归通过 | — | C-04 |
 | **T4.0-6** | §11 运行期每 30s 定时 msync/fdatasync | ✅ 已通过 F-04 补齐：`flusher_loop` 接入 30s 超时唤醒与 `durability_sync`，落盘 + staging 强刷盘 | — | — |
@@ -758,8 +762,8 @@
 
 | 编号 | 问题 | 编号 | 问题 |
 |:---|:---|:---|:---|
-| S-03 | kBlockHeaderSize 注释 32B→34B | S-04 | max_log_length 默认值注释 |
-| S-05 | staging 指针未置 null | FM-03 | 64KB 栈数组溢出风险 |
+| S-03 | kBlockHeaderSize 注释 32B→34B [✅ 已修复] | S-04 | max_log_length 默认值注释 [✅ 已修复] |
+| S-05 | staging 指针未置 null [✅ 已修复] | FM-03 | 64KB 栈数组溢出风险 |
 | FM-04 | cksum O(n²) 重扫 | F-08 | flush_blocking 无超时 [✅ 已修复] |
 | F-09 | random_bytes 退化低熵 [✅ 已修复] | P-04 | QPF 重复查询 |
 | P-05 | SetFilePointer 冗余 | P-06 | atomic_add 对齐断言 |

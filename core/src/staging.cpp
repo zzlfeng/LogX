@@ -261,6 +261,14 @@ void Staging::commit_header_locked(uint32_t seqno, uint32_t f, uint32_t w,
     write_header_raw(base_, h);
     h.header_crc = compute_header_crc(base_);
     write_header_raw(base_, h);
+    // spec §4.2/§10 (T4.0-3 / S-06): 双 Header 提交纪律为
+    // "写 A 完整 → seq_cst 屏障 → 写 B 完整"。
+    // seq_cst 屏障保证 A 的所有字节先于 B 的任意字节全局可见:
+    //   - 读者只可能观察到 (A新,B旧) / (A新,B新) / (A旧,B旧) 三种组合,
+    //     永远不会出现 (A旧,B新) 的逆序窗口;
+    //   - 掉电场景下 pick_header 取 CRC 完整且 seqno 较新者,
+    //     seq_cst 纪律把"半新半旧"窗口压缩到单个 Header 内部(由 CRC 把关)。
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     write_header_raw(base_ + kHeaderASize, h);
     std::atomic_thread_fence(std::memory_order_release);
 }

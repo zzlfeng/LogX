@@ -30,7 +30,7 @@ struct Instance {
     // ---- 配置 ----
     std::string log_dir;
     std::string staging_path;
-    uint32_t    max_log_length = 0;     // 64KB 默认
+    uint32_t    max_log_length = 64 * 1024;  // 64KB 默认 (S-04: 与 Kotlin/JNI 默认值及注释对齐)
     uint32_t    retention_days = 7;
     uint64_t    max_file_size  = 10 * 1024 * 1024;
     uint32_t    flush_threshold = 8 * 1024;

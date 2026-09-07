@@ -330,6 +330,7 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     // 启动 Flusher 线程
     if (inst->pal->thread_start(&flusher_main, inst, &inst->flusher_thread) != 0) {
         delete inst->staging;
+        inst->staging = nullptr;  // S-05: 防御性置空,杜绝潜在 double-free
         inst->pal->ev_destroy(inst->flush_event);
         inst->pal->mutex_destroy(inst->mu);
         delete inst;
