@@ -273,6 +273,59 @@ bool write_file_header(Instance* inst, int fd,
     return true;
 }
 
+constexpr uint32_t kBlockMaxRawPlausible = 16 * 1024 * 1024;  // 16MB 块上限防御
+
+bool block_header_plausible(const uint8_t bhdr[34], uint64_t file_remaining_bytes,
+                            uint32_t prev_seqno, bool has_prev_seqno,
+                            uint32_t* out_seqno, uint32_t* out_raw_len,
+                            uint32_t* out_payload_len, uint64_t* out_block_size) {
+    if (!bhdr) return false;
+
+    // 1. Magic 校验: 'LGXB'
+    if (get_u32(bhdr) != kMagicBlock) return false;
+
+    // 2. 版本校验: 仅支持 v1
+    if (bhdr[4] != 1) return false;
+
+    // 3. flag 保留位校验: 仅允许 bit0 (加密), bit1..2 (压缩算法)
+    uint8_t flag = bhdr[5];
+    if ((flag & ~0x07) != 0) return false;
+
+    // 4. 压缩算法支持性与编译宏校验
+    uint8_t algo = flag_algo(flag);
+#if LOGX_WITH_ZSTD
+    if (algo != kAlgoNone && algo != kAlgoZstd) return false;
+#else
+    if (algo != kAlgoNone) return false;
+#endif
+
+    // 5. seqno 严格单调递增
+    uint32_t seqno = get_u32(bhdr + 6);
+    if (seqno == 0) return false;
+    if (has_prev_seqno && seqno <= prev_seqno) return false;
+
+    // 6. raw_len 范围防御: [6, kBlockMaxRawPlausible]
+    uint32_t raw_len = get_u32(bhdr + 10);
+    if (raw_len < 6 || raw_len > kBlockMaxRawPlausible) return false;
+
+    // 7. payload_len 范围防御
+    uint32_t payload_len = get_u32(bhdr + 14);
+    if (payload_len == 0 || payload_len > kBlockMaxRawPlausible) return false;
+
+    // 8. 协议自洽性: 未压缩时 payload_len 必须严格等于 raw_len (无论是否加密)
+    if (algo == kAlgoNone && payload_len != raw_len) return false;
+
+    // 9. block_size 计算与文件剩余容量校验
+    uint64_t block_size = 34ULL + payload_len + (flag_encrypted(flag) ? 16ULL : 0ULL);
+    if (block_size > file_remaining_bytes) return false;
+
+    if (out_seqno) *out_seqno = seqno;
+    if (out_raw_len) *out_raw_len = raw_len;
+    if (out_payload_len) *out_payload_len = payload_len;
+    if (out_block_size) *out_block_size = block_size;
+    return true;
+}
+
 // 扫描 hint_path;若文件不存在则返回 ok=false 让上层决定创建。
 // repair = true 时对损坏尾部做 ftruncate 修复(确定追加目标时用);
 // false 时只评估不修改(scan_dir_for_target 遍历候选文件时用,避免副作用)。
@@ -318,6 +371,8 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
     }
     // 顺序扫剩余块
     uint64_t off = 32;
+    uint32_t prev_seqno = 0;
+    bool has_prev_seqno = false;
     while (off < static_cast<uint64_t>(sz)) {
         uint8_t bhdr[34];
         if (inst->pal->file_pread(fd, bhdr, 34, off) != 34) {
@@ -328,18 +383,11 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
             r.ok = true;
             return r;
         }
-        if (get_u32(bhdr) != kMagicBlock) {
-            if (repair) inst->pal->file_truncate(fd, off);
-            r.truncated = true;
-            r.last_block_end_offset = off;
-            inst->pal->file_close(fd);
-            r.ok = true;
-            return r;
-        }
-        uint32_t payload_len = get_u32(bhdr + 14);
-        uint8_t flag = bhdr[5];
-        uint64_t block_size = 34 + payload_len + (flag_encrypted(flag) ? 16 : 0);
-        if (off + block_size > static_cast<uint64_t>(sz)) {
+        uint32_t seqno = 0, raw_len = 0, payload_len = 0;
+        uint64_t block_size = 0;
+        if (!block_header_plausible(bhdr, static_cast<uint64_t>(sz) - off,
+                                    prev_seqno, has_prev_seqno,
+                                    &seqno, &raw_len, &payload_len, &block_size)) {
             if (repair) inst->pal->file_truncate(fd, off);
             r.truncated = true;
             r.last_block_end_offset = off;
@@ -360,7 +408,7 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
         } else if (expected_crc != 0) {
             block_valid = false;
         }
-        if (block_valid && (flag & kFlagEncrypted)) {
+        if (block_valid && flag_encrypted(bhdr[5])) {
             uint8_t tag[16];
             if (inst->pal->file_pread(fd, tag, 16, off + 34 + payload_len) != 16) {
                 block_valid = false;
@@ -374,9 +422,11 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
             r.ok = true;
             return r;
         }
-        r.seqno = get_u32(bhdr + 6);
+        r.seqno = seqno;
         r.last_block_offset = off;
         r.last_block_end_offset = off + block_size;
+        prev_seqno = seqno;
+        has_prev_seqno = true;
         off += block_size;
     }
     r.ok = true;
@@ -853,24 +903,52 @@ bool sum_raw_len_since(Instance* inst, const std::string& target_path,
         inst->pal->file_close(fd);
         return false;
     }
+    uint32_t staging_capacity = (inst && inst->staging) ? inst->staging->data_size() : 0;
     uint64_t off = kFileHeaderSize;
+    uint32_t prev_seqno = 0;
+    bool has_prev_seqno = false;
     while (off + 34 <= static_cast<uint64_t>(sz)) {
         uint8_t bhdr[34];
         if (inst->pal->file_pread(fd, bhdr, 34, off) != 34) break;
-        if (get_u32(bhdr) != kMagicBlock) break;   // 撕裂半头:计入后续对账失败,宁丢不脏
-        uint32_t seqno = get_u32(bhdr + 6);
-        uint32_t raw_len = get_u32(bhdr + 10);
-        uint32_t payload_len = get_u32(bhdr + 14);
-        uint8_t flag = bhdr[5];
-        // raw_len 范围防御:必须在 (0, kSingleRecordMaxRaw] 范围内,超限视作块头损坏,终止对账防错误推进水位
-        if (raw_len == 0 || raw_len > kSingleRecordMaxRaw) break;
-        uint64_t block_size = 34 + payload_len + (flag_encrypted(flag) ? 16 : 0);
-        if (off + block_size > static_cast<uint64_t>(sz)) break;  // 半块尾巴
+        uint32_t seqno = 0, raw_len = 0, payload_len = 0;
+        uint64_t block_size = 0;
+        if (!block_header_plausible(bhdr, static_cast<uint64_t>(sz) - off,
+                                    prev_seqno, has_prev_seqno,
+                                    &seqno, &raw_len, &payload_len, &block_size)) {
+            break;
+        }
+        // 校验块 CRC32(payload) 与 Tag 可读性 (宁丢不脏, 与 scan_one 保持一致)
+        uint32_t expected_crc = get_u32(bhdr + 18);
+        bool block_valid = true;
+        if (payload_len > 0) {
+            std::vector<uint8_t> pbuf(payload_len);
+            if (inst->pal->file_pread(fd, pbuf.data(), payload_len, off + 34) != static_cast<long>(payload_len)) {
+                block_valid = false;
+            } else if (crc32_update(0, pbuf.data(), payload_len) != expected_crc) {
+                block_valid = false;
+            }
+        } else if (expected_crc != 0) {
+            block_valid = false;
+        }
+        if (block_valid && flag_encrypted(bhdr[5])) {
+            uint8_t tag[16];
+            if (inst->pal->file_pread(fd, tag, 16, off + 34 + payload_len) != 16) {
+                block_valid = false;
+            }
+        }
+        if (!block_valid) break;
+
         if (seqno > upto_seqno) {
+            if (staging_capacity > 0 && (*out_bytes + raw_len >= staging_capacity)) {
+                // 水位回推上界防御: 累加 raw_len 达到或超过环形缓冲区容量，终止累加防错误推进水位
+                break;
+            }
             *out_bytes += raw_len;      // raw_len(spec §3.2 对账关键字段)
         }
         *out_last_block_offset = off;
         *out_last_block_end_offset = off + block_size;
+        prev_seqno = seqno;
+        has_prev_seqno = true;
         off += block_size;
     }
     inst->pal->file_close(fd);

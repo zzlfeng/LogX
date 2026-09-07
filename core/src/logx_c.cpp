@@ -89,18 +89,23 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
     }
     uint64_t off = 32;
     std::vector<uint8_t> carry_slice_buf;
+    uint32_t prev_seqno = 0;
+    bool has_prev_seqno = false;
     while (off + 34 <= end_size) {
         uint8_t bhdr[34];
         if (inst->pal->file_pread(fd, bhdr, 34, off) != 34) break;
-        if (get_u32(bhdr) != kMagicBlock) break;
-        uint32_t seqno      = get_u32(bhdr + 6);
-        uint32_t raw_len    = get_u32(bhdr + 10);
-        uint32_t payload_len = get_u32(bhdr + 14);
+        uint32_t seqno = 0, raw_len = 0, payload_len = 0;
+        uint64_t block_size = 0;
+        if (!block_header_plausible(bhdr, end_size - off,
+                                    prev_seqno, has_prev_seqno,
+                                    &seqno, &raw_len, &payload_len, &block_size)) {
+            break;
+        }
+        prev_seqno = seqno;
+        has_prev_seqno = true;
         uint32_t crc        = get_u32(bhdr + 18);
         uint8_t  flag       = bhdr[5];
         bool enc = flag_encrypted(flag);
-        uint64_t block_size = 34 + payload_len + (enc ? 16 : 0);
-        if (off + block_size > end_size) break;
         std::vector<uint8_t> payload(payload_len);
         if (inst->pal->file_pread(fd, payload.data(), payload_len, off + 34) !=
             static_cast<long>(payload_len)) break;

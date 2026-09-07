@@ -491,6 +491,55 @@ static bool create_test_log_file(Instance* inst, const std::string& path, uint32
     return wr.ok;
 }
 
+static bool append_test_block(Instance* inst, const std::string& path, uint32_t seqno,
+                             uint8_t seed = 0x20, uint64_t* out_off = nullptr) {
+    int fd = inst->pal->file_open(path.c_str(), true, true);
+    if (fd < 0) return false;
+    int64_t sz = inst->pal->file_size(fd);
+    if (sz < 32) { inst->pal->file_close(fd); return false; }
+    if (out_off) *out_off = static_cast<uint64_t>(sz);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<uint8_t> rec;
+    append_entry_record(&rec, seed);
+    BlockWriteResult wr = write_and_record(inst, fd, rec.data(),
+                                           static_cast<uint32_t>(rec.size()),
+                                           seqno, 0, salt, nullptr);
+    inst->pal->file_close(fd);
+    return wr.ok;
+}
+
+static bool tamper_file_bytes(Instance* inst, const std::string& path, uint64_t offset, const void* data, size_t len) {
+    int fd = inst->pal->file_open(path.c_str(), true, true);
+    if (fd < 0) return false;
+    long written = inst->pal->file_pwrite(fd, data, static_cast<long>(len), offset);
+    inst->pal->file_close(fd);
+    return written == static_cast<long>(len);
+}
+
+static bool append_test_block_custom_len(Instance* inst, const std::string& path, uint32_t seqno,
+                                        uint32_t raw_len) {
+    if (raw_len < 6) return false;
+    int fd = inst->pal->file_open(path.c_str(), true, true);
+    if (fd < 0) return false;
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<uint8_t> rec(raw_len, 0);
+    uint32_t payload_len = raw_len - 6;
+    put_u16(rec.data(), static_cast<uint16_t>(payload_len));
+    put_u16(rec.data() + 2, kMagicEntry);
+    rec[4] = 0x00;
+    uint8_t c = 0;
+    for (uint32_t i = 0; i < payload_len; ++i) {
+        rec[6 + i] = static_cast<uint8_t>(i & 0xFF);
+        c ^= rec[6 + i];
+    }
+    rec[5] = c;
+    BlockWriteResult wr = write_and_record(inst, fd, rec.data(),
+                                           static_cast<uint32_t>(rec.size()),
+                                           seqno, 0, salt, nullptr);
+    inst->pal->file_close(fd);
+    return wr.ok;
+}
+
 TEST_F(RecoveryTest, RecoveryResume_PreservesSplitNoInAppendTargetCache) {
     Instance* inst = new Instance();
     inst->pal = &default_pal();
@@ -563,6 +612,234 @@ TEST_F(RecoveryTest, RecoveryRebuilt_PreservesSplitNoInAppendTargetCache) {
     EXPECT_EQ(committed_atc.date, yyyymmdd);
     EXPECT_EQ(committed_atc.split_no, 2);
     EXPECT_EQ(get_u32(inst->staging->raw_base() + 8), 20u);
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, CorruptBlock_BadVersion_TruncatedOnRecovery) {
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+    std::string path = make_log_path(log_dir_, yyyymmdd, 0);
+
+    // 块 1 (seqno=1), 块 2 (seqno=2)
+    ASSERT_TRUE(create_test_log_file(inst, path, yyyymmdd, 1));
+    uint64_t blk2_off = 0;
+    ASSERT_TRUE(append_test_block(inst, path, 2, 0x20, &blk2_off));
+    EXPECT_EQ(blk2_off, 80u);
+
+    // 篡改块 2 版本号: bhdr[4] = 2 (或 0xFF)
+    uint8_t bad_ver = 2;
+    ASSERT_TRUE(tamper_file_bytes(inst, path, blk2_off + 4, &bad_ver, 1));
+
+    // 执行扫描修复: 块 2 应被识别为非法版本并被截断, 恢复只保留块 1
+    FileScanResult sr = scan_one(inst, path, /*repair=*/true);
+    EXPECT_TRUE(sr.ok);
+    EXPECT_TRUE(sr.truncated);
+    EXPECT_EQ(sr.seqno, 1u);
+    EXPECT_EQ(inst->pal->file_size_path(path.c_str()), 80);
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, CorruptBlock_BadFlag_TruncatedOnRecovery) {
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+    std::string path = make_log_path(log_dir_, yyyymmdd, 0);
+
+    // 块 1 (seqno=1), 块 2 (seqno=2)
+    ASSERT_TRUE(create_test_log_file(inst, path, yyyymmdd, 1));
+    uint64_t blk2_off = 0;
+    ASSERT_TRUE(append_test_block(inst, path, 2, 0x20, &blk2_off));
+
+    // 篡改块 2 flag: 保留位 bit7 置 1 (0x80)
+    uint8_t bad_flag = 0x80;
+    ASSERT_TRUE(tamper_file_bytes(inst, path, blk2_off + 5, &bad_flag, 1));
+
+    FileScanResult sr = scan_one(inst, path, /*repair=*/true);
+    EXPECT_TRUE(sr.ok);
+    EXPECT_TRUE(sr.truncated);
+    EXPECT_EQ(sr.seqno, 1u);
+    EXPECT_EQ(inst->pal->file_size_path(path.c_str()), static_cast<int64_t>(blk2_off));
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, CorruptBlock_MismatchedRawLenAndPayloadLen_TruncatedOnRecovery) {
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+    std::string path = make_log_path(log_dir_, yyyymmdd, 0);
+
+    // 块 1: raw_len=14, uncompressed (algo=none), payload_len=14
+    ASSERT_TRUE(create_test_log_file(inst, path, yyyymmdd, 1));
+
+    // 篡改 payload_len 为 28 (与 raw_len 不一致)
+    uint8_t bad_plen[4];
+    put_u32_le(bad_plen, 28);
+    ASSERT_TRUE(tamper_file_bytes(inst, path, 32 + 14, bad_plen, 4));
+
+    FileScanResult sr = scan_one(inst, path, /*repair=*/true);
+    EXPECT_TRUE(sr.ok);
+    EXPECT_TRUE(sr.truncated);
+    EXPECT_EQ(sr.seqno, 0u);
+    EXPECT_EQ(inst->pal->file_size_path(path.c_str()), 32);
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, CorruptBlock_OutOfRangeRawLen_TruncatedOnRecovery) {
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+    std::string path = make_log_path(log_dir_, yyyymmdd, 0);
+
+    // Case 1: raw_len < 6
+    ASSERT_TRUE(create_test_log_file(inst, path, yyyymmdd, 1));
+    uint8_t small_len[4];
+    put_u32_le(small_len, 3);
+    ASSERT_TRUE(tamper_file_bytes(inst, path, 32 + 10, small_len, 4));
+
+    FileScanResult sr = scan_one(inst, path, /*repair=*/true);
+    EXPECT_TRUE(sr.ok);
+    EXPECT_TRUE(sr.truncated);
+    EXPECT_EQ(sr.seqno, 0u);
+    EXPECT_EQ(inst->pal->file_size_path(path.c_str()), 32);
+
+    // Case 2: raw_len > 16MB
+    std::string path2 = make_log_path(log_dir_, yyyymmdd, 1);
+    ASSERT_TRUE(create_test_log_file(inst, path2, yyyymmdd, 1));
+    uint8_t large_len[4];
+    put_u32_le(large_len, 20 * 1024 * 1024);
+    ASSERT_TRUE(tamper_file_bytes(inst, path2, 32 + 10, large_len, 4));
+
+    FileScanResult sr2 = scan_one(inst, path2, /*repair=*/true);
+    EXPECT_TRUE(sr2.ok);
+    EXPECT_TRUE(sr2.truncated);
+    EXPECT_EQ(sr2.seqno, 0u);
+    EXPECT_EQ(inst->pal->file_size_path(path2.c_str()), 32);
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, CorruptBlock_SeqnoRollbackStopsBackfill_NormalGapAllowed) {
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+
+    // 1) 允许正常跳洞 (截断跳跃): seqno 从 1 直接到 3
+    std::string path_gap = make_log_path(log_dir_, yyyymmdd, 0);
+    ASSERT_TRUE(create_test_log_file(inst, path_gap, yyyymmdd, 1));
+    ASSERT_TRUE(append_test_block(inst, path_gap, 3, 0x30));
+
+    FileScanResult sr_gap = scan_one(inst, path_gap, /*repair=*/true);
+    EXPECT_TRUE(sr_gap.ok);
+    EXPECT_FALSE(sr_gap.truncated);
+    EXPECT_EQ(sr_gap.seqno, 3u);
+
+    // 2) 拒绝 seqno 回滚 / 重复: 块 1 (seqno=5), 块 2 篡改为 seqno=5 (重复)
+    std::string path_dup = make_log_path(log_dir_, yyyymmdd, 1);
+    ASSERT_TRUE(create_test_log_file(inst, path_dup, yyyymmdd, 5));
+    uint64_t blk2_off = 0;
+    ASSERT_TRUE(append_test_block(inst, path_dup, 6, 0x30, &blk2_off));
+
+    uint8_t bad_seq[4];
+    put_u32_le(bad_seq, 5); // 篡改为与前一块相同的 seqno=5
+    ASSERT_TRUE(tamper_file_bytes(inst, path_dup, blk2_off + 6, bad_seq, 4));
+
+    FileScanResult sr_dup = scan_one(inst, path_dup, /*repair=*/true);
+    EXPECT_TRUE(sr_dup.ok);
+    EXPECT_TRUE(sr_dup.truncated);
+    EXPECT_EQ(sr_dup.seqno, 5u);
+    EXPECT_EQ(inst->pal->file_size_path(path_dup.c_str()), static_cast<int64_t>(blk2_off));
+
+    delete inst->staging;
+    delete inst;
+}
+
+TEST_F(RecoveryTest, Recovery_SumRawLenExceedsCapacity_DoesNotCorruptStaging) {
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = log_dir_;
+    inst->staging_path = staging_path_;
+    inst->staging = new Staging(inst->pal, staging_path_, kDataSize);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
+    std::string path = make_log_path(log_dir_, yyyymmdd, 0);
+
+    // 写入 2 个合法大块: 各 5000 字节 raw_len, 累计 10000 字节 > kDataSize (8192)
+    int fd = inst->pal->file_open(path.c_str(), true, true);
+    ASSERT_GE(fd, 0);
+    uint8_t fhdr[32];
+    std::memset(fhdr, 0, sizeof(fhdr));
+    put_u32_le(fhdr + 0, kMagicFile);
+    fhdr[4] = 1;
+    put_u32_le(fhdr + 6, yyyymmdd);
+    uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::memcpy(fhdr + 12, salt, 8);
+    put_u32_le(fhdr + 28, crc32_update(0, fhdr, 28));
+    ASSERT_EQ(inst->pal->file_pwrite(fd, fhdr, 32, 0), 32);
+    inst->pal->file_close(fd);
+
+    ASSERT_TRUE(append_test_block_custom_len(inst, path, 1, 5000));
+    ASSERT_TRUE(append_test_block_custom_len(inst, path, 2, 5000));
+
+    // 1. 验证 sum_raw_len_since 自身具备容量上限熔断:
+    //    累加第一块 5000B, 加上第二块 5000B 会达到 10000 >= 8192, 因而主动 break
+    uint64_t sum = 0, blk_off = 0, blk_end = 0;
+    ASSERT_TRUE(sum_raw_len_since(inst, path, 0, &sum, &blk_off, &blk_end));
+    EXPECT_EQ(sum, 5000u);
+    EXPECT_LT(sum, inst->staging->data_size());
+
+    // 2. 模拟 staging 初始状态: S_hdr = 0, F = 0, w = 0
+    AppendTargetCache atc{};
+    atc.date = yyyymmdd;
+    atc.split_no = 0;
+    inst->staging->commit_header_locked(0, 0, 0, &atc);
+
+    // 3. 执行恢复: 触发 S_file (2) > S_hdr (0) 回推链路
+    run_recovery(inst);
+
+    // 4. 验证: staging flushed_len 安全推进到 5000 (而非错误回绕 10000 % 8192 = 1808)
+    const uint8_t* base = inst->staging->raw_base();
+    EXPECT_EQ(get_u32(base + 8), 2u);
+    EXPECT_EQ(get_u32(base + 12), 5000u);
+    EXPECT_EQ(get_u32(base + 16), 5000u);
+    EXPECT_TRUE(inst->staging->debug_check_invariant(5000, 5000));
 
     delete inst->staging;
     delete inst;

@@ -148,6 +148,16 @@ struct FileScanResult {
     bool     ok = false;
     std::string path;              // 命中文件路径
 };
+// 校验 34B 块头字段合理性 (F-05)。
+// 校验项: magic、ver=1、flag 保留位全 0、压缩算法有效性(且与编译宏匹配)、
+// seqno 严格单调递增 (seqno > prev_seqno)、raw_len ∈ [6, kSingleRecordMaxRaw]、
+// payload_len 合理范围及无压缩时 payload_len == raw_len、block_size <= file_remaining_bytes。
+// 校验通过返回 true, 并在 out 参数中返回解析后的字段; 校验失败返回 false。
+bool block_header_plausible(const uint8_t bhdr[34], uint64_t file_remaining_bytes,
+                            uint32_t prev_seqno, bool has_prev_seqno,
+                            uint32_t* out_seqno, uint32_t* out_raw_len,
+                            uint32_t* out_payload_len, uint64_t* out_block_size);
+
 FileScanResult scan_one(Instance* inst, const std::string& path, bool repair);
 FileScanResult scan_append_target(Instance* inst, const std::string& hint_path);
 // 显式断电持久化检查点: 同步 staging 脏数据 (MS_SYNC) 与活跃日志文件 (fdatasync) (spec §11)。

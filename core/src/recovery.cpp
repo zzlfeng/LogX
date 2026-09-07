@@ -216,7 +216,12 @@ void run_recovery(Instance* inst) {
         uint64_t sum = 0, blk_off = 0, blk_end = 0;
         if (sum_raw_len_since(inst, rec.target_path, S_hdr,
                               &sum, &blk_off, &blk_end) && sum > 0) {
-            F = static_cast<uint32_t>((static_cast<uint64_t>(F) + sum) % size);
+            if (sum < size) {
+                F = static_cast<uint32_t>((static_cast<uint64_t>(F) + sum) % size);
+            } else {
+                emit_event(inst, LOGX_EV_RECOVERY, -1,
+                           "backfill sum exceeds staging capacity; trusting file seqno");
+            }
         } else {
             // 回溯失败(IO 错误 / 文件内无更后继的完整块):退化为信任文件 seqno
             emit_event(inst, LOGX_EV_RECOVERY, -1,

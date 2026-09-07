@@ -173,11 +173,38 @@
      - 基础 OFF/OFF: 65/65 单测 + 4/4 压测全绿通过；
      - Android arm64-v8a NDK Clang Ninja 交叉编译零警告零错误通过。
 
-### 🟠 [F-05] 恢复扫描对块头字段校验不足
+### 🟠 [F-05] 恢复扫描对块头字段校验不足 [✅ 已修复]
 - **来源：** 报告二 R2-高#8
-- **位置：** `core/src/flusher.cpp:752`（`sum_raw_len_since`）、`core/src/recovery.cpp:224`
+- **位置：** `core/src/flusher.cpp`（`block_header_plausible`、`scan_one`、`sum_raw_len_since`）、`core/include/logx_internal.h`、`core/src/recovery.cpp`、`core/src/logx_c.cpp`
+- **状态：** ✅ **已修复并全矩阵闭环验证**
 - **描述：** 恢复逻辑使用块头中的 `raw_len` 推进 staging 水位，但未完整验证：`raw_len` 合法范围、解码结果长度一致性、块版本支持、压缩算法标志有效、seqno 连续、`payload_len` 与块边界满足协议。畸形或损坏块可能导致恢复错误清零 staging 区间，造成额外数据丢失。（根因之一：34B 块头本身不在任何 CRC 覆盖范围内。）
-- **修复建议：** 恢复路径增加块头字段与水位校验。
+- **修复方案与落地：**
+  1. **块头合理性全字段严检（`block_header_plausible`）**：在 `core/include/logx_internal.h` 声明、`core/src/flusher.cpp` 实现统一块头解析与前置校验 helper，覆盖以下严苛契约：
+     - Magic 校验：必须为 `kMagicBlock`（`0x4258474c`，'LGXB'）；
+     - 块版本校验：`bhdr[4] == 1`（拒绝非法版本/未来协议/0xFF）；
+     - Flag 保留位校验：严格限制 `(flag & ~0x07) == 0`，保留位（bit3~bit7）非零一律拒绝；
+     - 压缩算法支持性与宏匹配：`flag_algo(flag) <= kAlgoZstd`，且未定义 `LOGX_WITH_ZSTD` 时仅允许 `kAlgoNone`；
+     - seqno 严格单调自增：`seqno > 0`，且块间强制 `seqno > prev_seqno`（拒绝乱序、回滚与重复，同时天生兼容截断修复跳跃合法空洞）；
+     - `raw_len` / `payload_len` 合法性与协议自洽：`raw_len ∈ [6, 16MB]`（记录头至少 6B），未压缩时（`algo == kAlgoNone`）强制 `payload_len == raw_len`（无论加密与否，密文长度严格等于明文长度）；
+     - 文件物理容量防御：`block_size = 34 + payload_len + (enc ? 16 : 0) <= file_remaining_bytes`。
+  2. **扫描与修复路径统一接入**：
+     - `scan_one`：维护 `prev_seqno`，凡块头校验失败立即触发 `repair` 截断修复（宁丢不脏）；
+     - `sum_raw_len_since`：统一接入 `block_header_plausible`，并补齐与 `scan_one` 对称的 payload CRC32 及 GCM Tag 可读性验证，坏块提前 break；
+     - `logx_c.cpp:export_file_range`：导出路径同样接入 `block_header_plausible`，坏块立即终止扫描，根除损坏块头导致内存越界或死循环风险。
+  3. **双层水位回推上界与溢出熔断**：
+     - 第一层（`sum_raw_len_since`）：累加过程中检测 `*out_bytes + raw_len >= staging_capacity` 时主动终止对账累加；
+     - 第二层（`recovery.cpp:run_recovery`）：推进 `F` 前做硬防御 `if (sum < size)`，若累加值异常超限则拒绝回绕、发射 `LOGX_EV_RECOVERY` 告警并安全信任文件 seqno，杜绝 staging 内部数据结构静默被破坏。
+  4. **单测全闭环（`tests/unit/test_recovery.cpp` 新增 6 组用例）**：
+     - `CorruptBlock_BadVersion_TruncatedOnRecovery`：验证非法块版本（ver=2）触发截断修复；
+     - `CorruptBlock_BadFlag_TruncatedOnRecovery`：验证保留位非零（bit7=1）触发截断修复；
+     - `CorruptBlock_MismatchedRawLenAndPayloadLen_TruncatedOnRecovery`：验证非压缩块 raw_len 与 payload_len 不一致时被拦截并截断；
+     - `CorruptBlock_OutOfRangeRawLen_TruncatedOnRecovery`：验证 `raw_len < 6` 及超限极大值被拦截并截断；
+     - `CorruptBlock_SeqnoRollbackStopsBackfill_NormalGapAllowed`：验证截断跳跃合法 seqno 空洞正常放行，seqno 重复与回滚被严厉拦截截断；
+     - `Recovery_SumRawLenExceedsCapacity_DoesNotCorruptStaging`：构造超环形容量的多块累加场景，验证双层容量熔断防御生效、staging 环形不变量完好保持。
+  5. **三构建矩阵全绿验证**：
+     - 基础构建（OFF/OFF）：71/71 单测 + 4/4 压测 100% 通过；
+     - 全开构建（ON/ON）：88/88 单测 + 4/4 压测 100% 通过（含 50 线程高并发压测 10 轮连续跑全过）；
+     - Android arm64-v8a：交叉编译 0 警告 0 错误通过。
 
 ### 🟠 [F-06] `atc.last_block_offset` 将 `uint64_t` 截断为 `uint32_t`
 - **来源：** 报告一 BUG-13
@@ -554,7 +581,7 @@
 | 真实进程级崩溃窗口（独立子进程强杀） | 🔴 高 | 报告二（掩盖 T-01） |
 | PAL 短写注入（短写截断回滚与中途 ENOSPC 容灾） | ✅ 已补齐 | 报告二（F-03 闭环，Case A/B/C） |
 | PAL fsync 失败和 mmap 同步失败注入 | ✅ 已补齐 | 报告二（F-04 闭环，MockFsyncPal 5 组用例） |
-| 畸形 `raw_len`、非法版本和非法 flag | 🟠 中 | 报告二 |
+| 畸形 `raw_len`、非法版本和非法 flag | ✅ 已补齐 | 报告二（F-05 闭环，test_recovery 6 组用例） |
 | 分卷恢复及 `.log.N` 目标选择（掩盖 F-02） | ✅ 已补齐 | 报告二/三（F-02 闭环，T1~T4 用例） |
 | 双 Header 双坏（整区重建）路径 | 🟠 中 | 报告一 |
 | 双 Header 容错（B 损坏，A 接管）反向场景 | 🟠 中 | 报告一 |
@@ -652,7 +679,7 @@
 | 编号 | 问题 | 编号 | 问题 |
 |:---|:---|:---|:---|
 | F-03 | 短写未检测致日志丢失 [✅ 已修复] | F-04 | fsync/同步持久化零接入 [✅ 已修复] |
-| F-05 | 恢复块头校验不足 | F-06 | atc offset uint32 截断 |
+| F-05 | 恢复块头校验不足 [✅ 已修复] | F-06 | atc offset uint32 截断 |
 | F-07 | split_no uint8 / 255 停写（T4.0-2） | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
 | C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed |
 | FM-01 | tag[64] 越界读 UB | FM-02 | 重同步未清 carry_slice_buf |
@@ -685,6 +712,6 @@
 
 1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → 真实崩溃恢复测试（T-01）
 2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ JNI 关闭顺序与 UAF 防护（J-01）→ Win64 句柄截断修复（P-01）
-3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → 恢复校验加强（F-05）→ 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
+3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → [✅ 恢复校验加强（F-05）] → 50~100ms Debounce 聚集刷盘（F-10）→ 分卷序号 uint16_t（F-07）
 4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
 5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）
