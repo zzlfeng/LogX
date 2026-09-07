@@ -337,29 +337,33 @@
 
 ## 四、格式化模块
 
-### 🟠 [FM-01] `tag[tag_len]` 在 64 字节非 NUL 结尾 buffer 时越界读（UB）
+### 🟠 [FM-01] `tag[tag_len]` 在 64 字节非 NUL 结尾 buffer 时越界读（UB）[✅ 已修复]
 - **来源：** 报告一 BUG-7 ＝ 报告二 R2-中#11
-- **位置：** `core/src/format.cpp:92`
+- **位置：** `core/src/format.cpp:89-97`、`core/include/logx_c.h:102-107`
 - **描述：** `tag` 恰为 64 字节无 NUL 终止的 buffer 时，循环停止于 `tag_len == 64`，随后访问 `tag[64]` 超出边界，属未定义行为。
 - **修复建议：** 改用 `strnlen(tag, 65)` + 范围检查；明确 C API 的 tag 终止符契约。
+- **状态：** ✅ 已修复——(1) `format_record` 改用 `strnlen(tag, 65)`：仅当 `tag[0..63]` 全非 NUL 时才检视 `tag[64]`（此时 NUL 契约保证其必在界内），`n == 65` 直接判非法，原实现在 64B 无 NUL 输入下无条件读 `tag[64]` 的越界路径消除；(2) 发现并修正了根因级契约矛盾——`logx_c.h` 原注释声称 "tag 不需要 NUL 结尾" 但接口无长度参数、实现必须扫描 NUL，两者自相矛盾；头文件契约更正为 "tag 必须是 NUL 终止的 C 字符串且有效长度 ≤ 64B"（与 JNI 侧 `GetStringUTFRegion` 后显式写 `'\0'` 的实际行为一致），payload 保持 "不需要 NUL 结尾、长度由 payload_len 显式给出" 不变。
 
-### 🟠 [FM-02] `parse_records_stream` 重同步后未清除 `carry_slice_buf` 残片
+### 🟠 [FM-02] `parse_records_stream` 重同步后未清除 `carry_slice_buf` 残片 [✅ 已修复]
 - **来源：** 报告一 BUG-16
-- **位置：** `core/src/format.cpp:233-245`
+- **位置：** `core/src/format.cpp:241-268`
 - **描述：** 检测到无效 magic 并重同步后，已积累的跨片数据未被清除，后续数据会与前一条记录的残片错误拼接，产生错乱输出。
 - **修复建议：** 重同步成功后立即清空 `current_slice_buf`。
+- **状态：** ✅ 已修复——三条错误路径（magic 无效重同步成功、重同步失败退出、长度越界、cksum 失败）均追加 `current_slice_buf.clear()`：重同步意味着字节流已断裂，此前积累的跨片残片属于被破坏的旧记录，必须丢弃；export 侧 `carry_slice_buf` 跨块生命周期不受影响（仅坏块路径清空，正常末片提交后本就清空）。
 
-### 🟡 [FM-03] 栈上 64KB scratch 数组存在线程栈溢出风险
+### 🟡 [FM-03] 栈上 64KB scratch 数组存在线程栈溢出风险 [✅ 已修复]
 - **来源：** 报告一 WARN-1
-- **位置：** `core/src/format.cpp:101`
+- **位置：** `core/src/format.cpp:105-113`
 - **描述：** `format_record` 为热路径，每次调用在栈上分配 64KB；非主线程（Flusher、JNI 调用链）栈通常只有 512KB～1MB。
 - **修复建议：** 改为堆分配（`std::vector<uint8_t>`）或 `static thread_local`。
+- **状态：** ✅ 已修复——采用修复建议第二方案 `static thread_local uint8_t scratch[64*1024]`：热路径零分配零初始化开销、每线程仅一份且跨调用复用、堆段存放不受线程栈深约束。中途曾尝试"直接在 out_buf 组装 + 头区集中回填"的零拷贝方案，但该布局改变了磁盘交错格式 `[h0][user0][h1][user1]...`（decoder/恢复按 `pos += 6+len` 顺序遍历的格式契约），被既有 `Format.LongRecord_Slices` 字节级断言当场拦截，随即回退为 thread_local 方案——既有格式契约优先。
 
-### 🟡 [FM-04] cksum 失败时 `pos += 1` 逐字节重扫，O(n²) 复杂度
+### 🟡 [FM-04] cksum 失败时 `pos += 1` 逐字节重扫，O(n²) 复杂度 [✅ 已修复]
 - **来源：** 报告一 WARN-9
-- **位置：** `core/src/format.cpp:259-262`
+- **位置：** `core/src/format.cpp:258-268`
 - **描述：** 校验失败后逐字节滑动重同步，最坏情况复杂度过高。
 - **修复建议：** 至少跳过 `kHeaderLen` 或整条记录长度。
+- **状态：** ✅ 已修复——两条逐字节路径均改为跳过语义完整单元：cksum 失败跳过 `kHeaderLen + len`（原记录已损坏，其长度内不存在任何合法子记录——记录格式按头起始对齐，逐字节重扫既不可能找回数据又造成最坏 O(n²)）；长度越界（头声明长度不可信）跳过 `kHeaderLen`。最坏复杂度从 O(n²) 降为 O(n)。
 
 ---
 
@@ -746,7 +750,7 @@
 | F-05 | 恢复块头校验不足 [✅ 已修复] | F-06 | atc offset uint32 截断 [✅ 已修复] |
 | F-07 | split_no uint8 / 255 停写（T4.0-2） [✅ 已修复] | C-02 | 压缩/加密 flag 命名歧义 [✅ 已修复] |
 | C-03 | decode_block 忽略 raw/raw_len [✅ 已修复] | S-02 | AppendTargetCache 非 packed [✅ 已解决] |
-| FM-01 | tag[64] 越界读 UB | FM-02 | 重同步未清 carry_slice_buf |
+| FM-01 | tag[64] 越界读 UB [✅ 已修复] | FM-02 | 重同步未清 carry_slice_buf [✅ 已修复] |
 | R-01 | was_truncated 误传播 | R-02 | 丢块统计少计 1 |
 | R-03 | 日期校验不完整 / 多套解析不一致 | E-02 | drop_too_large 统计与错误分类 |
 | E-03 | 导出错误被吞 | E-04 | export 临时文件命名冲突 |
@@ -763,8 +767,8 @@
 | 编号 | 问题 | 编号 | 问题 |
 |:---|:---|:---|:---|
 | S-03 | kBlockHeaderSize 注释 32B→34B [✅ 已修复] | S-04 | max_log_length 默认值注释 [✅ 已修复] |
-| S-05 | staging 指针未置 null [✅ 已修复] | FM-03 | 64KB 栈数组溢出风险 |
-| FM-04 | cksum O(n²) 重扫 | F-08 | flush_blocking 无超时 [✅ 已修复] |
+| S-05 | staging 指针未置 null [✅ 已修复] | FM-03 | 64KB 栈数组溢出风险 [✅ 已修复] |
+| FM-04 | cksum O(n²) 重扫 [✅ 已修复] | F-08 | flush_blocking 无超时 [✅ 已修复] |
 | F-09 | random_bytes 退化低熵 [✅ 已修复] | P-04 | QPF 重复查询 |
 | P-05 | SetFilePointer 冗余 | P-06 | atomic_add 对齐断言 |
 | J-03 | NewStringUTF 编码风险 | K-03 | errorHandler GC 延迟 |

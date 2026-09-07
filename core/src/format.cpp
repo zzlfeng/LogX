@@ -87,9 +87,14 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
     if (out_buf_capacity < kMaxRecordTotal) return false;
 
     // ---- 计算 tag 长度 ----
-    uint32_t tag_len = 0;
-    for (const char* p = tag; *p && tag_len < 64; ++p) ++tag_len;
-    if (tag[tag_len] != '\0') return false;  // tag 超过 64B 视为非法
+    // (FM-01) 有界扫描:最多检视 tag[0..64] 共 65 字节。
+    // 契约:tag 必须是 NUL 终止的 C 字符串(logx_c.h 显式约定;JNI 侧 GetStringUTFRegion
+    // 后显式写 '\0')。仅当 tag[0..63] 全非 NUL 时才会读取 tag[64],此时契约保证
+    // NUL 位于下标 >= 64 处,tag[64] 必在调用方缓冲区内 —— 扫描不越界。
+    // 恰好 64B 无 NUL 的 buffer 属调用方违反 C 字符串契约(与任何 C 字符串 API 同)。
+    const size_t n = strnlen(tag, 65);
+    if (n == 65) return false;  // >64B 视为非法
+    const uint32_t tag_len = static_cast<uint32_t>(n);
 
     // ---- 内部用户数据(待分片的载荷)----
     // 内部格式:[ts_ms:8][pid:4][tid:8][level:1][taglen:2][tag:N][msglen:4][msg:M]
@@ -97,8 +102,13 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
     const uint64_t user_total = static_cast<uint64_t>(hdr_size) + tag_len + payload_len;
     if (user_total > 60u * 1024u) return false;
 
-    // 把内部数据先组装到 scratch(最多 60KB,远超 20KB 单片上限)。
-    uint8_t scratch[64 * 1024];
+    // (FM-03) scratch 从栈数组(64KB)改为 static thread_local:
+    //   - format_record 是热路径且全程无阻塞/无递归, 线程独占安全;
+    //   - 非主线程(Flusher/JNI 调用链)栈仅 512KB~1MB, 每次调用压栈 64KB 有溢出
+    //     风险并反复触碰新内存页;thread_local 存放于堆段, 每线程仅一份且复用。
+    //   - 多线程写并发(业务线程)正是本库常态, thread_local 天然无竞争。
+    // 注意:此缓冲仅在本函数内使用, 不返回指针, 出栈后内容由下次调用覆盖。
+    static thread_local uint8_t scratch[64 * 1024];
     if (user_total > sizeof(scratch)) return false;
     uint8_t* w = scratch;
     put_u64(w, ts_ms); w += 8;
@@ -111,7 +121,7 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
     if (payload_len > 0) std::memcpy(w, payload, payload_len); w += payload_len;
     // w - scratch == user_total
 
-    // ---- 分片写入 out_buf ----
+    // ---- 分片写入 out_buf(交错布局: [h0][user0][h1][user1]..., 磁盘格式契约) ----
     uint8_t* out = out_buf;
     constexpr uint32_t kMaxSlicePayload = 20 * 1024;  // spec: 单片 payload ≤ 20KB
 
@@ -230,6 +240,8 @@ bool parse_records_stream(const uint8_t* recs, uint32_t recs_len,
         uint8_t cksum = recs[pos + 5];
         // 如果 magic 既不是 Entry 也不是 Pad (包括段尾 1..5 字节留零缝隙与填充):
         // 必须向前滑动重同步, 绝不因缝残留提前截断退出!
+        // (FM-02) 重同步意味着当前字节流已断裂, 此前积累的跨片残片属于被破坏的
+        // 旧记录, 必须丢弃 —— 否则后续找到的首/中片会与残片错误拼接产生错乱输出。
         if (magic != kMagicEntry && magic != kMagicPad) {
             bool resynced = false;
             for (uint32_t s = 1; pos + s + kHeaderLen <= recs_len; ++s) {
@@ -240,13 +252,20 @@ bool parse_records_stream(const uint8_t* recs, uint32_t recs_len,
                     break;
                 }
             }
-            if (resynced) continue;
+            if (resynced) {
+                current_slice_buf.clear();
+                continue;
+            }
+            current_slice_buf.clear();
             break;
         }
 
         if (recs_len - pos < uint32_t(kHeaderLen + len)) {
-            // 长度越界, 滑动重同步
-            pos += 1;
+            // 长度越界, 记录头声明的长度不可信:
+            // (FM-04) 至少滑动一个完整记录头(6B)而非逐字节, 避免最坏 O(n²) 重扫;
+            // 6B 内不含任何可判定的记录边界, 逐字节滑动只增加复杂度不增加找回率。
+            pos += kHeaderLen;
+            current_slice_buf.clear();
             continue;
         }
 
@@ -257,7 +276,11 @@ bool parse_records_stream(const uint8_t* recs, uint32_t recs_len,
         }
 
         if (cksum1(payload, len) != cksum) {
-            pos += 1;
+            // (FM-04) cksum 失败 = 本记录已损坏, 原记录长度 (6B 头 + len) 内不存在
+            // 任何合法子记录(记录格式按头起始对齐), 逐字节重扫既不可能找回数据
+            // 又造成最坏 O(n²);跳过整个损坏记录长度重新对齐。
+            pos += kHeaderLen + len;
+            current_slice_buf.clear();
             continue;
         }
 

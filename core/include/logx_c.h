@@ -99,7 +99,10 @@ logx_status_e logx_open(const logx_config_t* cfg,
 logx_status_e logx_close(logx_instance_t* inst);
 
 /* ===== 写入 ===== */
-/* 单条日志写入;level ∈ {0..5};tag/payload UTF-8,不需要 NUL 结尾。
+/* 单条日志写入;level ∈ {0..5};tag/payload UTF-8。
+ * tag 必须是 NUL 终止的 C 字符串且有效长度 ≤ 64B(无长度参数,按 C 字符串契约
+ * 扫描;恰好 64B 非常终止的 buffer 属未定义输入,将被拒绝);payload 不需要
+ * NUL 结尾,长度由 payload_len 显式给出。
  * 返回 LOGX_ERR_NO_SPACE 表示 staging 满(LOGX_EV_DROP);返回 LOGX_ERR_TOO_LARGE
  * 表示超 maxLogLength。 */
 logx_status_e logx_write(logx_instance_t* inst,
