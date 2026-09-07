@@ -630,6 +630,17 @@ cmake --build build-android -j
 
 ---
 
+## Flusher 75ms Debounce 超时聚合与低频兜底 (2026-09-07, F-10 / T4.0-4 闭环)
+
+针对报告三 §四 T4.0-4 指出的 `flusher_loop` 缺少 50~100ms Debounce 机制致低频写入滞留长达 30 秒的缺陷，完成消费循环改造与单测验证：
+
+1. **定型 Debounce 黄金中值**：定义 `kFlushDebounceMs = 75`（50~100ms 窗口中值）；
+2. **消费端常态化防抖轮询**：`flusher_loop` 将原 30000ms 等待超时重构为 `kFlushDebounceMs`（堆降级维持 5000ms），彻底打通冷写入与空闲唤醒链路，零星日志最迟 75ms 内必被 Flusher 兜底落盘；
+3. **生产端正交保持**：`logx_write` 保持 `pending >= flush_threshold`（8KB）数据量唤醒，小写入不发送 `ev_signal` 避免 sticky 信号破坏防抖，让零散记录在 75ms 窗口内自然聚集落盘；
+4. **单测覆盖与全矩阵验证**：在 `test_flusher.cpp` 新增 `Debounce_LowFrequencyWritesFlushedWithinWindow`（验证 ≤ 500ms 内落盘且数据完整）与 `Debounce_BurstAggregatesIntoFewBlocks`（验证 10 条零散写入被聚集进 ≤ 2 个物理块）。
+
+---
+
 ## 附:构建命令速查
 
 ### Windows(桌面,MSVC)

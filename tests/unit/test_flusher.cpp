@@ -1859,3 +1859,167 @@ TEST(FlusherTest, KeyProvider_DrainsEncryptedTailAndNotCalledAfterClose) {
 }
 
 #endif  // LOGX_WITH_AESGCM
+
+// =========================================================================
+// F-10: 75ms Debounce 聚集刷盘与低频兜底测试 (Spec §4.1 / T4.0-4)
+// =========================================================================
+
+TEST(Flush, Debounce_LowFrequencyWritesFlushedWithinWindow) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_debounce_lowfreq_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+    cfg.flush_threshold = 8 * 1024; // 8KB, 3 条小日志绝不会触发 threshold 唤醒
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 写入 3 条日志, 间隔 ~20ms, 总字节数远低于 8KB
+    for (int i = 1; i <= 3; ++i) {
+        std::string line = "low_freq_log_message_" + std::to_string(i);
+        EXPECT_EQ(logx_write(inst, 1, "TAG", reinterpret_cast<const uint8_t*>(line.c_str()),
+                             static_cast<uint32_t>(line.size())), LOGX_OK);
+        pal.sleep_ms(20);
+    }
+
+    uint64_t t0 = pal.monotonic_ns();
+
+    // 不调用 logx_flush, 轮询等待 Debounce 兜底刷盘 (断言 <= 500ms 内落盘)
+    bool flushed = false;
+    std::string log_file;
+    while ((pal.monotonic_ns() - t0) / 1000000 <= 500) {
+        auto files = pal.file_list(dir.c_str());
+        for (const auto& f : files) {
+            if (f.find(".log") != std::string::npos && pal.file_size_path(f.c_str()) >= 32) {
+                // 检查是否有大于 32 字节的文件(即已包含数据块)
+                if (pal.file_size_path(f.c_str()) > 32) {
+                    flushed = true;
+                    log_file = f;
+                    break;
+                }
+            }
+        }
+        if (flushed) break;
+        pal.sleep_ms(10);
+    }
+
+    uint64_t elapsed_ms = (pal.monotonic_ns() - t0) / 1000000;
+    EXPECT_TRUE(flushed) << "Debounce failed to flush within 500ms, elapsed: " << elapsed_ms << "ms";
+    EXPECT_LE(elapsed_ms, 500ULL);
+
+    // 验证导出 3 条日志完整且无解码失败
+    uint32_t ymd = 0, hms = 0;
+    pal.wallclock_date(&ymd, &hms);
+    char date_str[16];
+    std::snprintf(date_str, sizeof(date_str), "%08u", ymd);
+
+    struct ExpCtx {
+        int count = 0;
+        std::string content;
+        Pal* pal = nullptr;
+    } ctx;
+    ctx.pal = &pal;
+
+    auto cb = [](void* user, const char* /*date*/, const char* plaintext_path, uint64_t size) -> int {
+        auto* c = static_cast<ExpCtx*>(user);
+        int fd = c->pal->file_open(plaintext_path, false, false);
+        if (fd >= 0) {
+            std::vector<char> buf(size);
+            if (c->pal->file_pread(fd, buf.data(), size, 0) == static_cast<long>(size)) {
+                c->content.append(buf.data(), size);
+            }
+            c->pal->file_close(fd);
+        }
+        return 0;
+    };
+
+    EXPECT_EQ(logx_export(inst, date_str, date_str, cb, &ctx), LOGX_OK);
+    EXPECT_EQ(ctx.content.find("decode fail"), std::string::npos);
+    // 导出行格式为 "seq=N raw=M <hex payload>"(logx_c.cpp), 内容断言必须用 hex 特征
+    // low_freq_log_message_1/2/3 的 hex 前缀 ( 共同前缀 "low_freq_log_message_" ):
+    EXPECT_NE(ctx.content.find("6c6f775f667265715f6c6f675f6d6573736167655f31"), std::string::npos);
+    EXPECT_NE(ctx.content.find("6c6f775f667265715f6c6f675f6d6573736167655f32"), std::string::npos);
+    EXPECT_NE(ctx.content.find("6c6f775f667265715f6c6f675f6d6573736167655f33"), std::string::npos);
+
+    logx_close(inst);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+TEST(Flush, Debounce_BurstAggregatesIntoFewBlocks) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_debounce_burst_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(rand());
+    pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+    cfg.flush_threshold = 8 * 1024; // 8KB threshold
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 突发一次性写入 10 条小日志 (每条 ~50B, 总计 ~500B, 远小于 8KB)
+    for (int i = 1; i <= 10; ++i) {
+        std::string line = "burst_small_log_record_" + std::to_string(i);
+        EXPECT_EQ(logx_write(inst, 1, "TAG", reinterpret_cast<const uint8_t*>(line.c_str()),
+                             static_cast<uint32_t>(line.size())), LOGX_OK);
+    }
+
+    // 不调用 logx_flush, 等待 75ms Debounce 窗口触发落盘 (等待 200ms)
+    pal.sleep_ms(200);
+
+    logx_close(inst);
+
+    // 找到生成的 .log 文件并统计块数
+    auto files = pal.file_list(dir.c_str());
+    std::string log_file;
+    for (const auto& f : files) {
+        if (f.find(".log") != std::string::npos && pal.file_size_path(f.c_str()) > 32) {
+            log_file = f;
+            break;
+        }
+    }
+    ASSERT_FALSE(log_file.empty());
+
+    // 统计文件中的物理块数量
+    int fd = pal.file_open(log_file.c_str(), false, false);
+    ASSERT_GE(fd, 0);
+    int64_t fsz = pal.file_size(fd);
+    int block_count = 0;
+    uint64_t off = 32;
+    while (off + 34 <= static_cast<uint64_t>(fsz)) {
+        uint8_t bhdr[34];
+        if (pal.file_pread(fd, bhdr, 34, off) != 34) break;
+        if (bhdr[0] != 'L' || bhdr[1] != 'G' || bhdr[2] != 'X' || bhdr[3] != 'B') break;
+        uint32_t enc_len = get_u32(bhdr + 14);
+        block_count++;
+        off += 34 + enc_len;
+    }
+    pal.file_close(fd);
+
+    // 断言: 10 条记录被聚集在少量块内 (<= 2 块, 通常为 1 块), 而非产生 10 个碎片块
+    EXPECT_GT(block_count, 0);
+    EXPECT_LE(block_count, 2);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}

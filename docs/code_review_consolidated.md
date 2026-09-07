@@ -279,11 +279,15 @@
   4. **生产端拒绝服务**：`flusher.cpp:open_append_target` 与 `append_block` 检查返回值，获取安全盐失败发射 `LOGX_EV_IO`（"secure random unavailable..."）明确报警，关闭文件并拒绝创建低熵密文文件；
   5. **单测覆盖**：在 `test_robustness.cpp` 新增 `RandomBytesFailure_RefusesNewFileCreation`（验证 CSPRNG 失败拒绝建文件、发射报警且不卡死）与 `RandomBytesSuccess_ProducesNonTrivialSalt`（验证 8B 盐非全零非全同）。
 
-### 🟠 [F-10] 缺少 50~100ms Debounce 聚集刷盘机制（T4.0-4 偏差）
+### 🟠 [F-10] 缺少 50~100ms Debounce 聚集刷盘机制（T4.0-4 偏差）[✅ 已修复]
 - **来源：** 报告三 §四 T4.0-4（Spec 偏差）
-- **位置：** `core/src/flusher.cpp:605-611`
-- **描述：** spec §4.1 规定 Flusher 具备 50~100ms Debounce 聚集刷盘机制，以避免低频或零散写入触发过度频繁写盘；当前 `flusher_loop` 为无超时阻塞 `ev_wait`（仅堆内存降级模式有 5s 超时），缺乏定时聚集刷盘兜底机制。
-- **修复建议：** 引入带 50~100ms 超时的等待或定时器机制，实现聚集刷盘与定时兜底。
+- **位置：** `core/include/logx_internal.h`、`core/src/flusher.cpp:774-778`
+- **描述：** spec §4.1 规定 Flusher 具备 50~100ms Debounce 聚集刷盘机制，以避免低频或零散写入触发过度频繁写盘；原 `flusher_loop` 在非降级模式下等待超时为 30000ms（仅为 30s 持久化检查点服务），导致零星低频写入在 staging 滞留长达 30 秒才落盘。
+- **闭环方案：**
+  1. **超时上界与窗口中值定型**：定义 `kFlushDebounceMs = 75`（50~100ms 黄金中值）；
+  2. **消费端常态化防抖轮询**：`flusher_loop` 等待超时直接对接 `kFlushDebounceMs`（堆降级维持 5000ms），彻底消除冷启动或刷空后的长等待滞留死角；
+  3. **生产端正交保持**：`logx_write` 保持 `pending >= flush_threshold`（8KB）阈值唤醒不变，小写入不发 signal 避免 sticky 信号破坏防抖，让零散记录在 75ms 内自然聚集落盘；
+  4. **单测覆盖**：在 `test_flusher.cpp` 新增 `Debounce_LowFrequencyWritesFlushedWithinWindow`（验证小写入 ≤ 500ms 内必落盘且数据无损）与 `Debounce_BurstAggregatesIntoFewBlocks`（验证 10 条零散写入被聚集进 ≤ 2 个块，避免碎片化小块）。
 
 ---
 
@@ -675,7 +679,7 @@
 | **T4.0-1** | §7 `flush()` 水位线 `target_seqno` 防饥饿 | ✅ 已通过 F-08 闭环（累计字节水位线 + PAD 跨度补偿 + 5000ms 超时熔断 + LOGX_ERR_TIMEOUT） | — | F-08 |
 | **T4.0-2** | §3.1/§4.4 切分序号 2B (uint16_t) | ✅ 已通过 F-07 闭环（16B 自然对齐 + 历史恒零扩宽至 uint16_t + 达上限明确告警与去重） | — | F-07 |
 | **T4.0-3** | §4.2/§10 双 Header "写 A→seq_cst 屏障→写 B" | 实现为 A(中间态 CRC)→ B → release fence | 掉电极端窗口内存序轻微偏离 | S-06 |
-| **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | `flusher_loop` 仍为无超时阻塞 `ev_wait`（仅堆降级模式有 5s 超时） | 缺乏低频写定时兜底刷盘机制 | F-10 |
+| **T4.0-4** | §4.1 Flusher 50~100ms Debounce 聚集刷盘 | ✅ 已通过 F-10 闭环（定型 75ms 聚集窗口 + 常态化防抖轮询，零散小写入自然聚集落盘） | — | F-10 |
 | **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | ✅ 已落地并闭环：`aesce.c` 移植完成，AESE/AESMC/EOR 标准指令直通；后续独立复审完成官方向量锚定（McGrew-Viega TC13/14/15 + 零密钥基线，OpenSSL 交叉验证 72/72）、热路径逐块探针消除与防竞态定型，x86 + 真机（骁龙865）双路径全量回归通过 | — | C-04 |
 | **T4.0-6** | §11 运行期每 30s 定时 msync/fdatasync | ✅ 已通过 F-04 补齐：`flusher_loop` 接入 30s 超时唤醒与 `durability_sync`，落盘 + staging 强刷盘 | — | — |
 | **T4.0-7** | §9 未对齐访问 / 23:59:59 时钟跳变用例 | ✅ 已通过 T4.5 落地 | — | — |
@@ -747,7 +751,7 @@
 | P-03 | file_rmdir 错误转译 | J-02 | g_err_ctx 多实例互踩 |
 | K-01 | Kotlin export 丢返回值 | K-02 | runBlocking 嵌套 |
 | D-01 | Python cksum break 丢记录 | D-02 | Python 坏块 break 丢文件 |
-| D-03 | GCM 失败策略不一致 | F-10 | 缺少 50~100ms Debounce 聚集刷盘 |
+| D-03 | GCM 失败策略不一致 | F-10 | 缺少 50~100ms Debounce 聚集刷盘 [✅ 已修复] |
 | T-02~T-11 | 测试用例缺陷（详见第十一节） | — | — |
 
 ### 🟡 P2 —— 质量 / 性能 / 可维护性
@@ -768,6 +772,6 @@
 
 1. **P0 核心数据正确性与崩溃恢复**：[✅ 文件头加密标志（F-01）] → [✅ 压缩降级 flag（C-01）] → [✅ 分卷号恢复（F-02）] → [✅ 真实崩溃恢复测试（T-01）]
 2. **P0 并发安全与内存生命周期**：CRC 表 call_once（S-01）→ 错误回调保护（E-01）→ [✅ JNI 关闭顺序与 UAF 防护（J-01）] → [✅ Win64 句柄截断修复（P-01）]
-3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → [✅ 恢复校验加强（F-05）] → [✅ 分卷序号 uint16_t 与上限告警（F-07）] → 50~100ms Debounce 聚集刷盘（F-10）
+3. **P1 协议健壮性与持久化**：[✅ 短写检测与撕裂回滚（F-03）] → [✅ 持久化同步接入（F-04）] → [✅ 恢复校验加强（F-05）] → [✅ 分卷序号 uint16_t 与上限告警（F-07）] → [✅ 50~100ms Debounce 聚集刷盘（F-10）]
 4. **P2 API、测试质量与工具链**：tag 边界、日期校验、统计分类、导出错误传播、Python 解码器容错、测试命名与恒真断言清理、故障注入路径断言补全
 5. **覆盖率补齐**：优先补"压缩降级往返"与"多分卷恢复后再轮转"两个负向用例（正是它们缺席掩盖了 C-01 与 F-02）

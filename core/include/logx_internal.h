@@ -71,6 +71,9 @@ struct Instance {
 
 constexpr uint32_t kFlushBlockingTimeoutMs = 5000;
 
+// Spec §4.1 / T4.0-4 / F-10: Flusher 50~100ms Debounce 超时聚合窗口 (取中值 75ms)
+constexpr uint32_t kFlushDebounceMs = 75;
+
 // 触发回调的便捷函数;忽略 null 回调。
 inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char* msg) {
     if (inst->err_fn) {

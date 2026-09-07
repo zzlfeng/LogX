@@ -772,7 +772,9 @@ void flusher_loop(Instance* inst) {
         }
 
         if (inst->flush_event) {
-            uint32_t timeout_ms = (inst->staging && inst->staging->is_degraded()) ? 5000 : 30000;
+            uint32_t timeout_ms = (inst->staging && inst->staging->is_degraded())
+                                      ? 5000
+                                      : kFlushDebounceMs;
             inst->pal->ev_wait_timeout(inst->flush_event, timeout_ms);
         }
     }
