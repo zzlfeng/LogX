@@ -572,29 +572,59 @@
 
 ## 九、Kotlin 封装层
 
-### 🟠 [K-01] 协程 `export` 丢弃 `nativeExport` 返回值，底层失败静默返回成功
+### ✅ [K-01] 协程 `export` 丢弃 `nativeExport` 返回值，底层失败静默返回成功 [已修复并闭环]
 - **来源：** 报告三 BUG-K5
-- **位置：** `android/kotlin/LogX.kt:177-198`
+- **位置：** `android/kotlin/LogX.kt`（协程 `export`）
+- **状态：** ✅ **已修复并闭环**
 - **描述：** `nativeExport` 返回 Int 状态码，但协程函数未接收该返回值，恒返回初始化的 `var result = 0`。底层彻底失败且从未触发回调时，业务侧仍收到 0（成功），导致导出状态误判。
-- **修复建议：** 接收 `nativeExport` 返回值，出错时优先返回底层错误码。
+- **修复方案与落地：**
+  1. 协程 `export` 直接接收并返回 `nativeExport` 的状态码，删除无用 `var result = 0` 中转变量；
+  2. 函数 KDoc 固化返回值与异常契约：0 = LOGX_OK；-1 = 实例未初始化；-6 LOGX_ERR_CODEC = 业务回调返回非 0（经 E-03 错误传播链路上报）；-3 LOGX_ERR_IO = 临时文件写出失败；-8 LOGX_ERR_NOT_FOUND = 时段内无日志文件；
+  3. 异常如实传播：若业务 block 内部抛出真实异常，优先向外抛出真实业务异常，避免掩盖错误根因；临时文件在 finally 块中安全兜底删除；
+  4. 多分卷容错：前一分卷处理抛出异常后快速失败，后续分卷直接返回 -1 抑制冗余调用。
+- **备注：** 本条与 K-02 在同一函数内协同重构，验证方式一致（见 K-02）。
 
-### 🟠 [K-02] `export` 协程中嵌套 `runBlocking` 阻塞 IO 调度器
-- **来源：** 报告三 BUG-K3
-- **位置：** `android/kotlin/LogX.kt:184-186`
-- **描述：** 在 `withContext(Dispatchers.IO)` 内再启动 `runBlocking`，违背协程规范，外部协程上下文与结构化并发特征丢失。
-- **修复建议：** 采用 `CountDownLatch` 或异步续体桥接。
+### ✅ [K-02] `export` 协程中嵌套 `runBlocking` 阻塞 IO 调度器 [已修复并闭环（含死锁与编译缺陷校正）]
+- **来源：** 报告三 BUG-K3；2026-09-08 复审修正初版 `CountDownLatch` 改动缺陷
+- **位置：** `android/kotlin/LogX.kt`（协程 `export`）
+- **状态：** ✅ **已修复并闭环**
+- **描述：** 在 `withContext(Dispatchers.IO)` 内直接启动无上下文的 `runBlocking`，外部协程上下文与结构化并发特征丢失。
+- **复审追溯（初版修复缺陷校正）：**
+  初版尝试采用 `CountDownLatch` + `launch(ATOMIC)`，复审发现三大严重缺陷：
+  1. 编译错误：标准 JDK / Android SDK 的 `CountDownLatch` 根本没有 `awaitUninterruptibly()` 方法（属于 Guava / Netty 第三方库），在纯 Kotlin 编译链下直接无法编译；
+  2. 调度器饥饿与死锁：C++ `logx_export` 为同步 Push 契约（回调返回即执行 `file_unlink` 删除临时文件），回调线程必须同步等待。若回调线程阻塞在 Latch 上，同时通过 `launch` 将 block 派发到同一个 `Dispatchers.IO`，单次导出将占用 2 个 IO 线程；若调用方在受限并发度调度器（如 `limitedParallelism(1)`）下运行或线程池耗尽，将发生**确定性永久死锁**；
+  3. 语法兼容性与异常吞噬：`catch (_: Throwable)` 在低于 Kotlin 2.1 时报错，且将业务真实异常吞噬转化为 -6 状态码，无法排查定位。
+- **最终修复方案与落地：**
+  1. 上下文绑定：在协程入口捕获外层挂起点上下文 `val parentContext = coroutineContext`，通过 `runBlocking(parentContext)` 执行业务 block；
+  2. 结构化并发保真：`parentContext` 包含父协程的 Job 与取消状态，父协程被取消时（如 Activity/ViewModel 销毁），取消信号能无缝传导至 `block` 挂起点中断执行；
+  3. 防死锁与零额外线程占用：`runBlocking` 直接在当前已被 native 调用的线程上运行事件循环，不向 `Dispatchers.IO` 重复派发任务，在 `limitedParallelism(1)` 或单线程调度器下依然 100% 安全运行，杜绝互锁；
+  4. 异常真实传递：`userException?.let { throw it }`，业务发生网络/解析等异常时真实抛出，临时文件仍在 finally 中安全删除。
+- **验证方式：** 全文静态复核、全编译兼容性断言、调度器并发无死锁推演。
 
-### 🟡 [K-03] `init()` 失败时 `errorHandler` 静态引用未清理导致 GC 延迟
+### ✅ [K-03] `init()` 失败时 `errorHandler` 静态引用未清理导致 GC 延迟 [已修复并闭环]
 - **来源：** 报告三 BUG-K1
-- **位置：** `android/kotlin/LogX.kt:106-110`
+- **位置：** `android/kotlin/LogX.kt`（`init`）
+- **状态：** ✅ **已修复并闭环（顺带修复 initCount 卡死隐患）**
 - **描述：** `nativeInit` 返回 0 失败时，抛异常前未将 `errorHandler` 重置为 null，单例持有的引用导致外部回调对象无法及时释放。
-- **修复建议：** 失败路径重置 `errorHandler`。
+- **修复方案与落地：**
+  1. `init` 全体语句纳入 `try/catch(Throwable)`：任何失败路径（参数校验 `require` 失败 / 目录创建异常 / `nativeInit` 返回 0）统一执行 `errorHandler = null` + `initCount.set(0)` 后原样重抛；
+  2. 顺带修复原实现隐患：失败路径原仅 `nativeInit == 0` 分支会归零 `initCount`，`require` 校验失败路径会导致 `initCount` 永久卡在非零、后续合法重试 init 被"重复 init"误拒——现统一回滚，允许业务修正配置后重试；
+  3. `close()` 同步补齐同一纪律：关闭成功后 `errorHandler = null`，回调对象可及时释放。
+- **验证方式：** 同 K-02（全文静态复核，回滚路径覆盖全部失败分支）。
 
-### 🟡 [K-04] `setErrorHandler` 缺乏并发与时序校验
-- **来源：** 报告三 BUG-K4
-- **位置：** `android/kotlin/LogX.kt:128`
+### ✅ [K-04] `setErrorHandler` 缺乏并发与时序校验 [已修复并闭环（含 init 前配置拦截校正）]
+- **来源：** 报告三 BUG-K4；2026-09-08 复审修正初版时序逻辑缺陷
+- **位置：** `android/kotlin/LogX.kt`（`setErrorHandler` / `close` / `init`）
+- **状态：** ✅ **已修复并闭环**
 - **描述：** 允许在任意时机修改错误处理器，缺乏状态检查与并发保护。
-- **修复建议：** 增加并发保护或限定在初始化配置时传入。
+- **复审追溯（初版修复缺陷校正）：**
+  初版拦截条件为 `if (initCount.get() == 0L && nativeHandle == 0L) return`，意图是防止 close 后的悬挂注册，却混淆了“未初始化状态”与“已关闭状态”（两者均为 0 与 0L），导致在 `LogX.init()` 前注册全局错误回调被静默丢弃（No-op）。
+- **最终修复方案与落地：**
+  1. 显式终结状态隔离：引入 `@Volatile private var isClosed: Boolean = false`，精确区分未初始化与已关闭；
+  2. `setErrorHandler` 标注 `@Synchronized`：仅当 `isClosed` 为真时拒绝注册（保持 null 语义，防止悬挂引用）；未初始化时完全允许注册，支持在 `Application.onCreate` 提前配置；
+  3. 生命周期联动：`init` 成功重置 `isClosed = false`；`close()` 终结时设置 `isClosed = true` 并清理 `errorHandler = null`；
+  4. 读方 `onNativeError` 维持 `@Volatile errorHandler` 高性能无锁读取，可见性由 `@Volatile` 保证，锁仅保护写方与时序切换。
+- **验证方式：** 同 K-02（全文静态复核，状态机时序推演覆盖全生命周期）。
 
 ---
 
@@ -761,7 +791,7 @@
 | **T4.0-6** | §11 运行期每 30s 定时 msync/fdatasync | ✅ 已通过 F-04 补齐：`flusher_loop` 接入 30s 超时唤醒与 `durability_sync`，落盘 + staging 强刷盘 | — | — |
 | **T4.0-7** | §9 未对齐访问 / 23:59:59 时钟跳变用例 | ✅ 已通过 T4.5 落地 | — | — |
 | **T4.0-8** | §2/§10 离线解码工具 `logx_decode.py` | 坏块 break、死代码残留、容错性待对齐 | 影响离线日志捞取成功率 | D-01~D-04 |
-| **T4.0-9** | §7/§10 Kotlin Facade `LogX.kt` | export 丢弃 native 返回值；runBlocking 嵌套 | 导出状态误判与调度器线程阻塞 | K-01/K-02 |
+| **T4.0-9** | §7/§10 Kotlin Facade `LogX.kt` | ✅ 已通过 K-01/K-02 闭环（export 状态码如实透传 + 结构化上下文 runBlocking(parentContext) 防死锁 + 异常如实传播） | — | K-01/K-02 |
 | **T4.0-10** | §7/§10 JNI Config 传递与 ErrorHandler | Compress 映射语义混淆 [✅ C-02 部分已闭环]；全局错误上下文单例化 | 多实例接入与算法配置异味 | C-02/J-02 |
 | **T4.0-11** | §4.3/§4.4 恢复后切分序号强制归 0 风险 | ✅ 已通过 F-02 落地（严格解析文件名 + 探测安全网） | — | — |
 | **T4.0-12** | §10 新建文件父目录 fsync | ✅ 已通过 F-04 补齐：新建日志文件头落盘后执行文件与父目录 `file_dir_fsync` 双同步 | — | — |
@@ -826,7 +856,7 @@
 | E-05 | Windows 路径分隔符 [✅ 已修复] | E-06 | flush_threshold==0 语义 [✅ 已修复] |
 | E-07 | logx_stats_t ABI 兼容 [✅ 已修复] | P-02 | file_size_path 开销 [✅ 已修复] |
 | P-03 | file_rmdir 错误转译 [✅ 已修复] | J-02 | g_err_ctx 多实例互踩 [✅ 已修复] |
-| K-01 | Kotlin export 丢返回值 | K-02 | runBlocking 嵌套 |
+| K-01 | Kotlin export 丢返回值 [✅ 已修复] | K-02 | runBlocking 嵌套 [✅ 已修复] |
 | D-01 | Python cksum break 丢记录 | D-02 | Python 坏块 break 丢文件 |
 | D-03 | GCM 失败策略不一致 | F-10 | 缺少 50~100ms Debounce 聚集刷盘 [✅ 已修复] |
 | T-02~T-11 | 测试用例缺陷（详见第十一节） | — | — |
@@ -840,8 +870,8 @@
 | FM-04 | cksum O(n²) 重扫 [✅ 已修复] | F-08 | flush_blocking 无超时 [✅ 已修复] |
 | F-09 | random_bytes 退化低熵 [✅ 已修复] | P-04 | QPF 重复查询 [✅ 已修复] |
 | P-05 | SetFilePointer 冗余 [✅ 已修复] | P-06 | atomic_add 对齐断言 [✅ 已修复] |
-| J-03 | NewStringUTF 编码风险 [✅ 已修复] | K-03 | errorHandler GC 延迟 |
-| K-04 | setErrorHandler 并发校验 | D-04 | Python 死代码 |
+| J-03 | NewStringUTF 编码风险 [✅ 已修复] | K-03 | errorHandler GC 延迟 [✅ 已修复] |
+| K-04 | setErrorHandler 并发校验 [✅ 已修复] | D-04 | Python 死代码 |
 | D-05 | Python 64MB 解压上限 | C-04 | 缺少 ARMv8 硬件加速（T4.0-5）[✅ 已修复] |
 | S-06 | 双 Header 提交内存序偏离（T4.0-3） | — | — |
 

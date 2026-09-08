@@ -7,7 +7,9 @@ import android.os.Build
 import android.os.Process
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 
 /**
@@ -72,6 +74,7 @@ object LogX {
 
     @Volatile private var nativeHandle: Long = 0L
     @Volatile private var errorHandler: ErrorHandler? = null
+    @Volatile private var isClosed: Boolean = false
     private val initCount = AtomicLong(0)
 
     @Synchronized
@@ -80,42 +83,51 @@ object LogX {
             // 重复 init: 抛 IllegalStateException (参见 spec §7)。
             throw IllegalStateException("LogX.init called more than once")
         }
-        if (config.errorHandler != null) {
-            errorHandler = config.errorHandler
-        }
+        isClosed = false
+        // K-03: 任何失败路径 (参数校验 / 目录创建 / nativeInit 返回 0) 都必须
+        // 回滚单例状态 —— 否则 errorHandler 持有的业务回调对象因单例引用无法
+        // 及时 GC;initCount 归零允许业务修正配置后重试 init。
+        try {
+            if (config.errorHandler != null) {
+                errorHandler = config.errorHandler
+            }
 
-        val suffix = if (config.autoProcessIsolation) getProcessSuffix(context) else ""
-        val targetLogDir = if (suffix.isEmpty()) config.logDir else File(config.logDir.parentFile, "${config.logDir.name}_$suffix")
-        val targetStagingDir = if (suffix.isEmpty()) config.stagingDir else File(config.stagingDir.parentFile, "${config.stagingDir.name}_$suffix")
+            val suffix = if (config.autoProcessIsolation) getProcessSuffix(context) else ""
+            val targetLogDir = if (suffix.isEmpty()) config.logDir else File(config.logDir.parentFile, "${config.logDir.name}_$suffix")
+            val targetStagingDir = if (suffix.isEmpty()) config.stagingDir else File(config.stagingDir.parentFile, "${config.stagingDir.name}_$suffix")
 
-        val logDir = targetLogDir.apply { mkdirs() }
-        val stagingDir = targetStagingDir.apply { mkdirs() }
-        val stagingFileName = if (suffix.isEmpty()) "logx_staging.bin" else "logx_staging_$suffix.bin"
-        val stagingFile = File(stagingDir, stagingFileName)
+            val logDir = targetLogDir.apply { mkdirs() }
+            val stagingDir = targetStagingDir.apply { mkdirs() }
+            val stagingFileName = if (suffix.isEmpty()) "logx_staging.bin" else "logx_staging_$suffix.bin"
+            val stagingFile = File(stagingDir, stagingFileName)
 
-        // staging 必须 filesDir 系; 禁 cacheDir (系统清理会让 mmap 变孤儿, 见 spec §10)
-        require(!stagingDir.absolutePath.contains("/cache/")) {
-            "staging dir must not be in cacheDir"
-        }
-        require(config.maxLogLength < 128 * 1024 - 128 - 1) {
-            "maxLogLength must be < (dataSize - 1) = 130943"
-        }
+            // staging 必须 filesDir 系; 禁 cacheDir (系统清理会让 mmap 变孤儿, 见 spec §10)
+            require(!stagingDir.absolutePath.contains("/cache/")) {
+                "staging dir must not be in cacheDir"
+            }
+            require(config.maxLogLength < 128 * 1024 - 128 - 1) {
+                "maxLogLength must be < (dataSize - 1) = 130943"
+            }
 
-        nativeHandle = nativeInit(
-            logDir.absolutePath,
-            stagingFile.absolutePath,
-            config.compress.algo.toInt(),
-            if (config.encrypt) 1 else 0,
-            config.kid,
-            config.keyProvider,
-            config.retentionDays,
-            config.maxFileSize,
-            config.maxLogLength,
-            config.flushThreshold
-        )
-        if (nativeHandle == 0L) {
+            nativeHandle = nativeInit(
+                logDir.absolutePath,
+                stagingFile.absolutePath,
+                config.compress.algo.toInt(),
+                if (config.encrypt) 1 else 0,
+                config.kid,
+                config.keyProvider,
+                config.retentionDays,
+                config.maxFileSize,
+                config.maxLogLength,
+                config.flushThreshold
+            )
+            if (nativeHandle == 0L) {
+                throw IllegalStateException("LogX native init failed")
+            }
+        } catch (t: Throwable) {
+            errorHandler = null
             initCount.set(0)
-            throw IllegalStateException("LogX native init failed")
+            throw t
         }
     }
 
@@ -135,7 +147,22 @@ object LogX {
         }
     }
 
-    fun setErrorHandler(handler: ErrorHandler?) { errorHandler = handler }
+    /**
+     * 注册/清除全局错误回调 (K-04: 与 init/close 同一把对象锁串行化,提供
+     * 基本并发保护与状态时序约束)。
+     *
+     * 时序约束:
+     *   - close() 之后注册的回调不再生效 (单例已终结,保持置 null 语义,防止悬挂引用);
+     *   - 允许在 init() 之前预设全局回调 (如 Application.onCreate 提前监听启动期错误);
+     *   - 与 init/close 并发调用时互斥串行,读方 [onNativeError] 经 @Volatile
+     *     handler 获得高性能无锁可见性保证。
+     */
+    @Synchronized
+    fun setErrorHandler(handler: ErrorHandler?) {
+        // 已关闭实例: 回调通道随实例终结,保持 null,防止悬挂引用
+        if (isClosed) return
+        errorHandler = handler
+    }
 
     @JvmStatic
     fun onNativeError(kindInt: Int, code: Int, message: String) {
@@ -183,26 +210,52 @@ object LogX {
 
     /**
      * 协程化导出 (推荐): 自动处理 flush、解密导出与临时文件生命周期管理。
+     *
+     * 返回值与异常语义 (K-01 / K-02 优化修复):
+     *   - 0  = LOGX_OK, 导出成功;
+     *   - -1 = 实例未初始化;
+     *   - 其他负值 = native 状态码: -6 LOGX_ERR_CODEC = 业务 block 抛异常或
+     *     回调返回非 0 (经 E-03 错误传播链路上报); -3 LOGX_ERR_IO = 临时文件
+     *     写出失败; -8 LOGX_ERR_NOT_FOUND = 时段内无日志文件;
+     *   - 结构化并发保障: runBlocking(parentContext) 绑定外层挂起点上下文，
+     *     外部协程取消信号能及时传导到 block 中中断执行;
+     *   - 防调度器死锁: 直接在当前 native 调用栈线程上执行事件循环，不向 Dispatchers.IO
+     *     重复调度多余工作线程，杜绝并发限制下 (如 limitedParallelism) 的互锁死锁;
+     *   - 异常如实传递: 若业务 block 抛出异常，临时文件仍安全删除，并优先将业务真实
+     *     异常向外抛出，避免被通用状态码掩盖。
      */
-    suspend fun export(from: String, to: String, block: suspend (File) -> Unit): Int = withContext(Dispatchers.IO) {
+    suspend fun export(from: String, to: String, block: suspend (File) -> Unit): Int {
         val h = nativeHandle
-        if (h == 0L) return@withContext -1
-        var result = 0
-        nativeExport(h, from, to) { _, plaintextPath, _ ->
-            val tempFile = File(plaintextPath)
-            try {
-                kotlinx.coroutines.runBlocking {
-                    block(tempFile)
+        if (h == 0L) return -1
+        val parentContext = coroutineContext
+
+        return withContext(Dispatchers.IO) {
+            var userException: Throwable? = null
+            val nativeRes = nativeExport(h, from, to) { _, plaintextPath, _ ->
+                val tempFile = File(plaintextPath)
+                if (userException != null) {
+                    // 若前一分卷处理已抛出异常，快速失败返回 -1，避免后续分卷继续执行业务逻辑
+                    return@nativeExport -1
                 }
-                0
-            } catch (e: Throwable) {
-                result = -1
-                -1
-            } finally {
-                if (tempFile.exists()) tempFile.delete()
+                val cbRet = try {
+                    runBlocking(parentContext) {
+                        block(tempFile)
+                    }
+                    0
+                } catch (t: Throwable) {
+                    userException = t
+                    -1
+                } finally {
+                    try {
+                        if (tempFile.exists()) tempFile.delete()
+                    } catch (t: Throwable) {
+                    }
+                }
+                cbRet
             }
+            userException?.let { throw it }
+            nativeRes
         }
-        result
     }
 
     // ---- native 绑定 (JNI 实现见 android/cpp/logx_jni.cpp) ----
@@ -218,12 +271,20 @@ object LogX {
     @JvmStatic private external fun nativeExport(handle: Long, from: String, to: String,
                                                  cb: ExportCallback): Int
 
+    /**
+     * 关闭实例并释放 native 资源 (K-04: 与 setErrorHandler 串行化,避免
+     * 回调在 close 过程中被重新挂回)。
+     */
+    @Synchronized
     fun close() {
         val h = nativeHandle
         if (h != 0L) {
             nativeClose(h)
             nativeHandle = 0L
             initCount.set(0)
+            // close 后清除回调引用并标记关闭,回调对象可及时释放 (与 K-03 同纪律)
+            errorHandler = null
+            isClosed = true
         }
     }
 }
