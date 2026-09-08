@@ -20,8 +20,8 @@ logx/
 │   └── kotlin/LogX.kt     # Kotlin Facade (协程 export, 自动进程名隔离)
 ├── decoder/logx_decode.py # 离线解码工具
 ├── tests/
-│   ├── unit/              # gtest 单测 (59 个用例: 格式/编解码/对账/保留期/未对齐/跨日跳变)
-│   └── stress/            # 压测套件 (50 线程极限并发 + 15ms flush 竞争 + 50 轮崩溃注入自愈)
+│   ├── unit/              # gtest 单测 (127 个用例: 格式/编解码/对账/保留期/未对齐/跨日跳变/鲁棒性/JNI 字符串)
+│   └── stress/            # 压测套件 (50 线程极限并发 + 15ms flush 竞争 + 50 轮崩溃注入自愈 + 3 组真实进程强杀恢复)
 ```
 
 ## 构建与测试
@@ -131,10 +131,14 @@ lifecycleScope.launch(Dispatchers.IO) {
   - 硬件级未对齐内存访问校验 (零 SIGBUS) 与 23:59:59 跨日/回拨时钟跳变仿真；
   - 崩溃注入与 50 轮随机多阶段崩溃恢复自愈测试，397/397 条日志 100% 挽回；
   - 根治环尾不足 6B 留零脏内存与滑动窗口重同步提前截断 Bug；
-  - 全量 59 个单元测试 + 4 个压测用例在 Windows (MSVC) 与 Android 真机 (Redmi K30 Pro, arm64-v8a, Android 12) 上 100% 全部通过 (双端全绿)。
+  - 全量单元测试 + 压测用例在 Windows (MSVC) 与 Android 真机 (Redmi K30 Pro, arm64-v8a, Android 12) 上 100% 全部通过 (双端全绿);2026-09-08 现状: 全开矩阵 127 单测 + 4 压测 + 3 真实进程强杀恢复,基础矩阵 108 单测。
 
 ## 后续规划 (M5 阶段)
 
-- Android `allowBackup` / `dataExtractionRules` 安全工程化配置
-- JNI/Kotlin Facade 自动化编译与离线解码器端到端联调
-- 性能基线测试与报告输出 (P99 延迟、压缩比、so 二进制体积)
+> 2026-09-08: 三份代码审查报告 (C/F/S/R/E/P/J/K/D/T 全系列) 已全部闭环销号,进入 M5 交付阶段。
+
+- Android `allowBackup` / `dataExtractionRules` 备份安全工程化配置 (T5.1)
+- Kotlin Facade Gradle 自动化编译工程接入 (Kotlin 源码缺陷已全部修复,缺编译链)
+- 离线解码器用实际引擎真机产出日志做最终联调 (合成数据 18 项验证已通过)
+- 性能基线测试与报告输出 (P99 延迟、压缩比、so 二进制体积) (T5.2)
+- 接入指南与离线解码运维手册 (T5.3)

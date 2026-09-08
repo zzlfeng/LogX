@@ -643,6 +643,77 @@ cmake --build build-android -j
 
 ---
 
+## 审查报告 K/D/T 系列全闭环 (2026-09-08)
+
+三份审查报告合并清单中最后三个系列全部修复销号,双构建矩阵全量回归通过
+(全开 ON/ON: 127/127 单测 + 4/4 压测 + 3/3 真实进程强杀恢复;基础 OFF/OFF:
+108/108 单测 + 4/4 压测)。至此合并清单无任何未闭环条目。
+
+### K 系列 — Kotlin Facade (`android/kotlin/LogX.kt`)
+
+- **K-01** 协程 `export` 丢弃 `nativeExport` 返回值 → 状态码如实透传
+  (0=OK/-1=未初始化/-6=业务失败/-3=IO/-8=无文件),与 C++ E-03 传播链对齐;
+- **K-02** 嵌套 `runBlocking` 阻塞调度器 → `runBlocking(parentContext)` 上下文
+  绑定:结构化并发保真(父取消→子取消)、不重复占用 IO 线程
+  (`limitedParallelism(1)` 下无死锁)、业务异常真实上抛;
+- **K-03** `init` 失败未清理 `errorHandler` → 全失败路径统一回滚
+  (`errorHandler=null + initCount 归零`),顺带修复 require 失败致 initCount
+  永久卡死的重试封锁隐患;
+- **K-04** `setErrorHandler` 无并发保护 → `@Synchronized` + `isClosed` 显式
+  终结态(精确区分未初始化/已关闭,init 前允许预配置回调),`close` 串行化。
+
+### D 系列 — Python 离线解码器 (`decoder/logx_decode.py`)
+
+- **D-01** cksum 失败 `break` 丢记录 → 对齐现行 C++ FM-04:跳过整条损坏记录,
+  magic 失效字节重同步,流断裂丢弃跨片残片(FM-02);
+- **D-02** 块解码失败 `break` 丢整文件 → 新增 `block_header_plausible` 块头
+  严检(对齐 C++ F-05):结构损坏终止扫描(宁丢不脏),块级解码失败生成
+  `[seq=N crc fail]`/`[seq=N decode fail]` 占位行后跳过继续;
+- **D-03** GCM 失败策略差异 → 模块 docstring 三层错误策略归档;**顺带修复
+  GCM AAD 缺参缺陷**(`AESGCM.decrypt` 缺 `associated_data=None`,修复前
+  加密文件解密路径 100% TypeError);
+- **D-04** 死代码 `reassemble()` 清理;
+- **D-05** 解压上限 64MB → 收紧至 `kBlockMaxRaw = 20KB+6`(zstd 直接限长,
+  zlib 改 `decompressobj` 限长防 zip bomb);
+- **附带修复**: `--out` 模式同日多分卷(`.log`/`.log.1`)重复 `'w'` 打开导致
+  前序分卷被覆写抹除 → `current_date` 状态跟踪按日期归并连续写入;
+- **验证**: 按 C++ 写盘格式构造合成日志 18 项端到端验证全通过
+  (正常/zstd/AES-GCM/跨块分片/cksum 损坏/坏块头/坏 magic 重同步/多分卷合并)。
+
+### T 系列 — 测试用例修正 (T-01 复核确认 + T-02~T-11 修复)
+
+- **T-01** 复核确认闭环(`logx_crash_fork_tests` 已注册 CMake,3 用例全绿);
+- **T-02** 名不符实用例更名 `..._PlaintextMode_ExportsAllLines` + 新增
+  `ExportEncryptedFile_MissingKey_SkipsGracefully` 真缺失密钥降级用例
+  (AESGCM 宏守卫);
+- **T-03** 复核确认随 F-01 闭环(生产加密端到端 + `EXPECT_NE(密文,明文)` 已在);
+- **T-04** PAL 注入竞态根除: `logx_config_t` 新增 `pal_override` 测试 seam
+  (本批次唯一生产代码改动,生产传 NULL 零行为变化),`logx_open` 在 Flusher
+  启动前定型 `inst->pal`;test_robustness 17 处 + test_flusher 同族注入点
+  全部改为 open 前注入;
+- **T-05** `FlushAndZeroMaintainsInvariant` 恒真假绿 → 反证断言(数据在场时
+  空闲区语义校验必须失败)+ 清零后双重校验;
+- **T-06** 压测补 `EXPECT_EQ(missing_count, 0)` 逐条精确对账断言;
+- **T-07** `ClockRollback` 补 seqno 单调(未来文件=1/回拨文件=2)/文件切换/
+  无撕裂三重断言;
+- **T-08** 硬编码 magic(0x4c,0x47) → `put_u16 + kMagicEntry` 常量构造
+  (test_recovery + test_format 两处);
+- **T-09** GCM 稀疏密钥 `{1,2,3}`/`{0xAA}` → `make_randomish(32)` 确定性
+  完整 32B 密钥(两用例三把密钥);
+- **T-10** 未播种 `rand()` 目录命名 → 文件级原子自增计数器(4 文件全部同族
+  用法,确定性可复现);
+- **T-11** 竞争线程前 15ms 空跑 → 两阶段发令枪(`pre_gun` 预热写 50×8 条 +
+  `staged_bytes_total >= 16KB` 门控后才放行竞争 flush)。
+
+### 配套文档同步
+
+- 实施计划表升级 v1.6:T3.4 置 ✅(残余真机联调归 M5)、验收清单 2 项拆分
+  勾选、测试数量 59→127、甘特图 T4.0 done / M5 active;
+- 合并清单 T4.0 跟踪表:T4.0-10 行闭环(J-02 已随 JNI 批次修复),
+  **T4.0 十二项偏差全部销号**。
+
+---
+
 ## 附:构建命令速查
 
 ### Windows(桌面,MSVC)
