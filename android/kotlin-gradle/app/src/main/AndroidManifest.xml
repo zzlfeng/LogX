@@ -1,3 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- LogX Kotlin Facade 编译验证工程:最小 Manifest (不安装运行,仅编译+单测) -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" />
+<!-- LogX Kotlin Facade 编译验证 + T5.4 logcat echo 最小 smoke 工程:
+     可安装到真机,SmokeActivity 驱动 consoleEcho=true 全链路(见 SmokeActivity.kt)。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:label="LogX Smoke"
+        android:allowBackup="false">
+
+        <activity
+            android:name=".SmokeActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

@@ -44,6 +44,7 @@ if(ANDROID)
     add_library(logx SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/android/cpp/logx_jni.cpp
     )
-    target_link_libraries(logx PRIVATE logx_core)
+    # T5.4: consoleEcho logcat 直通调用 __android_log_print,需链接 liblog。
+    target_link_libraries(logx PRIVATE logx_core log)
     # jni.h / android/log.h 由 NDK 提供,无需手动指定
 endif()

@@ -846,6 +846,54 @@ cmake --build build-android -j
 
 ---
 
+## T5.4 logcat 直通开关 consoleEcho (2026-09-09)
+
+用户需求驱动("日志支持输出到控制台吗" → 选型 JNI 层实现)。此前日志记录仅有
+单一文件 sink(mmap staging → 密文文件),无任何运行时控制台/logcat 输出路径
+(JNI 层 `__android_log_print` 宏自 M1 起即为零调用点死代码)。
+
+### 实现 (JNI 层, C ABI 零改动)
+
+- **`android/cpp/logx_jni.cpp`**:
+  - `nativeInit` 签名末尾追加 `jboolean jConsoleEcho`,存入进程级
+    `std::atomic<bool>`(Kotlin facade 单实例 init 契约下语义匹配;close→re-init
+    循环重新定型);关闭时 `nativeWrite` 仅付一次 relaxed 原子读;
+  - `nativeWrite` 在 `logx_write` 返回 OK 后、Critical/UTFChars 释放**之前**
+    (指针失效防御)同步完成 echo:2KB 栈缓冲截断 + NUL 结尾(防超长/非法
+    UTF-8 破坏 logcat),按 level 0..5 → VERBOSE/DEBUG/INFO/WARN/ERROR/FATAL
+    六级映射调用 `__android_log_print`,激活原死宏族(宏改为 `"%s"` 格式安全形态);
+  - **镜像语义**:仅镜像成功落盘的记录(logcat 与文件一一对应);丢弃
+    (NO_SPACE/TOO_LARGE)不 echo,仍走 ErrorHandler.DROP 事件通道;
+- **顶层 `CMakeLists.txt`**:ANDROID 块 logx 目标补链 `log`
+  (`__android_log_print` 的硬前提;readelf NEEDED 实证 `liblog.so`);
+- **`android/kotlin/LogX.kt`**:`Config` 末尾追加 `val consoleEcho: Boolean = false`
+  (追加式,不破坏按位置构造;注释注明明文进 logcat 有泄露面,生产默认关);
+  external `nativeInit` 声明同步;文件头 doc 补充。
+
+### 验证
+
+- NDK 交叉编译 0 错误,`liblogx.so` NEEDED 实证链接 `liblog.so`;
+- kotlin-gradle 离线 Gradle(8.9/JDK 17):`compileDebugKotlin` + 纯逻辑单测
+  **9/9 全绿**(新增 `preInitWrite_withConsoleEchoConfigSafe`;Config 默认值
+  用例补 consoleEcho=false 断言);
+- **真机端到端 smoke**(Redmi K30 Pro / Android 12):kotlin-gradle 扩展为可安装
+  最小工程(Manifest + SmokeActivity:loadLibrary → init(consoleEcho=true, ZSTD)
+  → 写 6 条中英文各等级记录),logcat 实测 **6/6 条按等级正确镜像、中文完好,
+  SMOKE PASS**(adb install 需设备端确认,首次被 INSTALL_FAILED_USER_RESTRICTED
+  拦截,唤醒屏幕后重装成功)。
+
+### 范围与边界
+
+- 桌面 C++ 使用者不受影响(echo 是 JNI 交付层能力);C ABI/核心零改动,
+  ctest 矩阵无回归面;
+- 镜像在调用方线程同步执行,2KB 截断上限;logcat 单行 ~4KB 截断为系统行为;
+- 明文进 logcat 的泄露面已在 Config 注释标注:仅限 debug 期,生产默认关闭;
+- T5.3(接入指南/解码手册)按用户指示暂停,文档将在其恢复时覆盖本开关。
+
+---
+
+## 附:构建命令速查
+
 ### Windows(桌面,MSVC)
 
 ```bash

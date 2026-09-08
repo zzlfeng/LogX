@@ -85,6 +85,8 @@ class LogXPureLogicTest {
         assertFalse(cfg.encrypt)
         assertTrue(cfg.autoProcessIsolation)
         assertEquals(7, cfg.retentionDays)
+        // T5.4: consoleEcho 生产默认关闭 (明文进 logcat 有泄露面, 仅 debug 期开启)
+        assertFalse(cfg.consoleEcho)
     }
 
     // ---- 状态机: pre-init / 重复 init / close 后行为 (native 句柄为 0, 不触 JNI) ----
@@ -125,5 +127,19 @@ class LogXPureLogicTest {
         LogX.setErrorHandler { _, _, _ -> }  // 未初始化态: 允许注册(预配置场景)
         LogX.setErrorHandler(null)
         assertTrue(true)  // 主断言: 全程无异常即通过
+    }
+
+    // ---- T5.4 consoleEcho 状态机: 开启时 pre-init 写入仍安全 no-op ----
+    // (consoleEcho 镜像发生在 nativeWrite 成功之后, pre-init 短路在前,
+    //  JVM 环境下不可能触达 android.util.Log —— 守卫时序的纯逻辑侧验证)
+    @Test
+    fun preInitWrite_withConsoleEchoConfigSafe() {
+        val cfg = LogX.Config(
+            logDir = java.io.File("/tmp"), stagingDir = java.io.File("/tmp"),
+            consoleEcho = true
+        )
+        assertTrue(cfg.consoleEcho)
+        LogX.i("T5.4", "pre-init echo-enabled write should be dropped silently")
+        assertEquals(0L, LogX.nativeHandleForTest())
     }
 }

@@ -1,10 +1,11 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.9 (2026-09-08 T5.2 性能基线测试与报告输出完成)  
+> **文档版本**: v1.10 (2026-09-09 T5.4 logcat 直通开关落地;T5.3 用户指示暂停)  
 > **制定日期**: 2026-09-02  
 > **基准方案**: [LogX 日志库最终实施方案.md](./LogX日志库最终实施方案.md) (v5.2 定稿)  
 > **变更日志**: [CHANGELOG.md](./logx/CHANGELOG.md)  
 >
+> **v1.10 修订说明**: 2026-09-09 **T5.4 logcat 直通开关 (consoleEcho) 落地**(用户需求驱动,T5.3 暂停让位): JNI 层实现(用户选型,零堆分配与库纪律一致),`nativeInit` 追加 jboolean 参数、进程级 atomic 存储、`nativeWrite` 成功后 2KB 栈缓冲截断镜像到 `__android_log_print`(level 六级映射,激活原死宏),顶层 CMake 补链 `liblog`;C ABI 零改动。kotlin-gradle 扩展为可安装 smoke 工程(Redmi K30 Pro 真机 6/6 echo 按等级正确、中文完好、SMOKE PASS),纯逻辑单测 9/9 全绿。  
 > **v1.9 修订说明**: 2026-09-08 **T5.2 性能基线测试与报告输出落地**: 新增独立基准 harness `tests/bench/logx_bench.cpp`(`LOGX_BUILD_BENCH=ON`,非 ctest)与 [docs/benchmark_report.md](./benchmark_report.md)。Windows 桌面 + Redmi K30 Pro 真机双端实测(全部轮次 0 丢弃 0 丢失):写入延迟桌面 P50 0.2µs/P99 3.1µs(纯路径),真机 P50 3.2µs;压缩开关对写路径零影响(实证热路径无 codec 成本);zstd 落盘体积 -38%(1.52x)、真机吞吐反超 +48%;so 体积(arm64 strip)MinSizeRel 全开 548.9KB(裸核心 121KB,超 500KB 目标归因 zstd ~426KB)。2µs/500KB 两目标判定与 v1.0 回归基线声明见报告。  
 > **v1.8 修订说明**: 2026-09-08 **T5.1 Android 备份安全策略配置工程化落地**: 交付 `android/res/xml/data_extraction_rules.xml` (API 31+,cloud-backup/device-transfer 双通道)、`android/res/xml/backup_rules.xml` (API 23~30 fullBackupContent) 与重写后的 `android/AndroidManifest-snippet.xml` 完整可集成片段(修正原草稿资源根元素命名错误 `<dataExtractionRules>` → `<data-extraction-rules>`)。`filesDir/logs/` 与 `filesDir/logx_staging/` 在云端备份与设备迁移双通道均被排除,防明文 staging/密文日志进云;附自定义目录/多进程隔离目录 (`logs_<后缀>/`) 边界说明与 `allowBackup="false"` 最严备选方案。三个 XML 经 xml.etree 逐项断言校验通过。  
 >
@@ -41,7 +42,7 @@ gantt
 | **M2 恢复与对账** | 对账四分支、k 块回溯、Σraw_len 精确回推、双 Header 容错与不变量收尾、启动 O(1) 缓存定位 | **✅ 100% 已完成** | 截断续写自动跳 1 空隙；单测全绿；崩溃恢复自愈实测通过。 |
 | **M3 压缩与加密** | zstd 单文件版、AES-256-GCM、mbedtls 裁剪、KeyProvider JNI 桥、协程 export、Python 解码工具 | **✅ 核心闭环 / 工具待联调** | `zstd` 与 `AES-256-GCM` 闭环；12B Nonce 安全构造；JNI KeyProvider 全局引用桥接。 |
 | **M4 生产加固与压测** | 降级矩阵（堆缓冲）、保留期清理、50 线程高并发压测、断电/撕裂/时钟跳变故障注入与恢复自愈 | **✅ 100% 已完成** | 堆内存降级自愈；保留期全时机自动清理；50 线程高频竞争压测零死锁/零重复(30w+ logs/s)；50 轮崩溃注入 397/397 日志零丢失；未对齐读写零 SIGBUS；单测 59/59 全绿（后续批次扩充至 127,见 v1.6）。 |
-| **M5 交付与基线** | Android 备份安全规则配置、最低支持 API 21 基线与兼容性测试、性能与包体积基线、接入与密钥管理文档 | **🟡 进行中** (T5.1 ✅ / T5.2 ✅ 已完成;剩余 T5.3 交付文档) | `dataExtractionRules` 配置 (✅ 2026-09-08,见 T5.1);性能/压缩比/so 体积基线报告 (✅ 2026-09-08,见 T5.2);minSdkVersion 21 基准测试；接入与密钥管理文档；发布 Release AAR。 |
+| **M5 交付与基线** | Android 备份安全规则配置、最低支持 API 21 基线与兼容性测试、性能与包体积基线、接入与密钥管理文档 | **🟡 进行中** (T5.1 ✅ / T5.2 ✅ / T5.4 ✅ 已完成;T5.3 ⏸ 用户指示暂停) | `dataExtractionRules` 配置 (✅ 2026-09-08,见 T5.1);性能/压缩比/so 体积基线报告 (✅ 2026-09-08,见 T5.2);logcat 直通开关 (✅ 2026-09-09,见 T5.4);接入与密钥管理文档 (⏸ T5.3);Release AAR(发布工程动作,随 T5.3 后收尾)。 |
 
 ---
 
@@ -79,7 +80,8 @@ gantt
 |---|---|---|---|---|---|
 | **T5.1** | Android 备份安全策略配置工程化 | `android/AndroidManifest-snippet.xml`, `android/res/xml/` | **P2** | **✅ 100% 已完成 (2026-09-08)** | 1. 交付完整 `res/xml/data_extraction_rules.xml` (API 31+,`<cloud-backup>` 与 `<device-transfer>` 双通道各排除 `logs/` 与 `logx_staging/`) 与 `res/xml/backup_rules.xml` (API 23~30 `<full-backup-content>`,同两条 exclude;API 21/22 无 Auto Backup 机制,由 `allowBackup="false"` 兜底);<br>2. `logs/` 与 `logx_staging/` 彻底排除出云端备份与设备迁移,防明文 staging 泄露;export 明文临时文件 (`.tmp_export_*`) 位于 log_dir 内被一并覆盖;<br>3. `AndroidManifest-snippet.xml` 重写为完整可集成片段: 修正原草稿资源根元素命名错误 (`<dataExtractionRules>` → `<data-extraction-rules>`),三步集成流程 + `tools:targetApi="31"` lint 抑制 (minSdk 21 基线) + `allowBackup="false"` 最严备选方案;<br>4. 边界注释内置: 自定义 logDir/stagingDir 须同步改 path;多进程隔离兄弟目录 (`logs_<后缀>/`) 不支持通配符,须逐目录追加 exclude 或改用 allowBackup="false";<br>5. 验证: 三个 XML 经 xml.etree 解析良构校验,根元素名/双通道 exclude 清单/application 四属性逐项断言通过。 |
 | **T5.2** | 性能基线测试与报告输出 | `docs/benchmark_report.md`, `tests/bench/logx_bench.cpp` | **P2** | **✅ 100% 已完成 (2026-09-08)** | 1. 新增独立基准 harness `tests/bench/logx_bench.cpp`(`LOGX_BUILD_BENCH=ON` 开关,非 ctest),三阶段:单条延迟分布(生产口径+纯路径口径,含失真护栏)/ zstd 开关吞吐与落盘体积(混合负载,NO_SPACE 有界重试可持续口径)/ flush 阻塞耗时;**Windows 桌面 + Redmi K30 Pro 真机双端实测,全部轮次 0 丢弃 0 丢失**;<br>2. 实测:桌面写入 P50 0.2µs(纯路径)/ P99 3.1µs,真机 P50 3.2µs;压缩开关对写路径零影响(实证热路径无 codec 成本);zstd 落盘体积 -38%(1.52x),真机吞吐反超 +48%,桌面 -27%;flush P99 桌面 17ms / 真机 9.4ms;<br>3. so 体积(arm64 strip 后):MinSizeRel 全开 **548.9KB**(超 500KB 目标 10%,归因 zstd 贡献 ~426KB 占 77%,裸核心仅 121KB);判定与回归基线声明见 [benchmark_report.md](./benchmark_report.md)(2µs 目标建议改口径为确定性热路径段,已达成;500KB 目标建议接受 548.9KB 为 v1.0 基线,zstd 源码裁剪列为可选优化)。 |
-| **T5.3** | 接入指南与运维解码文档 | `docs/integration_guide.md`, `README.md` | **P2** | 0.5d | 1. 编写接入流程文档（Application 初始化、KeyStore 密钥包裹示例、协程 export 示例）；<br>2. 编写离线解码与线上排障手册。 |
+| **T5.3** | 接入指南与运维解码文档 | `docs/integration_guide.md`, `README.md` | **P2** | ⏸ 暂停 (用户指示) | 1. 编写接入流程文档（Application 初始化、KeyStore 密钥包裹示例、协程 export 示例）；<br>2. 编写离线解码与线上排障手册。 |
+| **T5.4** | logcat 直通开关 (consoleEcho, 用户需求驱动) | `android/cpp/logx_jni.cpp`, `android/kotlin/LogX.kt`, `android/kotlin-gradle/` | **P2** | **✅ 100% 已完成 (2026-09-09)** | 1. **JNI 层实现**(用户选型): `nativeInit` 追加 `jboolean jConsoleEcho`,进程级 `std::atomic<bool>` 存储(C ABI 零改动;Kotlin 单实例契约下语义匹配);`nativeWrite` 成功后以 2KB 栈缓冲(截断+NUL)调 `__android_log_print`,level 0..5 → VERBOSE..FATAL 六宏映射,激活原死宏;顶层 CMake ANDROID 块补链 `liblog`(readelf NEEDED 实证);<br>2. **镜像语义**: 仅镜像成功落盘记录(logcat 与文件一一对应),丢弃走 ErrorHandler.DROP 不重复;echo 在 Critical/UTFChars 释放前同步完成(指针失效防御);<br>3. **Kotlin 侧**: `Config.consoleEcho: Boolean = false`(追加式;注释注明明文泄露面,生产默认关);external 签名同步;<br>4. **验证**: 交叉编译 0 错误;kotlin-gradle 离线 Gradle 编译 + 纯逻辑单测 **9/9 全绿**;smoke app(Redmi K30 Pro/Android 12)真机端到端:`System.loadLibrary` → init(consoleEcho=true, ZSTD) → 6 条中英文记录,**logcat 6/6 按等级正确镜像、中文完好、SMOKE PASS**。 |
 
 ---
 

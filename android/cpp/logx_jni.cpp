@@ -16,15 +16,60 @@
 #include "logx_internal.h"
 #include "jni_string_util.h"
 
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #define LOGX_TAG "LogX"
-#define LOGX_LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOGX_TAG, __VA_ARGS__)
-#define LOGX_LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOGX_TAG, __VA_ARGS__)
+#define LOGX_LOGV(...) __android_log_print(ANDROID_LOG_VERBOSE, LOGX_TAG, "%s", __VA_ARGS__)
+#define LOGX_LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOGX_TAG, "%s", __VA_ARGS__)
+#define LOGX_LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOGX_TAG, "%s", __VA_ARGS__)
+#define LOGX_LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOGX_TAG, "%s", __VA_ARGS__)
+#define LOGX_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOGX_TAG, "%s", __VA_ARGS__)
+#define LOGX_LOGF(...) __android_log_print(ANDROID_LOG_FATAL, LOGX_TAG, "%s", __VA_ARGS__)
 
 namespace {
+
+// T5.4: consoleEcho logcat 直通开关。C ABI 不变 —— echo 是 JNI 交付层能力,
+// 桌面 C++ 使用者不受影响。进程级语义与 Kotlin facade 的单实例 init 契约匹配;
+// 关闭时 nativeWrite 仅付一次 relaxed 原子读,零分配零字符串操作。
+std::atomic<bool> g_console_echo{false};
+
+// level(0..5) → android.util.Log 优先级。仅 echo 路径使用。
+inline int logx_level_to_priority(int level) {
+    switch (level) {
+        case 0: return ANDROID_LOG_VERBOSE;
+        case 1: return ANDROID_LOG_DEBUG;
+        case 2: return ANDROID_LOG_INFO;
+        case 3: return ANDROID_LOG_WARN;
+        case 4: return ANDROID_LOG_ERROR;
+        default: return ANDROID_LOG_FATAL;  // 5 (Level.F) 与一切越界值兜底
+    }
+}
+
+// T5.4: echo 一条已成功落盘的记录到 logcat。独立栈缓冲截断 + NUL 结尾,
+// 防超长 payload / 非法 UTF-8 破坏 logcat(__android_log_print 以 %s 输出,
+// 单行超 ~4KB 由 logcat 系统侧截断,此处栈缓冲为本地硬上限)。
+// 镜像语义: 仅 nativeWrite 返回 OK 后调用 —— logcat 与日志文件一一对应;
+// 丢弃/降级仍走 ErrorHandler 事件通道,不在 echo 里重复。
+void console_echo(int level, const char* tag, const uint8_t* payload, uint32_t len) {
+    char msg_buf[2048];
+    uint32_t copy = len < (sizeof(msg_buf) - 1) ? len : (sizeof(msg_buf) - 1);
+    if (copy && payload) {
+        std::memcpy(msg_buf, payload, copy);
+    }
+    msg_buf[copy] = '\0';
+    const int priority = logx_level_to_priority(level);
+    switch (priority) {
+        case ANDROID_LOG_VERBOSE: LOGX_LOGV(msg_buf); break;
+        case ANDROID_LOG_DEBUG:   LOGX_LOGD(msg_buf); break;
+        case ANDROID_LOG_INFO:    LOGX_LOGI(msg_buf); break;
+        case ANDROID_LOG_WARN:    LOGX_LOGW(msg_buf); break;
+        case ANDROID_LOG_ERROR:   LOGX_LOGE(msg_buf); break;
+        default:                  LOGX_LOGF(msg_buf); break;
+    }
+}
 
 struct JniKeyProviderContext {
     JavaVM* jvm = nullptr;
@@ -166,15 +211,22 @@ extern "C" {
 // Java LogX.init native 签名:
 //   private static native long nativeInit(String logDir, String stagingPath,
 //       int compressAlgo, int encryptEnable, int kid,
-//       Object keyProvider);   // returns native handle
+//       Object keyProvider, int retentionDays, long maxFileSize,
+//       int maxLogLength, int flushThreshold, boolean consoleEcho);
+//       // returns native handle
 JNIEXPORT jlong JNICALL
 Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
                                       jstring jLogDir, jstring jStagingPath,
                                       jint compressAlgo, jint encryptEnable,
                                       jint kid, jobject jKeyProvider,
                                       jint retentionDays, jlong maxFileSize,
-                                      jint maxLogLength, jint flushThreshold) {
+                                      jint maxLogLength, jint flushThreshold,
+                                      jboolean jConsoleEcho) {
     if (!jLogDir || !jStagingPath) return 0;
+
+    // T5.4: consoleEcho 开关在 init 时点定型(Kotlin facade 单实例契约下
+    // 进程级存储无歧义;close→re-init 循环会重新走到这里刷新)。
+    g_console_echo.store(jConsoleEcho == JNI_TRUE, std::memory_order_relaxed);
 
     const char* log_dir = env->GetStringUTFChars(jLogDir, nullptr);
     const char* staging_path = env->GetStringUTFChars(jStagingPath, nullptr);
@@ -306,7 +358,15 @@ Java_com_example_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
         payload_ptr = reinterpret_cast<const uint8_t*>(env->GetPrimitiveArrayCritical(jPayload, nullptr));
     }
 
-    logx_write(inst, level, tag_ptr, payload_ptr, payload_ptr ? static_cast<uint32_t>(n) : 0);
+    logx_status_e wrc = logx_write(inst, level, tag_ptr, payload_ptr,
+                                   payload_ptr ? static_cast<uint32_t>(n) : 0);
+
+    // T5.4: consoleEcho —— 仅镜像成功落盘的记录(logcat 与文件一一对应);
+    // 丢弃(NO_SPACE/TOO_LARGE)不 echo,由 ErrorHandler.DROP 事件通道上报。
+    // 必须在 Critical/UTFChars 释放之前同步完成栈缓冲拷贝(释放后指针失效)。
+    if (wrc == LOGX_OK && g_console_echo.load(std::memory_order_relaxed)) {
+        console_echo(level, tag_ptr, payload_ptr, static_cast<uint32_t>(n));
+    }
 
     if (payload_ptr) {
         env->ReleasePrimitiveArrayCritical(jPayload, const_cast<uint8_t*>(payload_ptr), JNI_ABORT);

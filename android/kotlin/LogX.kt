@@ -27,6 +27,8 @@ import kotlinx.coroutines.withContext
  *   - 单条日志上限 64KB (格式化后); 超过被丢弃 + 打点。
  *   - 首次 init 之前调用任何写接口一律丢弃 + 计数。
  *   - KeyProvider 返回 null → 该 KID 不可解, export 跳过该文件但不中断。
+ *   - consoleEcho (T5.4) 开启时每条成功落盘记录由 JNI 层镜像到 logcat,
+ *     仅限 debug 期; 生产保持默认关闭。
  */
 object LogX {
 
@@ -70,6 +72,11 @@ object LogX {
         val keyProvider: KeyProvider? = null,
         val errorHandler: ErrorHandler? = null,
         val autoProcessIsolation: Boolean = true, // 默认开启多进程目录防呆隔离
+        // T5.4: logcat 直通 —— 开启后每条成功落盘的记录同步镜像到 logcat
+        // (tag=LogX,优先级按 Level 映射;单条 >2KB 在 native 侧截断,logcat
+        // 单行 ~4KB 截断为系统行为)。仅限 debug 期使用: 明文进 logcat 有泄露面
+        // (adb 任意可读),生产保持默认关闭。丢弃记录不镜像(走 ErrorHandler.DROP)。
+        val consoleEcho: Boolean = false,
     )
 
     @Volatile private var nativeHandle: Long = 0L
@@ -122,7 +129,8 @@ object LogX {
                 config.retentionDays,
                 config.maxFileSize,
                 config.maxLogLength,
-                config.flushThreshold
+                config.flushThreshold,
+                config.consoleEcho
             )
             if (nativeHandle == 0L) {
                 throw IllegalStateException("LogX native init failed")
@@ -265,7 +273,8 @@ object LogX {
     @JvmStatic private external fun nativeInit(
         logDir: String, stagingPath: String,
         compressAlgo: Int, encryptEnable: Int, kid: Int, keyProvider: Any?,
-        retentionDays: Int, maxFileSize: Long, maxLogLength: Int, flushThreshold: Int
+        retentionDays: Int, maxFileSize: Long, maxLogLength: Int, flushThreshold: Int,
+        consoleEcho: Boolean
     ): Long
     @JvmStatic private external fun nativeClose(handle: Long)
     @JvmStatic private external fun nativeWrite(handle: Long, level: Int,
