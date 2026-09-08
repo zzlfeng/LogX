@@ -9,11 +9,15 @@
 //   - 裸 write_pos 越界钳制(撕裂写防御)
 
 #include "logx_internal.h"
+#include <atomic>
 #include <gtest/gtest.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// (T-10) 原子自增目录序号:替代未播种 rand(),消除并行/重跑撞名
+static std::atomic<uint64_t> s_recovery_dir_seq{0};
 
 using namespace logx;
 
@@ -29,10 +33,10 @@ protected:
         Pal& pal = default_pal();
         staging_path_ = std::string("logx_test_tmp_") +
                         std::to_string(pal.pid()) + "_" +
-                        std::to_string(rand()) + ".bin";
+                        std::to_string(s_recovery_dir_seq.fetch_add(1)) + ".bin";
         log_dir_ = std::string("logx_test_tmp_") +
                    std::to_string(pal.pid()) + "_" +
-                   std::to_string(rand());
+                   std::to_string(s_recovery_dir_seq.fetch_add(1));
         pal.file_unlink(staging_path_.c_str());
         pal.file_mkdirs(log_dir_.c_str());
     }
@@ -115,9 +119,14 @@ TEST_F(RecoveryTest, RingScanStopsOnTear) {
         chunk.insert(chunk.end(), rec, rec + 12);
     }
     // 半条:头 6B 完(len=4 声明 4B payload),payload 只有 2B(截断 2B)
-    chunk.push_back(4); chunk.push_back(0);  // len = 4
-    chunk.push_back(0x4c); chunk.push_back(0x47); // magic LG
-    chunk.push_back(0x00); chunk.push_back(0x00);
+    // (T-08) 魔数改用常量写入,避免硬编码 0x4c/0x47 与 kMagicEntry 脱钩
+    {
+        uint8_t half[6];
+        put_u16(half, 4);
+        put_u16(half + 2, kMagicEntry);
+        half[4] = 0x00; half[5] = 0x00;
+        chunk.insert(chunk.end(), half, half + 6);
+    }
     chunk.insert(chunk.end(), {0,0});  // 只有 2B(应 4B)→ 撕裂尾巴
 
     ASSERT_EQ(inst->staging->write_records(chunk.data(),
@@ -509,7 +518,7 @@ static bool append_test_block(Instance* inst, const std::string& path, uint32_t 
 }
 
 static bool tamper_file_bytes(Instance* inst, const std::string& path, uint64_t offset, const void* data, size_t len) {
-    int fd = inst->pal->file_open(path.c_str(), true, true);
+    int fd = inst->pal->file_open(path.c_str(), false, false);
     if (fd < 0) return false;
     long written = inst->pal->file_pwrite(fd, data, static_cast<long>(len), offset);
     inst->pal->file_close(fd);

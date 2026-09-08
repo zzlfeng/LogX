@@ -121,10 +121,18 @@ TEST_F(StagingTest, FlushAndZeroMaintainsInvariant) {
     ASSERT_TRUE(s.open(&st, &rec));
     std::vector<uint8_t> a(256, 'x');
     ASSERT_EQ(s.write_records(a.data(), 256), Staging::WriteStatus::kOk);
+    // (T-05) 反证前置断言:清零前 [0,256) 有数据,检查器以 (f=0,w=256)
+    // 认定其为已提交区,校验通过 —— 证明检查器真实读取了该区间内容。
+    EXPECT_TRUE(s.debug_check_invariant(0, 256));
+    // 反证:数据仍在 [0,256) 时,把该区间当"必须为零"的空闲区 (f=w=256)
+    // 校验必须失败 —— 排除"区域本就全零导致断言恒真"的假绿。
+    EXPECT_FALSE(s.debug_check_invariant(256, 256));
     // 模拟 Flusher 清零 [0, 256)
     s.zero_range_locked(0, 256);
-    // 此时 f=0,w=256;除 [0,256) 外全零(数据区本来全零)
+    // 清零后 f=0,w=256:除 [0,256) 外全零;且刚清零的区域按空闲区语义
+    // (f=w=256) 也必须确认为零,证明 zero_range_locked 真实执行(未漏清)
     EXPECT_TRUE(s.debug_check_invariant(0, 256));
+    EXPECT_TRUE(s.debug_check_invariant(256, 256));
     // 提交 Header(f=256)
     AppendTargetCache atc{};
     s.commit_header_locked(/*seqno=*/1, /*f=*/256, /*w=*/256, &atc);

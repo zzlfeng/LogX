@@ -274,6 +274,7 @@ public:
         return 0;
     }
     int thread_join(void* handle) override {
+        if (!handle) return -1;
         pthread_t* pt = static_cast<pthread_t*>(handle);
         int rc = ::pthread_join(*pt, nullptr);
         delete pt;

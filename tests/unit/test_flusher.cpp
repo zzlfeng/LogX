@@ -18,6 +18,9 @@
 #include <thread>
 #include <vector>
 
+// (T-10) 原子自增目录序号:替代未播种 rand(),消除并行/重跑目录撞名
+static std::atomic<uint64_t> s_test_dir_seq{0};
+
 using namespace logx;
 
 namespace {
@@ -116,7 +119,7 @@ TEST(Flush, BlocksEncodeAndFileWrite_Roundtrip) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_tmp_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string path = dir + "/20260831.log";
 
@@ -169,7 +172,7 @@ TEST(Flush, EncryptedBlockFileWriteAndDecode_Roundtrip) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_enc_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string path = dir + "/20260902.log";
 
@@ -251,7 +254,7 @@ TEST(Flush, EndToEndFormattedLog_WriteAndExport) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_e2e_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -356,7 +359,7 @@ TEST(Flush, ExportHistoricalEncryptedFileWithUnsetFileHeaderFlag_RecoversSuccess
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_hist_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -466,7 +469,7 @@ TEST(Flush, RetentionCleanup_DeletesExpiredLogsKeepsStaging) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_ret_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
 
     uint32_t yyyymmdd = 0, hhmmss = 0;
@@ -519,7 +522,7 @@ TEST(Flush, RetentionCleanup_TriggeredOnFlushBlocking) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_ret_flush_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -556,7 +559,7 @@ TEST(Flush, RetentionCleanup_TriggeredOnDayRollover) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_ret_rollover_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
 
     Instance inst{};
@@ -587,7 +590,7 @@ TEST(Flush, RetentionCleanup_LeapYearAndMonthBoundary) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_ret_leap_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
 
     Instance inst{};
@@ -616,7 +619,7 @@ TEST(Flush, FileSizeThreshold_RotatesToSplitFile) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_split_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -760,7 +763,7 @@ TEST(Flush, FileSizeThreshold_ResumeRotatesToNextSplitWithoutOverwrite) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_split_resume_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -889,7 +892,7 @@ TEST(Flush, FileSizeThreshold_DefensiveProbeSkipsExistingSplit) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_split_defensive_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -977,11 +980,14 @@ TEST(Flush, FileSizeThreshold_DefensiveProbeSkipsExistingSplit) {
     pal.file_rmdir(dir.c_str());
 }
 
-TEST(Flush, ExportWithMultipleRecordsAndMissingKey_HandledGracefully) {
+// (T-02) 原名 ExportWithMultipleRecordsAndMissingKey_HandledGracefully 与实现
+// 不符:配置实为明文模式,从未涉及"缺失密钥"。更名如实反映测试内容;
+// 真正的"缺失密钥导出优雅降级"场景由下方 MissingKey 派生用例覆盖。
+TEST(Flush, ExportWithMultipleRecords_PlaintextMode_ExportsAllLines) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_exp_multi_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -1042,12 +1048,103 @@ TEST(Flush, ExportWithMultipleRecordsAndMissingKey_HandledGracefully) {
     pal.file_rmdir(dir.c_str());
 }
 
+// (T-02 补齐) 真正的"缺失密钥"场景:加密文件 + key_provider 对该 kid 返回
+// null → 导出必须优雅降级:返回 LOGX_OK、输出 [skipped: ...] 占位行(与
+// C++ decode_one_file 的降级契约一致),绝不崩溃、绝不误报成功导出明文。
+// (未接 AES-GCM 的基础构建下 logx_open 对 encrypt_enable=1 fail-fast,
+// 该用例无意义,按文件内既有惯例以宏守卫排除。)
+#if LOGX_WITH_AESGCM
+TEST(Flush, ExportEncryptedFile_MissingKey_SkipsGracefully) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_exp_nokey_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(s_test_dir_seq.fetch_add(1));
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    struct KeyContext {
+        std::atomic<bool> missing{false};
+    } key_ctx;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 20 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 8 * 1024;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 1;
+    cfg.kid = 77;
+    cfg.user = &key_ctx;
+    cfg.key_provider = [](uint16_t kid, void* user) -> const uint8_t* {
+        auto* ctx = static_cast<KeyContext*>(user);
+        if (ctx && ctx->missing.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        // 打开/写入阶段提供密钥 (写路径需要),但导出阶段若 missing=true 则返回 null
+        static uint8_t key[32] = {0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A,
+                                  0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A,
+                                  0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A,
+                                  0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A};
+        (void)kid;
+        return key;
+    };
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    ASSERT_EQ(logx_write(inst, 2, "Sec",
+                         (const uint8_t*)"encrypted_payload", 17), LOGX_OK);
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 导出阶段切换为"该 kid 缺失密钥":通过外部上下文标志使 key_provider 返回 null,
+    // 避免在运行期通过 static_cast 强写 Instance 内部指针
+    key_ctx.missing.store(true, std::memory_order_release);
+
+    uint32_t yyyymmdd = 0, hhmmss = 0;
+    pal.wallclock_date(&yyyymmdd, &hhmmss);
+    char date_str[16];
+    std::snprintf(date_str, sizeof(date_str), "%08u", yyyymmdd);
+
+    struct Ctx { int called = 0; std::string content; } ctx;
+    auto cb = [](void* user, const char* /*date*/, const char* path, uint64_t size) -> int {
+        auto* c = static_cast<Ctx*>(user);
+        c->called++;
+        Pal& p = default_pal();
+        int fd = p.file_open(path, false, false);
+        if (fd >= 0 && size > 0) {
+            std::vector<char> buf(size);
+            if (p.file_pread(fd, buf.data(), size, 0) == static_cast<long>(size)) {
+                c->content.append(buf.data(), size);
+            }
+            p.file_close(fd);
+        }
+        return 0;
+    };
+
+    // 优雅降级契约:导出流程本身成功(不崩溃/不 IO 失败),但内容为
+    // [skipped: ...] 占位而非明文载荷
+    EXPECT_EQ(logx_export(inst, date_str, date_str, cb, &ctx), LOGX_OK);
+    EXPECT_GE(ctx.called, 1);
+    EXPECT_NE(ctx.content.find("[skipped:"), std::string::npos);
+    EXPECT_EQ(ctx.content.find("encrypted_payload"), std::string::npos);
+
+    logx_close(inst);
+
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+#endif  // LOGX_WITH_AESGCM
+
 TEST(Flush, HeapDegraded_WritesAndFlushesCorrectly) {
     // 验证在 mmap 降级模式下, 环形缓冲区的日志依然能够被 Flusher 正常切块、落盘和导出
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_degraded_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
 
     // 使用已存在的目录作为 staging 文件路径, 使得 file_open (O_RDWR) 失败 (EISDIR),
@@ -1101,7 +1198,7 @@ TEST(ErrorMonitoring, DropEventOnTooLargeAndFull) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_drop_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -1152,7 +1249,7 @@ TEST(ErrorMonitoring, InitStageEventsCapturedViaConfig) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_init_ev_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
 
     // 使用已存在的目录作为 staging 文件路径, 跨平台可靠触发启动阶段的堆内存降级
@@ -1231,7 +1328,7 @@ TEST(Flush, FileSizeThreshold_RotatesBeyond255_Succeeds) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_split_beyond255_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -1287,7 +1384,7 @@ TEST(Flush, FileSizeThreshold_SplitLimit65535_EmitsEventAndSuspends) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_split_limit65535_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -1366,7 +1463,7 @@ TEST(Flush, AppendTargetCache_HistoricalStagingLayoutCompatibility) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_atc_compat_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -1454,7 +1551,7 @@ TEST(Flush, WatermarkReturnsUnderSustainedWrites) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_f08_starve_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -1598,7 +1695,7 @@ TEST(Flush, TimeoutWhenFlusherStalled_EmitsEventAndReturns) {
 
     std::string dir = std::string("logx_test_f08_stall_") +
                       std::to_string(real_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     real_pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -1625,11 +1722,10 @@ TEST(Flush, TimeoutWhenFlusherStalled_EmitsEventAndReturns) {
         }
     };
     cfg.err_user = &tracker;
+    cfg.pal_override = &stall_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* internal_inst = static_cast<Instance*>(inst);
-    internal_inst->pal = &stall_pal;
 
     // 启用写入挂起注入
     stall_pal.stall_write.store(true, std::memory_order_release);
@@ -1662,8 +1758,6 @@ TEST(Flush, TimeoutWhenFlusherStalled_EmitsEventAndReturns) {
     }
     stall_pal.stall_cv.notify_all();
 
-    // 恢复原生 PAL 并关闭实例
-    internal_inst->pal = &real_pal;
     logx_close(inst);
 
     for (const auto& f : real_pal.file_list(dir.c_str())) {
@@ -1676,7 +1770,7 @@ TEST(Flush, DiscardPathDoesNotStall) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_f08_discard_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -1751,7 +1845,7 @@ TEST(FlusherTest, KeyProvider_DrainsEncryptedTailAndNotCalledAfterClose) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_j01_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
@@ -1900,7 +1994,7 @@ TEST(Flush, Debounce_LowFrequencyWritesFlushedWithinWindow) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_debounce_lowfreq_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -1993,7 +2087,7 @@ TEST(Flush, Debounce_BurstAggregatesIntoFewBlocks) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_debounce_burst_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 

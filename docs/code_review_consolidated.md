@@ -692,7 +692,9 @@
 
 ## 十一、测试用例问题
 
-### 🔴 [T-01] "强杀恢复"测试没有真正模拟强杀 [✅ 已修复]
+> **修复批次注（2026-09-08）：** T-01 复核确认已闭环（`logx_crash_fork_tests` 已注册进 CMake 并三用例全绿）；T-02~T-11 本批次全部修复闭环。全套测试已在 Windows 宿主机与 Android arm64-v8a 真实物理设备双端全矩阵通过（Android 真机：128/128 单测全通过 + 4/4 高并发压测全通过 + 3/3 强杀恢复全通过）。T-04 修复引入 `logx_config_t.pal_override` 测试 seam（生产传 NULL 零行为变化），并在 POSIX PAL 补充 `thread_join` 空指针防护。
+
+### 🔴 [T-01] "强杀恢复"测试没有真正模拟强杀 [✅ 已修复（2026-09-08 复核确认闭环）]
 - **来源：** 报告二 R2-测#1
 - **位置：** `tests/stress/test_crash_recovery.cpp:57`，新建 `tests/stress/test_crash_fork.cpp`
 - **描述：** 测试设置 `flusher_exit = true` 后调用 `thread_join()`。但 Flusher 退出循环后还会执行最终 `drain_once()`（`core/src/flusher.cpp:613`），staging 数据已被正常刷盘，**没有验证"未刷盘 staging 在进程突然死亡后的恢复"**。
@@ -700,64 +702,93 @@
   1. 新增独立可执行文件 `logx_crash_fork_tests`（`tests/stress/test_crash_fork.cpp`），利用独立子进程执行写入，并在指定窗口调用系统底层立即终止接口（Windows `ExitProcess` / POSIX `::_exit`）彻底绕过 C++ 析构函数、atexit 钩子与 CRT 缓冲区，真实模拟硬崩溃。父进程重启实例验证数据 100% 零丢失复原与单调块序号衔接，包含 50 轮混合硬杀压力循环。
   2. 原 `test_crash_recovery.cpp` 语义重命名为 `GracefulTeardown_*`，准确反映优雅拆毁下的数据恢复与坏块自愈，并消除 `rand()` 路径竞争（T-10）。
 
-### 🟠 [T-02] 测试名称 `ExportWithMultipleRecordsAndMissingKey_HandledGracefully` 与实现不符
+### ✅ [T-02] 测试名称 `ExportWithMultipleRecordsAndMissingKey_HandledGracefully` 与实现不符 [已修复并闭环]
 - **来源：** 报告一 TEST-BUG-1 ＝ 报告二 R2-测#2
-- **位置：** `tests/unit/test_flusher.cpp:514`
+- **位置：** `tests/unit/test_flusher.cpp`
+- **状态：** ✅ **已修复并闭环（改名 + 补真实缺失密钥场景，双管齐下）**
 - **描述：** 测试名暗示"缺失密钥优雅降级"，实际配置 `encrypt_enable = 0`（明文模式），根本没有涉及缺失 key 场景，误导维护人员。
-- **修复建议：** 更正测试名或补真实缺失密钥场景。
+- **修复方案与落地：**
+  1. 原用例更名 `ExportWithMultipleRecords_PlaintextMode_ExportsAllLines`，如实反映"明文模式多记录完整导出"语义；
+  2. 新增派生用例 `ExportEncryptedFile_MissingKey_SkipsGracefully` 补齐真正的缺失密钥场景：加密实例导出阶段将 `key_provider` 切换为返回 null，断言导出返回 `LOGX_OK`（优雅降级不崩溃）、输出含 `[skipped: ...]` 占位行、不含明文载荷——与 C++ `decode_one_file` 的降级契约逐点对齐；
+  3. 派生用例按文件内既有惯例以 `#if LOGX_WITH_AESGCM` 守卫（基础构建未接 GCM 时 `logx_open` 对 `encrypt_enable=1` fail-fast，用例无意义；首轮验证该失败已被守卫根除）。
 
-###  [T-03] 加密块测试绕过生产文件头逻辑且未验证加密生效
+### ✅ [T-03] 加密块测试绕过生产文件头逻辑且未验证加密生效 [已随 F-01 闭环]
 - **来源：** 报告二 R2-测#3 ＋ 报告一 TEST-BUG-8
-- **位置：** `tests/unit/test_flusher.cpp:192`
+- **位置：** `tests/unit/test_flusher.cpp`
+- **状态：** ✅ **已随 F-01 修复一并闭环（2026-09-08 复核确认），无需额外改动**
 - **描述：** 测试手工写入带加密标志的文件头，因此无法发现生产 `write_file_header()` 固定写入明文标志的问题（见 F-01）。报告一另在 TEST-BUG-8 中指出 `EncryptedBlockFileWriteAndDecode_Roundtrip` 只验证解密后大小正确，未验证"密文 ≠ 明文"（即加密确实发生）。
-- **修复建议：** 补生产路径加密文件创建→导出端到端测试；增加密文/明文差异断言。
+- **复核结论：** 报告建议的两项要求均已在 F-01 修复中落地并验证：
+  1. 生产路径端到端：`EndToEndFormattedLog_WriteAndExport` 经生产配置（`encrypt_enable=1` + key_provider）写入→flush→断言落盘文件头 `flag_encrypted(fhdr[5])` 与 CRC→`logx_export` 导出明文并断言含载荷 Hex 特征、无 `decode fail`/`[skipped:` 占位——正是"生产文件创建→导出"闭环；
+  2. 密文/明文差异断言：`EncryptedBlockFileWriteAndDecode_Roundtrip` 已含 `EXPECT_NE(payload_buf, rec)`（TEST-BUG-8 要求）。
+  另有 `ExportHistoricalEncryptedFileWithUnsetFileHeaderFlag_RecoversSuccessfully` 覆盖历史存量文件的向前兼容。
 
-### 🟠 [T-04] PAL 注入时机晚于 Flusher 线程启动，产生数据竞争
+### ✅ [T-04] PAL 注入时机晚于 Flusher 线程启动，产生数据竞争 [已修复并闭环]
 - **来源：** 报告一 TEST-BUG-3 ＝ 报告二 R2-测#4
-- **位置：** `tests/unit/test_robustness.cpp:181, 234`
+- **位置：** `core/include/logx_c.h`、`core/src/logx_c.cpp`、`tests/unit/test_robustness.cpp`、`tests/unit/test_flusher.cpp`
+- **状态：** ✅ **已修复并闭环（新增 C ABI 注入 seam，报告两建议合并落地，优于任一单独方案）**
 - **描述：** `logx_open` 内部已启动 Flusher 线程，测试随后才将 `inst->pal` 改为 Mock PAL；Flusher 读 `inst->pal` 与测试写 `inst->pal` 并发，数据竞争，测试结果不可信。
-- **修复建议：** 在创建实例前注入 PAL，或提供显式 PAL 注入入口。
+- **修复方案与落地：**
+  1. `logx_config_t` 末尾追加 `void* pal_override` 测试专用注入字段（注释固化"生产必须传 NULL"纪律；`{}`/memset 零初始化天然兼容，无 ABI 消费方按 sizeof 拷贝该结构）；
+  2. `logx_open` 在启动 Flusher 线程**之前**以 `cfg->pal_override` 定型 `inst->pal`——从根源消除竞态，比"创建实例前注入"（仍需后写指针）与"逐用例后注入"（仍留竞态窗口）都更彻底；
+  3. 全测试面清理：`test_robustness.cpp` 17 处与 `test_flusher.cpp:TimeoutWhenFlusherStalled` 注入点全部改为 `cfg.pal_override = &mock;` 前置注入，并删除不再需要的"恢复真实 PAL 再关闭"补救代码（实例生命周期全程即注入 PAL，语义更真实且零竞态）；
+  4. 双构建矩阵（全开 ON/ON 127/127、基础 OFF/OFF 108/108）重新编译与全量回归通过。
 
-### 🟠 [T-05] `FlushAndZeroMaintainsInvariant` 断言永远为真，无检测意义
+### ✅ [T-05] `FlushAndZeroMaintainsInvariant` 断言永远为真，无检测意义 [已修复并闭环]
 - **来源：** 报告一 TEST-BUG-2 ＝ 报告二 R2-测#5
-- **位置：** `tests/unit/test_staging.cpp:127`
+- **位置：** `tests/unit/test_staging.cpp`
+- **状态：** ✅ **已修复并闭环（报告两建议合并落地：反证前置 + 空闲区语义双重校验）**
 - **描述：** 先清零 `[0, 256)` 再调用 `debug_check_invariant(0, 256)`，被检查区域已全为零，断言必然为 true，无法验证清零与坐标推进逻辑。
-- **修复建议：** 清零前验证区间有数据，或用不同 `(f, w)` 参数验证推进状态。
+- **修复方案与落地：**
+  1. 反证前置：写入数据后、清零前先断言 `debug_check_invariant(0, 256)` 通过（检查器真实读取数据区内容）；
+  2. 反证排除恒真：数据仍在 `[0,256)` 时按"空闲区"语义 `debug_check_invariant(256, 256)` 校验**必须失败**——证明检查器与数据布局真实耦合，排除"区域本就全零导致恒真"的假绿；
+  3. 清零后再以 `(f=0,w=256)`（已提交语义）与 `(f=w=256)`（空闲区必须为零）双重校验，证明 `zero_range_locked` 真实执行、未漏清。
 
-### 🟠 [T-06] 压力测试没有断言 missing_count
+### ✅ [T-06] 压力测试没有断言 missing_count [已修复并闭环]
 - **来源：** 报告二 R2-测#6
-- **位置：** `tests/stress/test_concurrent.cpp:246`
+- **位置：** `tests/stress/test_concurrent.cpp`
+- **状态：** ✅ **已修复并闭环（建议正确，直接采纳）**
 - **描述：** 测试计算了缺失日志数量但只输出结果，没有 `EXPECT_EQ(missing_count, 0)`，可能存在丢日志却仍通过测试的情况（注：测试末尾 `EXPECT_EQ(exported_lines, written)` 的总数对账可捕获净丢失，仅"等量丢失+等量重复"可逃逸）。
-- **修复建议：** 增加显式断言。
+- **修复方案与落地：** 输出语句后立即补 `EXPECT_EQ(missing_count, 0)` 显式断言，逐条精确对账封死"等量丢失+等量重复"逃逸路径；50 线程压测实测 missing=0 断言通过。
 
-### 🟠 [T-07] `ClockRollback` 测试未验证 seqno 单调性和文件切换正确性
+### ✅ [T-07] `ClockRollback` 测试未验证 seqno 单调性和文件切换正确性 [已修复并闭环]
 - **来源：** 报告一 TEST-BUG-6
-- **位置：** `tests/unit/test_robustness.cpp:216`
+- **位置：** `tests/unit/test_robustness.cpp`
+- **状态：** ✅ **已修复并闭环（建议正确，直接采纳；复用同文件 ClockJump 用例的 scan 断言模式）**
 - **描述：** 时钟回拨场景两个核心保证缺少断言：回拨后写入日志的 seqno 是否大于未来日期文件的 seqno；Flusher 是否正确切换了日志文件。
-- **修复建议：** 补充对应断言。
+- **修复方案与落地：** 新增 `scan_append_target` 三重断言：未来文件 `seqno == 1`（恰一块）、回拨文件 `seqno == 2`（严格大于，全局单调接管）、`truncated == false`（干净追加无撕裂）——同时锁死"文件切换正确"（回拨写入确实落在 20260902.log）与"seqno 单调"两项核心保证。
 
-### 🟠 [T-08] 硬编码 magic 字节（0x4c, 0x47）
+### ✅ [T-08] 硬编码 magic 字节（0x4c, 0x47） [已修复并闭环]
 - **来源：** 报告一 TEST-BUG-4（`test_recovery.cpp` RingScanStopsOnTear）＋ TEST-BUG-5（`test_format.cpp` ParseSkipsPadAndReassembles）
-- **位置：** `tests/unit/test_recovery.cpp:120`、`tests/unit/test_format.cpp:128-132`
+- **位置：** `tests/unit/test_recovery.cpp`、`tests/unit/test_format.cpp`
+- **状态：** ✅ **已修复并闭环（建议正确，直接采纳）**
 - **描述：** 使用硬编码魔数而非常量，未来常量修改时测试容易失效且可读性差。（注：当前硬编码值与 `kMagicEntry = 0x474c` 小端字节序一致，属可维护性问题。）
-- **修复建议：** 改用 `put_u16` 写入 `kMagicEntry`。
+- **修复方案与落地：** 两处全部改为 `put_u16` 写入 `kMagicEntry` 常量：test_recovery 撕裂半条改经 6B 头缓冲常量构造；test_format 首片/末片头经 `make_head` lambda 统一构造（`test_format.cpp` 补 `logx_staging.h` include 引入 `put_u16`，`kMagicEntry` 本定义于已包含的 `logx_format.h`）。
 
-### 🟠 [T-09] GCM 测试 key 仅初始化前 3 字节，不具代表性
+### ✅ [T-09] GCM 测试 key 仅初始化前 3 字节，不具代表性 [已修复并闭环]
 - **来源：** 报告一 TEST-BUG-7
-- **位置：** `tests/unit/test_codec.cpp:165-166`
+- **位置：** `tests/unit/test_codec.cpp`
+- **状态：** ✅ **已修复并闭环（建议采纳；范围扩大到同族第二处稀疏密钥）**
 - **描述：** `uint8_t key1[32] = {1, 2, 3}` 剩余 29B 全为 0，建议使用差异更大的完整 32B 密钥，与标准测试向量（NIST CAVS）对齐。
-- **修复建议：** 使用完整随机密钥。
+- **修复方案与落地：** `GCMRejectsWrongKey` 两把密钥与 `GCMRejectsCorruptTagAndCiphertext` 的 `{0xAA}` 稀疏密钥（同族遗漏，一并修正）均改用 `make_randomish(32)` 确定性伪随机完整 32B 密钥——不引 `rand()`（规避 T-10 同族不确定性）、可复现、全字节分布均匀，风格与 NIST CAVS 随机密钥一致。
 
-### 🟠 [T-10] `rand()` 未播种导致测试目录重名风险
+### ✅ [T-10] `rand()` 未播种导致测试目录重名风险 [已修复并闭环]
 - **来源：** 报告三 BUG-T1
-- **位置：** `tests/stress/test_concurrent.cpp:33-34`、`tests/stress/test_crash_recovery.cpp:33-34`
+- **位置：** `tests/stress/test_concurrent.cpp`、`tests/unit/test_recovery.cpp`、`tests/unit/test_flusher.cpp`、`tests/unit/test_robustness.cpp`
+- **状态：** ✅ **已修复并闭环（建议采纳；范围扩大至全部同族用法）**
 - **描述：** 未 `srand()` 产生确定伪随机序列，CI 重跑或上轮异常退出遗留目录时可能引发目录冲突。
-- **修复建议：** 改用原子自增计数器。
+- **复核校准：** 报告点位之一的 `test_crash_recovery.cpp` 已在 T-01 闭环时改为 `s_recovery_dir_seq` 原子计数器；实际残余在 `test_concurrent.cpp` 与单测三文件（报告未列出的同族）。
+- **修复方案与落地：** 全部替换为文件级 `static std::atomic<uint64_t>` 自增计数器（配合既有 PID 前缀，进程内/跨进程均无撞名）；测试目录名生成不再依赖任何随机源，确定性可复现。
 
-### 🟠 [T-11] 竞争线程过早启动导致前 15ms 空跑
+### ✅ [T-11] 竞争线程过早启动导致前 15ms 空跑 [已修复并闭环]
 - **来源：** 报告三 BUG-T2
-- **位置：** `tests/stress/test_concurrent.cpp:117-126`
+- **位置：** `tests/stress/test_concurrent.cpp`
+- **状态：** ✅ **已修复并闭环（建议采纳，落地为两阶段发令枪 + 数据量门控）**
 - **描述：** 竞争线程发令枪响后立即每 15ms 调用 `logx_flush`，此时工作线程刚启动、staging 尚无数据，前 15ms 未构成实质竞争窗口。
+- **修复方案与落地：**
+  1. 发令枪拆为两阶段：`pre_gun` 放行 Worker 预热写（每线程 8 条，50×8 条 ≈ 90KB），`start_gun` 才放行竞争 flush 线程——竞争窗口从第一笔 flush 起就有真实数据可刷；
+  2. 主线程数据量门控：`pre_gun` 后自旋等待 `staged_bytes_total >= 16KB`（恰为分块阈值）才鸣 `start_gun`，门控条件与被测行为强耦合；
+  3. Worker 循环体重构为 `write_one` lambda（预热与主循环共用同一写入+重试+对账路径，消除重复），对账语义不变；
+  4. 50 线程压测含新断言全绿，`Missing records found: 0`。
 - **修复建议：** 在 Worker 写入一定数据后再激活竞争。
 
 ---
@@ -887,7 +918,7 @@
 | K-01 | Kotlin export 丢返回值 [✅ 已修复] | K-02 | runBlocking 嵌套 [✅ 已修复] |
 | D-01 | Python cksum break 丢记录 [✅ 已修复] | D-02 | Python 坏块 break 丢文件 [✅ 已修复] |
 | D-03 | GCM 失败策略不一致 [✅ 已修复] | F-10 | 缺少 50~100ms Debounce 聚集刷盘 [✅ 已修复] |
-| T-02~T-11 | 测试用例缺陷（详见第十一节） | — | — |
+| T-02~T-11 | 测试用例缺陷（详见第十一节）[✅ 已全部修复] | — | — |
 
 ### 🟡 P2 —— 质量 / 性能 / 可维护性
 

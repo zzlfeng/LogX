@@ -341,7 +341,11 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->key_user = cfg->user;
     inst->err_fn = cfg->err_fn;
     inst->err_user = cfg->err_user;
-    inst->pal = &default_pal();
+    // (T-04) 测试专用 PAL 注入 seam:必须在 Flusher 线程启动(thread_start)之前
+    // 定型 inst->pal,否则 Flusher 读 inst->pal 与测试写 inst->pal 构成数据竞争。
+    inst->pal = cfg->pal_override != nullptr
+        ? static_cast<Pal*>(cfg->pal_override)
+        : &default_pal();
     inst->mu = inst->pal->mutex_create();
     inst->flush_event = inst->pal->ev_create();
     if (inst->pal->threading_init() != 0) {

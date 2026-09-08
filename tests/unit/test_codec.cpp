@@ -218,8 +218,14 @@ TEST(CodecTest, GCMRoundTrip_PlainAndCipher) {
 }
 
 TEST(CodecTest, GCMRejectsWrongKey) {
-    uint8_t key1[32] = {1, 2, 3};
-    uint8_t key2[32] = {4, 5, 6};
+    // (T-09) 密钥取确定性伪随机完整 32B(与 NIST CAVS 风格对齐),
+    // 替换原 {1,2,3}/{4,5,6} 的 29B 全零稀疏密钥
+    auto key1_v = make_randomish(32);
+    auto key2_v = make_randomish(32);
+    // 保证两把密钥至少 1B 不同(极端情况下 LCG 首块相同则错开重生成)
+    if (key1_v == key2_v) { key2_v[0] ^= 0xFF; }
+    const uint8_t* key1 = key1_v.data();
+    const uint8_t* key2 = key2_v.data();
     uint8_t nonce[12] = {1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 1};
     auto plain = make_randomish(256);
 
@@ -237,7 +243,9 @@ TEST(CodecTest, GCMRejectsWrongKey) {
 }
 
 TEST(CodecTest, GCMRejectsCorruptTagAndCiphertext) {
-    uint8_t key[32] = {0xAA};
+    // (T-09) 同步补全为完整 32B 确定性密钥
+    auto key_v = make_randomish(32);
+    const uint8_t* key = key_v.data();
     uint8_t nonce[12] = {1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 2};
     auto plain = make_randomish(512);
 

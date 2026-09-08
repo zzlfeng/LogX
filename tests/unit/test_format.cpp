@@ -9,6 +9,7 @@
 //   - 撕裂记录 cksum 失败
 
 #include "logx_format.h"
+#include "logx_staging.h"  // (T-08) put_u16 / kMagicEntry
 #include <gtest/gtest.h>
 #include <cstring>
 #include <string>
@@ -124,12 +125,22 @@ TEST(Format, ParseSkipsPadAndReassembles) {
     uint8_t pad[106];
     uint32_t rp = format_pad(pad, 100);
     std::vector<uint8_t> concat;
-    // 首片:len=4, LG, flags=01, cksum("ABCD")=0x04
-    uint8_t first[10] = {4, 0, 0x4c, 0x47, 0x01, 0x04, 'A', 'B', 'C', 'D'};
+    // (T-08) 记录头经 put_u16 + kMagicEntry 常量构造,杜绝硬编码魔数
+    auto make_head = [](uint8_t* h, uint16_t len, uint8_t flags, uint8_t ck) {
+        put_u16(h, len);
+        put_u16(h + 2, kMagicEntry);
+        h[4] = flags; h[5] = ck;
+    };
+    // 首片:len=4, flags=01, cksum("ABCD")=0x04
+    uint8_t first[10];
+    make_head(first, 4, 0x01, 0x04);
+    first[6] = 'A'; first[7] = 'B'; first[8] = 'C'; first[9] = 'D';
     concat.insert(concat.end(), first, first + sizeof(first));
     concat.insert(concat.end(), pad, pad + rp);
-    // 末片:len=4, LG, flags=11, cksum("EFGH")=0x0c
-    uint8_t last[10] = {4, 0, 0x4c, 0x47, 0x03, 0x0c, 'E', 'F', 'G', 'H'};
+    // 末片:len=4, flags=11, cksum("EFGH")=0x0c
+    uint8_t last[10];
+    make_head(last, 4, 0x03, 0x0c);
+    last[6] = 'E'; last[7] = 'F'; last[8] = 'G'; last[9] = 'H';
     concat.insert(concat.end(), last, last + sizeof(last));
 
     std::vector<uint8_t> user;

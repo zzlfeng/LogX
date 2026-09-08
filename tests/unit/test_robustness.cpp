@@ -25,6 +25,9 @@
 #include <windows.h>
 #endif
 
+// (T-10) 原子自增目录序号:替代未播种 rand(),消除并行/重跑目录撞名
+static std::atomic<uint64_t> s_test_dir_seq{0};
+
 using namespace logx;
 
 namespace {
@@ -174,7 +177,7 @@ TEST(Robustness, ClockJump_DayRolloverAtMidnight) {
     MockClockPal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_clock_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -187,9 +190,8 @@ TEST(Robustness, ClockJump_DayRolloverAtMidnight) {
     cfg.max_log_length = 4096;
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    // 注入 mock PAL
-    static_cast<Instance*>(inst)->pal = &mock_pal;
 
     // 写入第一天的日志并刷盘
     ASSERT_EQ(logx_write(inst, 2, "TAG", (const uint8_t*)"log_at_235959", 13), LOGX_OK);
@@ -228,7 +230,7 @@ TEST(Robustness, ClockRollback_GracefullyHandledWithoutOverwrite) {
     MockClockPal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_rollback_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -241,8 +243,8 @@ TEST(Robustness, ClockRollback_GracefullyHandledWithoutOverwrite) {
     cfg.max_log_length = 4096;
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    static_cast<Instance*>(inst)->pal = &mock_pal;
 
     ASSERT_EQ(logx_write(inst, 2, "TAG", (const uint8_t*)"future_log", 10), LOGX_OK);
     ASSERT_EQ(logx_flush(inst), LOGX_OK);
@@ -261,6 +263,17 @@ TEST(Robustness, ClockRollback_GracefullyHandledWithoutOverwrite) {
     EXPECT_GT(mock_pal.file_size_path(f_rollback.c_str()), 32);
     // 验证未来文件完全未被覆盖破坏
     EXPECT_EQ(mock_pal.file_size_path(f_future.c_str()), fsz_future);
+
+    // (T-07) 补齐两项核心保证断言:
+    // 1. 回拨写入发生在回拨日期文件 (文件切换正确,而非误追加到未来文件)
+    // 2. 回拨后新文件的块 seqno 严格大于未来文件块 seqno (全局单调,不回退)
+    auto scan_future = scan_append_target(static_cast<Instance*>(inst), f_future);
+    auto scan_rollback = scan_append_target(static_cast<Instance*>(inst), f_rollback);
+    EXPECT_TRUE(scan_future.ok);
+    EXPECT_TRUE(scan_rollback.ok);
+    EXPECT_EQ(scan_future.seqno, 1u);       // 未来文件恰 1 块 (seqno=1)
+    EXPECT_EQ(scan_rollback.seqno, 2u);     // 回拨文件块 seqno=2 > 1,单调接管
+    EXPECT_FALSE(scan_rollback.truncated);  // 干净追加,无撕裂截断
 
     logx_close(inst);
 
@@ -389,7 +402,7 @@ TEST(Robustness, ShortWrite_RollsBackTornBytesAndEmitsEvent) {
     MockShortWritePal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_short_write_a_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -406,9 +419,10 @@ TEST(Robustness, ShortWrite_RollsBackTornBytesAndEmitsEvent) {
     };
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* internal_inst = static_cast<Instance*>(inst);
-    internal_inst->pal = &mock_pal;
+auto* internal_inst = static_cast<Instance*>(inst);
+
 
     // 1. 正常写入一条基准日志并落盘，生成有效文件头与第一个数据块
     ASSERT_EQ(logx_write(inst, 2, "INIT", (const uint8_t*)"initial_payload", 15), LOGX_OK);
@@ -468,7 +482,7 @@ TEST(Robustness, ShortWrite_TransientFailureAllowsSubsequentBlocksToResumeCleanl
     MockShortWritePal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_short_write_b_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -478,9 +492,10 @@ TEST(Robustness, ShortWrite_TransientFailureAllowsSubsequentBlocksToResumeCleanl
     cfg.max_log_length = 4096;
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* internal_inst = static_cast<Instance*>(inst);
-    internal_inst->pal = &mock_pal;
+auto* internal_inst = static_cast<Instance*>(inst);
+
 
     // 1. 写入一条基准日志并落盘
     ASSERT_EQ(logx_write(inst, 2, "BASE", (const uint8_t*)"base_block_data", 15), LOGX_OK);
@@ -560,7 +575,7 @@ TEST(Robustness, ShortWrite_MidStreamEnospcTruncatesTornTail) {
     MockShortWritePal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_short_write_c_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -570,9 +585,10 @@ TEST(Robustness, ShortWrite_MidStreamEnospcTruncatesTornTail) {
     cfg.max_log_length = 4096;
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* internal_inst = static_cast<Instance*>(inst);
-    internal_inst->pal = &mock_pal;
+auto* internal_inst = static_cast<Instance*>(inst);
+
 
     // 1. 基准写入一条日志并落盘
     ASSERT_EQ(logx_write(inst, 2, "BASE", (const uint8_t*)"base_data_for_c", 15), LOGX_OK);
@@ -750,7 +766,7 @@ TEST(Robustness, Persistence_FlushTriggersFileAndStagingFsync) {
     MockFsyncPal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_fsync_flush_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -760,9 +776,10 @@ TEST(Robustness, Persistence_FlushTriggersFileAndStagingFsync) {
     cfg.max_log_length = 4096;
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* internal_inst = static_cast<Instance*>(inst);
-    internal_inst->pal = &mock_pal;
+auto* internal_inst = static_cast<Instance*>(inst);
+
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
     }
@@ -794,7 +811,7 @@ TEST(Robustness, Persistence_DurabilitySyncDirectAndGraceful) {
     MockFsyncPal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_durability_direct_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -804,9 +821,10 @@ TEST(Robustness, Persistence_DurabilitySyncDirectAndGraceful) {
     cfg.max_log_length = 4096;
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* internal_inst = static_cast<Instance*>(inst);
-    internal_inst->pal = &mock_pal;
+auto* internal_inst = static_cast<Instance*>(inst);
+
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
     }
@@ -848,7 +866,7 @@ TEST(Robustness, Persistence_NewFileTriggersParentDirFsync) {
     MockFsyncPal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_fsync_dir_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -858,9 +876,10 @@ TEST(Robustness, Persistence_NewFileTriggersParentDirFsync) {
     cfg.max_log_length = 4096;
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* internal_inst = static_cast<Instance*>(inst);
-    internal_inst->pal = &mock_pal;
+auto* internal_inst = static_cast<Instance*>(inst);
+
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
     }
@@ -903,7 +922,7 @@ TEST(Robustness, Persistence_CloseTriggersFinalSync) {
     MockFsyncPal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_fsync_close_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -913,9 +932,10 @@ TEST(Robustness, Persistence_CloseTriggersFinalSync) {
     cfg.max_log_length = 4096;
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* internal_inst = static_cast<Instance*>(inst);
-    internal_inst->pal = &mock_pal;
+auto* internal_inst = static_cast<Instance*>(inst);
+
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
     }
@@ -945,7 +965,7 @@ TEST(Robustness, Persistence_FsyncFailureEmitsEventWithoutBlocking) {
     MockFsyncPal mock_pal(&default_pal());
     std::string dir = std::string("logx_test_fsync_fail_") +
                       std::to_string(mock_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     mock_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -962,9 +982,10 @@ TEST(Robustness, Persistence_FsyncFailureEmitsEventWithoutBlocking) {
     };
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* internal_inst = static_cast<Instance*>(inst);
-    internal_inst->pal = &mock_pal;
+auto* internal_inst = static_cast<Instance*>(inst);
+
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
     }
@@ -1049,7 +1070,7 @@ TEST(Robustness, Win64HandleTruncation_PalMmapAndThreadHandle64BitSafe) {
     // 4. Staging 多轮 Open -> Sync -> Close -> Reopen 生命周期循环 (验证 mapping HANDLE 正确关闭)
     std::string dir = std::string("logx_test_p01_mmap_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging_path = dir + "/staging.mmap";
 
@@ -1147,7 +1168,7 @@ TEST(PalRobustness, RandomBytesFailure_RefusesNewFileCreation) {
 
     std::string dir = std::string("logx_test_rand_fail_") +
                       std::to_string(real_pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     real_pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -1170,9 +1191,8 @@ TEST(PalRobustness, RandomBytesFailure_RefusesNewFileCreation) {
     cfg.err_user = &arg_pair;
 
     logx_instance_t* inst = nullptr;
+    cfg.pal_override = &failing_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    // 注入 failing_pal
-    static_cast<Instance*>(inst)->pal = &failing_pal;
 
     // 写入日志: 正常入 staging
     const char* line = "test log while secure random unavailable";
@@ -1208,7 +1228,7 @@ TEST(PalRobustness, RandomBytesSuccess_ProducesNonTrivialSalt) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_rand_succ_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -1275,7 +1295,7 @@ TEST(Robustness, ErrorHandler_ConcurrentReregistrationNoRace) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_e01_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -1331,7 +1351,7 @@ TEST(Robustness, WriteInvalidLevel_ClassifiedAsInvalidArg) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_e02_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -1378,7 +1398,7 @@ TEST(Robustness, ExportErrorPropagation_WriteFailAndCallbackFail) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_e03_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -1456,8 +1476,8 @@ TEST(Robustness, ExportErrorPropagation_WriteFailAndCallbackFail) {
         cfg.staging_path = st_path.c_str();
         cfg.max_log_length = 4096;
         logx_instance_t* inst = nullptr;
+        cfg.pal_override = &mock;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
         ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-        static_cast<Instance*>(inst)->pal = &mock;
 
         ASSERT_EQ(logx_write(inst, 2, "E03", (const uint8_t*)"export_err", 10), LOGX_OK);
         ASSERT_EQ(logx_flush(inst), LOGX_OK);
@@ -1513,7 +1533,7 @@ TEST(Robustness, ExportTmpPath_UniquePerCallAndCleaned) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_e04_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -1579,7 +1599,7 @@ TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_e06_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 
@@ -1642,9 +1662,10 @@ TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
         cfg.max_log_length = 4096;
         cfg.flush_threshold = 0;   // E-06: 显式禁用,不再被静默替换为 8KB
         logx_instance_t* inst = nullptr;
+        cfg.pal_override = &mock;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
         ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
         auto* ii = static_cast<Instance*>(inst);
-        ii->pal = &mock;  // 注入计数装饰器(logx_open 之后替换,仅影响写入路径 signal 计数)
+        (void)ii;
         EXPECT_EQ(ii->flush_threshold, 0u);
 
         // 确定性断言:阈值 0 下写入路径不触发任何 ev_signal(语义反转回归:
@@ -1663,7 +1684,6 @@ TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
         EXPECT_GE(mock.ev_signal_count_.load(), before + 1);
         EXPECT_GT(ii->flushed_bytes_total.load(), 0u);
 
-        ii->pal = &pal;  // 恢复真实 PAL 再关闭
         logx_close(inst);
     }
 
@@ -1677,9 +1697,10 @@ TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
         cfg.max_log_length = 4096;
         cfg.flush_threshold = UINT32_MAX;   // E-06: 显式默认哨兵
         logx_instance_t* inst = nullptr;
+        cfg.pal_override = &mock;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
         ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
         auto* ii = static_cast<Instance*>(inst);
-        ii->pal = &mock;
+        (void)ii;
         EXPECT_EQ(ii->flush_threshold, 8u * 1024);
 
         // 默认阈值 8KB:小写入 pending < 8KB 不应唤醒 → 零 signal
@@ -1699,15 +1720,15 @@ TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
         cfg.max_log_length = 4096;
         cfg.flush_threshold = 1;   // 任意写入都会 pending >= 1
         logx_instance_t* inst = nullptr;
+        cfg.pal_override = &mock;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
         ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
         auto* ii = static_cast<Instance*>(inst);
-        ii->pal = &mock;
+        (void)ii;
 
         int before = mock.ev_signal_count_.load();
         ASSERT_EQ(logx_write(inst, 2, "E06", (const uint8_t*)"x", 1), LOGX_OK);
         EXPECT_EQ(mock.ev_signal_count_.load(), before + 1);  // 自动唤醒生效
 
-        ii->pal = &pal;
         logx_close(inst);
     }
 
@@ -1722,7 +1743,7 @@ TEST(Robustness, StatsReservedZeroContract) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_e07_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_test_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string st_path = dir + "/staging.mmap";
 

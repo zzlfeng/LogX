@@ -24,14 +24,17 @@
 #include "logx_format.h"
 #include "logx_pal.h"
 #include "logx_staging.h"
+#include "logx_internal.h"  // (T-11) Instance 完整定义(staged_bytes_total)
 
 using namespace logx;
 
 TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
     Pal& pal = default_pal();
+    // (T-10) 原子自增替代未播种 rand():消除 CI 重跑/上轮残留目录撞名风险
+    static std::atomic<uint64_t> s_dir_seq{0};
     std::string dir = std::string("logx_stress_dir_") +
                       std::to_string(pal.pid()) + "_" +
-                      std::to_string(rand());
+                      std::to_string(s_dir_seq.fetch_add(1));
     pal.file_mkdirs(dir.c_str());
     std::string staging_file = dir + "/staging.mmap";
 
@@ -60,7 +63,8 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
 
-    std::atomic<bool> start_gun{false};
+    std::atomic<bool> pre_gun{false};    // (T-11) 第一阶段:允许 Worker 预热写
+    std::atomic<bool> start_gun{false};  // 第二阶段:预热达标后激活竞争 flush
     std::atomic<bool> stop_competitor{false};
     std::atomic<uint64_t> total_written{0};
     std::vector<std::thread> workers;
@@ -70,24 +74,16 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
 
     // 1. 启动 50 个 Worker 写线程
     for (int tid = 0; tid < kWorkerCount; ++tid) {
-        workers.emplace_back([&inst, &start_gun, &total_written, &written_table, tid, kLogsPerWorker]() {
-            // 等待发令枪响
-            while (!start_gun.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-
+        workers.emplace_back([&inst, &pre_gun, &start_gun, &total_written, &written_table, tid, kLogsPerWorker]() {
             char tag_buf[32];
             std::snprintf(tag_buf, sizeof(tag_buf), "Wk_%02d", tid);
 
-            for (int i = 0; i < kLogsPerWorker; ++i) {
-                // 变长日志负载: 80B ~ 1500B
+            // 单条写入(带 NO_SPACE 重试);warmup=true 时成功也计入对账表
+            auto write_one = [&](int i) {
                 int mode = (i + tid) % 20;
                 uint32_t payload_len = 80 + static_cast<uint32_t>((i * 17 + tid * 13) % 200);
-                if (mode == 18) {
-                    payload_len = 800;
-                } else if (mode == 19) {
-                    payload_len = 1500;
-                }
+                if (mode == 18) payload_len = 800;
+                else if (mode == 19) payload_len = 1500;
 
                 std::string msg;
                 msg.reserve(payload_len);
@@ -97,7 +93,6 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
                 if (msg.size() < payload_len) {
                     msg.append(payload_len - msg.size(), 'x');
                 }
-
                 logx_status_e rc = LOGX_ERR_NO_SPACE;
                 for (int retry = 0; retry < 50; ++retry) {
                     rc = logx_write(inst, 2, tag_buf,
@@ -110,6 +105,25 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
                     }
                     std::this_thread::yield();
                 }
+            };
+
+            // (T-11) 两阶段起跑:先等 pre_gun 预热写满 staging,
+            // 竞争线程只被 start_gun 放行 —— 竞争窗口无空转
+            while (!pre_gun.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            // 预热阶段:每线程先写 kWarmupPerWorker 条,50×8 条 ≈ 90KB > 16KB 阈值
+            constexpr int kWarmupPerWorker = 8;
+            for (int i = 0; i < kWarmupPerWorker; ++i) {
+                write_one(i);
+            }
+            // 等待竞争发令枪:主线程确认 staging 已有数据后鸣枪
+            while (!start_gun.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+
+            for (int i = kWarmupPerWorker; i < kLogsPerWorker; ++i) {
+                write_one(i);
             }
         });
     }
@@ -124,6 +138,13 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
             logx_flush(inst);
         }
     });
+
+    // 2.5 (T-11) 放行预热写,主线程等待 staging 积累真实数据后再激活竞争,
+    // 消除"竞争线程起跑后前 15ms staging 尚无数据"的空跑窗口
+    pre_gun.store(true, std::memory_order_release);
+    while (inst->staged_bytes_total.load(std::memory_order_acquire) < 16 * 1024) {
+        std::this_thread::yield();
+    }
 
     // 3. 鸣枪起跑!
     auto t_start = std::chrono::steady_clock::now();
@@ -252,6 +273,9 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
         }
     }
     std::cout << "  - Missing records found: " << missing_count << std::endl;
+    // (T-06) 显式断言:逐条对账不允许任何"已写入但导出缺失"的记录
+    // (纯总数对账无法捕捉"等量丢失+等量重复"逃逸,此处为逐条精确对账)
+    EXPECT_EQ(missing_count, 0);
 
     std::cout << "  - Verified Blocks: " << total_blocks_verified
               << ", Monotonic Seqno reached: " << (expected_next_seqno - 1)

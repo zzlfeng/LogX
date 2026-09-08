@@ -80,6 +80,12 @@ typedef struct logx_config {
     /* 错误回调(可选);若提供,启动恢复阶段事件亦会通知 */
     logx_error_fn err_fn;
     void* err_user;              /* 透传给 err_fn */
+
+    /* (T-04) 测试专用 PAL 注入 seam;生产代码必须传 NULL。
+     * logx_open 在启动 Flusher 线程之前把它赋给 inst->pal,
+     * 从根源消除"先 open 后改 inst->pal"造成的 Flusher 读 / 测试写数据竞争。
+     * 非 NULL 时要求 Pal 对象存活期覆盖整个实例生命周期。 */
+    void* pal_override;          /* 实际类型 logx::Pal*;仅测试构建使用 */
 } logx_config_t;
 
 #ifdef __cplusplus
