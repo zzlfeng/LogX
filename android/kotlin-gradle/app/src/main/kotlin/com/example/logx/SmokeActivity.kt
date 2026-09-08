@@ -28,9 +28,9 @@ class SmokeActivity : Activity() {
         setContentView(root)
 
         try {
-            // 接入步骤 ①: 显式加载 native 库(LogX.kt 不自动 loadLibrary)
-            System.loadLibrary("logx")
-            report("loadLibrary(logx) OK")
+            // 接入步骤 ①: native 库由 LogX 内部自动加载托管 (亦支持显式调用 LogX.loadLibrary())
+            LogX.loadLibrary()
+            report("LogX.loadLibrary() OK")
 
             val filesDir = getFilesDir()
             val logDir = File(filesDir, "logs")
@@ -47,7 +47,7 @@ class SmokeActivity : Activity() {
             ))
             report("init OK (compress=ZSTD, consoleEcho=true)")
 
-            // 接入步骤 ③: 写入 —— 每条应同步镜像到 logcat (tag=LogX)
+            // 接入步骤 ③: 写入 —— 每条应同步镜像到 logcat (tag=SmokeTag, 保留业务 tag)
             LogX.i("SmokeTag", "echo 中文测试 line-1")
             LogX.w("SmokeTag", "echo ASCII warning line-2")
             LogX.e("SmokeTag", "echo 混合 mixed 中文/English line-3")

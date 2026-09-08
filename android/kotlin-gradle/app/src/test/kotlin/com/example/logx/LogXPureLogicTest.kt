@@ -9,6 +9,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -141,5 +142,13 @@ class LogXPureLogicTest {
         assertTrue(cfg.consoleEcho)
         LogX.i("T5.4", "pre-init echo-enabled write should be dropped silently")
         assertEquals(0L, LogX.nativeHandleForTest())
+    }
+
+    // ---- 动态库加载能力: 暴露 loadLibrary 方法且在无对应 so 时抛出预期异常 ----
+    @Test
+    fun loadLibrary_throwsOnInvalidLibInJvm() {
+        assertThrows(UnsatisfiedLinkError::class.java) {
+            LogX.loadLibrary("non_existent_lib_for_test")
+        }
     }
 }

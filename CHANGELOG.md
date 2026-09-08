@@ -882,6 +882,13 @@ cmake --build build-android -j
   SMOKE PASS**(adb install 需设备端确认,首次被 INSTALL_FAILED_USER_RESTRICTED
   拦截,唤醒屏幕后重装成功)。
 
+### 审查加固 (2026-09-09)
+
+- **Tag 动态透传**: `console_echo` 改为动态透传业务 Tag（空 Tag 兜底 `LogX`），彻底解决控制台按 Tag 过滤问题，并去除多层宏和冗余 switch-case；
+- **JNI 临界区安全保障**: `nativeWrite` 在 Critical 保护期内仅做快速栈缓冲内存拷贝，拷贝完成后立即释放 `ReleasePrimitiveArrayCritical`，在临界区外执行 `__android_log_print`，彻底规避 GC 阻塞风险；
+- **LogX 自动加载动态库**: `LogX.kt` 内置静态 `init` 尝试 `System.loadLibrary("logx")`（JVM 单测捕获防御），并在 `init` 中兜底重试；对外暴露 `LogX.loadLibrary()` 支持自定义加载；
+- **自动化单测扩充**: Gradle 纯逻辑单测扩充至 **10/10 全绿**（补充动态库加载行为断言）。
+
 ### 范围与边界
 
 - 桌面 C++ 使用者不受影响(echo 是 JNI 交付层能力);C ABI/核心零改动,

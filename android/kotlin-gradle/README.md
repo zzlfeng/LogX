@@ -5,7 +5,7 @@
 
 > **T5.4 (2026-09-09) 起双用途**: 编译验证 + 最小真机 smoke。
 > `SmokeActivity`(launcher)驱动 `consoleEcho=true` 全链路 ——
-> `System.loadLibrary("logx")` → init(ZSTD) → 写 6 条中英文记录 →
+> LogX 自动 loadLibrary("logx") → init(ZSTD) → 写 6 条中英文记录 →
 > `adb logcat` 断言 echo 行。预编译 so 由 `build-android/` 拷入
 > `app/src/main/jniLibs/arm64-v8a/`(strip 后,含 libc++_shared)。
 

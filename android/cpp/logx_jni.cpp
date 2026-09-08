@@ -22,12 +22,6 @@
 #include <vector>
 
 #define LOGX_TAG "LogX"
-#define LOGX_LOGV(...) __android_log_print(ANDROID_LOG_VERBOSE, LOGX_TAG, "%s", __VA_ARGS__)
-#define LOGX_LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOGX_TAG, "%s", __VA_ARGS__)
-#define LOGX_LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOGX_TAG, "%s", __VA_ARGS__)
-#define LOGX_LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOGX_TAG, "%s", __VA_ARGS__)
-#define LOGX_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOGX_TAG, "%s", __VA_ARGS__)
-#define LOGX_LOGF(...) __android_log_print(ANDROID_LOG_FATAL, LOGX_TAG, "%s", __VA_ARGS__)
 
 namespace {
 
@@ -48,27 +42,19 @@ inline int logx_level_to_priority(int level) {
     }
 }
 
-// T5.4: echo 一条已成功落盘的记录到 logcat。独立栈缓冲截断 + NUL 结尾,
-// 防超长 payload / 非法 UTF-8 破坏 logcat(__android_log_print 以 %s 输出,
-// 单行超 ~4KB 由 logcat 系统侧截断,此处栈缓冲为本地硬上限)。
+// T5.4: echo 一条已成功落盘的记录到 logcat。
 // 镜像语义: 仅 nativeWrite 返回 OK 后调用 —— logcat 与日志文件一一对应;
 // 丢弃/降级仍走 ErrorHandler 事件通道,不在 echo 里重复。
-void console_echo(int level, const char* tag, const uint8_t* payload, uint32_t len) {
-    char msg_buf[2048];
-    uint32_t copy = len < (sizeof(msg_buf) - 1) ? len : (sizeof(msg_buf) - 1);
-    if (copy && payload) {
-        std::memcpy(msg_buf, payload, copy);
-    }
-    msg_buf[copy] = '\0';
+// 修复保障:
+// 1) [Tag 修复]: 优先使用调用方传递的业务 tag,为空时回退为 LOGX_TAG,
+//    确保 Android 开发者可按 Tag 过滤 logcat;
+// 2) [JNI 临界区安全]: 必须在 ReleasePrimitiveArrayCritical 之后调用,
+//    绝不持有 Critical 进行 IPC 系统调用,防止拖慢 JVM GC 或引发死锁;
+// 3) [格式串安全]: 统一使用 "%s" 格式化输出,防 payload 包含 % 字符导致崩溃。
+void console_echo(int level, const char* tag, const char* msg) {
     const int priority = logx_level_to_priority(level);
-    switch (priority) {
-        case ANDROID_LOG_VERBOSE: LOGX_LOGV(msg_buf); break;
-        case ANDROID_LOG_DEBUG:   LOGX_LOGD(msg_buf); break;
-        case ANDROID_LOG_INFO:    LOGX_LOGI(msg_buf); break;
-        case ANDROID_LOG_WARN:    LOGX_LOGW(msg_buf); break;
-        case ANDROID_LOG_ERROR:   LOGX_LOGE(msg_buf); break;
-        default:                  LOGX_LOGF(msg_buf); break;
-    }
+    const char* log_tag = (tag && tag[0] != '\0') ? tag : LOGX_TAG;
+    __android_log_print(priority, log_tag, "%s", msg ? msg : "");
 }
 
 struct JniKeyProviderContext {
@@ -363,14 +349,30 @@ Java_com_example_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
 
     // T5.4: consoleEcho —— 仅镜像成功落盘的记录(logcat 与文件一一对应);
     // 丢弃(NO_SPACE/TOO_LARGE)不 echo,由 ErrorHandler.DROP 事件通道上报。
-    // 必须在 Critical/UTFChars 释放之前同步完成栈缓冲拷贝(释放后指针失效)。
-    if (wrc == LOGX_OK && g_console_echo.load(std::memory_order_relaxed)) {
-        console_echo(level, tag_ptr, payload_ptr, static_cast<uint32_t>(n));
+    // [JNI 临界区安全]: 在 Critical 保护期内仅完成栈缓冲内存拷贝,
+    // 拷贝后立即释放 Critical 解除 GC 阻塞,绝不在持有 Critical 时执行 logcat IPC。
+    char echo_buf[2048];
+    bool need_echo = (wrc == LOGX_OK && g_console_echo.load(std::memory_order_relaxed));
+    if (need_echo) {
+        uint32_t copy = (n > 0 && payload_ptr)
+            ? (static_cast<uint32_t>(n) < (sizeof(echo_buf) - 1) ? static_cast<uint32_t>(n) : static_cast<uint32_t>(sizeof(echo_buf) - 1))
+            : 0;
+        if (copy > 0) {
+            std::memcpy(echo_buf, payload_ptr, copy);
+        }
+        echo_buf[copy] = '\0';
     }
 
     if (payload_ptr) {
         env->ReleasePrimitiveArrayCritical(jPayload, const_cast<uint8_t*>(payload_ptr), JNI_ABORT);
     }
+
+    // [Tag 修复 & 临界区外调用]: 在释放 Critical 之后调用 console_echo,
+    // 传入业务指定的 tag_ptr (tag_ptr 此时仍有效, 在下方释放)。
+    if (need_echo) {
+        console_echo(level, tag_ptr, echo_buf);
+    }
+
     if (tag_ptr != tag_buf) {
         env->ReleaseStringUTFChars(jTag, tag_ptr);
     }

@@ -73,9 +73,9 @@ object LogX {
         val errorHandler: ErrorHandler? = null,
         val autoProcessIsolation: Boolean = true, // 默认开启多进程目录防呆隔离
         // T5.4: logcat 直通 —— 开启后每条成功落盘的记录同步镜像到 logcat
-        // (tag=LogX,优先级按 Level 映射;单条 >2KB 在 native 侧截断,logcat
-        // 单行 ~4KB 截断为系统行为)。仅限 debug 期使用: 明文进 logcat 有泄露面
-        // (adb 任意可读),生产保持默认关闭。丢弃记录不镜像(走 ErrorHandler.DROP)。
+        // (保留调用方 tag、空 tag 回退 LogX, 优先级按 Level 映射; 单条 >2KB 在 native 侧截断,
+        // logcat 单行 ~4KB 截断为系统行为)。仅限 debug 期使用: 明文进 logcat 有泄露面
+        // (adb 任意可读), 生产保持默认关闭。丢弃记录不镜像(走 ErrorHandler.DROP)。
         val consoleEcho: Boolean = false,
     )
 
@@ -83,6 +83,26 @@ object LogX {
     @Volatile private var errorHandler: ErrorHandler? = null
     @Volatile private var isClosed: Boolean = false
     private val initCount = AtomicLong(0)
+    @Volatile private var isLibraryLoaded: Boolean = false
+
+    init {
+        try {
+            System.loadLibrary("logx")
+            isLibraryLoaded = true
+        } catch (ignored: UnsatisfiedLinkError) {
+            // 允许 JVM 单元测试等无 native 库环境加载此类; Android 运行时在 init() 时按需加载/抛出
+        }
+    }
+
+    /**
+     * 加载 native 动态库。
+     * 默认情况下无需手动调用 (LogX 类加载及 init 时会自动尝试加载 "logx")。
+     * 若使用 ReLinker 或自定义 so 名称，可在调用 init 之前主动调用此方法。
+     */
+    fun loadLibrary(libName: String = "logx") {
+        System.loadLibrary(libName)
+        isLibraryLoaded = true
+    }
 
     /** [LogXPureLogicTest] 等白盒单测专用:只读暴露句柄,生产代码禁止使用。 */
     internal fun nativeHandleForTest(): Long = nativeHandle
@@ -98,6 +118,11 @@ object LogX {
         // 回滚单例状态 —— 否则 errorHandler 持有的业务回调对象因单例引用无法
         // 及时 GC;initCount 归零允许业务修正配置后重试 init。
         try {
+            if (!isLibraryLoaded) {
+                System.loadLibrary("logx")
+                isLibraryLoaded = true
+            }
+
             if (config.errorHandler != null) {
                 errorHandler = config.errorHandler
             }
