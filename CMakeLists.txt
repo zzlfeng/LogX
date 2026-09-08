@@ -18,6 +18,7 @@ endif()
 
 option(LOGX_BUILD_TESTS "Build unit tests" ON)
 option(LOGX_BUILD_STRESS "Build stress tests" ON)
+option(LOGX_BUILD_BENCH "Build performance benchmark (logx_bench, not a ctest)" OFF)
 option(LOGX_WITH_ZSTD   "Link real zstd (vendored third_party/zstd)" OFF)
 option(LOGX_WITH_AESGCM "Link real AES-GCM (mbedtls)" OFF)
 
@@ -31,6 +32,10 @@ endif()
 if(LOGX_BUILD_STRESS)
     enable_testing()
     add_subdirectory(tests/stress)
+endif()
+
+if(LOGX_BUILD_BENCH)
+    add_subdirectory(tests/bench)
 endif()
 
 # NDK/Android 交叉编译时:把 JNI 胶水层编进 liblogx.so。

@@ -145,5 +145,5 @@ lifecycleScope.launch(Dispatchers.IO) {
   与 `allowBackup="false"` 最严备选方案。
 - ~~Kotlin Facade Gradle 自动化编译工程接入~~ (2026-09-08 已建成 `android/kotlin-gradle/`,见下文验证闭环)
 - ~~离线解码器用实际引擎真机产出日志做最终联调~~ (2026-09-08 真机联调通过, 104/104 精确对账,见下文验证闭环)
-- 性能基线测试与报告输出 (P99 延迟、压缩比、so 二进制体积) (T5.2)
+- ✅ **性能基线测试与报告输出 (T5.2, 2026-09-08)**: 新增 `tests/bench/logx_bench.cpp` 基准 harness (`-DLOGX_BUILD_BENCH=ON`) 与 [docs/benchmark_report.md](docs/benchmark_report.md)。双端实测 (Windows x64 + Redmi K30 Pro): 写入延迟桌面 P50 0.2µs / P99 3.1µs (纯路径口径), 真机 P50 3.2µs; 压缩开关对写路径零影响; zstd 落盘体积 -38% (1.52x); so 体积 (arm64 strip, MinSizeRel 全开) 548.9KB。含 v1.0 回归基线声明与 2µs/500KB 目标判定。
 - 接入指南与离线解码运维手册 (T5.3)

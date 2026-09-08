@@ -799,7 +799,52 @@ cmake --build build-android -j
 
 ---
 
-## 附:构建命令速查
+## T5.2 性能基线测试与报告输出 (2026-09-08)
+
+对应计划表 M5 阶段 T5.2。终结"性能验收无任何实测数据"的历史缺口(M1 验收 2µs、
+30w+ logs/s 此前均为无 harness 支撑的量级声明)。
+
+### 基准 harness (`tests/bench/logx_bench.cpp` + `tests/bench/CMakeLists.txt`)
+
+- 独立 main() 非 gtest,`option(LOGX_BUILD_BENCH, OFF)` 开关,不注册 ctest,
+  对既有测试矩阵零影响;桌面 Linux/Android 经 `find_package(Threads)` 链接;
+- **阶段 A 单条写入延迟**: 单线程热路径逐条 steady_clock 计时,近秩百分位
+  P50/P90/P99/P99.9/max;生产口径(8KB 阈值)与纯路径口径(flush_threshold=0)
+  双口径;none/zstd 各一轮(压缩在 Flusher 线程,预期并实证热路径零影响);
+- **阶段 B 吞吐与落盘体积**: 混合变长 payload(80~1536B,80% 中文文本+20% 伪随机),
+  同一二进制按运行期 `compress_algo` 分轮对比;NO_SPACE 有界重试(自旋为主)
+  度量可持续不丢吞吐,数据丢失判定为"重试耗尽仍失败";
+- **阶段 C flush 阻塞耗时**: 每轮 100 条后阻塞 flush 300 轮分布;
+- **失真护栏**: 全程校验 drop/丢失/IO 错误计数,非零即宣告该轮 INVALID 不纳入
+  结论;输出目录 run_N 唯一化防历史污染;测后即清日志文件压缩磁盘占用。
+
+### 实测结果 (双端全部轮次 0 丢弃 0 丢失)
+
+| 指标 | Windows x64 (MSVC Release) | Redmi K30 Pro (骁龙 865, NDK) |
+|---|---|---|
+| 写入 P50 / P99 (纯路径) | 0.2µs / 3.1µs | 3.2µs / 12.2µs |
+| 写入 P50 / P99 (生产 8KB 阈值) | 0.4µs / 5.3µs | 3.4µs / 41~86µs |
+| 压缩开关对写路径影响 | 零(P50 逐位一致) | 零 |
+| zstd 落盘体积 | -38% (1.52x vs 0.95x) | -38% (1.52x) |
+| 可持续吞吐 none / zstd | 26.7 万 / 19.4 万 logs/s | 3.7 万 / 5.5 万 logs/s (zstd 反超 +48%) |
+| flush P99 | 17.0ms | 9.4ms |
+| so 体积 (arm64 strip, MinSizeRel 全开) | — | 548.9KB(未 strip 4.76MB) |
+
+### 目标判定 (详见 docs/benchmark_report.md)
+
+- **P99 < 2µs**: 确定性热路径段达成(桌面 P50 0.2µs,低一个数量级);整调用
+  严格口径未达,归因计时器开销(真机 0.4µs/条)、8KB 阈值唤醒成本(+68% P99)
+  与调度尾部;报告给出 v1.0 回归基线建议口径;
+- **so < 500KB**: 未达(548.9KB,超 10%);体积构成分析: zstd 贡献 ~426KB(77%),
+  裸核心仅 121KB,mbedtls 12KB;建议接受为 v1.0 基线,zstd 源码裁剪列为可选优化。
+
+### 附带
+
+- 体积构成经 4 组变体构建实测(双 OFF / 仅 zstd / 仅 AES-GCM / 全开);
+- 阶段 A 迭代中由护栏拦截两类方法论失真(周期 flush 间隔超环容量致 NO_SPACE、
+  Windows ~15ms 休眠粒度扼杀持续吞吐),最终节拍与重试策略经护栏验证有效。
+
+---
 
 ### Windows(桌面,MSVC)
 

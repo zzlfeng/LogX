@@ -1,0 +1,66 @@
+LogX 性能基线基准 (T5.2)  stage_a_n=100000 stage_b_m=100000
+计时器开销: 单次 steady_clock::now() 均值 ~= 16 ns (sink=10156233054475337240 防优化消除)
+输出目录: ./bench_out_win/run_4
+
+==== Stage A: 单条写入延迟分布 (单线程热路径, payload=200B, N=100000, 突发256条后flush清空) ====
+
+-- compress=none  thr=8KB(生产默认) --
+  聚合吞吐: 13481 logs/s (含每256条阻塞 flush 与其计时,仅供量级参考)
+  logx_write 延迟 (n=100000):
+    mean  =       673 ns (   0.673 us)
+    P50   =       400 ns (   0.400 us)
+    P90   =       700 ns (   0.700 us)
+    P99   =      5200 ns (   5.200 us)
+    P99.9 =     27100 ns (  27.100 us)
+    max   =    598700 ns ( 598.700 us)
+
+-- compress=zstd  thr=8KB(生产默认) --
+  聚合吞吐: 13788 logs/s (含每256条阻塞 flush 与其计时,仅供量级参考)
+  logx_write 延迟 (n=100000):
+    mean  =       674 ns (   0.674 us)
+    P50   =       400 ns (   0.400 us)
+    P90   =       700 ns (   0.700 us)
+    P99   =      5300 ns (   5.300 us)
+    P99.9 =     26400 ns (  26.400 us)
+    max   =    234600 ns ( 234.600 us)
+
+-- compress=none  thr=0(纯路径) --
+  聚合吞吐: 16474 logs/s (含每256条阻塞 flush 与其计时,仅供量级参考)
+  logx_write 延迟 (n=100000):
+    mean  =       365 ns (   0.365 us)
+    P50   =       200 ns (   0.200 us)
+    P90   =       300 ns (   0.300 us)
+    P99   =      3100 ns (   3.100 us)
+    P99.9 =     23100 ns (  23.100 us)
+    max   =     98200 ns (  98.200 us)
+
+-- compress=zstd  thr=0(纯路径) --
+  聚合吞吐: 16497 logs/s (含每256条阻塞 flush 与其计时,仅供量级参考)
+  logx_write 延迟 (n=100000):
+    mean  =       374 ns (   0.375 us)
+    P50   =       200 ns (   0.200 us)
+    P90   =       300 ns (   0.300 us)
+    P99   =      3200 ns (   3.200 us)
+    P99.9 =     24400 ns (  24.400 us)
+    max   =    169200 ns ( 169.200 us)
+
+==== Stage B: 纯写吞吐与落盘体积 (混合变长 80~1536B, 80%文本+20%伪随机, M=100000, NO_SPACE 有界重试) ====
+
+-- compress=none --
+  纯写吞吐: 267047 logs/s, 205.9 MB/s (payload 80831680 B / 0.374 s, NO_SPACE 重试 5562 次)
+  落盘体积: 85325664 B (含块头/CRC), payload/落盘压缩比 = 0.95x
+
+-- compress=zstd --
+  纯写吞吐: 194240 logs/s, 149.7 MB/s (payload 80831680 B / 0.515 s, NO_SPACE 重试 5722 次)
+  落盘体积: 53128640 B (含块头/CRC), payload/落盘压缩比 = 1.52x
+
+==== Stage C: logx_flush 阻塞耗时 (每轮写 100 条 ~200B 后 flush, 模拟退后台) ====
+  logx_flush 耗时 (n=300):
+    mean  =  15495965 ns (15495.965 us)
+    P50   =  15489500 ns (15489.500 us)
+    P90   =  16226500 ns (16226.500 us)
+    P99   =  16964900 ns (16964.900 us)
+    P99.9 =  17213600 ns (17213.600 us)
+    max   =  17213600 ns (17213.600 us)
+
+==== 基准完成 ====
