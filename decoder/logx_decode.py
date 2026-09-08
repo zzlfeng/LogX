@@ -8,6 +8,21 @@
   - 把"内部用户载荷"还原为可读行(ts/pid/tid/level/tag/msg)
   - 跳过块内 LGXP PAD 与块尾 <6B 零残留(spec §3.1/§3.2)
 
+错误处理策略(D-01~D-03,与 C++ 导出路径 decode_one_file /
+parse_records_stream 现行语义对齐):
+  - 块头结构损坏(bad magic / 版本 / 保留位 / seqno 回退 / 长度越界 / 截断):
+    终止该文件扫描 —— 块边界自描述于块头,结构损坏后无法定位下一块,
+    盲目继续会以错误 block_size 滑动导致整文件错位(对齐 C++ F-05
+    block_header_plausible:宁丢不脏);
+  - 块级解码失败(payload CRC / GCM / 解压 / 缺 key):输出与 C++ 导出一致的
+    占位行 "[seq=N crc fail]" / "[seq=N decode fail]" 后跳过该块继续扫描,
+    绝不截断文件后半部分(对齐 C++ 导出路径);
+  - 块内记录损坏(cksum 失败 / 长度越界 / magic 失效含零段):跳过损坏记录或
+    滑动重同步后继续解析,并丢弃跨块分片残片(对齐 C++ FM-02/FM-04),
+    绝不因单条记录损坏丢弃整块。
+  与 C++ 的差异仅在事件通道:C++ 经 emit_event 上报进程内监控,本工具打印
+  stderr 并置退出码 2。
+
 用法:
   python logx_decode.py <log_dir> [--from YYYYMMDD] [--to YYYYMMDD] \\
                           [--kid-map kid=hex,key ...] [--out out_dir]
@@ -23,8 +38,8 @@ import os
 import re
 import struct
 import sys
-from dataclasses import dataclass, field
-from typing import Callable, Optional, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple
 
 MAGIC_FILE = b'LGXF'
 MAGIC_BLOCK = b'LGXB'
@@ -41,6 +56,12 @@ ALGO_ZLIB = 2
 FLAG_ENCRYPTED      = 0x01
 COMP_MASK           = 0x06
 FLAG_COMPRESS_SHIFT = 1
+
+# 与 C++ core/include/logx_staging.h 的块格式常量严格一致 (spec §3.2):
+# 单块解压输出上限 = kBlockMaxRaw (单条独占一块上限,含 6B 记录头)。
+# (D-05) C++ 写入端单块 raw ≤ 20KB+6,超限块头在 F-05 严检即被拒绝;
+# 解码端按同一契约收紧,防畸形帧触发过度内存分配 (原 64MB 过宽)。
+MAX_BLOCK_RAW = 20 * 1024 + 6
 
 # ---------------- 文件格式 helpers ----------------
 def crc32_update(crc: int, data: bytes) -> int:
@@ -74,19 +95,35 @@ def decompress(algo: int, payload: bytes) -> bytes:
             import zstandard
         except ImportError:
             raise RuntimeError("pip install zstandard for zstd blocks")
-        return zstandard.ZstdDecompressor().decompress(payload, max_output_size=64 * 1024 * 1024)
+        # (D-05) 输出上限对齐块格式契约 MAX_BLOCK_RAW (20KB+6);
+        # 合法块解压结果恒 ≤ 上限,超限即畸形帧,拒绝过度分配。
+        return zstandard.ZstdDecompressor().decompress(
+            payload, max_output_size=MAX_BLOCK_RAW)
     if algo == ALGO_ZLIB:
         import zlib
-        return zlib.decompress(payload)
+        # zlib.decompress 无输出上限参数:用 decompressobj 限长解压,
+        # 解出超过 MAX_BLOCK_RAW 即判畸形 (防 zip bomb 过度分配)。
+        d = zlib.decompressobj()
+        out = d.decompress(payload, MAX_BLOCK_RAW + 1)
+        if not d.eof and len(out) > MAX_BLOCK_RAW:
+            raise RuntimeError(f"decompressed output exceeds {MAX_BLOCK_RAW}B")
+        if len(out) > MAX_BLOCK_RAW:
+            raise RuntimeError(f"decompressed output exceeds {MAX_BLOCK_RAW}B")
+        return out
     raise RuntimeError(f"unknown algo {algo}")
 
 def decrypt_gcm(key: bytes, nonce: bytes, ct_with_tag: bytes) -> bytes:
-    """AES-256-GCM;返回明文;cipher+tag 拼在一起传入。"""
+    """AES-256-GCM;返回明文;cipher+tag 拼在一起传入。
+
+    C++ 侧 encrypt_gcm 无 AAD (gcm_starts 的 add_len=0),此处必须显式传
+    associated_data=None —— cryptography 库该参数无默认值 (D 系列验证时
+    发现的解码器潜在缺陷,缺失即 TypeError)。
+    """
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     except ImportError:
         raise RuntimeError("pip install cryptography for AES-GCM blocks")
-    return AESGCM(key).decrypt(nonce, ct_with_tag)
+    return AESGCM(key).decrypt(nonce, ct_with_tag, None)
 
 # ---------------- LGXE 重组 ----------------
 def cksum1(payload: bytes) -> int:
@@ -135,41 +172,79 @@ class RecordReassembler:
                 self.in_split = False
         return results
 
-def reassemble(slices: List[LogSlice]) -> Optional[bytes]:
-    """把单条长日志切片重组为内部用户载荷。失败返回 None。"""
-    asm = RecordReassembler()
-    out = []
-    for s in slices:
-        out.extend(asm.feed(s))
-    return out[0] if out else None
+    def drop_carry(self) -> None:
+        """(FM-02 对齐) 字节流断裂后,未闭合的跨块分片残片必须整体丢弃 ——
+        重同步点之后找到的首/中片属于新流,与旧残片拼接只会产生错乱输出。"""
+        self.cur_slices.clear()
+        self.in_split = False
 
-def parse_lgxe(raw: bytes) -> List[LogSlice]:
-    """从 raw 字节流中抽取 LGXE 序列(跳过 LGXP 与 < 6B 零残留)。"""
-    out = []
+def parse_lgxe_segments(raw: bytes) -> Tuple[List[List[LogSlice]], bool]:
+    """从 raw 字节流中抽取 LGXE 分片,按"流断裂点"切分为段。
+
+    段边界 (每次边界 = 一次 carry 丢弃,对齐 C++ parse_records_stream 现行语义):
+      - cksum 失败: 跳过整条损坏记录 (6B 头 + len,FM-04: 记录按头起始对齐,
+        损坏记录内不存在合法子记录,逐字节重扫既找不回数据又 O(n²)),不丢块内
+        后续健康记录 —— 仅丢弃跨片残片;
+      - 记录头声明长度越界: 头长不可信,滑动 6B 重扫 (FM-04),丢弃残片;
+      - magic 失效 (含零段): 字节滑动重同步到下一个合法 magic (要求 6B 头完整),
+        重同步失败则停止本块扫描;残片丢弃 (FM-02)。
+    返回 (segments, carry_ok):carry_ok=False 表示流末尾存在断裂事件 (撕裂尾/
+    重同步失败),调用方须在喂完本块后丢弃重组器 carry;段间残片由调用方在
+    段边界处丢弃。块末尾干净收束时 carry 合法保留,跨块分片照常衔接。
+    """
+    segments: List[List[LogSlice]] = []
+    cur: List[LogSlice] = []
     pos = 0
+    carry_ok = True
     while pos + 6 <= len(raw):
-        if raw[pos:pos+6] == b'\x00' * 6:
+        magic = raw[pos+2:pos+4]
+        if magic != MAGIC_ENTRY and magic != MAGIC_PAD:
+            # 零段 / 未知 magic:字节滑动重同步 (对齐 C++ FM-02 路径)
+            carry_ok = False
+            found = -1
+            for s in range(1, len(raw) - pos - 5):
+                nxt = raw[pos+s+2:pos+s+4]
+                if nxt == MAGIC_ENTRY or nxt == MAGIC_PAD:
+                    found = s
+                    break
+            if cur:
+                segments.append(cur)
+                cur = []
+            if found < 0:
+                break  # 重同步失败:停止本块扫描
+            pos += found
+            continue
+        payload_len = get_u16(raw, pos)
+        if pos + 6 + payload_len > len(raw):
+            # 长度越界 (撕裂尾或头长不可信):FM-04 对齐 —— 丢弃残片、
+            # 滑动 6B 继续扫,而非整块放弃 (后续可能仍有健康记录)
+            carry_ok = False
+            if cur:
+                segments.append(cur)
+                cur = []
             pos += 6
             continue
-        magic = raw[pos+2:pos+4]
         if magic == MAGIC_PAD:
-            pad_len = get_u16(raw, pos)
-            pos += 6 + pad_len
-            continue
-        if magic == MAGIC_ENTRY:
-            payload_len = get_u16(raw, pos)
-            flags = raw[pos+4]
-            cksum = raw[pos+5]
-            if pos + 6 + payload_len > len(raw):
-                break  # 撕裂尾巴
-            actual = cksum1(raw[pos+6:pos+6+payload_len])
-            if actual != cksum:
-                break  # cksum 失败
-            out.append(LogSlice(flags, raw[pos+6:pos+6+payload_len]))
             pos += 6 + payload_len
             continue
-        break  # magic 不识别:停止扫描
-    return out
+        flags = raw[pos+4]
+        cksum = raw[pos+5]
+        payload = raw[pos+6:pos+6+payload_len]
+        if cksum1(payload) != cksum:
+            # (D-01) 对齐 C++ FM-04 现行语义:跳过整条损坏记录重新对齐,
+            # 单条损坏不丢整块;残片经段边界丢弃。
+            carry_ok = False
+            if cur:
+                segments.append(cur)
+                cur = []
+            pos += 6 + payload_len
+            continue
+        cur.append(LogSlice(flags, payload))
+        carry_ok = True
+        pos += 6 + payload_len
+    if cur:
+        segments.append(cur)
+    return segments, carry_ok
 
 # ---------------- 文件级解码 ----------------
 @dataclass
@@ -202,6 +277,16 @@ class DecodedBlockResult:
 def decode_block_raw(bhdr: bytes, payload: bytes, tag: Optional[bytes],
                      flag: int, raw_len: int, kid_keys: Dict[int, bytes],
                      kid_in_file: int) -> DecodedBlockResult:
+    """解码单块。错误时 error 字段以固定前缀分类 (D-03):
+    'crc32 mismatch' / 'gcm fail' / 'decompress fail' / 'missing key' ——
+    上层据此生成与 C++ 导出一致的占位行 ([seq=N crc fail] / [seq=N decode fail])。
+
+    GCM 校验失败策略差异 (D-03,与 C++ 现行行为一致,此处显式归档):
+      C++ 导出路径 (logx_c.cpp:decode_one_file) = 输出 "[seq=N decode fail]"
+      占位行 + emit_event 进程内监控,继续下一块;
+      本工具 = errors 收集 + stderr 打印 + 退出码 2,同样继续下一块。
+      差异仅在事件通道,C++ 走 emit_event、本工具走 stderr。
+    """
     seqno = get_u32(bhdr, 6)
     expected_crc = get_u32(bhdr, 18)
     actual_crc = crc32_update(0, payload)
@@ -228,8 +313,61 @@ def decode_block_raw(bhdr: bytes, payload: bytes, tag: Optional[bytes],
         return DecodedBlockResult(seqno, raw_len, error=f"decompress fail: {e}")
     return DecodedBlockResult(seqno, raw_len, raw_bytes=raw)
 
+# 块头严检常量 (对齐 C++ F-05 block_header_plausible)
+BLOCK_HEADER_SIZE = 34
+GCM_TAG_SIZE = 16
+BLOCK_VER = 1
+# raw_len 合法区间 [6, 16MB];payload_len ∈ (0, 16MB]
+BLOCK_RAW_MIN = 6
+BLOCK_LEN_MAX = 16 * 1024 * 1024
+
+def block_header_plausible(bhdr: bytes, file_remaining: int) -> Optional[Tuple[int, int, int, int]]:
+    """(D-02) 块头结构严检,对齐 C++ F-05 block_header_plausible。
+
+    校验项与 C++ 逐一对应: magic / 版本 / flag 保留位 / 算法编号 /
+    seqno > 0 / raw_len ∈ [6, 16MB] / payload_len ∈ (0, 16MB] /
+    未压缩时 payload_len == raw_len / 块大小不越过文件尾。
+    合法返回 (seqno, raw_len, payload_len, block_size);
+    结构损坏返回 None —— 块边界自描述于块头,此时无法定位下一块,必须终止
+    该文件扫描 (宁丢不脏,盲目 continue 会以错误 block_size 滑动整文件错位)。
+    """
+    if len(bhdr) < BLOCK_HEADER_SIZE:
+        return None
+    if bhdr[:4] != MAGIC_BLOCK:
+        return None
+    if bhdr[4] != BLOCK_VER:
+        return None
+    flag = bhdr[5]
+    if (flag & ~0x07) != 0:
+        return None
+    algo = (flag & COMP_MASK) >> FLAG_COMPRESS_SHIFT
+    if algo not in (ALGO_NONE, ALGO_ZSTD, ALGO_ZLIB):
+        return None
+    seqno = get_u32(bhdr, 6)
+    if seqno == 0:
+        return None
+    raw_len = get_u32(bhdr, 10)
+    if raw_len < BLOCK_RAW_MIN or raw_len > BLOCK_LEN_MAX:
+        return None
+    payload_len = get_u32(bhdr, 14)
+    if payload_len == 0 or payload_len > BLOCK_LEN_MAX:
+        return None
+    if algo == ALGO_NONE and payload_len != raw_len:
+        return None
+    enc = bool(flag & FLAG_ENCRYPTED)
+    block_size = BLOCK_HEADER_SIZE + payload_len + (GCM_TAG_SIZE if enc else 0)
+    if block_size > file_remaining:
+        return None
+    return seqno, raw_len, payload_len, block_size
+
 def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[bytes], List[str]]:
-    """解码整个文件，返回 (用户载荷列表, 警告与错误列表)。"""
+    """解码整个文件，返回 (用户载荷列表, 警告与错误列表)。
+
+    错误处理分两层 (D-02,对齐 C++ decode_one_file 现行语义):
+      - 块头结构损坏 → errors 记录后终止本文件扫描 (宁丢不脏);
+      - 块级解码失败 (payload CRC / GCM / 解压 / 缺 key) → errors 记录后
+        跳过该块继续,文件后半部分照常解码,绝不截断。
+    """
     with open(path, 'rb') as f:
         data = f.read()
     if len(data) < 32:
@@ -244,30 +382,45 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
     reassembler = RecordReassembler()
 
     off = 32
-    while off + 34 <= len(data):
-        bhdr = data[off:off+34]
-        if bhdr[:4] != MAGIC_BLOCK:
-            errors.append(f"{path} off={off}: bad block magic {bhdr[:4]!r}")
+    while off + BLOCK_HEADER_SIZE <= len(data):
+        bhdr = data[off:off+BLOCK_HEADER_SIZE]
+        hdr = block_header_plausible(bhdr, len(data) - off)
+        if hdr is None:
+            # 结构损坏:与 C++ 一致终止扫描 (块边界已不可信)
+            errors.append(f"{path} off={off}: bad block header; stop scanning file")
             break
-        payload_len = get_u32(bhdr, 14)
+        seqno, raw_len, payload_len, block_size = hdr
         flag = bhdr[5]
-        block_size = 34 + payload_len + (16 if (flag & FLAG_ENCRYPTED) else 0)
-        if off + block_size > len(data):
-            errors.append(f"{path} off={off}: truncated block")
-            break
-        raw_len = get_u32(bhdr, 10)
-        payload = data[off+34:off+34+payload_len]
-        tag = data[off+34+payload_len:off+34+payload_len+16] if (flag & FLAG_ENCRYPTED) else None
 
-        blk_res = decode_block_raw(bhdr, payload, tag, flag, raw_len, kid_keys, fh.kid)
+        payload = data[off+BLOCK_HEADER_SIZE:off+BLOCK_HEADER_SIZE+payload_len]
+        tag = data[off+BLOCK_HEADER_SIZE+payload_len:
+                   off+BLOCK_HEADER_SIZE+payload_len+GCM_TAG_SIZE] \
+               if (flag & FLAG_ENCRYPTED) else None
+
+        blk_res = decode_block_raw(bhdr, payload, tag, flag, raw_len,
+                                   kid_keys, fh.kid)
         if blk_res.error:
-            errors.append(f"{path} seq={blk_res.seqno}: {blk_res.error}")
-            break
+            # 块级解码失败:跳过该块继续 (对齐 C++ 导出路径占位行行为)
+            kind = blk_res.error.split(':', 1)[0]
+            errors.append(f"{path} seq={seqno}: {blk_res.error}")
+            if kind == 'crc32 mismatch':
+                user_records.append(f"[seq={seqno} crc fail]".encode('ascii'))
+            else:
+                user_records.append(f"[seq={seqno} decode fail]".encode('ascii'))
+            off += block_size
+            continue
         if blk_res.raw_bytes:
-            slices = parse_lgxe(blk_res.raw_bytes)
-            for s in slices:
-                for full_payload in reassembler.feed(s):
-                    user_records.append(full_payload)
+            # 分段喂入:段边界 = 流断裂事件 (cksum 失败/长度越界/重同步),
+            # 段间丢弃重组器 carry (FM-02);块末干净收束则 carry 跨块保留
+            segments, carry_ok = parse_lgxe_segments(blk_res.raw_bytes)
+            for i, seg in enumerate(segments):
+                if i > 0:
+                    reassembler.drop_carry()
+                for s in seg:
+                    for full_payload in reassembler.feed(s):
+                        user_records.append(full_payload)
+            if not carry_ok:
+                reassembler.drop_carry()
         off += block_size
     return user_records, errors
 
@@ -330,14 +483,19 @@ def main(argv: List[str]) -> int:
     if out_dir: os.makedirs(out_dir, exist_ok=True)
     out_fh = None
     out_path = None
+    current_date = None
 
     rc = 0
     for path in files:
         date = os.path.basename(path)[:8]
         if out_dir:
-            if out_fh: out_fh.close()
-            out_path = os.path.join(out_dir, f"plain_{date}.log")
-            out_fh = open(out_path, 'w', encoding='utf-8')
+            if date != current_date:
+                if out_fh:
+                    out_fh.close()
+                    print(f"[wrote {out_path}]", file=sys.stderr)
+                current_date = date
+                out_path = os.path.join(out_dir, f"plain_{date}.log")
+                out_fh = open(out_path, 'w', encoding='utf-8')
         else:
             out_fh = sys.stdout
             out_path = None
@@ -348,6 +506,12 @@ def main(argv: List[str]) -> int:
             rc = 2
 
         for payload in user_payloads:
+            # 块级解码失败的占位行 ([seq=N crc fail] / [seq=N decode fail]):
+            # 与 C++ 导出路径一致,占位行本身出现在输出流中标记数据空洞,
+            # 不进入用户载荷解析。
+            if payload.startswith(b'[seq=') and (payload.rstrip().endswith(b' crc fail]') or payload.rstrip().endswith(b' decode fail]')):
+                out_fh.write(payload.decode('ascii') + '\n')
+                continue
             try:
                 ts_ms, pid, tid, level, tag, msg = parse_user_payload(payload)
             except Exception as e:

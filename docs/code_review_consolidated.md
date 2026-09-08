@@ -630,35 +630,63 @@
 
 ## 十、Python 离线解码器
 
-### 🟠 [D-01] `parse_lgxe` cksum 失败直接 `break`，块内后续记录丢失
+> **校准总注（2026-09-08 修复与加固闭环）：** D 系列各报告的建议基于 FM-02/FM-04/F-05 修复**之前**的旧 C++ 行为写作，本次修复逐条对照现行 C++ 实现校准后落地，并按 C++ 写盘格式构造合成日志文件完成 18 项端到端验证（正常/zstd/AES-GCM 加密/跨块分片/cksum 损坏/坏块头/坏 magic 重同步/解压上限/同日多分卷合并/块尾断裂 carry 丢弃/CLI 冒烟），全部通过。复审中额外发现并修复两个解码器真实缺陷：
+> 1. `decrypt_gcm` 调用 `AESGCM.decrypt()` 缺失必需的 `associated_data` 参数（C++ 侧无 AAD，须显式传 `None`），即修复前任何加密文件的解密路径都会直接 TypeError 失败；
+> 2. `main()` 中在 `--out` 模式下同日多分卷文件（如 `20260908.log` 与 `20260908.log.1`）因重复以 `'w'` 模式打开同一个输出文件导致前序分卷被完全覆写抹除，现已改为 `current_date` 状态跟踪并在同日分卷下保持句柄顺序连续写入，确保多分卷日志无损合并。
+
+### ✅ [D-01] `parse_lgxe` cksum 失败直接 `break`，块内后续记录丢失 [已修复并闭环]
 - **来源：** 报告三 BUG-D2；报告二 R2-测#7 关联
-- **位置：** `decoder/logx_decode.py:158-163`
+- **位置：** `decoder/logx_decode.py`（`parse_lgxe_segments`）
+- **状态：** ✅ **已修复并闭环（校准方案落地，未采纳报告建议原文）**
 - **描述：** C++ 端 `parse_records_stream` 校验失败时滑动 1 字节重同步；Python 端直接 `break`，导致块内后续所有健康日志丢失。
-- **修复建议：** 改为 `pos += 1; continue`。
+- **建议校准：** 报告建议 `pos += 1; continue`（对齐旧 C++ 逐字节滑动）。FM-04 修复后现行 C++ 对 cksum 失败改为**跳过整条损坏记录**（6B 头 + len：记录格式按头起始对齐，损坏记录内不存在合法子记录，逐字节重扫既找不回数据又造成最坏 O(n²)）；对 magic 失效才做字节滑动重同步。逐字节 `pos += 1` 会落回 O(n²) 且与现行 C++ 语义脱节，故不采纳原文。
+- **修复方案与落地：**
+  1. `parse_lgxe` 重构为 `parse_lgxe_segments`：cksum 失败跳过整条损坏记录（`6 + payload_len`）继续，单条损坏不再丢弃块内后续健康记录（对齐现行 C++ FM-04）；
+  2. magic 失效（含零段）按现行 C++ 字节滑动重同步到下一个合法 magic（要求 6B 头完整），重同步失败才停止本块扫描；
+  3. 记录头长度越界（头长不可信）滑动 6B 重扫（对齐 FM-04），不再整块放弃；
+  4. 每次流断裂事件（cksum 失败 / 长度越界 / 重同步）按 FM-02 语义丢弃跨片残片：解析器输出分段序列，调用方在段边界调用重组器新增的 `drop_carry()`，重同步点后的首/中片绝不与旧残片错误拼接；
+  5. 块末状态精准追踪：任何流断裂事件（坏 cksum / 长度越界 / 坏 magic）置 `carry_ok = False`，仅当合法记录成功解析后置 `carry_ok = True`，确保块尾遭遇损坏截断时外层 `drop_carry()` 准时触发，彻底杜绝孤儿跨块残片误保留（实测用例覆盖）；块末干净收束时合法保留，跨块分片照常衔接。
 
-### 🟠 [D-02] `decode_file_records` 块解码失败直接 `break`，整文件后半部分截断
+### ✅ [D-02] `decode_file_records` 块解码失败直接 `break`，整文件后半部分截断 [已修复并闭环]
 - **来源：** 报告三 BUG-D3；报告二 R2-测#7 关联
-- **位置：** `decoder/logx_decode.py:259-261`
+- **位置：** `decoder/logx_decode.py`（`block_header_plausible`、`decode_file_records`、`main`）
+- **状态：** ✅ **已修复并闭环（校准方案落地，未采纳报告建议原文）**
 - **描述：** C++ 端遇坏块时记录标记并 `continue` 到下一块；Python 端 `break` 退出整文件扫描，单块损坏导致整文件后半部分丢失。
-- **修复建议：** 改为 `off += block_size; continue`。
+- **建议校准：** 报告建议一律 `off += block_size; continue` 不安全且不可行——块边界自描述于块头，**块头结构损坏**时 `block_size` 本身不可信，盲目 continue 会以错误跨度滑动导致整文件错位；现行 C++（F-05 `block_header_plausible`）对结构损坏正是终止扫描（宁丢不脏）。`continue` 仅适用于**块头合法但块级解码失败**（payload CRC / GCM / 解压 / 缺 key）的场景。
+- **修复方案与落地：**
+  1. 新增 `block_header_plausible` 块头严检，逐项对齐 C++ F-05：magic / 版本 / flag 保留位 / 算法编号 / `seqno > 0` / `raw_len ∈ [6, 16MB]` / `payload_len ∈ (0, 16MB]` / 未压缩时 `payload_len == raw_len` / 块大小不越文件尾；
+  2. 结构损坏 → errors 记录后终止本文件扫描（与 C++ 一致）；块级解码失败 → errors 记录 + 生成与 C++ 导出一致的占位行（`[seq=N crc fail]` / `[seq=N decode fail]`）后跳过该块继续，文件后半部分照常解码；
+  3. 占位行在 `main()` 输出层直通（精准匹配 `crc fail]` / `decode fail]` 后缀，不进入用户载荷解析），与 C++ 导出"占位行出现在导出文本流中标记数据空洞"的语义一致；
+  4. 同日多分卷无损合并：修复 `main()` 中 `--out` 模式下遍历同一天的分卷文件（`.log`、`.log.1`...）时重复以 `'w'` 打开导致前序分卷被覆写抹除的历史 Bug，改为按日期归并句柄顺序连续写入；
+  5. 端到端验证：坏 CRC 块跳过后续块解码成功、坏块头干净终止不错位、同日多分卷合并无损完整、CLI 退出码 2 + stderr 错误报告 + stdout 含占位行。
 
-### 🟠 [D-03] `decode_block_raw` 的 GCM 校验失败处理策略与 C++ 端不一致
+### ✅ [D-03] `decode_block_raw` 的 GCM 校验失败处理策略与 C++ 端不一致 [已修复并闭环]
 - **来源：** 报告三 BUG-D4
-- **位置：** `decoder/logx_decode.py:198-205`
+- **位置：** `decoder/logx_decode.py`（模块 docstring、`decode_block_raw`、`decrypt_gcm`）
+- **状态：** ✅ **已修复并闭环（文档化策略差异 + 顺带修复 GCM 缺参缺陷）**
 - **描述：** C++ 导出路径 GCM 校验失败时静默丢块并触发 Event；Python 端输出到 stderr，策略差异未在文档中明确。
-- **修复建议：** 在解码器文档中明确错误策略差异（或对齐）。
+- **修复方案与落地：**
+  1. 核实确认：现行 C++ 导出路径对块级解码失败（含 GCM）的行为 = 占位行 `[seq=N decode fail]` + `emit_event` 进程内监控 + 继续下一块——**并不"静默丢块"**，报告对 C++ 行为的描述已过时；Python 端 = errors 收集 + stderr + 退出码 2 + 继续下一块。差异仅在事件通道（C++ 走 emit_event、本工具走 stderr），扫描连续性两侧一致；
+  2. 模块 docstring 新增"错误处理策略"章节，按块头结构损坏 / 块级解码失败 / 块内记录损坏三层显式归档两侧语义与差异来源；`decode_block_raw` docstring 固化错误前缀分类（`crc32 mismatch` / `gcm fail` / `decompress fail` / `missing key`）与占位行映射；
+  3. **顺带修复（报告未提及的真实缺陷）**：`decrypt_gcm` 的 `AESGCM.decrypt(nonce, ct)` 缺失必需的 `associated_data` 位置参数——C++ `encrypt_gcm` 无 AAD，须显式传 `None`；修复前加密文件解密路径 100% TypeError 失败（端到端实测暴露并验证修复）。
 
-### 🟡 [D-04] 死代码 `reassemble()` 残留
+### ✅ [D-04] 死代码 `reassemble()` 残留 [已修复并闭环]
 - **来源：** 报告三 BUG-D1
-- **位置：** `decoder/logx_decode.py:134-140`
+- **位置：** `decoder/logx_decode.py`
+- **状态：** ✅ **已修复并闭环**
 - **描述：** 旧版切片重组函数已无任何调用者，容易误导维护者。
-- **修复建议：** 彻底清理。
+- **修复方案与落地：** 删除 `reassemble()`（全库引用核实：无任何调用者，CHANGELOG 中仅历史记录）；`RecordReassembler.feed` 流式重组器为唯一重组路径。端到端验证 `not hasattr(L, 'reassemble')`。
 
-### 🟡 [D-05] `decompress()` 内存输出上限 64MB 过宽
+### ✅ [D-05] `decompress()` 内存输出上限 64MB 过宽 [已修复并闭环]
 - **来源：** 报告三 BUG-D5
-- **位置：** `decoder/logx_decode.py:73`
+- **位置：** `decoder/logx_decode.py`（`decompress`、常量 `MAX_BLOCK_RAW`）
+- **状态：** ✅ **已修复并闭环（精确值校准：20KB+6 而非报告近似值 20KB+128）**
 - **描述：** C++ 内部块最大约 20KB，Python 解码器允许 64MB 输出，遭遇恶意畸形帧时存在内存过度分配风险。
-- **修复建议：** 上限收紧为约 `20 * 1024 + 128`。
+- **建议校准：** 报告建议收紧为约 `20 * 1024 + 128` 是近似估计；精确契约是 C++ `logx_staging.h` 的 `kBlockMaxRaw = 20 * 1024 + 6`（单条独占一块上限，含 6B 记录头），直接对齐该常量。
+- **修复方案与落地：**
+  1. 新增 `MAX_BLOCK_RAW = 20 * 1024 + 6` 常量并注明与 `kBlockMaxRaw` 的对应关系；zstd 路径 `max_output_size` 由 64MB 收紧至该值；
+  2. zlib 路径补齐同等防护（原 `zlib.decompress` 无上限参数）：改用 `decompressobj` 限长解压，输出超限抛 `RuntimeError`（防 zip bomb 过度分配）；
+  3. 端到端验证：超限输入被拒绝、合法小载荷解压不受影响。
 
 ---
 
@@ -790,7 +818,7 @@
 | **T4.0-5** | §10 ARMv8 Crypto Extensions 加速 | ✅ 已落地并闭环：`aesce.c` 移植完成，AESE/AESMC/EOR 标准指令直通；后续独立复审完成官方向量锚定（McGrew-Viega TC13/14/15 + 零密钥基线，OpenSSL 交叉验证 72/72）、热路径逐块探针消除与防竞态定型，x86 + 真机（骁龙865）双路径全量回归通过 | — | C-04 |
 | **T4.0-6** | §11 运行期每 30s 定时 msync/fdatasync | ✅ 已通过 F-04 补齐：`flusher_loop` 接入 30s 超时唤醒与 `durability_sync`，落盘 + staging 强刷盘 | — | — |
 | **T4.0-7** | §9 未对齐访问 / 23:59:59 时钟跳变用例 | ✅ 已通过 T4.5 落地 | — | — |
-| **T4.0-8** | §2/§10 离线解码工具 `logx_decode.py` | 坏块 break、死代码残留、容错性待对齐 | 影响离线日志捞取成功率 | D-01~D-04 |
+| **T4.0-8** | §2/§10 离线解码工具 `logx_decode.py` | ✅ 已通过 D-01~D-05 闭环（三层错误策略对齐现行 C++；同日多分卷无损合并；块尾断裂 carry 丢弃；死代码清理；解压上限收紧；顺带修复 GCM 缺参） | — | D-01~D-05 |
 | **T4.0-9** | §7/§10 Kotlin Facade `LogX.kt` | ✅ 已通过 K-01/K-02 闭环（export 状态码如实透传 + 结构化上下文 runBlocking(parentContext) 防死锁 + 异常如实传播） | — | K-01/K-02 |
 | **T4.0-10** | §7/§10 JNI Config 传递与 ErrorHandler | Compress 映射语义混淆 [✅ C-02 部分已闭环]；全局错误上下文单例化 | 多实例接入与算法配置异味 | C-02/J-02 |
 | **T4.0-11** | §4.3/§4.4 恢复后切分序号强制归 0 风险 | ✅ 已通过 F-02 落地（严格解析文件名 + 探测安全网） | — | — |
@@ -857,8 +885,8 @@
 | E-07 | logx_stats_t ABI 兼容 [✅ 已修复] | P-02 | file_size_path 开销 [✅ 已修复] |
 | P-03 | file_rmdir 错误转译 [✅ 已修复] | J-02 | g_err_ctx 多实例互踩 [✅ 已修复] |
 | K-01 | Kotlin export 丢返回值 [✅ 已修复] | K-02 | runBlocking 嵌套 [✅ 已修复] |
-| D-01 | Python cksum break 丢记录 | D-02 | Python 坏块 break 丢文件 |
-| D-03 | GCM 失败策略不一致 | F-10 | 缺少 50~100ms Debounce 聚集刷盘 [✅ 已修复] |
+| D-01 | Python cksum break 丢记录 [✅ 已修复] | D-02 | Python 坏块 break 丢文件 [✅ 已修复] |
+| D-03 | GCM 失败策略不一致 [✅ 已修复] | F-10 | 缺少 50~100ms Debounce 聚集刷盘 [✅ 已修复] |
 | T-02~T-11 | 测试用例缺陷（详见第十一节） | — | — |
 
 ### 🟡 P2 —— 质量 / 性能 / 可维护性
@@ -871,8 +899,8 @@
 | F-09 | random_bytes 退化低熵 [✅ 已修复] | P-04 | QPF 重复查询 [✅ 已修复] |
 | P-05 | SetFilePointer 冗余 [✅ 已修复] | P-06 | atomic_add 对齐断言 [✅ 已修复] |
 | J-03 | NewStringUTF 编码风险 [✅ 已修复] | K-03 | errorHandler GC 延迟 [✅ 已修复] |
-| K-04 | setErrorHandler 并发校验 [✅ 已修复] | D-04 | Python 死代码 |
-| D-05 | Python 64MB 解压上限 | C-04 | 缺少 ARMv8 硬件加速（T4.0-5）[✅ 已修复] |
+| K-04 | setErrorHandler 并发校验 [✅ 已修复] | D-04 | Python 死代码 [✅ 已修复] |
+| D-05 | Python 64MB 解压上限 [✅ 已修复] | C-04 | 缺少 ARMv8 硬件加速（T4.0-5）[✅ 已修复] |
 | S-06 | 双 Header 提交内存序偏离（T4.0-3） | — | — |
 
 ### 修复顺序建议（综合三份报告）
