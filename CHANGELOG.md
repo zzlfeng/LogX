@@ -714,6 +714,54 @@ cmake --build build-android -j
 
 ---
 
+## M5 验证闭环: Kotlin Gradle 工程 + 真机解码联调 + keyProvider 泄漏专项 (2026-09-08)
+
+### Kotlin Facade Gradle 编译工程 (`android/kotlin-gradle/`)
+
+终结"Kotlin 交付源文件无编译验证"的历史缺口:
+
+- **单源引用**: `app/build.gradle.kts` 经 `sourceSets` 直接把 `android/kotlin/`
+  挂为源目录,编译验证的就是交付源文件本身,无拷贝漂移;
+- **工具链**: AGP 8.5.1 + KGP 1.9.23 + Gradle 8.9 / JDK 17,`org.gradle.offline=true`
+  全离线构建(依赖全命中本机缓存);minSdk 21 与全库基线一致;
+- **纯逻辑单测 8/8 全绿** (`LogXPureLogicTest`): Compress 枚举与 C++ `kAlgo*`
+  三端同步契约、Level ∈ {0..5}、`onNativeError` kindInt 映射与业务异常吞噬、
+  Config 默认值(S-04/E-06)、pre-init no-op 状态机、协程 export 未初始化返回
+  -1(K-01 语义)、setErrorHandler 终结态保护(K-04);
+- **LogX.kt 微调**: 新增 `internal fun nativeHandleForTest()` 白盒只读访问器。
+
+### 真机解码联调 (T3.4 最终验收, Redmi K30 Pro / Android 12 / arm64-v8a)
+
+- 新增 `tests/unit/logx_decode_demo.cpp` 引擎驱动器(EXCLUDE_FROM_ALL,不进
+  ctest): 生产配置(`kAlgoZstd` + AES-256-GCM + kid=1 KeyProvider)写入
+  20 条中文消息 + 1 条 40KB 长记录(触发多分片跨块) + 120 条 1KB 记录,
+  `logx_export` 导出后产物 `adb pull`;
+- `logx_decode.py --kid-map` 离线解码: **104/104 行与 C++ 导出路径精确对账**,
+  中文 UTF-8 消息与 40KB 长记录(40956B 'B' + 'BIG:' 前缀 = 40960B)字节级还原,
+  单文件无切分(总量 < 64KB 阈值,符合预期);
+- 排查记录: 120 条 split-fill 中 37 条未落盘为 demo 静默忽略
+  `LOGX_ERR_NO_SPACE` — 总需求 ≈168KB 超 staging 数据区 129KB(溢出 39096B
+  ≈ 37 条),符合 spec"staging 满丢弃 + 打点"契约,非引擎缺陷;
+- 构建环境注意: Git Bash 下 adb push 需 `MSYS_NO_PATHCONV=1`;设备
+  /data 分卷 99% 满时 push 的 fchown 序列会失败且文件不落盘,经
+  `/sdcard` 中转 + `cat` + md5 双端校验绕过。
+
+### keyProvider 真机泄漏专项 (T4.4 归口项销号)
+
+- 加密/KeyProvider 用例连续 10 轮重复运行,设备 MemAvailable 波动 < 0.1%
+  (4128340kB → 4125824kB);
+- logcat 全量扫描 0 条 `ReferenceTable` / `global reference overflow` /
+  `JNI DETECTED ERROR` 告警;
+- `KeyProvider_DrainsEncryptedTailAndNotCalledAfterClose` 生命周期契约用例
+  随 128 项真机单测全绿。
+
+### 真机全量矩阵 (最新源码重建后)
+
+128/128 单测 + 4/4 压测(含 T-06 missing_count 精确对账) +
+3/3 真实进程强杀恢复,全部通过。
+
+---
+
 ## 附:构建命令速查
 
 ### Windows(桌面,MSVC)

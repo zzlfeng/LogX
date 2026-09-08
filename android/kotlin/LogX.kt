@@ -77,6 +77,9 @@ object LogX {
     @Volatile private var isClosed: Boolean = false
     private val initCount = AtomicLong(0)
 
+    /** [LogXPureLogicTest] 等白盒单测专用:只读暴露句柄,生产代码禁止使用。 */
+    internal fun nativeHandleForTest(): Long = nativeHandle
+
     @Synchronized
     fun init(context: Context, config: Config) {
         if (initCount.incrementAndGet() != 1L) {

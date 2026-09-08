@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LogX Kotlin Facade 编译验证工程:最小 Manifest (不安装运行,仅编译+单测) -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

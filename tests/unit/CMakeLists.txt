@@ -53,3 +53,18 @@ add_test(NAME logx_unit_tests COMMAND logx_unit_tests)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(logx_unit_tests PRIVATE -Wall -Wextra)
 endif()
+
+# 真机解码联调驱动器 (M5/T3.4): 生产配置引擎产日志 → 导出 → adb pull →
+# decoder/logx_decode.py 离线解码。非测试目标,不参与 ctest。
+add_executable(logx_decode_demo EXCLUDE_FROM_ALL logx_decode_demo.cpp)
+target_link_libraries(logx_decode_demo PRIVATE logx_core)
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(logx_decode_demo PRIVATE Threads::Threads)
+endif()
+target_include_directories(logx_decode_demo PRIVATE
+    ${CMAKE_SOURCE_DIR}/core/include
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(logx_decode_demo PRIVATE -Wall -Wextra)
+endif()
