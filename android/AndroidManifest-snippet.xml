@@ -1,26 +1,53 @@
-<!-- AndroidManifest.xml 排除规则片段(参见 spec §10) -->
-<!-- 把日志目录与 staging 文件一并排除出自动备份,防止云备份带走明文 staging 与密文日志 -->
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  LogX 备份安全策略 · AndroidManifest 集成片段 (计划表 T5.1, 依据 spec §10)
+  目的: 把日志目录与 staging 一并排除出自动备份/设备迁移, 防止云备份带走明文
+  staging 与密文日志 (staging 为 filesDir 内明文, spec §10 安全口径)。
 
-<!-- API 31+:用 dataExtractionRules(替代 fullBackupContent) -->
-<dataExtractionRules>
-    <cloud-backup>
-        <exclude domain="file" path="logs/" />
-        <exclude domain="file" path="logx_staging/" />
-    </cloud-backup>
-    <device-transfer>
-        <exclude domain="file" path="logs/" />
-        <exclude domain="file" path="logx_staging/" />
-    </device-transfer>
-</dataExtractionRules>
+  ══════════════════════════════════════════════════════════════════
+  三步集成 (把下面 <application> 的 4 个属性合并进业务方自己的 manifest):
+    1. 复制 res/xml/data_extraction_rules.xml 与 res/xml/backup_rules.xml
+       到业务工程的 app/src/main/res/xml/ 下;
+    2. 在 <application> 标签合并下方 android:allowBackup /
+       android:dataExtractionRules / android:fullBackupContent /
+       tools:targetApi 四个属性;
+    3. 验证: API 31+ 设备走 dataExtractionRules (cloud-backup 与
+       device-transfer 双通道), API 23~30 走 fullBackupContent, 自动分流,
+       无需运行时判断。
+  ══════════════════════════════════════════════════════════════════
 
-<!-- API 30 及以下:fullBackupContent -->
-<full-backup-content>
-    <exclude domain="file" path="logs/" />
-    <exclude domain="file" path="logx_staging/" />
-</full-backup-content>
+  属性说明:
+    - android:allowBackup="true"   开启 Auto Backup 并按规则文件精细排除;
+    - android:dataExtractionRules  API 31+ 生效 (Android 12+);
+    - android:fullBackupContent    API 23~30 生效;
+    - tools:targetApi="31"         minSdk 21 基线下抑制 dataExtractionRules
+                                   的 lint "requires API 31" 告警
+                                   (属性在低版本被系统忽略, 无兼容性风险)。
 
-<application
+  最严格备选方案: 若业务方不需要 Auto Backup, 直接
     android:allowBackup="false"
-    android:fullBackupContent="@xml/backup_rules"
-    android:dataExtractionRules="@xml/data_extraction_rules"
-    ... />
+  整体禁用备份 (含 adb backup 路径), 两个规则文件可不配置 —— 这是比
+  "白名单排除" 更简单且覆盖多进程目录的方案。两者取其一, 不可同时
+  allowBackup="false" 又依赖规则文件。
+
+  多进程注意: LogX 多进程自动隔离 (autoProcessIsolation=true) 会在 filesDir
+  生成兄弟目录 logs_<后缀>/ 与 logx_staging_<后缀>/ (如 :push 进程 →
+  logs_push/)。备份规则不支持通配符, 采用 allowBackup="true" + 规则文件方案时,
+  须为每个后缀目录在两个规则文件中显式追加 <exclude>, 或改用
+  allowBackup="false"。
+
+  自定义目录注意: 业务方自定义 Config.logDir / Config.stagingDir 时, 必须同步
+  修改规则文件中的 path; staging 仍必须在 filesDir 系 (LogX.kt 强制校验,
+  禁 cacheDir/外部存储)。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 集成时把以下属性合并进业务方现有的 <application> 标签 -->
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        tools:targetApi="31" />
+
+</manifest>

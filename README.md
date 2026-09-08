@@ -137,8 +137,13 @@ lifecycleScope.launch(Dispatchers.IO) {
 
 > 2026-09-08: 三份代码审查报告 (C/F/S/R/E/P/J/K/D/T 全系列) 已全部闭环销号,进入 M5 交付阶段。
 
-- Android `allowBackup` / `dataExtractionRules` 备份安全工程化配置 (T5.1)
-- Kotlin Facade Gradle 自动化编译工程接入 (Kotlin 源码缺陷已全部修复,缺编译链)
-- 离线解码器用实际引擎真机产出日志做最终联调 (合成数据 18 项验证已通过)
+- ✅ **Android `allowBackup` / `dataExtractionRules` 备份安全工程化配置 (T5.1, 2026-09-08)**:
+  交付 `android/res/xml/data_extraction_rules.xml` (API 31+, cloud-backup/device-transfer 双通道)、
+  `android/res/xml/backup_rules.xml` (API 23~30) 与 `android/AndroidManifest-snippet.xml`
+  完整集成片段, 将 `filesDir/logs/` 与 `filesDir/logx_staging/` 排除出云端备份与设备迁移,
+  防止明文 staging 与密文日志进云; 附自定义目录/多进程隔离目录 (`logs_<后缀>/`) 边界说明
+  与 `allowBackup="false"` 最严备选方案。
+- ~~Kotlin Facade Gradle 自动化编译工程接入~~ (2026-09-08 已建成 `android/kotlin-gradle/`,见下文验证闭环)
+- ~~离线解码器用实际引擎真机产出日志做最终联调~~ (2026-09-08 真机联调通过, 104/104 精确对账,见下文验证闭环)
 - 性能基线测试与报告输出 (P99 延迟、压缩比、so 二进制体积) (T5.2)
 - 接入指南与离线解码运维手册 (T5.3)

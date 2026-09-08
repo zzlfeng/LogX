@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  LogX 备份排除规则 (fullBackupContent, API 23~30 / Android 6~11)
+  依据 spec §10 / 计划表 T5.1: 日志目录与 staging 必须排除出自动备份,
+  防止云备份带走明文 staging 与密文日志。
+
+  API 分流:
+    - API 31+ 设备忽略本文件, 改读 res/xml/data_extraction_rules.xml;
+    - API 23~30 读本文件 (Auto Backup 自 API 23 引入);
+    - API 21/22 无 Auto Backup 机制, 本规则不参与运行
+      (allowBackup="false" 仍会禁用 adb 备份路径, 见 AndroidManifest-snippet.xml)。
+
+  集成注意 (与 data_extraction_rules.xml 相同):
+    1. domain="file" 即 getFilesDir() 根; LogX.kt 强制 staging 位于 filesDir 系,
+       故 domain="file" 全覆盖, 无需其他 domain。
+    2. 业务方自定义 Config.logDir / Config.stagingDir 目录名时, 必须同步修改下方 path。
+    3. 多进程自动隔离 (autoProcessIsolation=true) 会生成兄弟目录 logs_<后缀>/ 与
+       logx_staging_<后缀>/ (如 :push 进程 → logs_push/)。备份规则不支持通配符,
+       须为每个后缀目录显式追加 <exclude>, 或改用 allowBackup="false" 整体禁用备份。
+-->
+<full-backup-content>
+    <exclude domain="file" path="logs/" />
+    <exclude domain="file" path="logx_staging/" />
+</full-backup-content>

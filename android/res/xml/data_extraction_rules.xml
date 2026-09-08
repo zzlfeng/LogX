@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  LogX 备份排除规则 (API 31+ / Android 12+, cloud-backup 与 device-transfer 双通道)
+  依据 spec §10 / 计划表 T5.1: 日志目录与 staging 必须排除出自动备份,
+  防止云备份/设备迁移带走明文 staging 与密文日志。
+  API 30 及以下请使用 res/xml/backup_rules.xml (fullBackupContent)。
+
+  排除路径与 LogX.init 默认用法对齐 (见 README):
+    filesDir/logs/          正式密文日志; export 明文临时文件 (.tmp_export_*) 亦写在 log_dir 内, 一并被覆盖
+    filesDir/logx_staging/  mmap staging (filesDir 内明文, 严禁入云/迁移)
+
+  集成注意:
+    1. domain="file" 即 getFilesDir() 根; LogX.kt 强制 staging 位于 filesDir 系
+       (禁 cacheDir/外部存储), 故 domain="file" 全覆盖, 无需其他 domain。
+    2. 业务方自定义 Config.logDir / Config.stagingDir 目录名时, 必须同步修改下方 path。
+    3. 多进程自动隔离 (autoProcessIsolation=true) 会生成兄弟目录 logs_<后缀>/ 与
+       logx_staging_<后缀>/ (如 :push 进程 → logs_push/)。备份规则不支持通配符,
+       须为每个后缀目录显式追加 <exclude>, 或改用 allowBackup="false" 整体禁用备份
+       (见 AndroidManifest-snippet.xml 注释)。
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="logs/" />
+        <exclude domain="file" path="logx_staging/" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="logs/" />
+        <exclude domain="file" path="logx_staging/" />
+    </device-transfer>
+</data-extraction-rules>

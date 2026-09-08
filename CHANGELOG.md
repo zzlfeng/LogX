@@ -762,6 +762,43 @@ cmake --build build-android -j
 
 ---
 
+## T5.1 Android 备份安全策略配置工程化 (2026-09-08)
+
+对应计划表 M5 阶段 T5.1 与方案 §10 备份排除纪律("日志目录与 staging 必须排除出自动备份,
+防止云备份带走明文 staging 与密文日志")。纯交付配置,零 C++/Kotlin 代码改动。
+
+### 交付物
+
+1. **`android/res/xml/data_extraction_rules.xml`** (API 31+ / Android 12+):
+   根元素 `<data-extraction-rules>`,`<cloud-backup>` 与 `<device-transfer>` 双通道
+   各排除 `domain="file"` 下 `logs/` 与 `logx_staging/`;
+2. **`android/res/xml/backup_rules.xml`** (API 23~30, Auto Backup 自 API 23 引入;
+   API 21/22 无 Auto Backup 机制,`allowBackup="false"` 仍禁 adb 备份路径):
+   根元素 `<full-backup-content>`,同样两条 exclude;
+3. **`android/AndroidManifest-snippet.xml` 重写为完整可集成片段**:
+   修正原草稿把资源根元素写成 manifest 属性名 `<dataExtractionRules>` 的错误
+   (res/xml 文件根元素必须为 `<data-extraction-rules>`);给出三步集成流程、
+   `tools:targetApi="31"` lint 抑制说明(minSdk 21 基线)、`allowBackup="false"`
+   最严备选方案,以及自定义目录/多进程隔离目录边界说明。
+
+### 覆盖口径与边界说明(注释内置)
+
+- `domain="file"` 即 `getFilesDir()` 根;LogX.kt 强制 staging 位于 filesDir 系
+  (禁 cacheDir/外部存储),故 `domain="file"` 全覆盖;
+- export 明文临时文件 (`.tmp_export_*`) 由核心写在 log_dir 内,被 `logs/` 排除自然覆盖;
+- 多进程自动隔离产生**兄弟目录** `logs_<后缀>/` / `logx_staging_<后缀>/`
+  (如 `:push` → `logs_push/`),备份规则不支持通配符 —— 采用规则文件方案时须逐目录
+  显式追加 exclude,或改用 `allowBackup="false"` 整体禁用;
+- 自定义 `Config.logDir` / `Config.stagingDir` 时须同步修改规则文件 path。
+
+### 验证
+
+- 三个 XML 经 `xml.etree` 解析确认良构;根元素名、双通道 exclude 清单
+  (`logs/` + `logx_staging/`) 与 `<application>` 四属性
+  (allowBackup/dataExtractionRules/fullBackupContent/tools:targetApi) 逐项断言通过。
+
+---
+
 ## 附:构建命令速查
 
 ### Windows(桌面,MSVC)
