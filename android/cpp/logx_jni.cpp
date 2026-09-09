@@ -407,4 +407,31 @@ Java_com_example_logx_LogX_nativeExport(JNIEnv* env, jclass /*clazz*/, jlong han
     return (rc == LOGX_OK) ? 0 : static_cast<jint>(rc);
 }
 
+// 诊断统计:读取 core 原子计数器并以 long[] 返回给 Kotlin。
+// 返回 5 元素数组 [dropNoSpace, dropTooLarge, truncatedBlocks, padRecords, blockWriteErrors],
+// 与 logx_stats_t 非 reserved 字段一一对应;reserved 区保持全零契约(E-07),不上传。
+// 使用 jlongArray 而非构造 Java 对象:JNI 侧零反射、零 jclass 缓存,Kotlin 侧
+// 由 Stats data class 构造函数解包,两端各司其职。
+JNIEXPORT jlongArray JNICALL
+Java_com_example_logx_LogX_nativeGetStats(JNIEnv* env, jclass /*clazz*/, jlong handle) {
+    if (!handle) return nullptr;
+    auto* inst = reinterpret_cast<logx_instance_t*>(handle);
+
+    logx_stats_t st{};
+    logx_get_stats(inst, &st);
+
+    jlongArray arr = env->NewLongArray(5);
+    if (!arr) return nullptr;  // OOM
+
+    jlong buf[5] = {
+        static_cast<jlong>(st.drop_no_space),
+        static_cast<jlong>(st.drop_too_large),
+        static_cast<jlong>(st.truncated_blocks),
+        static_cast<jlong>(st.pad_records),
+        static_cast<jlong>(st.block_write_errors),
+    };
+    env->SetLongArrayRegion(arr, 0, 5, buf);
+    return arr;
+}
+
 }  // extern "C"

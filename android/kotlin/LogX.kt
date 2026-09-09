@@ -56,6 +56,23 @@ object LogX {
         fun onExport(date: String, plaintextPath: String, size: Long): Int
     }
 
+    /**
+     * 运行时诊断统计快照。字段与 C ABI `logx_stats_t` 非 reserved 成员一一对应,
+     * 所有计数均为累计值(自 init 起),线程安全读取(原子快照)。
+     */
+    data class Stats(
+        /** staging 缓冲区空闲不足导致的日志丢弃次数 */
+        val dropNoSpace: Long,
+        /** 单条日志超过 maxLogLength 被丢弃的次数 */
+        val dropTooLarge: Long,
+        /** 启动恢复时发现的截尾块计数 */
+        val truncatedBlocks: Long,
+        /** 环形缓冲区回绕时插入的 PAD 记录数 */
+        val padRecords: Long,
+        /** 写入短写或 IO 错误计数 */
+        val blockWriteErrors: Long,
+    )
+
     data class Config(
         val logDir: File,
         val stagingDir: File,
@@ -236,6 +253,25 @@ object LogX {
     }
 
     /**
+     * 获取运行时诊断统计快照。init 之前或 close 之后调用返回 null。
+     *
+     * 线程安全:底层通过原子变量逐字段 load,返回的 [Stats] 是值语义不可变快照,
+     * 调用方可安全跨线程传递;多次调用之间各字段可能独立递增(非全局快照原子性),
+     * 但对监控 / 告警场景已足够。
+     */
+    fun getStats(): Stats? {
+        val h = nativeHandle; if (h == 0L) return null
+        val arr = nativeGetStats(h) ?: return null
+        return Stats(
+            dropNoSpace = arr[0],
+            dropTooLarge = arr[1],
+            truncatedBlocks = arr[2],
+            padRecords = arr[3],
+            blockWriteErrors = arr[4],
+        )
+    }
+
+    /**
      * 按日期范围导出 (回调模式)。from/to = yyyyMMdd 闭区间;
      * 明文临时文件写在 filesDir 下独立临时目录 (禁外部存储、禁 cacheDir); 回调返回或抛出后立即删除。
      */
@@ -307,6 +343,7 @@ object LogX {
     @JvmStatic private external fun nativeFlush(handle: Long)
     @JvmStatic private external fun nativeExport(handle: Long, from: String, to: String,
                                                  cb: ExportCallback): Int
+    @JvmStatic private external fun nativeGetStats(handle: Long): LongArray?
 
     /**
      * 关闭实例并释放 native 资源 (K-04: 与 setErrorHandler 串行化,避免
