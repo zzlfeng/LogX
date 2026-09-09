@@ -1,4 +1,4 @@
-package com.example.logx
+package com.zzlfeng.logx
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi

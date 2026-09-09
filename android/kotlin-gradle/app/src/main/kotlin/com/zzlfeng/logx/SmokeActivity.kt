@@ -1,4 +1,4 @@
-package com.example.logx
+package com.zzlfeng.logx
 
 import android.app.Activity
 import android.os.Bundle

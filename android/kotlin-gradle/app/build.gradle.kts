@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.logx"
+    namespace = "com.zzlfeng.logx"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.logx"
+        applicationId = "com.zzlfeng.logx"
         minSdk = 21      // LogX 全库 API 21 基线 (spec §10)
         targetSdk = 34
         compileOptions {

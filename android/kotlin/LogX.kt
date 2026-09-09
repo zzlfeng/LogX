@@ -1,4 +1,4 @@
-package com.example.logx
+package com.zzlfeng.logx
 
 import android.app.ActivityManager
 import android.app.Application

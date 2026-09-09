@@ -201,7 +201,7 @@ extern "C" {
 //       int maxLogLength, int flushThreshold, boolean consoleEcho);
 //       // returns native handle
 JNIEXPORT jlong JNICALL
-Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
+Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
                                       jstring jLogDir, jstring jStagingPath,
                                       jint compressAlgo, jint encryptEnable,
                                       jint kid, jobject jKeyProvider,
@@ -226,7 +226,7 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     JniErrorContext* err_ctx = nullptr;
     if (jvm) {
         if (!g_logx_class) {
-            jclass localLogX = env->FindClass("com/example/logx/LogX");
+            jclass localLogX = env->FindClass("com/zzlfeng/logx/LogX");
             if (localLogX) {
                 g_logx_class = static_cast<jclass>(env->NewGlobalRef(localLogX));
                 g_mid_on_error = env->GetStaticMethodID(localLogX, "onNativeError", "(IILjava/lang/String;)V");
@@ -288,7 +288,7 @@ Java_com_example_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong handle) {
+Java_com_zzlfeng_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong handle) {
     if (handle == 0) return;
     auto* inst = reinterpret_cast<logx_instance_t*>(handle);
 
@@ -315,7 +315,7 @@ Java_com_example_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong hand
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong handle,
+Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong handle,
                                        jint level, jstring jTag,
                                        jbyteArray jPayload) {
     if (!handle || !jTag) return;
@@ -379,14 +379,14 @@ Java_com_example_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_logx_LogX_nativeFlush(JNIEnv* /*env*/, jclass /*clazz*/, jlong handle) {
+Java_com_zzlfeng_logx_LogX_nativeFlush(JNIEnv* /*env*/, jclass /*clazz*/, jlong handle) {
     if (handle != 0) {
         logx_flush(reinterpret_cast<logx_instance_t*>(handle));
     }
 }
 
 JNIEXPORT jint JNICALL
-Java_com_example_logx_LogX_nativeExport(JNIEnv* env, jclass /*clazz*/, jlong handle,
+Java_com_zzlfeng_logx_LogX_nativeExport(JNIEnv* env, jclass /*clazz*/, jlong handle,
                                         jstring jFrom, jstring jTo, jobject jCallback) {
     if (!handle || !jFrom || !jTo || !jCallback) return -1;
     auto* inst = reinterpret_cast<logx_instance_t*>(handle);
@@ -413,7 +413,7 @@ Java_com_example_logx_LogX_nativeExport(JNIEnv* env, jclass /*clazz*/, jlong han
 // 使用 jlongArray 而非构造 Java 对象:JNI 侧零反射、零 jclass 缓存,Kotlin 侧
 // 由 Stats data class 构造函数解包,两端各司其职。
 JNIEXPORT jlongArray JNICALL
-Java_com_example_logx_LogX_nativeGetStats(JNIEnv* env, jclass /*clazz*/, jlong handle) {
+Java_com_zzlfeng_logx_LogX_nativeGetStats(JNIEnv* env, jclass /*clazz*/, jlong handle) {
     if (!handle) return nullptr;
     auto* inst = reinterpret_cast<logx_instance_t*>(handle);
 
