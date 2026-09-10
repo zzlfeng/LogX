@@ -33,6 +33,22 @@ import kotlinx.coroutines.withContext
 object LogX {
 
     /**
+     * 错误码常量 (与 C ABI logx_status_e 严格对齐)。
+     * 供错误回调 (ErrorHandler) 及状态码判定使用。
+     */
+    const val ERR_OK = 0
+    const val ERR_INVALID_ARG = -1
+    const val ERR_STATE = -2
+    const val ERR_IO = -3
+    const val ERR_NO_SPACE = -4
+    const val ERR_TOO_LARGE = -5
+    const val ERR_CODEC = -6
+    const val ERR_NOMEM = -7
+    const val ERR_NOT_FOUND = -8
+    const val ERR_INTERNAL = -9
+    const val ERR_TIMEOUT = -10
+
+    /**
      * 压缩算法枚举。序号必须与 C++ core/include/logx_codec.h 的
      * kAlgoNone/kAlgoZstd/kAlgoZlib 严格一致(NONE=0/ZSTD=1/ZLIB=2),
      * 经 JNI 直传给 logx_open 校验,落盘时由 make_flag() 写入块头

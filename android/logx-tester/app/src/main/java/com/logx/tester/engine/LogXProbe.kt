@@ -23,15 +23,13 @@ import java.util.concurrent.atomic.AtomicLong
  * 仍包含一次 `finally { slot.set(null) }`（约 10ns）及 2 次 `System.nanoTime()` 系统调用底噪，
  * 对于微秒级日志写入影响在 1%~2% 以内，属于端到端实际感知延迟。
  *
- * 【问题记录 P2 · 为什么当前采用文案匹配而非错误码映射】:
- * 理论上应通过 Native 侧返回的错误码常量（如 LOGX_ERR_NO_SPACE / LOGX_ERR_TOO_LARGE）判定丢弃类型。
- * 但经核实当前发布的 C++ 内核源码（core/src/logx_c.cpp:425, 430, 452）：
- *   - `br == kBuildRecordsInvalidInput` -> `emit_event(inst, LOGX_EV_DROP, -1, "invalid log input")`
- *   - `total > inst->max_log_length`    -> `emit_event(inst, LOGX_EV_DROP, -1, "log too large")`
- *   - `st == Staging::WriteStatus::kFull`-> `emit_event(inst, LOGX_EV_DROP, -1, "staging full")`
- * 当前 Native 核心对所有 DROP 事件上报的 code 恒为 `-1`，且 JNI `nativeWrite` 返回值为 void 未透传 status_e。
- * 因此在不动 Native 二进制库的前提下，匹配 msg 文案是目前唯一可行的区分手段。
- * 后续演进路线：Native 库迭代时，将 `emit_event` 的 code 改为真实 status 码，届时上层即可平滑切换为按常量 code 匹配。
+ * 【问题 P2 解决方案 · 强类型错误码映射】:
+ * 现已打通 C++ 内核 (logx_c.cpp) 真实错误码透传链路：
+ *   - `br == kBuildRecordsInvalidInput` -> `emit_event(inst, LOGX_EV_DROP, LOGX_ERR_INVALID_ARG, "invalid log input")`
+ *   - `total > inst->max_log_length`    -> `emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, "log too large")`
+ *   - `st == Staging::WriteStatus::kFull`-> `emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full")`
+ * 上层优先根据 `c.code`（LogX.ERR_NO_SPACE / ERR_TOO_LARGE / ERR_INVALID_ARG）进行严格匹配，
+ * 彻底消除了对错误消息文案的脆弱依赖；同时保留文案匹配以向后兼容。
  */
 object LogXProbe {
     data class EventRow(val kind: LogX.EventKind, val code: Int, val msg: String)
@@ -94,9 +92,13 @@ object LogXProbe {
             slot.set(null)
         }
         val dt = System.nanoTime() - t0
-        // 问题 P2 待改进项：Native 端若升级 emit_event 错误码，可改由 c.code 映射
+        // 问题 P2 修复: 优先按 Native 错误码常量进行强类型匹配，彻底消除文案脆弱性
         return when {
             !c.hit                             -> R.Ok(dt)
+            c.code == LogX.ERR_NO_SPACE        -> R.NoSpace(dt)
+            c.code == LogX.ERR_TOO_LARGE       -> R.TooLarge(dt)
+            c.code == LogX.ERR_INVALID_ARG     -> R.Invalid(dt)
+            // 向后兼容兜底 (若对接未升级的旧 native 库)
             c.msg.contains("staging full")     -> R.NoSpace(dt)
             c.msg.contains("log too large")    -> R.TooLarge(dt)
             c.msg.contains("invalid log input")-> R.Invalid(dt)

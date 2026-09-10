@@ -422,12 +422,12 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     uint32_t total = 0;
     int br = build_records(inst, level, tag, payload, payload_len, buf, &total);
     if (br == kBuildRecordsInvalidInput) {
-        emit_event(inst, LOGX_EV_DROP, -1, "invalid log input");
+        emit_event(inst, LOGX_EV_DROP, LOGX_ERR_INVALID_ARG, "invalid log input");
         return LOGX_ERR_INVALID_ARG;
     }
     if (total > inst->max_log_length) {
         inst->drop_too_large.fetch_add(1);
-        emit_event(inst, LOGX_EV_DROP, -1, "log too large");
+        emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, "log too large");
         return LOGX_ERR_TOO_LARGE;
     }
 
@@ -449,7 +449,7 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         need_wake = inst->flush_threshold > 0 && pending >= inst->flush_threshold;
     } else if (st == Staging::WriteStatus::kFull) {
         inst->drop_no_space.fetch_add(1);
-        emit_event(inst, LOGX_EV_DROP, -1, "staging full");
+        emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full");
     }
     inst->pal->mutex_unlock(inst->mu);
 

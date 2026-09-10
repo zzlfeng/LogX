@@ -110,19 +110,15 @@ UI 指标区划分了三个不同的观察维度，避免混淆统计口径：
 
 ---
 
-## 6. 技术债务与已知问题记录 (Known Issues & Tech Debt)
+## 6. 技术债务与问题解决记录 (Resolved Issues)
 
-### P2 · `LogXProbe` 当前采用错误消息文案匹配而非错误码映射
+### P2 · `LogXProbe` 强类型错误码映射改造（已解决）
 
-- **现状说明**:
-  `LogXProbe.write()` 当前根据 `c.msg.contains("staging full")` 等字符串判定丢弃原因，而非读取 `c.code` 常量。
-- **底层原因**:
-  核查 C++ 内核源码（`core/src/logx_c.cpp:425, 430, 452`）发现：
-  - `invalid log input` -> `emit_event(inst, LOGX_EV_DROP, -1, "invalid log input")`
-  - `log too large` -> `emit_event(inst, LOGX_EV_DROP, -1, "log too large")`
-  - `staging full` -> `emit_event(inst, LOGX_EV_DROP, -1, "staging full")`
-  所有 DROP 事件在 Native 核心中硬编码上报的 `code` 均为 `-1`，且 JNI `nativeWrite()` 返回值为 `void`（未透传 `status_e`）。
-  因此在**不改动现有 Native 动态库二进制**的硬约束下，按 `msg` 匹配是目前唯一能够区分这三类丢弃的有效手段。
-- **后续演进规划**:
-  未来 Native 核心版本迭代时，推动在 `emit_event` 中传入对应的真实错误码枚举（如 `LOGX_ERR_NO_SPACE(-4)`、`LOGX_ERR_TOO_LARGE(-5)`、`LOGX_ERR_INVALID_ARG(-1)`），并在 JNI / Kotlin 暴露明确常量，届时上层探针可无缝升级为按 `code` 常量映射。
+- **解决背景**:
+  原实现通过 `c.msg.contains(...)` 匹配文案来判定丢弃原因，存在文案耦合脆弱性。
+- **全链路改造方案**:
+  1. **C++ 内核** (`core/src/logx_c.cpp`): 在 `logx_write` 的 3 处丢弃分支中，将硬编码的 `-1` 替换为 C ABI 错误码 `LOGX_ERR_INVALID_ARG(-1)`、`LOGX_ERR_TOO_LARGE(-5)`、`LOGX_ERR_NO_SPACE(-4)`；
+  2. **动态库重编**: 重新编译 `arm64-v8a` 架构的 `liblogx.so` 并同步更新至 `jniLibs`；
+  3. **Kotlin 常量导出** (`LogX.kt`): 导出与 C ABI `logx_status_e` 一一对应的 `LogX.ERR_*` 规范常量；
+  4. **探针判定升级** (`LogXProbe.kt`): 优先按 `c.code`（`LogX.ERR_NO_SPACE` 等）进行强类型匹配，同时保留文本匹配作为向后兼容兜底，彻底消除了对 Native 文案的脆弱耦合。
 
