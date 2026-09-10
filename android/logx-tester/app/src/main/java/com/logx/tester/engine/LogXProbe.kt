@@ -92,13 +92,18 @@ object LogXProbe {
             slot.set(null)
         }
         val dt = System.nanoTime() - t0
-        // 问题 P2 修复: 优先按 Native 错误码常量进行强类型匹配，彻底消除文案脆弱性
+        // 问题 P2 修复: 优先按 Native 错误码常量强类型匹配，同时彻底解决 code == -1 兜底分支死代码问题
         return when {
             !c.hit                             -> R.Ok(dt)
             c.code == LogX.ERR_NO_SPACE        -> R.NoSpace(dt)
             c.code == LogX.ERR_TOO_LARGE       -> R.TooLarge(dt)
-            c.code == LogX.ERR_INVALID_ARG     -> R.Invalid(dt)
-            // 向后兼容兜底 (若对接未升级的旧 native 库)
+            // 兜底处理: code == -1 既对应真实 ERR_INVALID_ARG，也可能是旧 Native 库写死的兜底值
+            c.code == LogX.ERR_INVALID_ARG || c.code == -1 -> when {
+                c.msg.contains("staging full")     -> R.NoSpace(dt)
+                c.msg.contains("log too large")    -> R.TooLarge(dt)
+                c.msg.contains("invalid log input")-> R.Invalid(dt)
+                else                               -> R.Invalid(dt)
+            }
             c.msg.contains("staging full")     -> R.NoSpace(dt)
             c.msg.contains("log too large")    -> R.TooLarge(dt)
             c.msg.contains("invalid log input")-> R.Invalid(dt)

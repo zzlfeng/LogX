@@ -345,20 +345,25 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
                         otherDrop = current.otherDrop + resultMetrics.otherDrop,
                         latency = resultMetrics.latency,
                         throughputLogsPerSec = resultMetrics.throughputLogsPerSec,
-                        isDistorted = resultMetrics.isDistorted
+                        isDistorted = resultMetrics.isDistorted,
+                        isInterrupted = resultMetrics.isInterrupted
                     )
                 }
 
                 val lat = resultMetrics.latency
                 val report = buildString {
-                    append("压测完成: 总写成功 ${resultMetrics.writeOk}, 吞吐 ${"%.1f".format(resultMetrics.throughputLogsPerSec)} logs/s\n")
+                    if (resultMetrics.isInterrupted) {
+                        append("⚠️ 压测已中止 (完成 ${resultMetrics.latency.count}/$totalLogs, 写成功 ${resultMetrics.writeOk}), 吞吐 ${"%.1f".format(resultMetrics.throughputLogsPerSec)} logs/s\n")
+                    } else {
+                        append("压测完成: 总写成功 ${resultMetrics.writeOk}, 吞吐 ${"%.1f".format(resultMetrics.throughputLogsPerSec)} logs/s\n")
+                    }
                     append("延迟分位数 (µs): P50=${"%.1f".format(lat.p50Us)} | P90=${"%.1f".format(lat.p90Us)} | P99=${"%.1f".format(lat.p99Us)} | P99.9=${"%.1f".format(lat.p999Us)} | Max=${"%.1f".format(lat.maxUs)}")
                     if (resultMetrics.isDistorted) {
                         append("\n⚠️ 数据失真：本轮有丢弃(NoSpace=${resultMetrics.dropNoSpace}, TooLarge=${resultMetrics.dropTooLarge}, Invalid=${resultMetrics.invalidInput})，吞吐/延迟结论无效！")
                     }
                 }
                 _stressReport.value = report
-                appendConsoleLine(tag = "Stress", text = report, kind = if (resultMetrics.isDistorted) LineKind.DROP else LineKind.SYSTEM)
+                appendConsoleLine(tag = "Stress", text = report, kind = if (resultMetrics.isDistorted || resultMetrics.isInterrupted) LineKind.DROP else LineKind.SYSTEM)
                 refreshLogFiles()
             }
         )

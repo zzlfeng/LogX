@@ -129,23 +129,35 @@ object StressRunner {
                 }
             }
 
+            var wasCancelled = false
             try {
                 deferreds.awaitAll()
             } catch (_: Exception) {
-                // 捕获提前中止异常
+                wasCancelled = true
             } finally {
                 tickerJob.cancel()
             }
 
             // 压测完成或中止后，在 NonCancellable 块中汇总统计分位数
             withContext(NonCancellable) {
-                val actualCompleted = completedCount.get()
+                // 问题2优化: 严格保留排除未填充 0 值逻辑，采用原生数组零装箱提取，杜绝数十万 Long 包装对象的堆内存抖动与 GC 停顿
+                var validCount = 0
+                for (i in latencies.indices) {
+                    if (latencies[i] > 0L) validCount++
+                }
+                val validLatencies = LongArray(validCount)
+                var validIdx = 0
+                for (i in latencies.indices) {
+                    val lat = latencies[i]
+                    if (lat > 0L) {
+                        validLatencies[validIdx++] = lat
+                    }
+                }
+                Arrays.sort(validLatencies)
+
+                val actualCompleted = validLatencies.size.toLong()
                 val totalElapsedMs = System.currentTimeMillis() - tStart
                 val overallTps = if (totalElapsedMs > 0) (actualCompleted * 1000.0) / totalElapsedMs else 0.0
-
-                // 问题2修复: 采用 filter { it > 0 } 排除提前中止时的未填充 0 值
-                val validLatencies = latencies.filter { it > 0 }.toLongArray()
-                Arrays.sort(validLatencies)
 
                 val p50 = quantile(validLatencies, 0.50) / 1000.0
                 val p90 = quantile(validLatencies, 0.90) / 1000.0
@@ -163,7 +175,7 @@ object StressRunner {
                     invalidInput = invalidCount.get(),
                     otherDrop = otherDropCount.get(),
                     latency = LatencyStats(
-                        count = validLatencies.size.toLong(),
+                        count = actualCompleted,
                         p50Us = p50,
                         p90Us = p90,
                         p99Us = p99,
@@ -171,7 +183,8 @@ object StressRunner {
                         maxUs = max
                     ),
                     throughputLogsPerSec = overallTps,
-                    isDistorted = distorted
+                    isDistorted = distorted,
+                    isInterrupted = wasCancelled || actualCompleted < total
                 )
 
                 onComplete(metrics)

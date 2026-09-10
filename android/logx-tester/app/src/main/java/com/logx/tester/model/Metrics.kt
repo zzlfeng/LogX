@@ -24,6 +24,7 @@ data class TesterMetrics(
     val latency: LatencyStats = LatencyStats(),
     val throughputLogsPerSec: Double = 0.0,
     val isDistorted: Boolean = false, // 有丢弃时标注数据失真
+    val isInterrupted: Boolean = false, // 压测是否被提前中止
     val nativeStats: LogX.Stats? = null // 问题6: LogX.getStats() 底层诊断快照
 )
 
