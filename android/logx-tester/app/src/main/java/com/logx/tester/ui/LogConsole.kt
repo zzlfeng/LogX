@@ -56,7 +56,8 @@ fun LogConsole(
     var autoScroll by remember { mutableStateOf(true) }
     val listState = rememberLazyListState()
 
-    LaunchedEffect(lines.size, autoScroll) {
+    // 问题5修复: 以最后一条日志的序号为 key，即使达到缓存上限依然保持平滑自动滚动
+    LaunchedEffect(lines.lastOrNull()?.seq, autoScroll) {
         if (autoScroll && lines.isNotEmpty()) {
             listState.scrollToItem(lines.size - 1)
         }

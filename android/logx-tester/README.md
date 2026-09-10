@@ -8,7 +8,16 @@
 - **Native 零改动**: 完全复用已有的 `liblogx.so` 和 `libc++_shared.so`，不改动任何 C++ 或 JNI 代码
 - **精准结果捕获**: 基于 `LogXProbe`（`ThreadLocal` 哨兵模式）拦截调用线程上的同步 DROP 事件（`"staging full"`、`"log too large"`、`"invalid log input"`），精确还原每条日志的写入判定
 - **防并发死锁与竞态**: `EngineController` 采用 `Mutex` 串行化 `applyAndRestart` 与 `stop`，状态跨配置变更存活于 `TesterViewModel`
-- **压测护栏**: 压测期间强制 `consoleEcho=false` 防 logcat 刷爆；使用预分配 `LongArray` 防 GC 抖动；若压测期间出现任何丢弃，顶部显示“数据失真”醒目警示
+- **压测护栏**: 压测期间强制 `consoleEcho=false` 防 logcat 刷爆；使用预分配 `LongArray` 与 `latencies.filter { it > 0 }` 防 GC 抖动与提前中止分位数失真；若压测期间出现任何丢弃，顶部显示“数据失真”醒目警示
+
+### 1.1 核心架构假设与约束 (Architectural Assumptions)
+
+1. **【核心假设 A · Native 同步回调】**:
+   `LogXProbe` 的 `ThreadLocal` 哨兵机制强依赖底层调用栈的同步性：`LogX.log()` -> JNI `nativeWrite()` -> `logx_write()` -> `emit_event()` -> `jni_error_trampoline()` -> `LogX.onNativeError()` -> `LogXProbe.onEvent()`。全程在发起调用的同一线程上同步执行完毕。若未来 Native 核心重构为异步消息队列分发，此捕获机制需同步重构为基于全局 RequestID 或无锁序列号追踪的关联映射。
+2. **【核心假设 B · 延迟测算口径】**:
+   压测测得的延迟（P50/P90/P99）为从 Kotlin API 发起到 Native 返回的**端到端耗时**。除包含实际写入 staging 环耗时外，还包含 2 次 `System.nanoTime()` 与 1 次 `ThreadLocal.set(null)` 的纳秒级系统底噪（约 20~30ns），对于微秒级日志写入影响在 1%~2% 以内。
+
+---
 
 ## 2. 构建与运行
 
@@ -83,10 +92,37 @@ adb logcat -s LogX:V TesterTag:V
 
 ---
 
-## 5. Native 统计指标透明度说明
+## 5. 指标口径与 Native 原子诊断快照说明
 
-UI 指标区对以下三项指标进行了透明度标注：
-1. **`truncated_blocks`**: **N/A**。该指标仅在 crash 启动恢复时递增，虽然会产生 RECOVERY 事件，但事件消息中不携带具体丢弃条数。
-2. **`pad_records`**: **恒为 0**。LogX core 当前版本未插桩递增该计数器，仅保留读取通道。
-3. **`block_write_errors`**: **只能间接感知**。`flusher.cpp` 仅在 `:140` 短写时伴随 IO 事件，其它底层错误无伴随事件。
+UI 指标区划分了三个不同的观察维度，避免混淆统计口径：
+
+1. **【调用端 API 写入判定】** (`writeOk`, `dropNoSpace`, `dropTooLarge`, `invalidInput`):
+   统计 App 业务线程发起 `LogX.log()` 调用的单条执行结果。
+2. **【内核事件广播累计】** (`DEGRADED`, `DROP`, `IO`, `RECOVERY`):
+   来自 `LogX.ErrorHandler` 回调事件流。**此处的 DROP 事件与上方 API 的写入丢弃属于同一物理事件的底层广播视角，数值相对应，绝非二次丢弃，不可叠加求和**。
+3. **【Native 核心原子计数快照】** (`LogX.getStats()`):
+   直接通过 JNI 读取 C++ 底层 `std::atomic<uint64_t>` 计数器：
+   - `dropNoSpace`: staging 环满丢弃次数（与 App 侧指标直接印证）；
+   - `dropTooLarge`: 单条超限丢弃次数（与 App 侧指标直接印证）；
+   - `truncatedBlocks`: 异常崩溃启动恢复时发现的截尾块数；
+   - `padRecords`: 环形缓冲区回绕时插入的 PAD 记录数；
+   - `blockWriteErrors`: flusher 落盘短写或 IO 错误计数。
+
+---
+
+## 6. 技术债务与已知问题记录 (Known Issues & Tech Debt)
+
+### P2 · `LogXProbe` 当前采用错误消息文案匹配而非错误码映射
+
+- **现状说明**:
+  `LogXProbe.write()` 当前根据 `c.msg.contains("staging full")` 等字符串判定丢弃原因，而非读取 `c.code` 常量。
+- **底层原因**:
+  核查 C++ 内核源码（`core/src/logx_c.cpp:425, 430, 452`）发现：
+  - `invalid log input` -> `emit_event(inst, LOGX_EV_DROP, -1, "invalid log input")`
+  - `log too large` -> `emit_event(inst, LOGX_EV_DROP, -1, "log too large")`
+  - `staging full` -> `emit_event(inst, LOGX_EV_DROP, -1, "staging full")`
+  所有 DROP 事件在 Native 核心中硬编码上报的 `code` 均为 `-1`，且 JNI `nativeWrite()` 返回值为 `void`（未透传 `status_e`）。
+  因此在**不改动现有 Native 动态库二进制**的硬约束下，按 `msg` 匹配是目前唯一能够区分这三类丢弃的有效手段。
+- **后续演进规划**:
+  未来 Native 核心版本迭代时，推动在 `emit_event` 中传入对应的真实错误码枚举（如 `LOGX_ERR_NO_SPACE(-4)`、`LOGX_ERR_TOO_LARGE(-5)`、`LOGX_ERR_INVALID_ARG(-1)`），并在 JNI / Kotlin 暴露明确常量，届时上层探针可无缝升级为按 `code` 常量映射。
 

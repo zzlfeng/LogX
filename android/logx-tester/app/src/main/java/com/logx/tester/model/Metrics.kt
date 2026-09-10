@@ -1,5 +1,7 @@
 package com.logx.tester.model
 
+import com.zzlfeng.logx.LogX
+
 data class LatencyStats(
     val count: Long = 0,
     val p50Us: Double = 0.0,
@@ -21,6 +23,7 @@ data class TesterMetrics(
     val eventRecovery: Long = 0,
     val latency: LatencyStats = LatencyStats(),
     val throughputLogsPerSec: Double = 0.0,
-    val isDistorted: Boolean = false // 有丢弃时标注数据失真
+    val isDistorted: Boolean = false, // 有丢弃时标注数据失真
+    val nativeStats: LogX.Stats? = null // 问题6: LogX.getStats() 底层诊断快照
 )
 

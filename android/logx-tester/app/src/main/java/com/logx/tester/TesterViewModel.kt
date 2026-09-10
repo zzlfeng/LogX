@@ -86,26 +86,14 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
     private var batchFlushJob: Job? = null
 
     init {
-        // 1. 监听全局事件流 (LogX.ErrorHandler)
+        // 1. 监听全局事件流 (用于控制台展示)
         viewModelScope.launch {
             LogXProbe.eventSink.collect { ev ->
                 val kind = when (ev.kind) {
-                    LogX.EventKind.DROP -> {
-                        _metrics.update { it.copy(eventDrop = it.eventDrop + 1) }
-                        LineKind.DROP
-                    }
-                    LogX.EventKind.DEGRADED -> {
-                        _metrics.update { it.copy(eventDegraded = it.eventDegraded + 1) }
-                        LineKind.DEGRADED
-                    }
-                    LogX.EventKind.IO -> {
-                        _metrics.update { it.copy(eventIo = it.eventIo + 1) }
-                        LineKind.IO
-                    }
-                    LogX.EventKind.RECOVERY -> {
-                        _metrics.update { it.copy(eventRecovery = it.eventRecovery + 1) }
-                        LineKind.RECOVERY
-                    }
+                    LogX.EventKind.DROP -> LineKind.DROP
+                    LogX.EventKind.DEGRADED -> LineKind.DEGRADED
+                    LogX.EventKind.IO -> LineKind.IO
+                    LogX.EventKind.RECOVERY -> LineKind.RECOVERY
                 }
                 appendConsoleLine(
                     level = ev.kind.name,
@@ -116,10 +104,21 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
 
-        // 2. 启动 100ms 批量合并定时协程
+        // 2. 启动 100ms 批量合并定时协程，并同步原子事件计数与 Native 诊断快照
         batchFlushJob = viewModelScope.launch(Dispatchers.Default) {
             while (isActive) {
                 delay(100)
+                // 定期同步原子事件计数与 native 诊断快照
+                _metrics.update { old ->
+                    old.copy(
+                        eventDegraded = LogXProbe.eventDegradedCount.get(),
+                        eventDrop = LogXProbe.eventDropCount.get(),
+                        eventIo = LogXProbe.eventIoCount.get(),
+                        eventRecovery = LogXProbe.eventRecoveryCount.get(),
+                        nativeStats = LogX.getStats() ?: old.nativeStats
+                    )
+                }
+
                 if (pendingLines.isNotEmpty()) {
                     val batch = ArrayList<ConsoleLine>()
                     while (true) {
@@ -376,8 +375,14 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
         _consoleLines.value = emptyList()
     }
 
+    fun refreshNativeStats() {
+        val stats = LogX.getStats()
+        _metrics.update { it.copy(nativeStats = stats) }
+    }
+
     fun clearMetrics() {
-        _metrics.value = TesterMetrics()
+        LogXProbe.resetEventCounts()
+        _metrics.value = TesterMetrics(nativeStats = LogX.getStats())
         _stressReport.value = null
     }
 

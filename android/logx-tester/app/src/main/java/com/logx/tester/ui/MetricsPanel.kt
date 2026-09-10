@@ -19,6 +19,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -48,7 +49,9 @@ fun MetricsPanel(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // 1. 4 张计数卡
+            // 1. 4 张计数卡 (调用端视角)
+            Text("1. API 写入结果 (调用端单条判定)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+            Spacer(modifier = Modifier.height(4.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 MetricCard(
                     title = "writeOk",
@@ -81,7 +84,7 @@ fun MetricsPanel(
             // 2. 延迟与吞吐
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("写入延迟 (µs)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text("2. 端到端延迟 (µs)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                     Text(
                         "P50: ${"%.1f".format(metrics.latency.p50Us)} | P90: ${"%.1f".format(metrics.latency.p90Us)} | P99: ${"%.1f".format(metrics.latency.p99Us)} | Max: ${"%.1f".format(metrics.latency.maxUs)}",
                         fontSize = 12.sp,
@@ -97,7 +100,10 @@ fun MetricsPanel(
             Spacer(modifier = Modifier.height(10.dp))
 
             // 3. 事件流计数
-            Text("库内核事件流累计 (ErrorHandler)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+            Column {
+                Text("3. 内核广播事件累计 (ErrorHandler 视角)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                Text("注: 此处 DROP 为内核广播事件数，与上方 API 写入判定对应，两者不叠加计算", fontSize = 10.sp, color = Color.Gray)
+            }
             Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("DEGRADED: ${metrics.eventDegraded}", fontSize = 12.sp, color = Color(0xFFF57C00))
                 Text("DROP: ${metrics.eventDrop}", fontSize = 12.sp, color = Color(0xFFD32F2F))
@@ -107,18 +113,38 @@ fun MetricsPanel(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // 4. Native 计数 N/A 声明
+            // 4. Native 核心原子快照 (LogX.getStats())
+            val ns = metrics.nativeStats
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(4.dp))
-                    .padding(8.dp)
+                    .background(Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(6.dp))
+                    .padding(10.dp)
             ) {
                 Column {
-                    Text("ℹ️ Native 统计指标透明度说明:", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color.Gray)
-                    Text("• truncated_blocks: N/A（仅 recovery 产生，事件不含条数）", fontSize = 11.sp, color = Color.Gray)
-                    Text("• pad_records: N/A（库 core 内无递增点，当前恒为 0）", fontSize = 11.sp, color = Color.Gray)
-                    Text("• block_write_errors: 间接感知（flusher 部分写错误无伴随事件）", fontSize = 11.sp, color = Color.Gray)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Native 核心原子计数 (LogX.getStats())", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                        Text(if (ns != null) "已连接" else "未连接", fontSize = 11.sp, color = if (ns != null) Color(0xFF2E7D32) else Color.Gray)
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    if (ns != null) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("dropNoSpace: ${ns.dropNoSpace}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                            Text("dropTooLarge: ${ns.dropTooLarge}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                            Text("truncated: ${ns.truncatedBlocks}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                        }
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("padRecords: ${ns.padRecords}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                            Text("blockWriteErrors: ${ns.blockWriteErrors}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                        }
+                    } else {
+                        Text("LogX 实例未运行，启动后将自动获取 native 原子计数快照", fontSize = 11.sp, color = Color.Gray)
+                    }
                 }
             }
         }

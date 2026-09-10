@@ -41,9 +41,10 @@ android {
     }
 
     sourceSets {
-//        getByName("main") {
-//            java.srcDir(rootDir.parentFile.resolve("kotlin"))
-//        }
+        getByName("main") {
+            java.srcDir(rootDir.parentFile.resolve("kotlin"))
+            kotlin.srcDir(rootDir.parentFile.resolve("kotlin"))
+        }
     }
 }
 
