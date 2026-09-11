@@ -40,6 +40,7 @@ TEST(ReviewFixesTest, P1_1_NoDeadlockWhenCallbackClosesInstance) {
     logx_config_t cfg{};
     cfg.log_dir = dir.c_str();
     cfg.staging_path = staging_file.c_str();
+    cfg.max_log_length = 64 * 1024;
     cfg.flush_threshold = 64 * 1024;  // 不自动唤醒，便于灌满 staging
 
     logx_instance_t* inst = nullptr;
@@ -98,6 +99,7 @@ TEST(ReviewFixesTest, P2_3_PadRecordsIncrementedOnWrap) {
     logx_config_t cfg{};
     cfg.log_dir = dir.c_str();
     cfg.staging_path = staging_file.c_str();
+    cfg.max_log_length = 64 * 1024;
     cfg.flush_threshold = 0;  // 禁用自动 flush，观察 staging 自身垫 PAD
 
     logx_instance_t* inst = nullptr;

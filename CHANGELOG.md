@@ -1009,3 +1009,25 @@ adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_st
     - `run_recovery` 改为返回 `bool`，若 `staging->open` 失败则立即释放资源并中止，防止后续后台线程解引用空指针发生 SIGSEGV。
 12. **P4 死代码与冗余字段清理**：
     - 清理 `Instance::stats` 未使用字段及 `write_block_to_file` 桩实现。
+
+---
+
+## 2026-09-11: R1~R3 回归修复与生命周期加固
+
+针对代码审查中发现的 3 项深层次问题进行彻底修复：
+
+1. **R1 修复回归测试配置缺失 `max_log_length` 导致 `logx_open` 失败**：
+   - `test_review_p1_p4.cpp` 中 `P1_1_NoDeadlockWhenCallbackClosesInstance` 与 `P2_3_PadRecordsIncrementedOnWrap` 两个用例在初始化 `logx_config_t` 时补齐 `cfg.max_log_length = 64 * 1024`。
+   - 杜绝因未配置 `max_log_length`（值为 0）触发 fail-fast 参数校验 `-1 (LOGX_ERR_INVALID_ARG)`，确保死锁与 PAD 计数测试真实执行并验证通过（3/3 tests PASSED）。
+
+2. **R2 活跃操作生命周期全覆盖与递延销毁（Deferred Close）**：
+   - 消除窄窗 TOCTOU：通过 `executeOp` 模板在读取 `nativeHandle` 之前原子自增 `activeOps`，进入后二次校验 `isClosed`，杜绝操作线程刚读到句柄被切走、而 `close()` 误判活跃数为 0 销毁实例造成的 UAF。
+   - 全接口覆盖：不仅针对 `log()`，将 `flush()`、`getStats()` 以及同步/协程 `export()` 全量纳入 `executeOp` 统一保护。
+   - 递延销毁机制：`close()` 最多等待活跃线程退栈 500ms；若超时仍有慢操作（如后台导出），或在 `ErrorHandler.onError` 回调内部同步调用 `close()`，不强行销毁句柄，而是将句柄登记至 `pendingCloseHandle`，由最后一个退出的 `executeOp` 在 `finally` 块中通过 CAS 原子完成递延 `nativeClose`。
+   - 消除回调自死锁：记录 `threadOpDepth`（ThreadLocal），在回调内部触发 `close()` 时自动感知深度 > 0，跳过等待直接返回，由外层调用退栈后执行关闭，杜绝自死锁与延迟。
+
+3. **R3 规范 `LogX.kt:init()` 状态机与回滚一致性**：
+   - 移除 `init()` 中重复设置 `isClosed = false` 的冗余代码。
+   - 仅在 `nativeInit` 成功返回非零句柄后将 `isClosed` 置为 `false`；在 `catch (t: Throwable)` 异常回滚分支中可靠重置 `isClosed = true`、`nativeHandle = 0L`、`errorHandler = null`、`initCount.set(0)`。
+   - `init()` 入口前置等待上一实例未退出的慢操作完成递延销毁，杜绝多轮初始化间的句柄交叠污染。
+

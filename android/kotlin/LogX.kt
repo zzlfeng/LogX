@@ -117,9 +117,54 @@ object LogX {
     @Volatile private var errorHandler: ErrorHandler? = null
     @Volatile private var isClosed: Boolean = false
     @Volatile private var minLevel: Level = Level.I
-    private val activeWriters = AtomicInteger(0)
+    private val activeOps = AtomicInteger(0)
+    private val pendingCloseHandle = AtomicLong(0L)
     private val initCount = AtomicLong(0)
     @Volatile private var isLibraryLoaded: Boolean = false
+
+    private val threadOpDepth = object : ThreadLocal<Int>() {
+        override fun initialValue(): Int = 0
+    }
+
+    /**
+     * 统一保护所有跨 JNI 的 native 操作 (log / flush / getStats / export)。
+     *
+     * 核心安全保障 (R2):
+     * 1. 消除 TOCTOU 窄窗: 进入前先原子自增 activeOps，杜绝操作线程刚读到句柄被切走、
+     *    而 close() 误以为无活跃线程直接 nativeClose 造成的 UAF。
+     * 2. 递延销毁 (Deferred Close): 若 close() 时仍有慢操作或后台 export 正在执行，
+     *    或在 ErrorHandler 回调线程中直接同步调用 close()，close() 绝不强制销毁句柄，
+     *    而是将句柄存入 pendingCloseHandle，由最后一个退出的 executeOp 在 finally 中
+     *    安全递延触发 nativeClose。
+     * 3. 递归/回调防死锁: 记录 threadOpDepth，若当前线程已在 op 中 (如 native 回调
+     *    onNativeError 触发的 onError 内调用 close)，close() 立即感知并跳过等待，
+     *    杜绝自等待死锁。
+     */
+    private inline fun <T> executeOp(block: (Long) -> T): T? {
+        if (isClosed) return null
+        activeOps.incrementAndGet()
+        val depth = threadOpDepth.get() ?: 0
+        threadOpDepth.set(depth + 1)
+        try {
+            if (isClosed) return null
+            val h = nativeHandle
+            if (h == 0L) return null
+            return block(h)
+        } finally {
+            if (depth == 0) {
+                threadOpDepth.remove()
+            } else {
+                threadOpDepth.set(depth)
+            }
+            val remaining = activeOps.decrementAndGet()
+            if (remaining == 0 && pendingCloseHandle.get() != 0L) {
+                val handleToClose = pendingCloseHandle.getAndSet(0L)
+                if (handleToClose != 0L) {
+                    nativeClose(handleToClose)
+                }
+            }
+        }
+    }
 
     /** 动态设置最低日志记录级别。低于此级别的日志将在 Kotlin 侧零开销直接过滤。 */
     fun setMinLevel(level: Level) {
@@ -157,10 +202,28 @@ object LogX {
             // 重复 init: 抛 IllegalStateException (参见 spec §7)。
             throw IllegalStateException("LogX.init called more than once")
         }
-        isClosed = false
-        // K-03: 任何失败路径 (参数校验 / 目录创建 / nativeInit 返回 0) 都必须
+        // 若前序实例仍有未退栈的后台/慢操作，等待其彻底退出并完成递延销毁
+        val deadline = System.currentTimeMillis() + 1000
+        while (activeOps.get() > 0 && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(2)
+            } catch (ignored: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+        if (activeOps.get() > 0) {
+            initCount.set(0)
+            throw IllegalStateException("Cannot init LogX: previous instance operations still active")
+        }
+        val lingering = pendingCloseHandle.getAndSet(0L)
+        if (lingering != 0L) {
+            nativeClose(lingering)
+        }
+
+        // K-03 / R3: 任何失败路径 (参数校验 / 目录创建 / nativeInit 返回 0) 都必须
         // 回滚单例状态 —— 否则 errorHandler 持有的业务回调对象因单例引用无法
-        // 及时 GC;initCount 归零允许业务修正配置后重试 init。
+        // 及时 GC; initCount 归零允许业务修正配置后重试 init; isClosed 保持/重置为 true。
         try {
             if (!isLibraryLoaded) {
                 System.loadLibrary("logx")
@@ -189,8 +252,7 @@ object LogX {
             }
 
             minLevel = config.level
-            isClosed = false
-            nativeHandle = nativeInit(
+            val handle = nativeInit(
                 logDir.absolutePath,
                 stagingFile.absolutePath,
                 config.compress.algo.toInt(),
@@ -203,10 +265,14 @@ object LogX {
                 config.flushThreshold,
                 config.consoleEcho
             )
-            if (nativeHandle == 0L) {
+            if (handle == 0L) {
                 throw IllegalStateException("LogX native init failed")
             }
+            nativeHandle = handle
+            isClosed = false
         } catch (t: Throwable) {
+            isClosed = true
+            nativeHandle = 0L
             errorHandler = null
             initCount.set(0)
             throw t
@@ -273,24 +339,16 @@ object LogX {
         // P3-3: 方案 A: Kotlin 层前置过滤, 彻底消除不符合等级日志的 JNI 栈跨越与内存开销
         if (level.v < minLevel.v) return
 
-        val h = nativeHandle
-        if (h == 0L || isClosed) return  // pre-init 调用或已关闭: 丢弃 (参见 spec §7)
-
-        // P2-4: 方案 A: CAS 活跃写线程计数保护, 杜绝与 close() 并发时的 UAF / SIGSEGV 野指针崩溃
-        activeWriters.incrementAndGet()
-        try {
-            if (!isClosed && nativeHandle == h) {
-                nativeWrite(h, level.v, tag, payload)
-            }
-        } finally {
-            activeWriters.decrementAndGet()
+        executeOp { h ->
+            nativeWrite(h, level.v, tag, payload)
         }
     }
 
     /** 阻塞至进入时刻的目标水位落盘提交。退后台 / onStop 调用。 */
     fun flush() {
-        val h = nativeHandle; if (h == 0L) return
-        nativeFlush(h)
+        executeOp { h ->
+            nativeFlush(h)
+        }
     }
 
     /**
@@ -301,15 +359,16 @@ object LogX {
      * 但对监控 / 告警场景已足够。
      */
     fun getStats(): Stats? {
-        val h = nativeHandle; if (h == 0L) return null
-        val arr = nativeGetStats(h) ?: return null
-        return Stats(
-            dropNoSpace = arr[0],
-            dropTooLarge = arr[1],
-            truncatedBlocks = arr[2],
-            padRecords = arr[3],
-            blockWriteErrors = arr[4],
-        )
+        return executeOp { h ->
+            val arr = nativeGetStats(h) ?: return@executeOp null
+            Stats(
+                dropNoSpace = arr[0],
+                dropTooLarge = arr[1],
+                truncatedBlocks = arr[2],
+                padRecords = arr[3],
+                blockWriteErrors = arr[4],
+            )
+        }
     }
 
     /**
@@ -317,8 +376,9 @@ object LogX {
      * 明文临时文件写在 filesDir 下独立临时目录 (禁外部存储、禁 cacheDir); 回调返回或抛出后立即删除。
      */
     fun export(from: String, to: String, cb: ExportCallback): Int {
-        val h = nativeHandle; if (h == 0L) return -1
-        return nativeExport(h, from, to, cb)
+        return executeOp { h ->
+            nativeExport(h, from, to, cb)
+        } ?: -1
     }
 
     /**
@@ -326,7 +386,7 @@ object LogX {
      *
      * 返回值与异常语义 (K-01 / K-02 优化修复):
      *   - 0  = LOGX_OK, 导出成功;
-     *   - -1 = 实例未初始化;
+     *   - -1 = 实例未初始化或已关闭;
      *   - 其他负值 = native 状态码: -6 LOGX_ERR_CODEC = 业务 block 抛异常或
      *     回调返回非 0 (经 E-03 错误传播链路上报); -3 LOGX_ERR_IO = 临时文件
      *     写出失败; -8 LOGX_ERR_NOT_FOUND = 时段内无日志文件;
@@ -338,36 +398,36 @@ object LogX {
      *     异常向外抛出，避免被通用状态码掩盖。
      */
     suspend fun export(from: String, to: String, block: suspend (File) -> Unit): Int {
-        val h = nativeHandle
-        if (h == 0L) return -1
         val parentContext = coroutineContext
 
         return withContext(Dispatchers.IO) {
             var userException: Throwable? = null
-            val nativeRes = nativeExport(h, from, to) { _, plaintextPath, _ ->
-                val tempFile = File(plaintextPath)
-                if (userException != null) {
-                    // 若前一分卷处理已抛出异常，快速失败返回 -1，避免后续分卷继续执行业务逻辑
-                    return@nativeExport -1
-                }
-                val cbRet = try {
-                    runBlocking(parentContext) {
-                        block(tempFile)
+            val res = executeOp { h ->
+                nativeExport(h, from, to) { _, plaintextPath, _ ->
+                    val tempFile = File(plaintextPath)
+                    if (userException != null) {
+                        // 若前一分卷处理已抛出异常，快速失败返回 -1，避免后续分卷继续执行业务逻辑
+                        return@nativeExport -1
                     }
-                    0
-                } catch (t: Throwable) {
-                    userException = t
-                    -1
-                } finally {
-                    try {
-                        if (tempFile.exists()) tempFile.delete()
+                    val cbRet = try {
+                        runBlocking(parentContext) {
+                            block(tempFile)
+                        }
+                        0
                     } catch (t: Throwable) {
+                        userException = t
+                        -1
+                    } finally {
+                        try {
+                            if (tempFile.exists()) tempFile.delete()
+                        } catch (t: Throwable) {
+                        }
                     }
+                    cbRet
                 }
-                cbRet
             }
             userException?.let { throw it }
-            nativeRes
+            res ?: -1
         }
     }
 
@@ -389,15 +449,32 @@ object LogX {
     /**
      * 关闭实例并释放 native 资源 (K-04: 与 setErrorHandler 串行化,避免
      * 回调在 close 过程中被重新挂回)。
+     *
+     * 优雅退栈与递延销毁 (R2):
+     * 1. 若当前调用者非正在执行 executeOp 的线程，最多等待 500ms 让正在写/导出/落盘的线程优雅退出;
+     * 2. 若由 ErrorHandler (如 onNativeError) 内部同步调用 close()，当前线程本身即为 activeOp，
+     *    感知 depth > 0 立即跳过等待，杜绝自死锁;
+     * 3. 若等待结束 activeOps == 0，由 close() 立即调用 nativeClose 销毁底层句柄;
+     * 4. 若超时后仍有慢操作未退出，不强制销毁句柄 (杜绝 UAF)，而是交由最后一个退出 executeOp 的
+     *    线程在 finally 块中安全递延触发 nativeClose。
      */
     @Synchronized
     fun close() {
         val h = nativeHandle
-        if (h != 0L) {
-            isClosed = true
-            // P2-4: 方案 A: 优雅等待正在执行 nativeWrite 的活跃写线程退栈 (最多等待 100ms)
-            val deadline = System.currentTimeMillis() + 100
-            while (activeWriters.get() > 0 && System.currentTimeMillis() < deadline) {
+        if (h == 0L) return
+        isClosed = true
+        nativeHandle = 0L
+        initCount.set(0)
+        // close 后清除回调引用并标记关闭,回调对象可及时释放 (与 K-03 同纪律)
+        errorHandler = null
+
+        // 登记待销毁句柄，保证必定被且仅被释放一次 (CAS / getAndSet 语义)
+        pendingCloseHandle.set(h)
+
+        val isCurrentThreadInOp = (threadOpDepth.get() ?: 0) > 0
+        if (!isCurrentThreadInOp) {
+            val deadline = System.currentTimeMillis() + 500
+            while (activeOps.get() > 0 && System.currentTimeMillis() < deadline) {
                 try {
                     Thread.sleep(1)
                 } catch (ignored: InterruptedException) {
@@ -405,11 +482,13 @@ object LogX {
                     break
                 }
             }
-            nativeClose(h)
-            nativeHandle = 0L
-            initCount.set(0)
-            // close 后清除回调引用并标记关闭,回调对象可及时释放 (与 K-03 同纪律)
-            errorHandler = null
+        }
+
+        if (activeOps.get() == 0) {
+            val toClose = pendingCloseHandle.getAndSet(0L)
+            if (toClose != 0L) {
+                nativeClose(toClose)
+            }
         }
     }
 }
