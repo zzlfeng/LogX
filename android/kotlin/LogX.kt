@@ -216,18 +216,18 @@ object LogX {
     internal fun nativeHandleForTest(): Long = nativeHandle
 
     /**
-     * 初始化 LogX 单例 (N6 方案 A: 前奏等待与遗留销毁在 @Synchronized 锁外完成)。
+     * 初始化 LogX 单例 (N6 方案 A: 前奏等待与遗留销毁在 synchronized(this) 锁外完成)。
      *
      * 前奏 (无锁, 最坏 ~1s 等待 + ~5s 遗留 nativeClose):
      *   1. 等待上一实例快/慢操作全部退栈 (1s 上界, 超时 fail-fast 抛 IllegalStateException);
      *   2. 在 closeLock 内领取遗留递延句柄并同步 nativeClose —— closeLock 与在途
      *      递延销毁 (executeOp finally) 互斥, 保证旧实例 staging/日志文件彻底释放后
      *      才开启新实例, 杜绝新旧实例并发操作同一 staging 文件。
-     *   3. 锁外前奏完成后才进入 @Synchronized: 锁内只做 initCount 翻转与 nativeInit
+     *   3. 锁外前奏完成后才进入 synchronized(this): 锁内只做 initCount 翻转与 nativeInit
      *      本身, 持锁时间不受慢销毁拖累 (此前锁内等待会让 setErrorHandler/close/init
-     *      全部挂起最坏 5s+)。
+     *      全部挂起最坏 5s+); 显式对 this 同步以确保与 close/setErrorHandler 锁监视器一致。
      *
-     * 并发契约: 两个线程同时 init 时, 后到者在 @Synchronized 上排队; 其前奏已在
+     * 并发契约: 两个线程同时 init 时, 后到者在 synchronized(this) 上排队; 其前奏已在
      * 锁外跑完, 锁内 initCount 检查保证单例语义不变 (spec §7 重复 init 抛异常)。
      */
     fun init(context: Context, config: Config) {
@@ -254,9 +254,8 @@ object LogX {
             }
         }
 
-        // ---- 状态翻转 + nativeInit (持 @Synchronized, 无慢等待) ----
-        @Synchronized
-        fun doInitLocked() {
+        // ---- 状态翻转 + nativeInit (同步于 LogX 单例实例 this, 无慢等待) ----
+        synchronized(this) {
             if (initCount.incrementAndGet() != 1L) {
                 // 重复 init: 抛 IllegalStateException (参见 spec §7)。
                 throw IllegalStateException("LogX.init called more than once")
@@ -318,7 +317,6 @@ object LogX {
                 throw t
             }
         }
-        doInitLocked()
     }
 
     private fun getProcessSuffix(context: Context): String {

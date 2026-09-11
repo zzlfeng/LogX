@@ -32,6 +32,9 @@
 | `5f9707d` | fix(jni): J-04 修复 nativeWrite 临界区错误回调 CheckJNI 崩溃，改用栈缓冲+GetByteArrayRegion |
 | `1bc827a` | fix(core,jni,kt): 全面修复 P1~P4 代码审查缺陷与 Android 默认集成 ZSTD |
 | `2a41b96` | fix(kt,test): R1 回归测试配置补齐、R2 活跃操作生命周期递延销毁、R3 init 状态机回滚一致性 |
+| `d19d94e` | fix(kt): N2~N4 状态机闭环：引入 closeLock 消除 Check-Then-Act 状态裂隙、快慢操作分离计数与热路径纯读快速预检 |
+| `9689f22` | fix(kt): N6 方案A——init() 前奏等待与遗留销毁移出 @Synchronized, 消除锁内长等待 |
+| `HEAD` | fix(kt): 纠正 init() 内部锁监视器分裂——以 synchronized(this) 替换局部函数 @Synchronized 确保与 close/setErrorHandler 精准互斥 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -1051,10 +1054,13 @@ adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_st
 3. **N4 热路径快速预检（pre-init / 已关闭零开销）**：
    - `executeOp` 入口增加纯读快速路径 `if (isClosed || nativeHandle == 0L) return null`：pre-init 或已关闭状态下的高频 log 调用不再支付原子计数与 ThreadLocal 开销（旧版每条白付 3~4 个原子操作 + 1 次 ThreadLocal 访问）。
    - 正确性：close 先写 `isClosed` 再清 `nativeHandle`、init 先写 `nativeHandle` 再写 `isClosed=false`（均 volatile），快速路径仅为拒绝 hint——误拒只发生在 init/close 过渡窗口（此时调用语义本就是 "过渡期丢弃"，与 spec §7 对 pre-init 的约定一致），误放行由 increment 之后的二次 `isClosed` 检查兜底，双重检查结构不变。
-4. **N6 修复（方案 A）：init() 前奏等待与遗留销毁移出 @Synchronized，消除锁内长等待**：
-   - 问题：closeLock 引入后 `init()` 在持有 `@Synchronized` 对象锁的情况下进入 `closeLock` 执行遗留 `nativeClose`（含 flush + Flusher join，最坏 ~5s），锁内慢等待使并发的 `setErrorHandler` / `close` / `init` 全部被挂起不可预测的时长。
-   - 修复：`init()` 拆为两段 —— 前奏（无锁）：等快/慢计数归零（1s fail-fast）→ closeLock 内领取遗留句柄并同步 nativeClose；随后才进入 `@Synchronized`（局部函数 `doInitLocked`）做 initCount 翻转与 nativeInit 本身。持锁时间回落到 nativeInit 量级，`close()` / `setErrorHandler` 不再被慢销毁拖累。
-   - 并发契约不变：两线程同时 init 时后到者在 `@Synchronized` 排队，锁内 initCount 检查保证 "重复 init 抛 IllegalStateException"（spec §7）；前奏的两次 fail-fast 抛出路径均不触碰 initCount（无锁阶段未递增）或已正确归零。
+4. **N6 修复（方案 A）：init() 前奏等待与遗留销毁移出互斥锁，消除锁内长等待**：
+   - 问题：closeLock 引入后 `init()` 在持有同步锁的情况下进入 `closeLock` 执行遗留 `nativeClose`（含 flush + Flusher join，最坏 ~5s），锁内慢等待使并发的 `setErrorHandler` / `close` / `init` 全部被挂起不可预测的时长。
+   - 修复：`init()` 拆为两段 —— 前奏（无锁）：等快/慢计数归零（1s fail-fast）→ closeLock 内领取遗留句柄并同步 nativeClose；随后才进入同步块做 initCount 翻转与 nativeInit 本身。持锁时间回落到 nativeInit 量级，`close()` / `setErrorHandler` 不再被慢销毁拖累。
+   - 并发契约不变：两线程同时 init 时后到者排队，锁内 initCount 检查保证 "重复 init 抛 IllegalStateException"（spec §7）；前奏的两次 fail-fast 抛出路径均不触碰 initCount（无锁阶段未递增）或已正确归零。
+5. **N6 锁监视器纠偏：以 `synchronized(this)` 替换局部函数 `@Synchronized`，消除锁对象分裂**：
+   - 根因：Kotlin 局部函数上标注 `@Synchronized`（如 `@Synchronized fun doInitLocked()`）时，kotlinc 编译器将其生成为 `private static final synchronized void init$doInitLocked(...)`，根据 JVM 规范其锁监视器为 `LogX.class` 类对象；而 `close()` 与 `setErrorHandler()` 是声明在 `object LogX` 单例上的成员函数，其 `@Synchronized` 锁监视器为 `LogX.INSTANCE`（`this`）。两者锁对象不一致导致锁分裂，`init` 临界区无法与并发的 `close()` / `setErrorHandler()` 形成真正的互斥保护。
+   - 修复：移除局部函数，改为直接在 `init()` 内部使用 `synchronized(this) { ... }` 代码块。字节码中通过 `aload_0`（即 `LogX.INSTANCE`）执行 `monitorenter`/`monitorexit`，与单例内其他同步方法锁监视器完全对齐，彻底消除并发互斥失效风险。
 
 ### 2. 【R2】`LogX.kt` 活跃操作生命周期全覆盖与递延销毁（Deferred Close）
 - **故障现象与潜在风险**：
