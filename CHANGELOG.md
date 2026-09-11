@@ -989,7 +989,7 @@ adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_st
    - 统一使用 `format_pad(data_base_ + pos, this_pad)` 替代原先手写内联 Header 写入。
 4. **P2-4 `LogX.kt` 引入无锁 CAS 活跃写线程保护（防 UAF / SIGSEGV）**：
    - 使用 `AtomicInteger activeWriters` 计数，`log()` 前置原子自增并在 `finally` 中自减。
-   - `close()` 置 `isClosed = true` 并微等待活跃写线程退栈（最多 100ms）后调用 `nativeClose`，彻底根除高并发下 `close()` 销毁 Native 句柄导致的 UAF 崩溃。
+   - `close()` 置 `isClosed = true` 并微等待活跃写线程退栈（最多 100ms）后调用 `nativeClose`，根除高并发下 `close()` 销毁 Native 句柄导致的 UAF 崩溃。（注：后经 R2 二轮审查全面升级为 `executeOp` 全接口覆盖与递延销毁机制）。
 5. **P2-5 `export_range` 增加 `flush_blocking` 结果检测与告警**：
    - 检查 `if (!flush_blocking(inst))`，当 flush 异常或超时时发出 `LOGX_EV_IO` 告警，并尽力导出已落盘分卷。
 6. **P3-1 `flush_blocking` 剥离 Retention 清理**：
@@ -1012,22 +1012,63 @@ adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_st
 
 ---
 
-## 2026-09-11: R1~R3 回归修复与生命周期加固
+## 2026-09-11: R1~R3 代码审查缺陷深度修复与生命周期加固
 
-针对代码审查中发现的 3 项深层次问题进行彻底修复：
+在 P1~P4 修复合入后，对回归测试配置有效性、JNI 并发保护边界以及 Kotlin 单例状态机进行了二轮深度审查，定位并彻底闭环了 3 项深层次缺陷：
 
-1. **R1 修复回归测试配置缺失 `max_log_length` 导致 `logx_open` 失败**：
-   - `test_review_p1_p4.cpp` 中 `P1_1_NoDeadlockWhenCallbackClosesInstance` 与 `P2_3_PadRecordsIncrementedOnWrap` 两个用例在初始化 `logx_config_t` 时补齐 `cfg.max_log_length = 64 * 1024`。
-   - 杜绝因未配置 `max_log_length`（值为 0）触发 fail-fast 参数校验 `-1 (LOGX_ERR_INVALID_ARG)`，确保死锁与 PAD 计数测试真实执行并验证通过（3/3 tests PASSED）。
+### 1. 【R1】修复 `test_review_p1_p4.cpp` 回归测试缺失配置导致门禁阻断
+- **故障现象**：
+  运行单测时 `ReviewFixesTest.P1_1_NoDeadlockWhenCallbackClosesInstance` 与 `ReviewFixesTest.P2_3_PadRecordsIncrementedOnWrap` 两个用例在首行 `ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK)` 处即返回 `-1` 失败。P1-1 锁外规避死锁场景与 P2-3 `pad_records` 计数器验证实际未被测到。
+- **根因分析**：
+  两个测试在初始化 `logx_config_t cfg{}` 时仅显式配置了 `log_dir`、`staging_path` 和 `flush_threshold`，漏设了 `max_log_length`（结构体零初始化为 0）。`core/src/logx_c.cpp:292` 的 fail-fast 校验规则明确要求：
+  ```cpp
+  if (cfg->max_log_length == 0 || cfg->max_log_length > LOGX_STAGING_DATA_SIZE - 128 - 1) {
+      return LOGX_ERR_INVALID_ARG;
+  }
+  ```
+  零值被直接判定为非法参数并返回 `LOGX_ERR_INVALID_ARG (-1)`，导致用例在门禁处中断。
+- **修复措施**：
+  在两个用例的 `logx_config_t` 中补齐 `cfg.max_log_length = 64 * 1024;`（与规范 64KB 对齐）。
+- **验证效果**：
+  单测 3 个用例全部真实执行并通过（3/3 PASSED），真实覆盖了 staging full 锁外触发 `onError` 并调用 `logx_close` 的零死锁路径，以及 staging 回绕时插入 PAD 记录并自增计数器的逻辑。
 
-2. **R2 活跃操作生命周期全覆盖与递延销毁（Deferred Close）**：
-   - 消除窄窗 TOCTOU：通过 `executeOp` 模板在读取 `nativeHandle` 之前原子自增 `activeOps`，进入后二次校验 `isClosed`，杜绝操作线程刚读到句柄被切走、而 `close()` 误判活跃数为 0 销毁实例造成的 UAF。
-   - 全接口覆盖：不仅针对 `log()`，将 `flush()`、`getStats()` 以及同步/协程 `export()` 全量纳入 `executeOp` 统一保护。
-   - 递延销毁机制：`close()` 最多等待活跃线程退栈 500ms；若超时仍有慢操作（如后台导出），或在 `ErrorHandler.onError` 回调内部同步调用 `close()`，不强行销毁句柄，而是将句柄登记至 `pendingCloseHandle`，由最后一个退出的 `executeOp` 在 `finally` 块中通过 CAS 原子完成递延 `nativeClose`。
-   - 消除回调自死锁：记录 `threadOpDepth`（ThreadLocal），在回调内部触发 `close()` 时自动感知深度 > 0，跳过等待直接返回，由外层调用退栈后执行关闭，杜绝自死锁与延迟。
+### 2. 【R2】`LogX.kt` 活跃操作生命周期全覆盖与递延销毁（Deferred Close）
+- **故障现象与潜在风险**：
+  1. **TOCTOU 竞态窄窗**：原方案中写线程在 `val h = nativeHandle` 读出句柄与 `activeWriters.incrementAndGet()` 之间存在纳秒级调度窗。写线程读到句柄后若被系统切走，此时 `close()` 介入看到 `activeWriters == 0`，直接执行 `nativeClose(h)` 并释放 Native `Instance` 堆内存；写线程恢复后调用 `nativeWrite(h)` 解引用已被释放的内存，导致野指针 UAF / SIGSEGV 崩溃；
+  2. **100ms 超时强制销毁不可靠**：原 `close()` 循环最多等待 100ms。若系统处于极端高负载、GC 停顿或 I/O 阻塞状态，耗时超过 100ms 后 `close()` 仍会强行销毁句柄，破坏内存安全契约；
+  3. **非写接口（flush / getStats / export）裸奔**：仅 `log()` 包含活跃计数保护，而 `flush()`、`getStats()` 以及同步/协程 `export()` 均直接裸调 JNI。特别是大文件解密导出（耗时可达数百毫秒至数秒），并发触发 `close()` 时百分之百复现 UAF 崩溃；
+  4. **回调内部调用 `close()` 自死锁**：C 核心契约明确允许在 `ErrorHandler.onError` 回调中调用 `close()`。写线程在 `nativeWrite` 内部触发回调时已占有活跃计数，若同一线程在 `close()` 中循环等待活跃计数归零，将发生无法恢复的自死锁。
+- **架构设计与修复方案**：
+  1. **通用保护模板 `executeOp<T>`**：
+     - 先原子自增 `activeOps.incrementAndGet()`，再读取 `nativeHandle` 并二次校验 `isClosed`，彻底消除 TOCTOU 窄窗；
+     - 将 `log`、`flush`、`getStats`、同步 `export`、协程 `export` 全量统一接入 `executeOp` 模板包裹，确保所有 Native 跨 JNI 调用均受生命周期管辖；
+  2. **递延销毁机制（Deferred Close）**：
+     - `close()` 标记 `isClosed = true` 并原子置空 `nativeHandle = 0L`，将待销毁句柄保存在原子变量 `pendingCloseHandle.set(h)` 中；
+     - `close()` 优雅等待最多 500ms 让活跃线程自然退栈；若超时仍有未退栈的后台慢操作（如后台导出），**坚决不强制调用 `nativeClose`**（杜绝 UAF）；
+     - 由最后一个退出的 `executeOp` 在 `finally` 块中通过原子 CAS `pendingCloseHandle.getAndSet(0L)` 触发递延 `nativeClose`，确保句柄必定延展至所有操作结束且仅被释放一次；
+  3. **基于 ThreadLocal 深度感知的回调自死锁消除**：
+     - 引入 `threadOpDepth`（`ThreadLocal<Int>`，兼容 Android 5.0+ / API 21+，归零时执行 `remove()` 杜绝线程池内存泄漏）；
+     - 当在 `onError` 回调内同步触发 `close()` 时，`close()` 感知当前线程递归深度 `depth > 0`，跳过等待直接返回，由外层调用退栈后安全递延释放，杜绝自死锁与延迟。
 
-3. **R3 规范 `LogX.kt:init()` 状态机与回滚一致性**：
-   - 移除 `init()` 中重复设置 `isClosed = false` 的冗余代码。
-   - 仅在 `nativeInit` 成功返回非零句柄后将 `isClosed` 置为 `false`；在 `catch (t: Throwable)` 异常回滚分支中可靠重置 `isClosed = true`、`nativeHandle = 0L`、`errorHandler = null`、`initCount.set(0)`。
-   - `init()` 入口前置等待上一实例未退出的慢操作完成递延销毁，杜绝多轮初始化间的句柄交叠污染。
+### 3. 【R3】规范 `LogX.kt:init()` 状态机与回滚一致性
+- **故障根因**：
+  1. `init()` 内部在行 160 与 192 重复对 `@Volatile var isClosed` 赋值为 `false`；
+  2. 在 `catch (t: Throwable)` 异常回滚分支中，未将 `isClosed` 重置为 `true`，导致初始化失败后（如参数校验非法或 `nativeInit` 失败）状态机残留为未关闭态，单例状态与底层句柄状态脱节；
+  3. 若此前实例尚有未完全退栈的慢操作在执行递延销毁，直接开始新一轮 `init()` 可能造成跨实例状态交叉污染与旧句柄泄漏。
+- **修复措施**：
+  1. **状态机严格单调**：清理重复赋值，仅在 `nativeInit` 成功返回非零有效句柄后将 `isClosed` 置为 `false`；
+  2. **失败彻底回滚**：在 `catch` 块中严格重置 `isClosed = true`、`nativeHandle = 0L`、`errorHandler = null`、`initCount.set(0)`，确保回滚后状态机处于完全干净的已关闭/未就绪态；
+  3. **跨实例周期隔离**：`init()` 入口处前置等待上一实例未退出的后台操作彻底退出（最多 1000ms），并在启动前清空旧实例的递延待关闭句柄，杜绝任何状态与内存泄漏。
+
+---
+
+### 自动化验证结果
+
+1. **C++ 全量单元测试**：
+   - 测试套件：`build_verify/tests/unit/Release/logx_unit_tests.exe`
+   - 测试结果：**132 个测试全部通过（132 / 132 PASSED, 0 FAILED）**，无任何回归错误。
+2. **Android 编译与打包**：
+   - 构建命令：`.\gradlew.bat assembleDebug`
+   - 构建结果：**`BUILD SUCCESSFUL`**，Kotlin 字节码编译与 APK 打包 0 错误 0 告警。
+
 
