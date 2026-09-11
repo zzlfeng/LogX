@@ -34,7 +34,7 @@
 | `2a41b96` | fix(kt,test): R1 回归测试配置补齐、R2 活跃操作生命周期递延销毁、R3 init 状态机回滚一致性 |
 | `d19d94e` | fix(kt): N2~N4 状态机闭环：引入 closeLock 消除 Check-Then-Act 状态裂隙、快慢操作分离计数与热路径纯读快速预检 |
 | `9689f22` | fix(kt): N6 方案A——init() 前奏等待与遗留销毁移出 @Synchronized, 消除锁内长等待 |
-| `HEAD` | fix(kt): 纠正 init() 内部锁监视器分裂——以 synchronized(this) 替换局部函数 @Synchronized 确保与 close/setErrorHandler 精准互斥 |
+| `7621993` | fix(kt): 纠正 init() 内部锁监视器分裂——以 synchronized(this) 替换局部函数 @Synchronized 确保与 close/setErrorHandler 精准互斥 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
