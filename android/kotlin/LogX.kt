@@ -6,6 +6,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Process
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
@@ -115,8 +116,18 @@ object LogX {
     @Volatile private var nativeHandle: Long = 0L
     @Volatile private var errorHandler: ErrorHandler? = null
     @Volatile private var isClosed: Boolean = false
+    @Volatile private var minLevel: Level = Level.I
+    private val activeWriters = AtomicInteger(0)
     private val initCount = AtomicLong(0)
     @Volatile private var isLibraryLoaded: Boolean = false
+
+    /** 动态设置最低日志记录级别。低于此级别的日志将在 Kotlin 侧零开销直接过滤。 */
+    fun setMinLevel(level: Level) {
+        minLevel = level
+    }
+
+    /** 获取当前最低日志记录级别。 */
+    fun getMinLevel(): Level = minLevel
 
     init {
         try {
@@ -177,6 +188,8 @@ object LogX {
                 "maxLogLength must be < (dataSize - 1) = 130943"
             }
 
+            minLevel = config.level
+            isClosed = false
             nativeHandle = nativeInit(
                 logDir.absolutePath,
                 stagingFile.absolutePath,
@@ -257,9 +270,21 @@ object LogX {
     fun f(tag: String, msg: String) = log(Level.F, tag, msg.toByteArray())
 
     fun log(level: Level, tag: String, payload: ByteArray) {
+        // P3-3: 方案 A: Kotlin 层前置过滤, 彻底消除不符合等级日志的 JNI 栈跨越与内存开销
+        if (level.v < minLevel.v) return
+
         val h = nativeHandle
-        if (h == 0L) return  // pre-init 调用: 丢弃 + 原子计数 (参见 spec §7)
-        nativeWrite(h, level.v, tag, payload)
+        if (h == 0L || isClosed) return  // pre-init 调用或已关闭: 丢弃 (参见 spec §7)
+
+        // P2-4: 方案 A: CAS 活跃写线程计数保护, 杜绝与 close() 并发时的 UAF / SIGSEGV 野指针崩溃
+        activeWriters.incrementAndGet()
+        try {
+            if (!isClosed && nativeHandle == h) {
+                nativeWrite(h, level.v, tag, payload)
+            }
+        } finally {
+            activeWriters.decrementAndGet()
+        }
     }
 
     /** 阻塞至进入时刻的目标水位落盘提交。退后台 / onStop 调用。 */
@@ -369,12 +394,22 @@ object LogX {
     fun close() {
         val h = nativeHandle
         if (h != 0L) {
+            isClosed = true
+            // P2-4: 方案 A: 优雅等待正在执行 nativeWrite 的活跃写线程退栈 (最多等待 100ms)
+            val deadline = System.currentTimeMillis() + 100
+            while (activeWriters.get() > 0 && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(1)
+                } catch (ignored: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
             nativeClose(h)
             nativeHandle = 0L
             initCount.set(0)
             // close 后清除回调引用并标记关闭,回调对象可及时释放 (与 K-03 同纪律)
             errorHandler = null
-            isClosed = true
         }
     }
 }

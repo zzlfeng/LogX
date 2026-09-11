@@ -66,7 +66,6 @@ struct Instance {
     std::atomic<uint64_t> flushed_bytes_total{0};
 
     // ---- 统计 ----
-    logx_stats_t stats{};
     std::atomic<uint64_t> drop_no_space{0};
     std::atomic<uint64_t> drop_too_large{0};
     std::atomic<uint64_t> pad_records{0};
@@ -183,11 +182,6 @@ inline bool safe_assign_atc_offsets(uint64_t start_offset, uint64_t end_offset,
     return true;
 }
 
-// 写一个完整块到日志文件;返回成功与否。
-bool write_block_to_file(Instance* inst,
-                         const uint8_t* raw, const PendingBlock& blk,
-                         uint32_t seqno,
-                         const uint8_t salt[8], uint8_t flag);
 
 // 一次性 helper:打开(或创建)追加目标文件并追加一个块。
 // 返回是否成功,*out_start/*out_end 写块在文件中的字节偏移。
@@ -257,8 +251,8 @@ bool flush_blocking(Instance* inst);
 // Flusher 线程入口。
 void* flusher_main(void* arg);
 
-// recovery 模块入口:启动时跑一次。
-void run_recovery(Instance* inst);
+// recovery 模块入口:启动时跑一次;返回是否成功(staging open 失败等返回 false)。
+bool run_recovery(Instance* inst);
 
 // export:按日期范围拉取并解密写临时文件;明文文件在 callback 后删除。
 // 期间 Flusher 继续写新块,但本次 export 的"快照止点" = 调用时刻各文件长度。

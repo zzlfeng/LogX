@@ -408,7 +408,7 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
         super.onCleared()
         batchFlushJob?.cancel()
         StressRunner.stop()
-        LogX.close()
+        EngineController.stopSync()
     }
 }
 

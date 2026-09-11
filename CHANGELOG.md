@@ -29,8 +29,8 @@
 | `74c55d3` | test(codec): 纠偏 GCM 官方向量编号并补齐 McGrew-Viega TC13 权威锚点 (方案 A+) |
 | `5aa713d` | fix(crypto): 移除 aesce 探针静态缓存恢复无状态纯读，根除并发数据竞争 (方案 A) |
 | `1943f1f` | fix(flusher): implement 75ms debounce aggregation flush for low-frequency writes (F-10) |
-| `7c1ee7c` | fix(staging): constexpr compile-time CRC32 table eliminating multi-thread data race (S-01) |
-| `b1df856` | fix(jni): J-04 修复 nativeWrite 临界区错误回调 CheckJNI 崩溃，改用栈缓冲+GetByteArrayRegion |
+| `5f9707d` | fix(jni): J-04 修复 nativeWrite 临界区错误回调 CheckJNI 崩溃，改用栈缓冲+GetByteArrayRegion |
+| `3d4878d` | fix(core,jni,kt): 全面修复 P1~P4 代码审查缺陷与 Android 默认集成 ZSTD |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -972,3 +972,40 @@ adb shell "chmod 755 /data/local/tmp/logx_test/*"
 adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_unit_tests"
 adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_stress_tests"
 ```
+
+---
+
+## 2026-09-11: P1~P4 代码审查缺陷全面修复与架构加固
+
+针对代码审查中深入发现的 12 项潜在缺陷、并发死锁与性能隐患进行彻底闭环修复：
+
+1. **P1-1 `logx_write` 锁外触发错误回调（防自死锁与写放大）**：
+   - 满缓冲分支（`staging full`）改为锁内仅标记 `need_drop_event = true`，在 `inst->mu` 释放后统一执行 `emit_event`。
+   - 彻底杜绝回调中调用 `logx_close` / `logx_flush` 时对非递归互斥锁重入导致的自死锁，杜绝满载时业务写线程停顿。
+2. **P2-2 JNI `nativeWrite` 传参长度与实际缓冲区安全对齐**：
+   - 当 `n > 64KB` 截断拷贝到 `tls_payload_buf` 时，传递给 C 核心的长度严格取 `safe_payload_len = copy_len`，消除潜在越界读未初始化脏内存的隐患。
+3. **P2-3 `pad_records` 回绕垫 PAD 计数器接线**：
+   - `Staging::write_records` 统计生成的 PAD 记录条数，`logx_write` 累加到 `inst->pad_records`，使运行时诊断快照 `Stats.padRecords` 指标真实反映回绕垫补行为。
+   - 统一使用 `format_pad(data_base_ + pos, this_pad)` 替代原先手写内联 Header 写入。
+4. **P2-4 `LogX.kt` 引入无锁 CAS 活跃写线程保护（防 UAF / SIGSEGV）**：
+   - 使用 `AtomicInteger activeWriters` 计数，`log()` 前置原子自增并在 `finally` 中自减。
+   - `close()` 置 `isClosed = true` 并微等待活跃写线程退栈（最多 100ms）后调用 `nativeClose`，彻底根除高并发下 `close()` 销毁 Native 句柄导致的 UAF 崩溃。
+5. **P2-5 `export_range` 增加 `flush_blocking` 结果检测与告警**：
+   - 检查 `if (!flush_blocking(inst))`，当 flush 异常或超时时发出 `LOGX_EV_IO` 告警，并尽力导出已落盘分卷。
+6. **P3-1 `flush_blocking` 剥离 Retention 清理**：
+   - 从 `flush_blocking` 中完全剥离 `retention_cleanup_impl` 目录遍历与日期计算，杜绝高频 flush 导致的磁盘 I/O 抖动。
+   - Retention 清理仅保留在实例启动和跨天 Rollover 时触发。
+7. **P3-2 `drain_once` 消除 75ms 空转 128KB 内存分配与 memset**：
+   - `snapshot_pending` 前置；若 `bytes == 0` 则立即解锁返回，避免无意义的缓冲区触碰。
+   - 在 `FlusherCtx` 中常驻复用 `scratch` vector，消除约 1.7 MB/s 的内存分配/释放与 CPU 缓存抖动。
+8. **P3-3 接通 `Config.level` 日志级别过滤**：
+   - `init()` 保存配置的 `minLevel`，`LogX.log()` 入口增加 `if (level.v < minLevel.v) return` 前置过滤，彻底阻断不符合级别日志的 JNI 栈跨越与数据拷贝开销。
+   - 增加运行时 `setMinLevel(level: Level)` / `getMinLevel()` 动态控制接口。
+9. **P3-4 动态库体积深度优化（llvm-strip）**：
+   - 使用 `llvm-strip --strip-unneeded` 对发布 SO 进行处理：`libc++_shared.so` 由 9.29MB 降至 1.33MB（-85%），`liblogx.so` 由 5.51MB 降至 470KB（-91%），节省 APK 约 13MB 空间。
+10. **P3-5 `EngineController` 状态同步**：
+    - 增加 `EngineController.stopSync()`，并在 `TesterViewModel.onCleared()` 中调用，保证单例状态机与底层实例完全同步。
+11. **P3-6 `run_recovery` 失败时安全中止 `logx_open`**：
+    - `run_recovery` 改为返回 `bool`，若 `staging->open` 失败则立即释放资源并中止，防止后续后台线程解引用空指针发生 SIGSEGV。
+12. **P4 死代码与冗余字段清理**：
+    - 清理 `Instance::stats` 未使用字段及 `write_block_to_file` 桩实现。

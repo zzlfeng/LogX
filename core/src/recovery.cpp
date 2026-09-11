@@ -157,13 +157,13 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
 
 }  // namespace
 
-void run_recovery(Instance* inst) {
+bool run_recovery(Instance* inst) {
     // 1) 读 staging 双 Header
     RecoveryState hdr;
     bool recovered = false;
     if (!inst->staging->open(&hdr, &recovered)) {
         emit_event(inst, LOGX_EV_RECOVERY, -1, "staging open failed");
-        return;
+        return false;
     }
 
     // 2) 对账
@@ -188,7 +188,7 @@ void run_recovery(Instance* inst) {
             }
         }
         inst->staging->commit_header_locked(hdr.seqno, 0, 0, &atc);
-        return;
+        return true;
     }
 
     // 3) 决定 S_hdr / S_file / Σraw_len 回推 / 是否截断
@@ -327,6 +327,7 @@ void run_recovery(Instance* inst) {
     if (pending > 0) {
         inst->staged_bytes_total.store(pending, std::memory_order_relaxed);
     }
+    return true;
 }
 
 }  // namespace logx

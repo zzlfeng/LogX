@@ -541,10 +541,13 @@ TEST(Flush, RetentionCleanup_TriggeredOnFlushBlocking) {
     pal.file_close(fd);
     ASSERT_GT(pal.file_size_path(old_file.c_str()), 0);
 
-    // 调用 flush_blocking (退后台落盘触发)
+    // P3-1 (方案 B): flush_blocking 严格专注落盘, 剥离 retention 清理以消除高频 flush 扫盘开销
     flush_blocking(&inst);
+    // 验证 flush_blocking 不再进行昂贵的目录扫描与删除
+    EXPECT_GT(pal.file_size_path(old_file.c_str()), 0);
 
-    // 验证退后台 flush 自动触发清理: 过期文件被自动清除
+    // 显式调用 retention_cleanup 或跨天/启动阶段执行文件清理
+    retention_cleanup(&inst);
     EXPECT_LT(pal.file_size_path(old_file.c_str()), 0);
 
     delete inst.staging;

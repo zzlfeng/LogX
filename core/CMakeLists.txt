@@ -30,6 +30,7 @@ else()
 endif()
 
 add_library(logx_core STATIC ${LOGX_CORE_SOURCES})
+set_target_properties(logx_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(logx_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -45,8 +46,16 @@ endif()
 # ---- 构建开关 ----
 # LOGX_WITH_ZSTD: 接入实 zstd(否则 flag=zstd 的块走 noop 编解码,文件大小不缩水)
 # LOGX_WITH_AESGCM: 接入实 AES-GCM(否则 flag=enc 的块以明文落盘,仅占位用于接口验收)
-option(LOGX_WITH_ZSTD "Link real zstd" OFF)
-option(LOGX_WITH_AESGCM "Link real AES-GCM (mbedtls)" OFF)
+if(ANDROID)
+    set(LOGX_WITH_ZSTD_DEFAULT ON)
+    set(LOGX_WITH_AESGCM_DEFAULT ON)
+else()
+    set(LOGX_WITH_ZSTD_DEFAULT OFF)
+    set(LOGX_WITH_AESGCM_DEFAULT OFF)
+endif()
+
+option(LOGX_WITH_ZSTD "Link real zstd" ${LOGX_WITH_ZSTD_DEFAULT})
+option(LOGX_WITH_AESGCM "Link real AES-GCM (mbedtls)" ${LOGX_WITH_AESGCM_DEFAULT})
 
 if(LOGX_WITH_ZSTD)
     target_compile_definitions(logx_core PUBLIC LOGX_WITH_ZSTD=1)

@@ -31,6 +31,7 @@ add_executable(logx_unit_tests
     test_robustness.cpp
     test_jni_string.cpp
     test_j04_regression.cpp
+    test_review_p1_p4.cpp
 )
 target_link_libraries(logx_unit_tests
     PRIVATE

@@ -289,8 +289,11 @@ void Staging::wipe_all_locked() {
     put_u32(base_ + kHeaderASize + 60, crc);
 }
 
-Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total, uint32_t* out_consumed_bytes) {
+Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total,
+                                            uint32_t* out_consumed_bytes,
+                                            uint32_t* out_pad_records) {
     if (out_consumed_bytes) *out_consumed_bytes = 0;
+    if (out_pad_records) *out_pad_records = 0;
     if (total == 0) return WriteStatus::kOk;
     if (total > data_size_ - 1) return WriteStatus::kTooLarge;
 
@@ -314,13 +317,8 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total,
             while (pos + 6 <= data_size_) {
                 uint32_t remain = data_size_ - pos;
                 uint32_t this_pad = std::min<uint32_t>(20 * 1024, remain - 6);
-                uint8_t header[6];
-                put_u16(header + 0, static_cast<uint16_t>(this_pad));
-                put_u16(header + 2, kMagicPad);
-                header[4] = 0x00;
-                header[5] = 0x00;
-                std::memcpy(data_base_ + pos, header, 6);
-                std::memset(data_base_ + pos + 6, 0, this_pad);
+                format_pad(data_base_ + pos, this_pad);
+                if (out_pad_records) (*out_pad_records)++;
                 pos += 6 + this_pad;
             }
             if (pos < data_size_) {

@@ -369,9 +369,11 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
 
     jsize n = jPayload ? env->GetArrayLength(jPayload) : 0;
     const uint8_t* payload_ptr = nullptr;
+    uint32_t safe_payload_len = 0;
     if (n > 0) {
         if (n <= kStackPayloadSize) {
             payload_ptr = stack_buf;
+            safe_payload_len = static_cast<uint32_t>(n);
             env->GetByteArrayRegion(jPayload, 0, n, reinterpret_cast<jbyte*>(stack_buf));
         } else {
             // 物理上限防卫: 单条日志 >64KB 在 core 中必被拒, 拷贝长度有界收敛, 防超大数组致 OOM
@@ -380,20 +382,22 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
                 tls_payload_buf.resize(static_cast<size_t>(copy_len));
             }
             payload_ptr = tls_payload_buf.data();
+            safe_payload_len = static_cast<uint32_t>(copy_len);
             env->GetByteArrayRegion(jPayload, 0, copy_len, reinterpret_cast<jbyte*>(tls_payload_buf.data()));
         }
     }
 
+    // P2-2: 传参长度与实际缓冲区安全长度严格对齐, 杜绝缓冲区与长度不符导致的潜在越界读
     logx_status_e wrc = logx_write(inst, level, tag_ptr, payload_ptr,
-                                   payload_ptr ? static_cast<uint32_t>(n) : 0);
+                                   payload_ptr ? safe_payload_len : 0);
 
     // T5.4: consoleEcho —— 仅镜像成功落盘的记录(logcat 与文件一一对应);
     // 丢弃(NO_SPACE/TOO_LARGE)不 echo,由 ErrorHandler.DROP 事件通道上报。
     char echo_buf[2048];
     bool need_echo = (wrc == LOGX_OK && g_console_echo.load(std::memory_order_relaxed));
     if (need_echo) {
-        uint32_t copy = (n > 0 && payload_ptr)
-            ? (static_cast<uint32_t>(n) < (sizeof(echo_buf) - 1) ? static_cast<uint32_t>(n) : static_cast<uint32_t>(sizeof(echo_buf) - 1))
+        uint32_t copy = (safe_payload_len > 0 && payload_ptr)
+            ? (safe_payload_len < (sizeof(echo_buf) - 1) ? safe_payload_len : static_cast<uint32_t>(sizeof(echo_buf) - 1))
             : 0;
         if (copy > 0) {
             std::memcpy(echo_buf, payload_ptr, copy);

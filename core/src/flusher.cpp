@@ -534,6 +534,7 @@ struct FlusherCtx {
     int      current_fd = -1;
     uint64_t current_size = 0;
     bool     date_changed = true;   // 启动时强制为 true,触发首次 target 选择
+    std::vector<uint8_t> scratch;   // P3-2: 常驻复用缓冲,避免每 75ms 轮询分配 128KB
 };
 
 void close_current(FlusherCtx* c, Pal* pal) {
@@ -635,27 +636,33 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
     if (yyyymmdd != c->current_date) c->date_changed = true;
 
-    // 1) 锁内取快照并把待刷字节拷贝到 scratch (锁内时间仅微秒级内存拷贝)
-    std::vector<uint8_t> scratch(inst->staging->data_size());
+    // 1) 锁内取快照判定 pending 字节数; 若无日志待刷, 零分配立即返回 (P3-2)
     uint32_t f = 0, snap = 0, bytes = 0;
     inst->pal->mutex_lock(inst->mu);
     bytes = inst->staging->snapshot_pending(&f, &snap);
-    if (bytes > 0) {
-        uint32_t copied = inst->staging->copy_pending(f, snap, scratch.data(),
-                                                      static_cast<uint32_t>(scratch.size()));
-        if (copied != bytes) {
-            inst->pal->mutex_unlock(inst->mu);
-            emit_event(inst, LOGX_EV_IO, -1, "copy_pending mismatch");
-            return;
-        }
+    if (bytes == 0) {
+        inst->pal->mutex_unlock(inst->mu);
+        return;
+    }
+
+    // 复用 FlusherCtx 常驻 scratch, 消除每 75ms 一次的 malloc(128KB)+memset+free (P3-2)
+    uint32_t staging_cap = inst->staging->data_size();
+    if (c->scratch.size() < staging_cap) {
+        c->scratch.resize(staging_cap);
+    }
+
+    uint32_t copied = inst->staging->copy_pending(f, snap, c->scratch.data(),
+                                                  static_cast<uint32_t>(c->scratch.size()));
+    if (copied != bytes) {
+        inst->pal->mutex_unlock(inst->mu);
+        emit_event(inst, LOGX_EV_IO, -1, "copy_pending mismatch");
+        return;
     }
     inst->pal->mutex_unlock(inst->mu);
 
-    if (bytes == 0) return;
-
     // 3) 沿记录边界切块
     std::vector<PendingBlock> blocks;
-    split_impl(scratch.data(), bytes, &blocks);
+    split_impl(c->scratch.data(), bytes, &blocks);
 
     // 4) 决定 flag:bit0 = encrypt,bit1-2 = compress(经 make_flag 组装)
     uint8_t flag = make_flag(inst->compress_algo, inst->encrypt_enable != 0);
@@ -708,7 +715,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         // 5.2 编码 + 写盘;seqno 取自当前 staging Header
         uint32_t cur_seqno = get_u32(inst->staging->raw_base() + 8);
         BlockWriteResult wr = write_and_record(inst, fd,
-                                               scratch.data() + blk.raw_offset,
+                                               c->scratch.data() + blk.raw_offset,
                                                blk.raw_len,
                                                cur_seqno + 1,
                                                flag,
@@ -821,11 +828,6 @@ int build_records(Instance* inst, int level, const char* tag,
     return static_cast<int>(*out_total_bytes);
 }
 
-bool write_block_to_file(Instance*, const uint8_t*, const PendingBlock&,
-                         uint32_t, const uint8_t[8], uint8_t) {
-    // 已统一到 write_and_record(internal);保留接口占位。
-    return false;
-}
 
 bool append_block(Instance* inst,
                   const uint8_t* file_salt, uint16_t kid,
@@ -994,7 +996,8 @@ bool flush_blocking(Instance* inst) {
     }
 
     durability_sync(inst, nullptr);
-    retention_cleanup_impl(inst);
+    // P3-1: 方案 B: flush_blocking 严格专注落盘, 移除每次 flush 都扫盘的 retention 清理;
+    // 过期清理已由实例启动阶段与后台跨天 Rollover 闭环保障。
     return true;
 }
 

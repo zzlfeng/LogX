@@ -215,8 +215,10 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
     if (!parse_yyyymmdd(req.to.c_str(), &to))     return LOGX_ERR_INVALID_ARG;
     if (to < from) return LOGX_ERR_INVALID_ARG;
 
-    // 1) flush
-    flush_blocking(inst);
+    // 1) flush (若超时或停滞则报警,但尽最大努力继续导出磁盘已有文件)
+    if (!flush_blocking(inst)) {
+        emit_event(inst, LOGX_EV_IO, LOGX_ERR_TIMEOUT, "export: flush stalled; proceeding with best effort");
+    }
 
     // 2) 取快照
     auto snaps = take_snapshot(inst, from, to);
@@ -368,7 +370,14 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->staging = new Staging(inst->pal, inst->staging_path, kDataSizeDefault);
 
     // 启动恢复(在创建 Flusher 之前,确保 Header 与 staging 已就绪)
-    run_recovery(inst);
+    if (!run_recovery(inst)) {
+        delete inst->staging;
+        inst->staging = nullptr;
+        inst->pal->ev_destroy(inst->flush_event);
+        inst->pal->mutex_destroy(inst->mu);
+        delete inst;
+        return LOGX_ERR_IO;
+    }
 
     if (inst->staging->is_degraded()) {
         emit_event(inst, LOGX_EV_DEGRADED, -1, "staging: mmap failed, degraded to heap");
@@ -434,9 +443,14 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     // 2) 锁内写入 staging
     inst->pal->mutex_lock(inst->mu);
     uint32_t consumed = 0;
-    auto st = inst->staging->write_records(buf, total, &consumed);
+    uint32_t pads = 0;
+    auto st = inst->staging->write_records(buf, total, &consumed, &pads);
     bool need_wake = false;
+    bool need_drop_event = false;
     if (st == Staging::WriteStatus::kOk) {
+        if (pads > 0) {
+            inst->pad_records.fetch_add(pads, std::memory_order_relaxed);
+        }
         inst->staged_bytes_total.fetch_add(consumed, std::memory_order_relaxed);
         uint32_t f, snap;
         uint32_t pending = inst->staging->snapshot_pending(&f, &snap);
@@ -449,9 +463,15 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         need_wake = inst->flush_threshold > 0 && pending >= inst->flush_threshold;
     } else if (st == Staging::WriteStatus::kFull) {
         inst->drop_no_space.fetch_add(1);
-        emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full");
+        need_drop_event = true;
     }
     inst->pal->mutex_unlock(inst->mu);
+
+    // P1-1: emit_event 必须在解锁后触发, 杜绝回调内调用 close/flush 造成自死锁,
+    // 同时避免回调内耗时阻断其他并发写线程。
+    if (need_drop_event) {
+        emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full");
+    }
 
     if (need_wake) inst->pal->ev_signal(inst->flush_event);
     return st == Staging::WriteStatus::kOk ? LOGX_OK : LOGX_ERR_NO_SPACE;

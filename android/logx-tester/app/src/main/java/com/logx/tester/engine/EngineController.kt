@@ -42,5 +42,11 @@ object EngineController {
             _state.value = EngineState.Stopped
         }
     }
+
+    fun stopSync() {
+        kotlinx.coroutines.runBlocking {
+            stop()
+        }
+    }
 }
 

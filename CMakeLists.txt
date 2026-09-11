@@ -1,6 +1,6 @@
 # 顶层 CMake:聚合 core + 单测。
 cmake_minimum_required(VERSION 3.16)
-project(logx CXX)
+project(logx C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,11 +16,20 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     add_compile_options(/utf-8)
 endif()
 
+# Android 交叉编译下默认启用 ZSTD 压缩与 AES-GCM 加密，保证移动端产物功能完整
+if(ANDROID)
+    set(LOGX_WITH_ZSTD_DEFAULT ON)
+    set(LOGX_WITH_AESGCM_DEFAULT ON)
+else()
+    set(LOGX_WITH_ZSTD_DEFAULT OFF)
+    set(LOGX_WITH_AESGCM_DEFAULT OFF)
+endif()
+
 option(LOGX_BUILD_TESTS "Build unit tests" ON)
 option(LOGX_BUILD_STRESS "Build stress tests" ON)
 option(LOGX_BUILD_BENCH "Build performance benchmark (logx_bench, not a ctest)" OFF)
-option(LOGX_WITH_ZSTD   "Link real zstd (vendored third_party/zstd)" OFF)
-option(LOGX_WITH_AESGCM "Link real AES-GCM (mbedtls)" OFF)
+option(LOGX_WITH_ZSTD   "Link real zstd (vendored third_party/zstd)" ${LOGX_WITH_ZSTD_DEFAULT})
+option(LOGX_WITH_AESGCM "Link real AES-GCM (mbedtls)" ${LOGX_WITH_AESGCM_DEFAULT})
 
 add_subdirectory(core)
 
