@@ -30,7 +30,8 @@
 | `5aa713d` | fix(crypto): 移除 aesce 探针静态缓存恢复无状态纯读，根除并发数据竞争 (方案 A) |
 | `1943f1f` | fix(flusher): implement 75ms debounce aggregation flush for low-frequency writes (F-10) |
 | `5f9707d` | fix(jni): J-04 修复 nativeWrite 临界区错误回调 CheckJNI 崩溃，改用栈缓冲+GetByteArrayRegion |
-| `3d4878d` | fix(core,jni,kt): 全面修复 P1~P4 代码审查缺陷与 Android 默认集成 ZSTD |
+| `1bc827a` | fix(core,jni,kt): 全面修复 P1~P4 代码审查缺陷与 Android 默认集成 ZSTD |
+| `2a41b96` | fix(kt,test): R1 回归测试配置补齐、R2 活跃操作生命周期递延销毁、R3 init 状态机回滚一致性 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -1031,6 +1032,25 @@ adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_st
   在两个用例的 `logx_config_t` 中补齐 `cfg.max_log_length = 64 * 1024;`（与规范 64KB 对齐）。
 - **验证效果**：
   单测 3 个用例全部真实执行并通过（3/3 PASSED），真实覆盖了 staging full 锁外触发 `onError` 并调用 `logx_close` 的零死锁路径，以及 staging 回绕时插入 PAD 记录并自增计数器的逻辑。
+
+---
+
+## 2026-09-11: N2~N4 生命周期状态机三轮加固 (close/init 并发闭环与热路径优化)
+
+针对三轮代码审查中确认的 3 项打磨项进行闭环（N1 双销毁竞争经 getAndSet 仲裁确证安全、N5 返回值语义经复查撤回，均无需修改）：
+
+1. **N2 递延销毁完成性与 Check-Then-Act 状态闭环（专用 closeLock 锁）**：
+   - 引入专用内部销毁锁 `closeLock = Any()`（与高频日志写热路径完全解耦）：根除 `pendingCloseHandle.getAndSet(0L)` 领取瞬间与 `nativeClose` 执行完成之间的 Check-Then-Act 状态裂隙。
+   - 在 `init()`、`close()` 以及 `executeOp.finally` 递延销毁点中，对 `pendingCloseHandle` 的仲裁领取与 `nativeClose` 的物理调用严格在 `synchronized(closeLock)` 互斥保护下完成。
+   - 若后台慢操作（如 `export`）仍在执行 `nativeClose`（含 flush 与 Flusher join），新实例 `init()` 天然阻塞挂起等待其彻底完成并释放文件资源，彻底消除 `Thread.sleep` 轮询与超时假死，**100% 杜绝新旧实例并发操作同一 staging 文件的潜在数据竞争**。
+
+2. **N3 快/慢操作分离计数（activeQuickOps / activeExportOps）**：
+   - `executeOp` 增加 `isExport` 参数：log/flush/getStats 计入快操作，两个 export 重载计入慢操作。
+   - `close()` 优雅等待只针对快操作（上界 500ms 收紧至 200ms，快操作微秒级退栈绰绰有余）；export 属分钟级慢操作，等了也等不完，直接登记 `pendingCloseHandle` 立即返回，由其退栈 finally 完成递延销毁——export 中调 close 从 "白等 500ms" 变为 "立即递延"。
+   - `executeOp` finally 的递延销毁触发条件同步收紧为 `快计数==0 && 慢计数==0 && pending!=0`，与 close 侧双向兜底；`threadOpDepth` 回调自死锁跳过逻辑保持不变。
+3. **N4 热路径快速预检（pre-init / 已关闭零开销）**：
+   - `executeOp` 入口增加纯读快速路径 `if (isClosed || nativeHandle == 0L) return null`：pre-init 或已关闭状态下的高频 log 调用不再支付原子计数与 ThreadLocal 开销（旧版每条白付 3~4 个原子操作 + 1 次 ThreadLocal 访问）。
+   - 正确性：close 先写 `isClosed` 再清 `nativeHandle`、init 先写 `nativeHandle` 再写 `isClosed=false`（均 volatile），快速路径仅为拒绝 hint——误拒只发生在 init/close 过渡窗口（此时调用语义本就是 "过渡期丢弃"，与 spec §7 对 pre-init 的约定一致），误放行由 increment 之后的二次 `isClosed` 检查兜底，双重检查结构不变。
 
 ### 2. 【R2】`LogX.kt` 活跃操作生命周期全覆盖与递延销毁（Deferred Close）
 - **故障现象与潜在风险**：

@@ -117,8 +117,14 @@ object LogX {
     @Volatile private var errorHandler: ErrorHandler? = null
     @Volatile private var isClosed: Boolean = false
     @Volatile private var minLevel: Level = Level.I
-    private val activeOps = AtomicInteger(0)
+    // N3: 快/慢操作分离计数。close() 只同步等待快操作 (微秒级) 退栈;
+    // export (分钟级) 不等待, 由其退栈 finally 完成递延销毁。
+    private val activeQuickOps = AtomicInteger(0)
+    private val activeExportOps = AtomicInteger(0)
     private val pendingCloseHandle = AtomicLong(0L)
+    // N2: 销毁互斥锁。仅用于 close / init / 递延销毁边界的仲裁与等待，
+    // 绝对不侵入日志写热路径。彻底消灭 Check-Then-Act 状态撕裂与 sleep 轮询。
+    private val closeLock = Any()
     private val initCount = AtomicLong(0)
     @Volatile private var isLibraryLoaded: Boolean = false
 
@@ -130,7 +136,7 @@ object LogX {
      * 统一保护所有跨 JNI 的 native 操作 (log / flush / getStats / export)。
      *
      * 核心安全保障 (R2):
-     * 1. 消除 TOCTOU 窄窗: 进入前先原子自增 activeOps，杜绝操作线程刚读到句柄被切走、
+     * 1. 消除 TOCTOU 窄窗: 进入前先原子自增活跃计数，杜绝操作线程刚读到句柄被切走、
      *    而 close() 误以为无活跃线程直接 nativeClose 造成的 UAF。
      * 2. 递延销毁 (Deferred Close): 若 close() 时仍有慢操作或后台 export 正在执行，
      *    或在 ErrorHandler 回调线程中直接同步调用 close()，close() 绝不强制销毁句柄，
@@ -139,10 +145,18 @@ object LogX {
      * 3. 递归/回调防死锁: 记录 threadOpDepth，若当前线程已在 op 中 (如 native 回调
      *    onNativeError 触发的 onError 内调用 close)，close() 立即感知并跳过等待，
      *    杜绝自等待死锁。
+     *
+     * N4: 入口先做纯读快速路径 (volatile hint): pre-init / 已关闭时零原子操作直接丢弃。
+     * 误拒只发生在 init/close 过渡窗口 (此时调用语义本就是"过渡期丢弃", 与 spec §7
+     * 对 pre-init 的约定一致); 误放行由 increment 之后的二次 isClosed 检查兜底。
+     *
+     * N3: isExport 区分快操作 (log/flush/stats, close 可同步等待退栈) 与慢操作
+     * (export, 分钟级, close 不等待、直接递延销毁)。
      */
-    private inline fun <T> executeOp(block: (Long) -> T): T? {
-        if (isClosed) return null
-        activeOps.incrementAndGet()
+    private inline fun <T> executeOp(isExport: Boolean = false, block: (Long) -> T): T? {
+        if (isClosed || nativeHandle == 0L) return null
+        val counter = if (isExport) activeExportOps else activeQuickOps
+        counter.incrementAndGet()
         val depth = threadOpDepth.get() ?: 0
         threadOpDepth.set(depth + 1)
         try {
@@ -156,11 +170,14 @@ object LogX {
             } else {
                 threadOpDepth.set(depth)
             }
-            val remaining = activeOps.decrementAndGet()
-            if (remaining == 0 && pendingCloseHandle.get() != 0L) {
-                val handleToClose = pendingCloseHandle.getAndSet(0L)
-                if (handleToClose != 0L) {
-                    nativeClose(handleToClose)
+            val remaining = counter.decrementAndGet()
+            if (remaining == 0 && activeQuickOps.get() == 0 && activeExportOps.get() == 0
+                && pendingCloseHandle.get() != 0L) {
+                synchronized(closeLock) {
+                    val handleToClose = pendingCloseHandle.getAndSet(0L)
+                    if (handleToClose != 0L) {
+                        nativeClose(handleToClose)
+                    }
                 }
             }
         }
@@ -202,9 +219,10 @@ object LogX {
             // 重复 init: 抛 IllegalStateException (参见 spec §7)。
             throw IllegalStateException("LogX.init called more than once")
         }
-        // 若前序实例仍有未退栈的后台/慢操作，等待其彻底退出并完成递延销毁
+        // 若前序实例仍有未退栈的后台/慢操作，等待其彻底退出 (N3: 快慢两组计数都须归零)
         val deadline = System.currentTimeMillis() + 1000
-        while (activeOps.get() > 0 && System.currentTimeMillis() < deadline) {
+        while ((activeQuickOps.get() > 0 || activeExportOps.get() > 0)
+            && System.currentTimeMillis() < deadline) {
             try {
                 Thread.sleep(2)
             } catch (ignored: InterruptedException) {
@@ -212,13 +230,17 @@ object LogX {
                 break
             }
         }
-        if (activeOps.get() > 0) {
+        if (activeQuickOps.get() > 0 || activeExportOps.get() > 0) {
             initCount.set(0)
             throw IllegalStateException("Cannot init LogX: previous instance operations still active")
         }
-        val lingering = pendingCloseHandle.getAndSet(0L)
-        if (lingering != 0L) {
-            nativeClose(lingering)
+        // N2: 领取遗留的递延销毁句柄，并通过 closeLock 等待任何在途 nativeClose 彻底完成。
+        // 锁内完成销毁保证旧实例的 staging/日志文件已彻底释放，杜绝新旧实例并发操作同一 staging 文件。
+        synchronized(closeLock) {
+            val lingering = pendingCloseHandle.getAndSet(0L)
+            if (lingering != 0L) {
+                nativeClose(lingering)
+            }
         }
 
         // K-03 / R3: 任何失败路径 (参数校验 / 目录创建 / nativeInit 返回 0) 都必须
@@ -376,7 +398,7 @@ object LogX {
      * 明文临时文件写在 filesDir 下独立临时目录 (禁外部存储、禁 cacheDir); 回调返回或抛出后立即删除。
      */
     fun export(from: String, to: String, cb: ExportCallback): Int {
-        return executeOp { h ->
+        return executeOp(isExport = true) { h ->
             nativeExport(h, from, to, cb)
         } ?: -1
     }
@@ -402,7 +424,7 @@ object LogX {
 
         return withContext(Dispatchers.IO) {
             var userException: Throwable? = null
-            val res = executeOp { h ->
+            val res = executeOp(isExport = true) { h ->
                 nativeExport(h, from, to) { _, plaintextPath, _ ->
                     val tempFile = File(plaintextPath)
                     if (userException != null) {
@@ -450,13 +472,18 @@ object LogX {
      * 关闭实例并释放 native 资源 (K-04: 与 setErrorHandler 串行化,避免
      * 回调在 close 过程中被重新挂回)。
      *
-     * 优雅退栈与递延销毁 (R2):
-     * 1. 若当前调用者非正在执行 executeOp 的线程，最多等待 500ms 让正在写/导出/落盘的线程优雅退出;
-     * 2. 若由 ErrorHandler (如 onNativeError) 内部同步调用 close()，当前线程本身即为 activeOp，
+     * 优雅退栈与递延销毁 (R2 / N2 / N3):
+     * 1. 若当前调用者非正在执行 executeOp 的线程，最多等待 200ms 让快操作
+     *    (log/flush/getStats, 微秒级) 优雅退栈;
+     * 2. 慢操作 (export) 不参与等待 —— 等了也等不完, 直接登记 pendingCloseHandle
+     *    立即返回, 由 export 退栈的 finally 完成递延销毁, 调用方不无谓阻塞;
+     * 3. 若由 ErrorHandler (如 onNativeError) 内部同步调用 close()，当前线程本身即为 activeOp，
      *    感知 depth > 0 立即跳过等待，杜绝自死锁;
-     * 3. 若等待结束 activeOps == 0，由 close() 立即调用 nativeClose 销毁底层句柄;
-     * 4. 若超时后仍有慢操作未退出，不强制销毁句柄 (杜绝 UAF)，而是交由最后一个退出 executeOp 的
-     *    线程在 finally 块中安全递延触发 nativeClose。
+     * 4. 若快操作已退栈且无在途销毁，由 close() 立即同步调用 nativeClose;
+     *    否则登记 pendingCloseHandle 交由最后退出的 executeOp 递延销毁。
+     *    两种路径均经 getAndSet 仲裁, 句柄保证恰好销毁一次。
+     * 5. nativeClose (含 flush + Flusher join, 最坏 ~5s) 在 @Synchronized 锁内执行;
+     *    建议调用方在后台线程调用 close()。
      */
     @Synchronized
     fun close() {
@@ -473,8 +500,9 @@ object LogX {
 
         val isCurrentThreadInOp = (threadOpDepth.get() ?: 0) > 0
         if (!isCurrentThreadInOp) {
-            val deadline = System.currentTimeMillis() + 500
-            while (activeOps.get() > 0 && System.currentTimeMillis() < deadline) {
+            // N3: 只等快操作 (200ms); export 属慢操作, 直接走递延
+            val deadline = System.currentTimeMillis() + 200
+            while (activeQuickOps.get() > 0 && System.currentTimeMillis() < deadline) {
                 try {
                     Thread.sleep(1)
                 } catch (ignored: InterruptedException) {
@@ -484,10 +512,14 @@ object LogX {
             }
         }
 
-        if (activeOps.get() == 0) {
-            val toClose = pendingCloseHandle.getAndSet(0L)
-            if (toClose != 0L) {
-                nativeClose(toClose)
+        // N2: 销毁前提 = 快慢操作全部退栈。
+        // 经 closeLock 仲裁销毁，若仍在递延中则由最后退出的 executeOp 在 closeLock 内安全执行。
+        if (activeQuickOps.get() == 0 && activeExportOps.get() == 0) {
+            synchronized(closeLock) {
+                val toClose = pendingCloseHandle.getAndSet(0L)
+                if (toClose != 0L) {
+                    nativeClose(toClose)
+                }
             }
         }
     }
