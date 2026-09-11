@@ -1040,9 +1040,9 @@ adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_st
 针对三轮代码审查中确认的 3 项打磨项进行闭环（N1 双销毁竞争经 getAndSet 仲裁确证安全、N5 返回值语义经复查撤回，均无需修改）：
 
 1. **N2 递延销毁完成性与 Check-Then-Act 状态闭环（专用 closeLock 锁）**：
-   - 引入专用内部销毁锁 `closeLock = Any()`（与高频日志写热路径完全解耦）：根除 `pendingCloseHandle.getAndSet(0L)` 领取瞬间与 `nativeClose` 执行完成之间的 Check-Then-Act 状态裂隙。
-   - 在 `init()`、`close()` 以及 `executeOp.finally` 递延销毁点中，对 `pendingCloseHandle` 的仲裁领取与 `nativeClose` 的物理调用严格在 `synchronized(closeLock)` 互斥保护下完成。
-   - 若后台慢操作（如 `export`）仍在执行 `nativeClose`（含 flush 与 Flusher join），新实例 `init()` 天然阻塞挂起等待其彻底完成并释放文件资源，彻底消除 `Thread.sleep` 轮询与超时假死，**100% 杜绝新旧实例并发操作同一 staging 文件的潜在数据竞争**。
+   - 引入专用内部销毁锁 `closeLock = Any()`（与高频日志写热路径完全解耦）：串行化 `pendingCloseHandle.getAndSet(0L)` 领取与 `nativeClose` 物理执行的全程，同一时刻至多一个 nativeClose 在执行。
+   - 在 `init()`、`close()` 以及 `executeOp.finally` 递延销毁点中，对 `pendingCloseHandle`的仲裁领取与 `nativeClose` 的物理调用严格在 `synchronized(closeLock)` 互斥保护下完成，杜绝新旧实例并发操作同一 staging 文件的潜在数据竞争。
+   - 注意：closeLock 只互斥销毁段本身，init/close 边界的活跃操作退栈等待仍为 sleep 轮询（见 N6 方案 A 的锁外化改造）。
 
 2. **N3 快/慢操作分离计数（activeQuickOps / activeExportOps）**：
    - `executeOp` 增加 `isExport` 参数：log/flush/getStats 计入快操作，两个 export 重载计入慢操作。
@@ -1051,6 +1051,10 @@ adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_st
 3. **N4 热路径快速预检（pre-init / 已关闭零开销）**：
    - `executeOp` 入口增加纯读快速路径 `if (isClosed || nativeHandle == 0L) return null`：pre-init 或已关闭状态下的高频 log 调用不再支付原子计数与 ThreadLocal 开销（旧版每条白付 3~4 个原子操作 + 1 次 ThreadLocal 访问）。
    - 正确性：close 先写 `isClosed` 再清 `nativeHandle`、init 先写 `nativeHandle` 再写 `isClosed=false`（均 volatile），快速路径仅为拒绝 hint——误拒只发生在 init/close 过渡窗口（此时调用语义本就是 "过渡期丢弃"，与 spec §7 对 pre-init 的约定一致），误放行由 increment 之后的二次 `isClosed` 检查兜底，双重检查结构不变。
+4. **N6 修复（方案 A）：init() 前奏等待与遗留销毁移出 @Synchronized，消除锁内长等待**：
+   - 问题：closeLock 引入后 `init()` 在持有 `@Synchronized` 对象锁的情况下进入 `closeLock` 执行遗留 `nativeClose`（含 flush + Flusher join，最坏 ~5s），锁内慢等待使并发的 `setErrorHandler` / `close` / `init` 全部被挂起不可预测的时长。
+   - 修复：`init()` 拆为两段 —— 前奏（无锁）：等快/慢计数归零（1s fail-fast）→ closeLock 内领取遗留句柄并同步 nativeClose；随后才进入 `@Synchronized`（局部函数 `doInitLocked`）做 initCount 翻转与 nativeInit 本身。持锁时间回落到 nativeInit 量级，`close()` / `setErrorHandler` 不再被慢销毁拖累。
+   - 并发契约不变：两线程同时 init 时后到者在 `@Synchronized` 排队，锁内 initCount 检查保证 "重复 init 抛 IllegalStateException"（spec §7）；前奏的两次 fail-fast 抛出路径均不触碰 initCount（无锁阶段未递增）或已正确归零。
 
 ### 2. 【R2】`LogX.kt` 活跃操作生命周期全覆盖与递延销毁（Deferred Close）
 - **故障现象与潜在风险**：

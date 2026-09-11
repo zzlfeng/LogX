@@ -122,8 +122,10 @@ object LogX {
     private val activeQuickOps = AtomicInteger(0)
     private val activeExportOps = AtomicInteger(0)
     private val pendingCloseHandle = AtomicLong(0L)
-    // N2: 销毁互斥锁。仅用于 close / init / 递延销毁边界的仲裁与等待，
-    // 绝对不侵入日志写热路径。彻底消灭 Check-Then-Act 状态撕裂与 sleep 轮询。
+    // N2: 销毁互斥锁。串行化三处销毁点 (close 同步分支 / init 遗留销毁 / executeOp
+    // finally 递延销毁) 的 "领取 pendingCloseHandle + nativeClose" 全程, 保证同一
+    // 时刻至多一个 nativeClose 在执行。注意: 它只互斥销毁段本身, 不消灭 init/close
+    // 边界的 sleep 退栈轮询 (N6 方案 A 已把轮询与慢销毁移出 @Synchronized)。
     private val closeLock = Any()
     private val initCount = AtomicLong(0)
     @Volatile private var isLibraryLoaded: Boolean = false
@@ -213,13 +215,23 @@ object LogX {
     /** [LogXPureLogicTest] 等白盒单测专用:只读暴露句柄,生产代码禁止使用。 */
     internal fun nativeHandleForTest(): Long = nativeHandle
 
-    @Synchronized
+    /**
+     * 初始化 LogX 单例 (N6 方案 A: 前奏等待与遗留销毁在 @Synchronized 锁外完成)。
+     *
+     * 前奏 (无锁, 最坏 ~1s 等待 + ~5s 遗留 nativeClose):
+     *   1. 等待上一实例快/慢操作全部退栈 (1s 上界, 超时 fail-fast 抛 IllegalStateException);
+     *   2. 在 closeLock 内领取遗留递延句柄并同步 nativeClose —— closeLock 与在途
+     *      递延销毁 (executeOp finally) 互斥, 保证旧实例 staging/日志文件彻底释放后
+     *      才开启新实例, 杜绝新旧实例并发操作同一 staging 文件。
+     *   3. 锁外前奏完成后才进入 @Synchronized: 锁内只做 initCount 翻转与 nativeInit
+     *      本身, 持锁时间不受慢销毁拖累 (此前锁内等待会让 setErrorHandler/close/init
+     *      全部挂起最坏 5s+)。
+     *
+     * 并发契约: 两个线程同时 init 时, 后到者在 @Synchronized 上排队; 其前奏已在
+     * 锁外跑完, 锁内 initCount 检查保证单例语义不变 (spec §7 重复 init 抛异常)。
+     */
     fun init(context: Context, config: Config) {
-        if (initCount.incrementAndGet() != 1L) {
-            // 重复 init: 抛 IllegalStateException (参见 spec §7)。
-            throw IllegalStateException("LogX.init called more than once")
-        }
-        // 若前序实例仍有未退栈的后台/慢操作，等待其彻底退出 (N3: 快慢两组计数都须归零)
+        // ---- 前奏阶段 (无锁): 等待旧实例静默 + 完成遗留销毁 ----
         val deadline = System.currentTimeMillis() + 1000
         while ((activeQuickOps.get() > 0 || activeExportOps.get() > 0)
             && System.currentTimeMillis() < deadline) {
@@ -231,11 +243,10 @@ object LogX {
             }
         }
         if (activeQuickOps.get() > 0 || activeExportOps.get() > 0) {
-            initCount.set(0)
             throw IllegalStateException("Cannot init LogX: previous instance operations still active")
         }
-        // N2: 领取遗留的递延销毁句柄，并通过 closeLock 等待任何在途 nativeClose 彻底完成。
-        // 锁内完成销毁保证旧实例的 staging/日志文件已彻底释放，杜绝新旧实例并发操作同一 staging 文件。
+        // N2/N6: closeLock 内领取遗留递延句柄并同步销毁; 若在途递延销毁正在执行,
+        // 此处阻塞等待其 nativeClose 彻底完成 (flush + Flusher join, 最坏 ~5s)。
         synchronized(closeLock) {
             val lingering = pendingCloseHandle.getAndSet(0L)
             if (lingering != 0L) {
@@ -243,62 +254,71 @@ object LogX {
             }
         }
 
-        // K-03 / R3: 任何失败路径 (参数校验 / 目录创建 / nativeInit 返回 0) 都必须
-        // 回滚单例状态 —— 否则 errorHandler 持有的业务回调对象因单例引用无法
-        // 及时 GC; initCount 归零允许业务修正配置后重试 init; isClosed 保持/重置为 true。
-        try {
-            if (!isLibraryLoaded) {
-                System.loadLibrary("logx")
-                isLibraryLoaded = true
+        // ---- 状态翻转 + nativeInit (持 @Synchronized, 无慢等待) ----
+        @Synchronized
+        fun doInitLocked() {
+            if (initCount.incrementAndGet() != 1L) {
+                // 重复 init: 抛 IllegalStateException (参见 spec §7)。
+                throw IllegalStateException("LogX.init called more than once")
             }
+            try {
+                if (!isLibraryLoaded) {
+                    System.loadLibrary("logx")
+                    isLibraryLoaded = true
+                }
 
-            if (config.errorHandler != null) {
-                errorHandler = config.errorHandler
+                if (config.errorHandler != null) {
+                    errorHandler = config.errorHandler
+                }
+
+                val suffix = if (config.autoProcessIsolation) getProcessSuffix(context) else ""
+                val targetLogDir = if (suffix.isEmpty()) config.logDir else File(config.logDir.parentFile, "${config.logDir.name}_$suffix")
+                val targetStagingDir = if (suffix.isEmpty()) config.stagingDir else File(config.stagingDir.parentFile, "${config.stagingDir.name}_$suffix")
+
+                val logDir = targetLogDir.apply { mkdirs() }
+                val stagingDir = targetStagingDir.apply { mkdirs() }
+                val stagingFileName = if (suffix.isEmpty()) "logx_staging.bin" else "logx_staging_$suffix.bin"
+                val stagingFile = File(stagingDir, stagingFileName)
+
+                // staging 必须 filesDir 系; 禁 cacheDir (系统清理会让 mmap 变孤儿, 见 spec §10)
+                require(!stagingDir.absolutePath.contains("/cache/")) {
+                    "staging dir must not be in cacheDir"
+                }
+                require(config.maxLogLength < 128 * 1024 - 128 - 1) {
+                    "maxLogLength must be < (dataSize - 1) = 130943"
+                }
+
+                minLevel = config.level
+                val handle = nativeInit(
+                    logDir.absolutePath,
+                    stagingFile.absolutePath,
+                    config.compress.algo.toInt(),
+                    if (config.encrypt) 1 else 0,
+                    config.kid,
+                    config.keyProvider,
+                    config.retentionDays,
+                    config.maxFileSize,
+                    config.maxLogLength,
+                    config.flushThreshold,
+                    config.consoleEcho
+                )
+                if (handle == 0L) {
+                    throw IllegalStateException("LogX native init failed")
+                }
+                nativeHandle = handle
+                isClosed = false
+            } catch (t: Throwable) {
+                // K-03 / R3: 任何失败路径都必须回滚单例状态 —— 否则 errorHandler
+                // 持有的业务回调对象因单例引用无法及时 GC; initCount 归零允许业务
+                // 修正配置后重试 init; isClosed 保持 true 封死 pre-init 写入。
+                isClosed = true
+                nativeHandle = 0L
+                errorHandler = null
+                initCount.set(0)
+                throw t
             }
-
-            val suffix = if (config.autoProcessIsolation) getProcessSuffix(context) else ""
-            val targetLogDir = if (suffix.isEmpty()) config.logDir else File(config.logDir.parentFile, "${config.logDir.name}_$suffix")
-            val targetStagingDir = if (suffix.isEmpty()) config.stagingDir else File(config.stagingDir.parentFile, "${config.stagingDir.name}_$suffix")
-
-            val logDir = targetLogDir.apply { mkdirs() }
-            val stagingDir = targetStagingDir.apply { mkdirs() }
-            val stagingFileName = if (suffix.isEmpty()) "logx_staging.bin" else "logx_staging_$suffix.bin"
-            val stagingFile = File(stagingDir, stagingFileName)
-
-            // staging 必须 filesDir 系; 禁 cacheDir (系统清理会让 mmap 变孤儿, 见 spec §10)
-            require(!stagingDir.absolutePath.contains("/cache/")) {
-                "staging dir must not be in cacheDir"
-            }
-            require(config.maxLogLength < 128 * 1024 - 128 - 1) {
-                "maxLogLength must be < (dataSize - 1) = 130943"
-            }
-
-            minLevel = config.level
-            val handle = nativeInit(
-                logDir.absolutePath,
-                stagingFile.absolutePath,
-                config.compress.algo.toInt(),
-                if (config.encrypt) 1 else 0,
-                config.kid,
-                config.keyProvider,
-                config.retentionDays,
-                config.maxFileSize,
-                config.maxLogLength,
-                config.flushThreshold,
-                config.consoleEcho
-            )
-            if (handle == 0L) {
-                throw IllegalStateException("LogX native init failed")
-            }
-            nativeHandle = handle
-            isClosed = false
-        } catch (t: Throwable) {
-            isClosed = true
-            nativeHandle = 0L
-            errorHandler = null
-            initCount.set(0)
-            throw t
         }
+        doInitLocked()
     }
 
     private fun getProcessSuffix(context: Context): String {
