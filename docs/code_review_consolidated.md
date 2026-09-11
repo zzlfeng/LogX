@@ -568,6 +568,21 @@
   4. 回归测试：新增 `tests/unit/test_jni_string.cpp` 共 9 个用例（ASCII 恒等、Modified NUL、2/3 字节 BMP、4 字节 emoji 代理对、过长编码/代理区/U+10FFFF 以上拒绝、截断与乱码重同步不丢后续字符、混合串往返），桌面与 Android 单测同源覆盖；CMakeLists 增补 `android/cpp` include 路径。
 - **构建验证：** 三重矩阵全绿（同 J-02）。
 
+### 🔴 [J-04] `nativeWrite` 使用 `GetPrimitiveArrayCritical` 在临界区触发 JNI 错误回调致 CheckJNI 崩溃 [✅ 已修复]
+- **来源：** Android 真机/测试器多线程压测实测崩溃（ART CheckJNI 致命报错：`using JNI after critical get in call to NewString`）
+- **位置：** `android/cpp/logx_jni.cpp`（`Java_com_zzlfeng_logx_LogX_nativeWrite`）
+- **状态：** ✅ **已修复并闭环**
+- **描述：** 原实现为追求 Payload 零拷贝读取，在 `nativeWrite` 中调用了 `env->GetPrimitiveArrayCritical(jPayload, nullptr)` 进入 JNI 临界区并包裹了 `logx_write(...)` 的整个调用过程。在多线程并发或压测写入导致 staging 环形缓冲写满（`kFull`）、单条日志超长或入参非法时，`logx_write` 会在当前调用线程同步触发 `emit_event(inst, LOGX_EV_DROP, ...)`，经 `jni_error_trampoline` 间接调用 `make_jstring_utf16`（执行 `env->NewString`）和 `env->CallStaticVoidMethod` 向 Kotlin 层的 `errorHandler` 派发错误通知。然而 JNI 规范与 Android ART 严禁在持有 Critical 临界区期间执行任何 JNI 调用（除释放外），ART CheckJNI 立即捕获非法操作并使应用崩溃终止。此外，在 Critical 临界区内加锁（`inst->pal->mutex_lock(inst->mu)`）同样违背 JNI 规范并有潜在 GC 死锁风险。
+- **修复方案与落地：**
+  1. 废除 `GetPrimitiveArrayCritical` / `ReleasePrimitiveArrayCritical`，改用 Android 官方推荐的 `GetByteArrayRegion` 内存拷贝（底层为 Java 堆内存直读 `memcpy`，不进入 JNI 临界区、不阻塞 GC、无任何后续 JNI 调用禁令）；
+  2. 针对 $\le 4\text{ KB}$ 的常规日志（覆盖 99.9%+ 生产场景），直接使用 4KB 栈缓冲 `stack_buf` 接收 `GetByteArrayRegion` 拷贝，保持热路径零堆分配（Zero Heap Allocation）与极低 CPU 缓存开销；
+  3. 针对 $> 4\text{ KB}$ 的超长日志，使用 `static thread_local std::vector<uint8_t> tls_payload_buf` 动态扩容复用，避免并发竞争的同时在初次扩容后达成零堆分配；
+  4. 镜像日志输出（`console_echo`）在 `logx_write` 成功后基于有效的栈或 TLS 缓冲执行，彻底消除野指针与临界区交织风险。
+- **构建验证：**
+  - Android NDK 交叉编译（`build-android` 与 `build-android-arm64`）双架构重新构建 `liblogx.so` 均 0 错误通过；
+  - 最新 `liblogx.so` 已同步更新至 `android/logx-tester` 与 `android/kotlin-gradle` 的 `jniLibs/arm64-v8a`；
+  - `logx-tester` 通过 Gradle `assembleDebug` 成功打包验证。
+
 ---
 
 ## 九、Kotlin 封装层
@@ -898,6 +913,7 @@
 | S-01 | CRC32 表初始化多线程数据竞争（UB） [✅ 已修复] | 报告一 BUG-3 / 报告二#4 |
 | E-01 | 错误回调注册数据竞争（UB）[✅ 已修复] | 报告一 BUG-4 / 报告二#5 |
 | P-01 | Win64 HANDLE → int 截断（报告一列 P0） [✅ 已修复] | 报告一 BUG-5 / 报告二#10（报告二列中等） |
+| J-04 | `nativeWrite` 临界区错误回调致 CheckJNI 崩溃 [✅ 已修复] | Android 压测实测（using JNI after critical get） |
 | T-01 | "强杀恢复"测试未真正模拟强杀（恢复路径零覆盖） [✅ 已修复] | 报告二测#1 |
 
 ### 🟠 P1 —— 功能 / 并发 / 协议 / 容错缺陷

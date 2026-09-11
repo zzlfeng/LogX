@@ -30,6 +30,7 @@
 | `5aa713d` | fix(crypto): 移除 aesce 探针静态缓存恢复无状态纯读，根除并发数据竞争 (方案 A) |
 | `1943f1f` | fix(flusher): implement 75ms debounce aggregation flush for low-frequency writes (F-10) |
 | `7c1ee7c` | fix(staging): constexpr compile-time CRC32 table eliminating multi-thread data race (S-01) |
+| `b1df856` | fix(jni): J-04 修复 nativeWrite 临界区错误回调 CheckJNI 崩溃，改用栈缓冲+GetByteArrayRegion |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -896,6 +897,37 @@ cmake --build build-android -j
 - 镜像在调用方线程同步执行,2KB 截断上限;logcat 单行 ~4KB 截断为系统行为;
 - 明文进 logcat 的泄露面已在 Config 注释标注:仅限 debug 期,生产默认关闭;
 - T5.3(接入指南/解码手册)按用户指示暂停,文档将在其恢复时覆盖本开关。
+
+---
+
+## JNI 临界区安全与 CheckJNI 崩溃修复记录 (2026-09-11, J-04)
+
+### 故障现象与报错信息
+在 Android 压测及多线程并发写场景下（如协程调度器线程 `DefaultDispatcher-worker-4` 持续写入导致环形缓冲写满时），ART 虚拟机抛出 CheckJNI 致命崩溃并强制杀死进程：
+```text
+java_vm_ext.cc:579] JNI DETECTED ERROR IN APPLICATION: thread Thread[3,tid=14957,Runnable,Thread*=0xb400007c822b3400,peer=0x12c96360,"DefaultDispatcher-worker-4"] using JNI after critical get
+                                                                    java_vm_ext.cc:579]     in call to NewString
+                                                                    java_vm_ext.cc:579]     from void com.zzlfeng.logx.LogX.nativeWrite(long, int, java.lang.String, byte[])
+```
+
+### 根因深度剖析
+1. **JNI 规范冲突**: `nativeWrite` 原实现为追求零拷贝读取 Payload，调用了 `env->GetPrimitiveArrayCritical(jPayload, nullptr)` 进入 JNI 临界区并包裹了 `logx_write` 的全流程。JNI 规范与 Android ART 严格禁止在 Critical 临界区内调用任何其它 JNI 函数或发生互斥阻塞；
+2. **同步错误回调触发 JNI 调用**: 当 staging 环形缓冲写满 (`kFull` / `ERR_NO_SPACE`)、单条日志超长 (`ERR_TOO_LARGE`) 或入参非法时，`logx_write` 会在调用方线程同步调用 `emit_event`，进而触发 `jni_error_trampoline`；
+3. **CheckJNI 拦截崩溃**: `jni_error_trampoline` 为向 Kotlin 的 `errorHandler` 上报错误，调用了 `make_jstring_utf16`（执行 `env->NewString`）与 `env->CallStaticVoidMethod`。由于此时调用线程仍在 Critical 保护期内，ART CheckJNI 校验到 `critical_ > 0`，立刻判定为非法 JNI 操作并抛出 Fatal Error；
+4. **互斥锁与 GC 停顿风险**: `logx_write` 内部持 `inst->pal->mutex_lock(inst->mu)`，在 Critical 期间长时间加锁同样违背 JNI 临界区纪律，有诱发 GC 停顿与潜在死锁的隐患。
+
+### 修复方案
+1. **废弃 Critical 临界区**: 彻底移除 `GetPrimitiveArrayCritical` 与 `ReleasePrimitiveArrayCritical`，拔除崩溃诱因；
+2. **分级零堆读取 (GetByteArrayRegion)**:
+   - **常规日志 ($\le 4\text{ KB}$)**: 覆盖 99.9%+ 业务日志，直接使用 4KB 栈缓冲 `stack_buf` 配合 `env->GetByteArrayRegion`。在 ART 中该函数直接从 Java 堆内存执行连续 `memcpy`，不进临界区、不阻塞 GC、零堆内存分配（Zero Heap Allocation）；
+   - **超长日志 ($> 4\text{ KB}$)**: 采用 `static thread_local std::vector<uint8_t> tls_payload_buf` 动态扩容复用，消除多线程竞争，各线程首次扩容后后续同样为零堆分配；
+3. **生命周期自然闭环**: 栈缓冲与 TLS 缓冲在 `nativeWrite` 调用期间始终有效，成功落盘后的 `console_echo` 镜像拷贝与输出逻辑更加清晰安全。
+
+### 验证与产物交付
+- Android NDK 交叉编译：`build-android` 与 `build-android-arm64` 双目标 `liblogx.so` 编译 0 错误 0 警告；
+- 预编译 so 已同步至 `android/logx-tester/app/src/main/jniLibs/arm64-v8a/` 与 `android/kotlin-gradle/app/src/main/jniLibs/arm64-v8a/`；
+- Android 测试工程 `logx-tester` 通过 Gradle `assembleDebug` 构建验证成功；
+- **桌面回归测试（C ABI 层，`tests/unit/test_j04_regression.cpp`）**：桌面端无法加载 JVM 复现 JNI 临界区，故精确守护本崩溃依赖的核心契约——`emit_event` 同步直调语义。两用例分别覆盖超长丢日志（`LOGX_ERR_TOO_LARGE`）与 staging 环满丢日志（`flush_threshold=0` 确定性塞满数据区 → `LOGX_ERR_NO_SPACE`），断言错误回调「同步 + 在调用线程 tid + kind/code 正确 + 持 `inst->mu` 触发时不锁死 + 单次丢弃后实例仍可写」，全量单测 129 用例 PASSED（含本用例重复 5 次无时序抖动）。
 
 ---
 

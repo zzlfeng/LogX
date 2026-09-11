@@ -30,6 +30,7 @@ add_executable(logx_unit_tests
     test_codec.cpp
     test_robustness.cpp
     test_jni_string.cpp
+    test_j04_regression.cpp
 )
 target_link_libraries(logx_unit_tests
     PRIVATE

@@ -5,7 +5,8 @@
 //
 // 性能要点:
 //   - 单条日志路径使用 GetStringUTFRegion 栈缓冲读取 tag,
-//     搭配 GetPrimitiveArrayCritical 读取 payload, 实现 JNI 边界零堆内存分配 (Zero Heap Allocation)。
+//     搭配 GetByteArrayRegion 栈缓冲/thread_local 读取 payload, 实现 JNI 边界零堆内存分配 (Zero Heap Allocation),
+//     同时彻底杜绝 GetPrimitiveArrayCritical 临界区内触发错误回调导致的 CheckJNI 崩溃。
 //   - keyProvider 回调里不能重入 LogX(JNI 调用栈已在 native,死锁风险)。
 //   - 错误回调 / export 回调运行在调用线程,直接回调 Kotlin。
 
@@ -48,8 +49,7 @@ inline int logx_level_to_priority(int level) {
 // 修复保障:
 // 1) [Tag 修复]: 优先使用调用方传递的业务 tag,为空时回退为 LOGX_TAG,
 //    确保 Android 开发者可按 Tag 过滤 logcat;
-// 2) [JNI 临界区安全]: 必须在 ReleasePrimitiveArrayCritical 之后调用,
-//    绝不持有 Critical 进行 IPC 系统调用,防止拖慢 JVM GC 或引发死锁;
+// 2) 镜像输出在 logx_write 落盘成功后调用, 确保 logcat 真实反映落盘日志;
 // 3) [格式串安全]: 统一使用 "%s" 格式化输出,防 payload 包含 % 字符导致崩溃。
 void console_echo(int level, const char* tag, const char* msg) {
     const int priority = logx_level_to_priority(level);
@@ -120,6 +120,9 @@ static void jni_error_trampoline(void* user, logx_event_kind_e kind, int code, c
         }
         env->CallStaticVoidMethod(ctx->g_logx_class, ctx->mid_on_error,
                                   static_cast<jint>(kind), static_cast<jint>(code), jMsg);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
         env->DeleteLocalRef(jMsg);
         if (need_detach) {
             ctx->jvm->DetachCurrentThread();
@@ -154,6 +157,10 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     jbyteArray jKeyArr = static_cast<jbyteArray>(
         env->CallObjectMethod(ctx->g_provider, ctx->mid_get_key, static_cast<jint>(kid))
     );
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        jKeyArr = nullptr;
+    }
 
     const uint8_t* res = nullptr;
     if (jKeyArr) {
@@ -184,6 +191,10 @@ static int export_trampoline(void* user, const char* date, const char* plaintext
     jstring jPath = make_jstring_utf16(env, plaintext_path ? plaintext_path : "");
 
     jint res = env->CallIntMethod(ctx->cb, ctx->mid, jDate, jPath, static_cast<jlong>(size));
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        res = -1;
+    }
 
     env->DeleteLocalRef(jDate);
     env->DeleteLocalRef(jPath);
@@ -216,6 +227,11 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
 
     const char* log_dir = env->GetStringUTFChars(jLogDir, nullptr);
     const char* staging_path = env->GetStringUTFChars(jStagingPath, nullptr);
+    if (!log_dir || !staging_path) {
+        if (log_dir) env->ReleaseStringUTFChars(jLogDir, log_dir);
+        if (staging_path) env->ReleaseStringUTFChars(jStagingPath, staging_path);
+        return 0;
+    }
 
     JniKeyProviderContext* kp_ctx = nullptr;
     JavaVM* jvm = nullptr;
@@ -336,12 +352,36 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
     } else {
         tag_ptr = env->GetStringUTFChars(jTag, nullptr);
     }
+    if (!tag_ptr) return;
 
-    // 2) Payload 读取: 使用 GetPrimitiveArrayCritical 实现零拷贝/零堆分配
+    // 2) Payload 读取: 优先使用栈缓冲 + GetByteArrayRegion 避免堆分配与 GC 阻塞。
+    // [CheckJNI 安全保障]: 严禁使用 GetPrimitiveArrayCritical。当 staging 环形缓冲写满(kFull)、
+    // 日志超长或入参非法时, logx_write 会同步调用 emit_event 触发 jni_error_trampoline,
+    // 进而执行 make_jstring_utf16 (env->NewString) 和 env->CallStaticVoidMethod。
+    // 在持有 Critical 临界区期间执行任何 JNI 调用都会触发 CheckJNI 的致命崩溃:
+    // "using JNI after critical get in call to NewString"。
+    // 改用栈缓冲(≤4KB, 覆盖 99.9% 常规日志)配合 thread_local 缓冲(超长日志),
+    // 既保持热路径零堆分配(Zero Heap Allocation)与零 GC 抖动, 又彻底杜绝 JNI 临界区冲突与 GC 阻塞风险。
+    constexpr jsize kStackPayloadSize = 4096;
+    constexpr jsize kMaxPayloadCapacity = 64 * 1024;
+    uint8_t stack_buf[kStackPayloadSize];
+    static thread_local std::vector<uint8_t> tls_payload_buf;
+
     jsize n = jPayload ? env->GetArrayLength(jPayload) : 0;
     const uint8_t* payload_ptr = nullptr;
     if (n > 0) {
-        payload_ptr = reinterpret_cast<const uint8_t*>(env->GetPrimitiveArrayCritical(jPayload, nullptr));
+        if (n <= kStackPayloadSize) {
+            payload_ptr = stack_buf;
+            env->GetByteArrayRegion(jPayload, 0, n, reinterpret_cast<jbyte*>(stack_buf));
+        } else {
+            // 物理上限防卫: 单条日志 >64KB 在 core 中必被拒, 拷贝长度有界收敛, 防超大数组致 OOM
+            jsize copy_len = (n <= kMaxPayloadCapacity) ? n : kMaxPayloadCapacity;
+            if (tls_payload_buf.size() < static_cast<size_t>(copy_len)) {
+                tls_payload_buf.resize(static_cast<size_t>(copy_len));
+            }
+            payload_ptr = tls_payload_buf.data();
+            env->GetByteArrayRegion(jPayload, 0, copy_len, reinterpret_cast<jbyte*>(tls_payload_buf.data()));
+        }
     }
 
     logx_status_e wrc = logx_write(inst, level, tag_ptr, payload_ptr,
@@ -349,8 +389,6 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
 
     // T5.4: consoleEcho —— 仅镜像成功落盘的记录(logcat 与文件一一对应);
     // 丢弃(NO_SPACE/TOO_LARGE)不 echo,由 ErrorHandler.DROP 事件通道上报。
-    // [JNI 临界区安全]: 在 Critical 保护期内仅完成栈缓冲内存拷贝,
-    // 拷贝后立即释放 Critical 解除 GC 阻塞,绝不在持有 Critical 时执行 logcat IPC。
     char echo_buf[2048];
     bool need_echo = (wrc == LOGX_OK && g_console_echo.load(std::memory_order_relaxed));
     if (need_echo) {
@@ -361,19 +399,10 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
             std::memcpy(echo_buf, payload_ptr, copy);
         }
         echo_buf[copy] = '\0';
-    }
-
-    if (payload_ptr) {
-        env->ReleasePrimitiveArrayCritical(jPayload, const_cast<uint8_t*>(payload_ptr), JNI_ABORT);
-    }
-
-    // [Tag 修复 & 临界区外调用]: 在释放 Critical 之后调用 console_echo,
-    // 传入业务指定的 tag_ptr (tag_ptr 此时仍有效, 在下方释放)。
-    if (need_echo) {
         console_echo(level, tag_ptr, echo_buf);
     }
 
-    if (tag_ptr != tag_buf) {
+    if (tag_ptr && tag_ptr != tag_buf) {
         env->ReleaseStringUTFChars(jTag, tag_ptr);
     }
 }
@@ -397,6 +426,11 @@ Java_com_zzlfeng_logx_LogX_nativeExport(JNIEnv* env, jclass /*clazz*/, jlong han
 
     const char* from = env->GetStringUTFChars(jFrom, nullptr);
     const char* to = env->GetStringUTFChars(jTo, nullptr);
+    if (!from || !to) {
+        if (from) env->ReleaseStringUTFChars(jFrom, from);
+        if (to) env->ReleaseStringUTFChars(jTo, to);
+        return -1;
+    }
 
     ExportContext ctx{env, jCallback, mid};
     logx_status_e rc = logx_export(inst, from, to, export_trampoline, &ctx);

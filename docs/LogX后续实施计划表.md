@@ -1,10 +1,11 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.10 (2026-09-09 T5.4 logcat 直通开关落地;T5.3 用户指示暂停)  
+> **文档版本**: v1.11 (2026-09-11 J-04 JNI 临界区安全修复闭环;T5.3 用户指示暂停)  
 > **制定日期**: 2026-09-02  
 > **基准方案**: [LogX 日志库最终实施方案.md](./LogX日志库最终实施方案.md) (v5.2 定稿)  
 > **变更日志**: [CHANGELOG.md](./logx/CHANGELOG.md)  
 >
+> **v1.11 修订说明**: 2026-09-11 **J-04 nativeWrite 临界区错误回调 CheckJNI 崩溃修复**: 实测暴露在 staging 环满 (kFull) 或超长丢日志时，`logx_write` 同步触发 `emit_event` -> `jni_error_trampoline` (`NewString` / `CallStaticVoidMethod`)，与 `GetPrimitiveArrayCritical` 临界区冲突致 CheckJNI 致命报错。废除 Critical 临界区，改用 4KB 栈缓冲 + `GetByteArrayRegion` 配合 `thread_local std::vector<uint8_t>` 动态扩容，保持零堆分配与零 GC 抖动的同时彻底消除 JNI 临界区合规风险。Android 双目标交叉编译 0 错误，`logx-tester` 打包验证成功。  
 > **v1.10 修订说明**: 2026-09-09 **T5.4 logcat 直通开关 (consoleEcho) 落地**(用户需求驱动,T5.3 暂停让位): JNI 层实现(用户选型,零堆分配与库纪律一致),`nativeInit` 追加 jboolean 参数、进程级 atomic 存储、`nativeWrite` 成功后 2KB 栈缓冲截断镜像到 `__android_log_print`(level 六级映射,激活原死宏),顶层 CMake 补链 `liblog`;C ABI 零改动。kotlin-gradle 扩展为可安装 smoke 工程(Redmi K30 Pro 真机 6/6 echo 按等级正确、中文完好、SMOKE PASS),纯逻辑单测 9/9 全绿。  
 > **v1.9 修订说明**: 2026-09-08 **T5.2 性能基线测试与报告输出落地**: 新增独立基准 harness `tests/bench/logx_bench.cpp`(`LOGX_BUILD_BENCH=ON`,非 ctest)与 [docs/benchmark_report.md](./benchmark_report.md)。Windows 桌面 + Redmi K30 Pro 真机双端实测(全部轮次 0 丢弃 0 丢失):写入延迟桌面 P50 0.2µs/P99 3.1µs(纯路径),真机 P50 3.2µs;压缩开关对写路径零影响(实证热路径无 codec 成本);zstd 落盘体积 -38%(1.52x)、真机吞吐反超 +48%;so 体积(arm64 strip)MinSizeRel 全开 548.9KB(裸核心 121KB,超 500KB 目标归因 zstd ~426KB)。2µs/500KB 两目标判定与 v1.0 回归基线声明见报告。  
 > **v1.8 修订说明**: 2026-09-08 **T5.1 Android 备份安全策略配置工程化落地**: 交付 `android/res/xml/data_extraction_rules.xml` (API 31+,cloud-backup/device-transfer 双通道)、`android/res/xml/backup_rules.xml` (API 23~30 fullBackupContent) 与重写后的 `android/AndroidManifest-snippet.xml` 完整可集成片段(修正原草稿资源根元素命名错误 `<dataExtractionRules>` → `<data-extraction-rules>`)。`filesDir/logs/` 与 `filesDir/logx_staging/` 在云端备份与设备迁移双通道均被排除,防明文 staging/密文日志进云;附自定义目录/多进程隔离目录 (`logs_<后缀>/`) 边界说明与 `allowBackup="false"` 最严备选方案。三个 XML 经 xml.etree 逐项断言校验通过。  
