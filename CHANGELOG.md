@@ -44,6 +44,7 @@
 | `28acf7f` | feat(core): T5.5 超长日志截断保前缀——B-1 方案B 落地,超长不再整条丢弃(预算求解+marker+truncated_logs 计数,顺带修正 >60KB 误报 INVALID_ARG) |
 | `60f2365` | refactor(core): R8 收口——死常量 kMaxMsg 清理 + 20KB 常量族单源化(复审 3 项属实;本行系 1904cfb 漏加,R9 补记) |
 | `7b2ead6` | refactor(core): R9 收口——PAD 循环裸 6 补齐 + 6B/16KB 常量族全量单源化(复审 1×P3/观察/Nit 属实 + 2 项自查含 60f2365 行补记) |
+| `85f0b31` | refactor(core): R10 收口——recovery.cpp 裸 6 补齐 + 全仓模式穷尽扫描纠偏(复审 3 项属实;Backlog 新增 B-4 平行实现收敛) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -1504,6 +1505,9 @@ peek_record_len 的 `total - off < 6` / `sz = 6 + len`,split_impl 的两处循�
 (`flags@6`)与 flusher.cpp:120/264/305(`seqno@6`/`date@6`)为**块/文件头字段偏移**,
 与 6B 记录头概念不同,保留(与复审 §4.1 说明一致)。
 
+> **勘误(R10)**:本节"全量扫描 / 6B 单源声称完全成立"失准——实际扫描仅覆盖
+> 5 个 TU,`recovery.cpp` 尚有 5 处同概念裸 `6` 漏转(R10-1 补齐,见下节);历史原文保留。
+
 ### R9-3 (§4.2 观察,采纳) 16KB 常量族单源化
 flusher.cpp 的 `kNormalBlockMax = 16 * 1024` → `= kBlockMaxNormal`
 (logx_staging.h:232),与 R8-3 的 20KB 族同款处理。单源清单增至
@@ -1518,6 +1522,39 @@ flusher.cpp 的 `kNormalBlockMax = 16 * 1024` → `= kBlockMaxNormal`
 提交记录表并无该行——R8 复审"哈希列全部合规、真实哈希行已写入"的结论失准(仅核对
 无占位/无重复,未核对行存在性)。本轮于提交表补记 `60f2365` 行。R8-2 承诺的
 "fix 提交在前、docs 单次提交带真实哈希"流程本身继续有效并沿用。
+
+### 验证
+三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;Android arm64
+交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。
+
+---
+
+## R10 批次: R9 复审 §3 收口 (2026-09-13)
+
+> 复审报告(`code_review_R9_2026-09-13.md`,对象 7b2ead6/2aa6984)1 项 P3 + 1 项观察 +
+> 1 项 Nit 经核实**全部属实**;复审对 R9-1/R9-3/R9-4 落实、R9-5 自纠成立(含其对 R8
+> "哈希行已写入"误判的确认与教训补记)的确认无异议。
+
+### R10-1 (P3) recovery.cpp 5 处同概念裸 `6` 补齐 + 扫描方式纠偏
+R9-2 的"全量扫描"实际仅覆盖 5 个 TU(漏 `recovery.cpp`),其与 flusher.cpp 平行实现
+对应的 5 处同概念裸 `6` 漏转:`probe_record` 下界/步长(:37/:39)、`ring_scan` 循环界
+(:59)、6B 全零终止符判定(:67)、cksum 载荷起点(:91)——一并绑定 `kHeaderLen`
+(该 TU 经 `logx_internal.h` 传递本已可见,纯遗漏,无需新增包含)。本批起扫描方式
+改为**按模式全仓穷尽**:core/src + core/include 全部 14 文件 + android/cpp 逐一检索;
+修复后 C++ 核心记录头语义裸 `6` **零残留**,余下命中均为不同概念(字段偏移
+flags@6/seqno@6/date@6、错误码 -6、stats 数组长度 6、UTF-8 `<< 6` 位运算)。
+tests/ 与 decoder/ 的字面量**有意保留**:单测以具体值钉死线上格式,Python 解码器
+为独立跨语言镜像(且已有 `BLOCK_RAW_MIN = 6`/`MAX_BLOCK_RAW` 命名常量)。
+
+### R10-2 (§3.3 Nit,采纳) 头注释同步
+`logx_internal.h:219` 块头严检注释 `raw_len ∈ [6, kSingleRecordMaxRaw]` →
+`[kHeaderLen, kSingleRecordMaxRaw]`,与 R9-2 已转换的实现同步。
+
+### R10-3 (§3.2 观察,采纳) Backlog 新增 B-4
+`peek_record_len`/`split_impl`(flusher)与 `probe_record`/`ring_scan`(recovery)为
+平行重复实现,是常量单源化三度遗漏(R8-3/R9-2/R10-1)的结构性根因。收敛方案
+(共享原语参数化 vs 维持平行 + 流程门禁)涉及写/恢复两条关键路径的等价性论证,
+按复审建议**后续评估**,记入计划表 Backlog **B-4** 待决策。
 
 ### 验证
 三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;Android arm64
