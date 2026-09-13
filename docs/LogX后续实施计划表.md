@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.22 (2026-09-13 T5.2 补测批次:资源占用/抖动/零分配/泄漏回归四类用例,收口 §8.4 局限与 spec §349 条款;T5.3 用户指示暂停)  
+> **文档版本**: v1.23 (2026-09-13 R12 批次:T5.2 补测批次审查收口——B-5 定性纠偏/§349→L349/bench 限制表述修正/补批次表行;T5.3 用户指示暂停)  
+>
+> **v1.23 修订说明**: 2026-09-13 **R12 批次**(对象:自审 T5.2 补测批次 `e67be46`/`51e2c47`): 测试资产质量合格、提交纪律保持(提交表行存在、局限显式声明);修正 3 项文档层发现 + 1 项补记,**零生产代码改动**(仅 test 注释 3 处)。**R12-1(P2)**——B-5 定性纠偏:"既有失败/稳定失败"改"**间歇性失败**(单次观测,复现条件未知)",证据=同日 R11 基线 142/142 全绿(含本用例)+ R12 filtered 10 连跑 10/10 + 三矩阵 126/132/145 全绿;"'Windows 桌面单测全绿'基线在本机不成立"的表述撤回;方案 A/B/C 前置**稳定性复现协议**(循环 ≥100 次/负载下运行/GetLastError 日志增强,命中 ≥2 次并归纳条件方可立项);探针 exe 判别手法保留(其证明的是代码无关性,非确定性)。**R12-2(Nit)**——"spec §349"实为实施方案**第 349 行**(L349 验收条款"50 线程压测无 fd/内存泄漏",内容属实),非章节号;现行文本修正(test 注释 3 处 + §5 清单 ④),历史文本以 CHANGELOG T5.2 内联勘误覆盖。**R12-3(Nit)**——benchmark_report"其驱动命令受本机安全策略限制"表述删除(`logx_bench` 构建实测通过),改"未重跑属刻意延后"。**R12-4**——批次表补 T5.2 补测批次行(原批次仅落清单项+B-5+头部说明)。F4(新用例 RAII 清理守卫)维持观察不实施;F5(Linux/Android 分支未编译未运行)维持共同局限待真机/CI。验证:三矩阵 **126/126 + 132/132 + 145/145** + hotpath **2/2 ×3** + ctest 4/4 + 压测 4/4×3 全绿,arm64 无待办,bench 编译通过。
 >
 > **v1.22 修订说明**: 2026-09-13 **T5.2 补测批次**(提交 `e67be46`,**非审查批次**;收口 `benchmark_report.md` §8.4 已知局限 + spec §349 未落实条款): 既有自动化(约 170 用例 / 9,206 行测试代码)对"**内存占用、延迟抖动、热路径零堆分配、fd/内存泄漏**"四项**零覆盖**——§8.4 自认未覆盖 CPU 占用率与 JNI 路径 GC 监控,spec §349「50 线程压测无 fd/内存泄漏」条款在自动化中**无任何 fd/内存计数断言**(压测仅有数据完整性断言),属"条款存在、门禁缺失"。**本批次把设计声明与验收条款变成可回归契约,零生产代码改动**:
 > ① 新增 `tests/unit/test_observability.cpp`——`MemoryRssPss_BoundedGrowthAcrossWriteCycles`(预热+稳定期取基线,40k 条后 RSS/PSS 稳态增量 < 16MB;Linux/Android 走 `/proc/self/statm` + `smaps_rollup`,Windows 走 psapi,缺失平台降级"仅报告不判定")、`LatencyJitter_StddevCvWithinSanityBound`(输出 stddev/CV/median/MAD/robustCV 与长尾比;因**经典 CV 对单次 OS 抢占极敏感**,断言以 **robustCV<5.0** 为准、CV<50.0 仅作灾难护栏)、`LeakRegression.CountingPal_NoResourceLeakAcrossOpenCloseCycles`(CountingPal 包装 `default_pal()`,仅在真实成功时计数 fd/mmap/mutex/ev/thread 的 create/destroy,6 轮 open→写→flush→close 后断言**各自净 0**;含"计数链路确实被走到"反假通过断言与 OS 级 fd 数交叉验证);
@@ -120,6 +122,8 @@ gantt
 | **R9** | R8 复审收口(`code_review_R8_2026-09-13.md` §4) | `core/src/staging.cpp`, `core/src/flusher.cpp` | **P3** | **✅ 100% 已完成 (2026-09-13)** | **R9-1(§4.1,属实)**: R8-3 在回绕 PAD 块仅替换 1/4 处同概念裸 `6`,其余 3 处(`pad >= 6` 阈值/`pos + 6 <= data_size_` 循环界/`pos += 6 + this_pad` 步进)补齐 `kHeaderLen`;**R9-2(审查未及,同类自查)**: flusher.cpp 另有 5 处同概念裸 `6`(peek_record_len ×2 / split_impl ×2 / `raw_len < 6` 防御)一并绑定——"6B 单源"声称至此完全成立(块/文件头字段偏移 flags@6/seqno@6/date@6 概念不同,保留);**R9-3(§4.2,采纳)**: `kNormalBlockMax = kBlockMaxNormal` 16KB 常量族单源;**R9-4(§4.3,采纳)**: flusher.cpp 直含 `logx_staging.h`(IWYU,codec.cpp:22 先例);**R9-5(自纠,复审误判)**: `1904cfb` 声称"补 60f2365 提交记录行"但其 diff 未含该行,复审"哈希列全部合规"结论失准,本轮补记该行。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。 |
 | **R10** | R9 复审收口(`code_review_R9_2026-09-13.md` §3) | `core/src/recovery.cpp`, `core/include/logx_internal.h` | **P3** | **✅ 100% 已完成 (2026-09-13)** | **R10-1(§3.1,属实)**: R9-2"全量扫描"漏 `recovery.cpp`(仅扫 5 个 TU),其 5 处同概念裸 `6`(probe_record ×2 / ring_scan 循环界 + 全零终止符 / cksum 载荷起点)绑定 `kHeaderLen`(TU 内本已可见,纯遗漏);本批起改**按模式全仓穷尽扫描**(14 个 C++ 文件 + android/cpp),修复后记录头语义裸 `6` 零残留,余下命中均为字段偏移/错误码/数组长度/位运算等不同概念,tests/decoder 字面量有意保留(格式钉死/跨语言镜像);**R10-2(§3.3,采纳)**: `logx_internal.h:219` 注释 `[6,…]` 同步 `[kHeaderLen,…]`;**R10-3(§3.2,观察采纳)**: Backlog 新增 B-4(收敛平行记录扫描实现——三度遗漏结构性根因,待决策)。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。 |
 | **R11** | R10 复审收口(`code_review_R10_2026-09-13.md` §4) | `core/src/flusher.cpp`, `core/src/staging.cpp`, `core/src/format.cpp`, `core/include/logx_format.h` | **Nit** | **✅ 100% 已完成 (2026-09-13)** | **R11-1(§4.1,属实)**: 6 处核心注释裸 `6`(记录头语义)同步 `kHeaderLen`——flusher.cpp:310 范围下界、staging.cpp:315/329(PAD 块内)、format.cpp:201/205(求解器)、logx_format.h:69(format_pad 契约),连同同块复审未列的 format.cpp:203 `− 6s` 共 7 处;编号项/spec §6/"6B"单位/字段偏移按判据豁免;**R11-2(流程固化,复审 §六建议)**: "按模式穷尽扫描"固化为批次收口门禁,清单覆盖代码+注释两层,判据=记录头语义裸 `6`(无 B 单位)零残留。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。 |
+| **T5.2补测** | 资源占用/延迟抖动/零分配/泄漏回归四类观测门禁(收口 benchmark_report §8.4 局限 + 实施方案 L349 验收条款) | `tests/unit/test_observability.cpp`, `tests/unit/test_hotpath_alloc.cpp`, `tests/unit/CMakeLists.txt`, `tests/bench/logx_bench.cpp` | **P2** | **✅ 100% 已完成 (2026-09-13)** | 新增 `test_observability.cpp`(RSS/PSS 稳态增量有界/抖动以 robustCV<5.0 为准/CountingPal create-destroy 净 0 + OS 级 fd 交叉验证)与独立目标 `logx_hotpath_alloc_tests`(operator new 替换 + thread_local 计数 + 仪器自检防假通过;常规 400 条与截断 100 条窗口 0 次/0B);`print_ns_dist` 增 stddev/CV/MAD/robustCV 与长尾比;WIN32 链 psapi。本机全开矩阵实测:ΔRSS=4096B、robustCV 0.125~0.25、资源净 0、零分配;hotpath 2/2。原记录"145 项 144 通过"含一例间歇性失败,经 R12 审查改定性并复跑 145/145(见 Backlog B-5)。R12 审查同步修正 §349 编号口径与 bench 限制表述。 |
+| **R12** | T5.2 补测批次审查收口(自审 `e67be46`/`51e2c47`) | `tests/unit/test_observability.cpp`, `docs/benchmark_report.md`, `docs/LogX后续实施计划表.md` | **P2** | **✅ 100% 已完成 (2026-09-13)** | **R12-1(P2)**: B-5 定性纠偏——复现性证据(同日 R11 基线 142/142 全绿含本用例/10 连跑 10/10/三矩阵 126/132/145 全绿)证明非确定性语义缺陷,改口径"间歇性失败(复现条件未知)",新增前置稳定性复现协议(命中 ≥2 次方可投入方案 A/B/C),探针判别手法保留(含义收窄为代码无关性);**R12-2(Nit)**: "spec §349"→"实施方案 L349"(第 349 行非章节号),现行文本修正 test 注释 3 处+§5 清单 ④,历史文本以 CHANGELOG 内联勘误覆盖;**R12-3(Nit)**: benchmark_report "安全策略限制"表述删除(bench 构建实测通过),改"未重跑属刻意延后";**R12-4**: 补 T5.2 补测批次表行;F4(RAII 清理守卫)维持观察不实施,F5(Linux/Android 分支)维持共同局限待真机/CI。三矩阵 126/132/145 + hotpath 2/2×3 + 压测 4/4×3 全绿,arm64 无待办,bench 编译通过。 |
 
 ---
 
@@ -172,7 +176,7 @@ gantt
 - [x] ✅ **崩溃注入与 50 轮随机阶段崩溃循环自愈压测**: Staging 未落盘强杀 100% 挽回，磁盘撕裂尾块安全截断，50 轮多阶段随机崩溃循环 397/397 日志 100% 复原（T4.5 实测通过）。
 - [x] ✅ **未对齐访问与时钟跳变仿真**: 奇数内存地址读写整型与编解码零 SIGBUS；23:59:59 跨日平滑归档轮转与时钟回拨接管验证通过（T4.5 实测通过）。
 - [x] ✅ **性能基线报告已输出** (2026-09-08,T5.2):单条日志写入实测桌面 P50 0.2µs(纯路径口径,确定性热路径段达成 2µs 量级目标;整调用口径 P99 3.1µs 未达,归因计时器开销与调度尾部,见 [benchmark_report.md](./benchmark_report.md) §4);zstd 体积 -38% / so 体积 548.9KB(strip,MinSizeRel)等全部实测数据与回归基线声明已归档。
-- [x] ✅ **资源占用与抖动量化 + 零分配 + 泄漏回归四类观测门禁** (2026-09-13,T5.2 补测批次,提交 `e67be46`):① **内存占用**——RSS/PSS 稳态增量有界(预热+稳定期取基线,40k 条后实测 **ΔRSS=4096B** < 16MB 阈值;Windows 走 psapi,Linux/Android 走 `/proc/self/statm` + `smaps_rollup`,缺失平台降级"仅报告不判定");② **延迟抖动量化**——输出 stddev/CV/median/MAD/robustCV 与长尾比(P99/P50、max/P50),断言以 **robustCV<5.0** 为准(实测 robustCV 0.125~0.25 vs 经典 CV 2.5~6.3;经典 CV 对单次 OS 抢占极敏感,仅作灾难护栏);③ **热路径零堆分配由"设计声明"升级为可执行守护**——替换全局 `operator new` + thread_local 计数 + 仪器自检(防替换失效致断言永真),常规路径与截断路径窗口内均实测 **0 次/0B**;④ **spec §349「50 线程压测无 fd/内存泄漏」条款落地为可回归断言**——CountingPal 统计 fd/mmap/mutex/ev/thread 的 create/destroy 配对,6 轮 open→写→flush→close 后**净 0**,并以 OS 级 fd 数独立交叉验证。新增 `tests/unit/test_observability.cpp` 与独立目标 `logx_hotpath_alloc_tests`(2/2)、`logx_unit_tests` 145 项 144 通过。**已知遗留**:`Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing` 既有失败(见 Backlog B-5),已证明与本批次无关。
+- [x] ✅ **资源占用与抖动量化 + 零分配 + 泄漏回归四类观测门禁** (2026-09-13,T5.2 补测批次,提交 `e67be46`):① **内存占用**——RSS/PSS 稳态增量有界(预热+稳定期取基线,40k 条后实测 **ΔRSS=4096B** < 16MB 阈值;Windows 走 psapi,Linux/Android 走 `/proc/self/statm` + `smaps_rollup`,缺失平台降级"仅报告不判定");② **延迟抖动量化**——输出 stddev/CV/median/MAD/robustCV 与长尾比(P99/P50、max/P50),断言以 **robustCV<5.0** 为准(实测 robustCV 0.125~0.25 vs 经典 CV 2.5~6.3;经典 CV 对单次 OS 抢占极敏感,仅作灾难护栏);③ **热路径零堆分配由"设计声明"升级为可执行守护**——替换全局 `operator new` + thread_local 计数 + 仪器自检(防替换失效致断言永真),常规路径与截断路径窗口内均实测 **0 次/0B**;④ **实施方案 L349「50 线程压测无 fd/内存泄漏」验收条款落地为可回归断言**——CountingPal 统计 fd/mmap/mutex/ev/thread 的 create/destroy 配对,6 轮 open→写→flush→close 后**净 0**,并以 OS 级 fd 数独立交叉验证。新增 `tests/unit/test_observability.cpp` 与独立目标 `logx_hotpath_alloc_tests`(2/2)、`logx_unit_tests` 145 项 144 通过。**已知遗留**:`Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing` 间歇性失败(单次观测,审查未复现,见 Backlog B-5),已证明与本批次无关;"145 项 144 通过"为该次运行快照,R12 审查复跑 **145/145**。
 
 ---
 
@@ -235,20 +239,22 @@ gantt
   - **B. 维持平行实现**: 接受重复,以"裸 `6`(记录头语义)模式穷尽扫描"作为批次收口流程门禁(R10 已执行一次)防再漂移;零回归风险。
 - **决策点**: 等价性论证成本 vs 长期漂移风险;两处语义差异(magic 校验时机/终止符语义)能否无损参数化;若选 A,可顺势把记录头布局断言扩展到扫描原语。
 
-### B-5 Windows PAL 目录/文件删除 errno 语义与单测期望不符(既有失败)
+### B-5 Windows PAL 目录/文件删除 errno 间歇性失败(单次观测,审查未复现)
 
-- **记录日期**: 2026-09-13
-- **状态**: ⏸ 待决策(**既有缺陷**,非 T5.2 补测批次引入;由补测批次跑全量矩阵时暴露)
-- **现象**: 用例 `Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing`(`tests/unit/test_robustness.cpp:1785`)在 Windows/MSVC 下**稳定失败**(单跑亦失败),四处断言与实测:
+- **记录日期**: 2026-09-13(T5.2 补测批次记录;R12 审查改定性)
+- **状态**: ⏸ 待决策——**间歇性失败**(单次观测,复现条件未知;非 T5.2 补测批次引入,其代码无关性论证成立)
+- **单次观测记录**(2026-09-13,补测批次跑全量矩阵时;用例 `Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing`,`tests/unit/test_robustness.cpp:1785`): 该次运行中失败,四处断言与实测:
   1. 对**非空目录** `file_rmdir(dir2)` 返回 **0**(期望 -1);
   2. 随之 `errno` 为 **0**(期望 `ENOTEMPTY` = 41);
   3. 随后 `file_unlink(dir2/occupied.bin)` 返回 **-1**(期望 0,该文件应存在);
   4. 最后 `file_rmdir(dir2)` 返回 **-1**(期望 0,该目录应仍在)。
-  自洽解释是该序列中 `dir2` 与其中新建的 `occupied.bin` 在 rmdir 之前即已不生效/不可见 —— 即 Windows 分支 `file_mkdirs` → `file_open(OPEN_ALWAYS)` → `file_write` → `file_close` → `file_rmdir` 的组合行为与用例假设不符(`file_open` 返回 fd ≥ 0 且 `file_write` 返回 1,故非"创建失败"这样简单)。细节待方案 A 实测定位。
-- **归因证据(已排除"本次改动引入")**: 用 `cl.exe` 手工链接一个**仅含 `test_robustness.cpp` + `logx_core.lib`、不含任何本次改动文件**的探针 exe(自带 3 行 gtest main,`/MD /utf-8`),单跑该用例**复现同一失败** → 确认为既有缺陷。该手法可复用于今后一切"失败是否本次引入"的判别。
-- **影响**: 本机全开矩阵 `logx_unit_tests` 为 **145 项 144 通过**(唯一失败即此项)。该用例本身为平台语义用例(注释明示"Windows 转译 `ERROR_DIR_NOT_EMPTY` → `ENOTEMPTY`"),故不影响 Android/Linux 路径;但**"Windows 桌面单测全绿"这一基线声称在本机不成立**,后续引用该基线时须扣除。
-- **候选方案**:
+  当时的自洽解释是 `dir2` 与其中新建的 `occupied.bin` 在 rmdir 之前即已不生效/不可见(即 Windows 分支 `file_mkdirs` → `file_open(OPEN_ALWAYS)` → `file_write` → `file_close` → `file_rmdir` 的组合行为与用例假设不符);细节未定位。
+- **复现性证据(R12 审查,改定性依据)**: ① 同日更早的 R11 批次验证本机 **142/142 全绿**(含本用例,同机);② R12 审查 filtered **10 连跑 10/10 通过**;③ 三矩阵全套件 **126/126、132/132、145/145 全绿**(含 Robustness 全部)。结论:**非确定性语义缺陷**,至多为间歇性/环境相关(候选:AV/索引器瞬态句柄、删除时序、构建目录状态)。原"稳定失败(单跑亦失败)"与""Windows 桌面单测全绿"基线在本机不成立"的表述**失准**,予以撤回。
+- **归因证据(保留,含义收窄)**: "仅含 `test_robustness.cpp` + `logx_core.lib`、零改动文件"的独立探针 exe(`cl.exe` 手工链接)——它证明的是**代码无关性**(本用例与补测批次改动零交集),该判别手法保留复用;但它**不能**证明失败是确定性的(探针运行同样受环境瞬态影响),单次复现不足以定性。
+- **影响(修正后)**: 当前本机三矩阵全绿,"Windows 桌面单测全绿"基线声称**成立**;若未来复现,按前置协议记录环境与命中频率后再评估。
+- **前置协议(方案 A/B/C 的先决条件)**: 建立**稳定性复现手段**——循环 ≥100 次、并行负载下运行、`GetLastError` 逐调用点日志增强、记录 AV/索引器活动;**命中 ≥2 次并归纳出命中条件**方可立项后续方案。
+- **候选方案(前置协议通过后评估)**:
   - **A. 修 PAL**: 复核 `core/src/pal_win32.cpp` 中 `file_open`(`CreateFileA` + `_open_osfhandle`)、`file_unlink`/`file_rmdir`(`DeleteFileA`/`RemoveDirectoryA` + `translate_win32`)在"相对路径 → 目录内新建文件 → 立即删除"序列下的实际行为与各调用点 `GetLastError`,据实修正实现或 errno 映射。
   - **B. 修用例**: 若确属 Windows 语义差异(非实现缺陷),把用例的 Windows 期望改为平台分支,并在注释中显式记录差异与依据。
-  - **C. 暂缓**: 接受该项在 Windows 桌面矩阵长期红,仅在报告/CHANGELOG 中标注。
-- **决策点**: 先判定"实现缺陷 vs 用例表述缺陷"(方案 A 的实测定位);若涉及 `translate_win32` 的 errno 契约,需同步 `logx_pal.h` 的接口文档。
+  - **C. 暂缓**: 接受该项为已知间歇性红,仅在报告/CHANGELOG 中标注。
+- **决策点**: 前置协议的命中频率与命中条件;若复现,先判定"实现缺陷 vs 用例表述缺陷"(方案 A 的实测定位);若涉及 `translate_win32` 的 errno 契约,需同步 `logx_pal.h` 的接口文档。

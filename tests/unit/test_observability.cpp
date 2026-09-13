@@ -2,7 +2,7 @@
 //
 // 立项依据:
 //   1) docs/benchmark_report.md §8.4「已知局限」自认未覆盖 CPU 占用率与 JNI 路径
-//      GC 监控;docs/LogX日志库最终实施方案.md §349 把「50 线程压测无 fd/内存
+//      GC 监控;docs/LogX日志库最终实施方案.md L349 把「50 线程压测无 fd/内存
 //      泄漏」列为验收条款,但既有自动化只有数据完整性断言,无任何 fd/内存计数;
 //   2) 延迟指标只有 P50/P90/P99/P99.9/max 分位数,缺方差/标准差/CV 等离散度
 //      (jitter)维度 —— 分位数反映长尾量级,不等于抖动。
@@ -258,7 +258,7 @@ void print_latency_stats(const char* label, const LatencyStats& s) {
 // 3. CountingPal: Pal 层资源 create/destroy 计数包装
 // =========================================================================
 //
-// 用途:把 spec §349「无 fd/内存泄漏」条款变成可回归断言。
+// 用途:把实施方案 L349「无 fd/内存泄漏」验收条款变成可回归断言。
 // 纪律:仅在真实成功时计数(create 失败/close 失败不计),保证等式
 //       create == destroy 严格等价于"net 0 泄漏"。
 class CountingPal : public Pal {
@@ -542,7 +542,7 @@ TEST(Observability, LatencyJitter_StddevCvWithinSanityBound) {
 }
 
 // =========================================================================
-// 用例 3: CountingPal 资源泄漏回归(spec §349 条款自动化)
+// 用例 3: CountingPal 资源泄漏回归(实施方案 L349 验收条款自动化)
 // =========================================================================
 TEST(LeakRegression, CountingPal_NoResourceLeakAcrossOpenCloseCycles) {
     Pal& real = default_pal();
