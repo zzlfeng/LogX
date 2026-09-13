@@ -1300,6 +1300,12 @@ tag + payload,长 tag 会提前触限)",与 `format_record` 实际门槛一致�
 `ArrayIndexOutOfBoundsException`。
 
 ### R5-7 (观察项) marker 常量化 + static_assert 固化安全前提
+
+> ⚠️ **R6-1 勘误(2026-09-13)**:本节数值 61346/61407/33B 均有误——budget 随 tag_len
+> 单调递减,缓冲取最坏须按 tag_len=0(非减 tag 上限 64),且 61407 源自未覆盖 ≥1e9
+> dropped 的扫描(marker 恒 <45B)。真实解析最坏 msg_len = **61410**、余量 **30B**,
+> 断言下界已同步修正,详见 R6 章节。以下保留历史原文。
+
 `trunc_buf` 缩至 60KB 后余量仅 33B,安全性依赖"marker ≤ 45B"与"payload 为 uint32_t"
 两条未固化前提。R5-7:marker 拆为 `kMarkerHead[]`/`kMarkerTail[]` 常量并经
 `snprintf("%s%llu%s")` 引用(字面量与断言绑定);两条 `static_assert` 固化
@@ -1398,3 +1404,41 @@ CHANGELOG T5.6 章节补"迁移提示"小节:外部按 `kind == LOGX_EV_DROP`(�
 三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿(收紧后的
 static_assert 编译通过,即 61440 ≥ 61410 得证);Android arm64 交叉编译 0 错误,
 `liblogx.so` 同步双 jniLibs。本批次无 Kotlin 改动,kotlin-gradle/logx-tester 无需重建。
+
+---
+
+## R7 批次: R6 复审 §3 收口 (2026-09-13)
+
+> 复审报告(`code_review_R6_2026-09-13.md`)3 项发现经核实**全部属实**;复审同时确认
+> R6-1 断言下界 61410 经 27.3M 组穷举为紧界(余量 30B)、R6-2 迁移提示落实——无异议。
+> 另自纠 1 项审查未提及的同类问题(kHardUserTotal 与既有 kMaxUserPayload 重复)。
+
+### R7-1 (P3) 常量绑定权威定义处 `format_record`
+R6-1 上提 `kUserHdrSize`/`kHardUserTotal` 后,`format_record`(权威定义处)仍用独立
+字面量 `hdr_size = 8+4+8+1+2+4` 与 `60u*1024u`——若头布局或上限变更,断言/求解器
+基于过期常量照常成立,`落环总长 ≤ max_total` 不变量可能被破坏。修正:`format_record`
+改用 `kUserHdrSize`/`kMaxUserPayload`,并以
+`static_assert(kUserHdrSize == 8+4+8+1+2+4, "user hdr layout: ...")` 把布局表达式
+钉在定义处——常量与权威实现编译期绑定,漂移即失配报警。
+
+### R7-2 (P3) CHANGELOG R5-7 条目内联勘误
+R5-7 节以断言口吻留存 R6 已证伪的 61346/61407/33B,与 R6 章节"61410/30B"并存矛盾。
+按"历史原文保留 + 顶部勘误标注"处理:节首补 ⚠️ 勘误块(错因:tag 方向取反 + 扫描
+未覆盖 ≥1e9 dropped),检索 `61346` 的命中者即刻可见取代关系。
+
+### R7-3 (P3) 删除 `kMaxSlicePayload` 函数局部遮蔽
+`format_record` 内 T5.5 遗留的局部 `constexpr kMaxSlicePayload = 20*1024` 遮蔽头文件
+命名空间常量,删除,分片上限回归单源(logx_format.h)。
+
+### R7-4 (自纠) 删除 `kHardUserTotal` 重复常量
+R6-1 新增的 `kHardUserTotal`(60*1024) 与头文件既有 `kMaxUserPayload`(60*1024,
+logx_format.h:17,此前全仓库零引用)完全重复。删除前者,求解器/`kTruncBufSize` 断言/
+`format_record` 三处统一引用 `kMaxUserPayload`;其头文件注释同步对账(B-1B 后超限
+语义:format_record 拒绝格式化 → 截断路径接管;精确口径 user_total = 27B 头 + tag +
+payload)。至此截断子系统全部数值前提(27/60KB/20480/48/45/61410/61440)均单源命名
+常量,相互以 static_assert 或同一表达式绑定。
+
+### 验证
+三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;Android arm64
+交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。全仓检索 `kHardUserTotal`/局部
+`kMaxSlicePayload` 零残留。

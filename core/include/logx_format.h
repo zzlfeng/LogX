@@ -13,7 +13,9 @@ namespace logx {
 // 单条日志 staging 总上限(格式化后,含记录头与全部分片);由 Config.maxLogLength 注入。
 constexpr uint32_t kMaxRecordTotal = 64 * 1024;
 
-// 单条日志格式化"内部用户载荷"上限(扣 6B 头约 60KB);超过此值整条丢弃。
+// 单条日志格式化"内部用户数据"上限:user_total = 用户头 27B + tag + payload ≤ 60KB,
+// 超过此值 format_record 拒绝格式化(B-1B 后该"内容超长"类由截断路径接管,
+// 见 format_record_bounded;kUserHdrSize 为其 27B 头的命名空间常量)。
 constexpr uint32_t kMaxUserPayload = 60 * 1024;
 
 // 单片 LGXE payload 上限(20KB);超过即分片。

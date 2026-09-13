@@ -26,6 +26,11 @@ inline uint8_t cksum1(const uint8_t* p, uint32_t n) {
     return c;
 }
 
+// 内部用户数据头尺寸: [ts_ms:8][pid:4][tid:8][level:1][taglen:2][msglen:4] = 27B
+// (R7 上提至命名空间级,供 format_record / 截断求解器 / kTruncBufSize 断言共用;
+// 布局表达式由 format_record 内的 static_assert 钉住,常量与权威定义处绑定)。
+constexpr uint32_t kUserHdrSize = 27;
+
 // 把整数按小端写入(便于 raw 字节比较与 gtest 复读)。
 inline void put_u16(uint8_t* p, uint16_t v) { p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; }
 inline void put_u32(uint8_t* p, uint32_t v) {
@@ -106,9 +111,13 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
 
     // ---- 内部用户数据(待分片的载荷)----
     // 内部格式:[ts_ms:8][pid:4][tid:8][level:1][taglen:2][tag:N][msglen:4][msg:M]
-    const uint32_t hdr_size = 8 + 4 + 8 + 1 + 2 + 4;  // 27B (已包含 4B msglen)
+    // R7: 头尺寸与 60KB 上限改用命名空间/头文件常量,使 static_assert 的前提与
+    // 权威定义处编译期绑定(布局变更时此处失配报警,求解器/断言不再可能脱钩)。
+    static_assert(kUserHdrSize == 8 + 4 + 8 + 1 + 2 + 4,
+                  "user hdr layout: ts8+pid4+tid8+level1+taglen2+msglen4");
+    const uint32_t hdr_size = kUserHdrSize;
     const uint64_t user_total = static_cast<uint64_t>(hdr_size) + tag_len + payload_len;
-    if (user_total > 60u * 1024u) return false;
+    if (user_total > kMaxUserPayload) return false;
 
     // (FM-03) scratch 从栈数组(64KB)改为 static thread_local:
     //   - format_record 是热路径且全程无阻塞/无递归, 线程独占安全;
@@ -130,8 +139,8 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
     // w - scratch == user_total
 
     // ---- 分片写入 out_buf(交错布局: [h0][user0][h1][user1]..., 磁盘格式契约) ----
+    // kMaxSlicePayload 用头文件命名空间常量(R7 删除 T5.5 遗留的函数局部遮蔽)
     uint8_t* out = out_buf;
-    constexpr uint32_t kMaxSlicePayload = 20 * 1024;  // spec: 单片 payload ≤ 20KB
 
     if (user_total <= kMaxSlicePayload) {
         // 整条
@@ -183,10 +192,9 @@ constexpr uint32_t kMaxU32Digits = 10;
 static_assert(kMarkerReserve >= sizeof(kMarkerHead) - 1 + kMaxU32Digits + sizeof(kMarkerTail) - 1,
               "kMarkerReserve must cover head + max uint32 digits + tail");
 
-// 用户载荷布局常量(求解器与 kTruncBufSize 断言共用,R6-1 自函数局部上提):
-// user_total = kUserHdrSize(27B 头) + tag_len + payload,硬上限 kHardUserTotal(60KB)。
-constexpr uint32_t kUserHdrSize = 27;
-constexpr uint32_t kHardUserTotal = 60u * 1024u;
+// (R7:kUserHdrSize 上移至文件头匿名命名空间——format_record 亦需引用;
+//  kHardUserTotal 删除——60KB 上限统一用头文件既有的 kMaxUserPayload,
+//  消除 R6-1 引入的重复常量。)
 
 // 求解截断后 msg(含 marker 占用)的最大字节数,使落环总长 ≤ max_total:
 //   total(user_total) = user_total + 6·slices,slices = max(1, ⌈user_total/20480⌉)
@@ -204,7 +212,7 @@ bool solve_truncated_msg_budget(uint32_t max_total, uint32_t tag_len, uint32_t* 
     for (uint64_t s = 1; s <= s_scan && s <= 4; ++s) {
         uint64_t cap = static_cast<uint64_t>(max_total) - kHeaderLen * s;  // 落环总长约束
         if (cap > kMaxSlicePayload * s) cap = kMaxSlicePayload * s;        // 片容量约束
-        if (cap > kHardUserTotal) cap = kHardUserTotal;                    // 60KB 硬上限
+        if (cap > kMaxUserPayload) cap = kMaxUserPayload;                  // 60KB 硬上限
         if (cap <= fixed) continue;
         const uint64_t b = cap - fixed;
         if (b > best) best = b;
@@ -216,11 +224,11 @@ bool solve_truncated_msg_budget(uint32_t max_total, uint32_t tag_len, uint32_t* 
 // 截断拼装缓冲容量(R6-1 修正下界):budget = cap − (kUserHdrSize + tag_len) 随
 // tag_len 单调递减,缓冲取最坏须按 tag_len = 0(空 tag 合法可达),不得减 tag 上限
 // —— R5-7 首版误减 64 使断言偏松(61346 < 真实最坏 61410),失去防护意义。
-// 最坏 msg_len = (kHardUserTotal − kUserHdrSize) − kMarkerReserve + 45 = 61410,
+// 最坏 msg_len = (kMaxUserPayload − kUserHdrSize) − kMarkerReserve + 45 = 61410,
 // 对 kTruncBufSize(61440) 余量 30B。
 constexpr uint32_t kTruncBufSize = 60 * 1024;
 static_assert(kTruncBufSize >=
-                  kHardUserTotal - kUserHdrSize - kMarkerReserve +
+                  kMaxUserPayload - kUserHdrSize - kMarkerReserve +
                   (sizeof(kMarkerHead) - 1 + kMaxU32Digits + sizeof(kMarkerTail) - 1),
               "trunc_buf must hold worst-case msg (prefix + max marker, tag_len=0)");
 
