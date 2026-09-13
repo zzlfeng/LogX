@@ -36,6 +36,7 @@
 | `9689f22` | fix(kt): N6 方案A——init() 前奏等待与遗留销毁移出 @Synchronized, 消除锁内长等待 |
 | `7621993` | fix(kt): 纠正 init() 内部锁监视器分裂——以 synchronized(this) 替换局部函数 @Synchronized 确保与 close/setErrorHandler 精准互斥 |
 | `9b1af14` | docs: 记录 LogX.kt 状态机复杂度上限备忘与后续并发测试门禁规范 (B-2) |
+| `516d091` | fix(core,android): R4 审查批次收口——T5.5 外部审查 6 项发现闭环(5实1误;出参守卫/truncatedLogs 接线/msg 契约/匿名空间/契约注释) |
 | `28acf7f` | feat(core): T5.5 超长日志截断保前缀——B-1 方案B 落地,超长不再整条丢弃(预算求解+marker+truncated_logs 计数,顺带修正 >60KB 误报 INVALID_ARG) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
