@@ -132,7 +132,7 @@ staging 内记录统一格式(条目与 PAD),头部 6B(所有多字节读写均�
 - flags:bit0–1 = 分片类型(00 整条 / 01 首片 / 10 中片 / 11 末片),其余预留
 - cksum:payload 的 8 位校验和(XOR 折叠或 CRC-8),**锁外随格式化在 TLS Scratch Buffer 一并计算**,热路径只多一次顺序读;PAD payload 全零,cksum 恒为 0。它是撕裂扫描的守门——仅靠 magic/len 无法识别"头已写完、payload 截断"的记录,cksum 失败即停;漏检率约 1/256,只作撕裂守门,不承担传输完整性
 - 同一条日志的全部分片在**单次临界区内连续写入**,逻辑上必然相邻,分片运行中不会出现其他条目;解码按"连续分片段"重组,**允许跨块**、跨 PAD 仍视为连续;首片到末片不完整即整条丢弃 + 打点
-- 单条日志(格式化后含全部分片与记录头)上限 64KB,超出整条丢弃 + 打点;上限必须小于数据区大小 − 1,否则永远放不进环
+- 单条日志(格式化后含全部分片与记录头)上限 64KB(Config.maxLogLength),超出**截断保留前缀**后照常落环:msg 压缩为"原始前缀 + ASCII marker(...[LogX truncated, dropped N bytes])"并经预算求解保证落环总长 ≤ 上限(预算不足 48B 时弃 marker 保前缀;连空记录都放不下的病态小上限仍整条丢弃 + 打点兜底);截断经 errorHandler(LOGX_EV_DROP / LOGX_ERR_TOO_LARGE,"log truncated")同步打点并计入 truncated_logs 计数(B-1B 方案B,2026-09-13);上限必须小于数据区大小 − 1,否则永远放不进环
 
 ### 3.2 正式日志文件 `prefix_YYYYMMDD.log`(单文件超 10MB 切 `.1`, `.2` 等)
 
@@ -278,7 +278,7 @@ void write_records(const char* recs, uint32_t total) {  // 一条日志的全部
 
 **为什么不用 memmove 压缩**:见 §1。回收只有清零一条路,且在锁外完成(生产者此间视该区间为占用),不存在长临界区。
 
-**边界情况**:staging 空闲不足则丢弃+打点;单条超上限(64KB,§3.1)整条丢弃+打点;格式化与 Flusher 路径禁止调用业务回调(防重入死锁);signal handler 内禁用日志接口(非异步信号安全);锁粒度=单实例,多进程按进程隔离目录,进程间共享文件永远禁止。
+**边界情况**:staging 空闲不足则丢弃+打点;单条超上限(64KB,§3.1)截断保留前缀后照常落环(打点 truncated_logs,病态小上限仍丢弃+打点兜底,B-1B 方案B);格式化与 Flusher 路径禁止调用业务回调(防重入死锁);signal handler 内禁用日志接口(非异步信号安全);锁粒度=单实例,多进程按进程隔离目录,进程间共享文件永远禁止。
 
 ## 6. 降级矩阵
 
@@ -302,7 +302,7 @@ LogX.init(context, LogX.Config(
     level = LogLevel.INFO,
     retentionDays = 7,
     maxFileSize = 10 * 1024 * 1024,
-    maxLogLength = 64 * 1024,             // 单条上限(格式化后); init 校验: 必须 < staging 数据区 − 1, 否则 init 抛错; 推荐 ≤ 数据区/2; 运行期超出丢弃+打点
+    maxLogLength = 64 * 1024,             // 单条上限(格式化后); init 校验: 必须 < staging 数据区 − 1, 否则 init 抛错; 推荐 ≤ 数据区/2; 运行期超出截断保留前缀+打点(病态小上限仍丢弃,§3.1 B-1B)
     flushThreshold = 8 * 1024,
     compress = Compress.ZSTD,             // ZSTD / ZLIB / NONE
     keyProvider = { kid -> keyStore.getKey(kid) },  // (kid)->32B 裸密钥; 须能应答历史 KID; null=该 KID 不可解

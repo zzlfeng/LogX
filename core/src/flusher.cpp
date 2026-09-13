@@ -814,16 +814,25 @@ uint32_t split_into_blocks(const uint8_t* raw, uint32_t total,
 
 int build_records(Instance* inst, int level, const char* tag,
                   const uint8_t* payload, uint32_t payload_len,
-                  uint8_t* out_buf, uint32_t* out_total_bytes) {
+                  uint8_t* out_buf, uint32_t* out_total_bytes,
+                  bool* out_truncated, uint64_t* out_dropped) {
     if (!inst) return kBuildRecordsInvalidInput;
     if (level < 0 || level > 5) return kBuildRecordsInvalidInput;
     uint64_t ts_ms = inst->pal->wallclock_ms();
     uint32_t pid_v = inst->pal->pid();
     uint64_t tid_v = inst->pal->tid();
-    if (!format_record(static_cast<uint8_t>(level), tag, payload, payload_len,
-                       ts_ms, pid_v, tid_v,
-                       out_buf, kMaxRecordTotal, out_total_bytes)) {
-        return kBuildRecordsInvalidInput;  // E-02: 输入非法(空 tag 等),非超长
+    // B-1B 方案B: 超长(max_log_length 或 60KB 用户载荷硬上限)不再由调用方丢弃,
+    // 而是截断保前缀后照常落环;kCannotFit(病态小上限)交回调用方走丢弃兜底。
+    logx::FormatBoundedStatus st = logx::format_record_bounded(
+        static_cast<uint8_t>(level), tag, payload, payload_len,
+        ts_ms, pid_v, tid_v,
+        out_buf, kMaxRecordTotal, out_total_bytes,
+        inst->max_log_length, out_truncated, out_dropped);
+    if (st == logx::FormatBoundedStatus::kInvalidInput) {
+        return kBuildRecordsInvalidInput;  // E-02: 输入非法(level 越界 / tag 非法),非超长
+    }
+    if (st == logx::FormatBoundedStatus::kCannotFit) {
+        return kBuildRecordsCannotFit;
     }
     return static_cast<int>(*out_total_bytes);
 }

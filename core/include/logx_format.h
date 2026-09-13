@@ -35,6 +35,31 @@ bool format_record(uint8_t level, const char* tag,
                    uint8_t* out_buf, uint32_t out_buf_capacity,
                    uint32_t* out_total_bytes);
 
+// B-1B 方案B: format_record_bounded 的三态结果。
+enum class FormatBoundedStatus {
+    kOk,             // 成功(可能已截断,见 out_truncated / out_dropped)
+    kInvalidInput,   // 输入非法(level 越界 / tag 非法 / payload 契约),与 format_record 同款
+    kCannotFit,      // 截断到空记录仍超 max_total_bytes(病态小上限,调用方走丢弃兜底)
+};
+
+// 带截断预算的格式化:格式化后总长超 max_total_bytes 时,把 msg 截断为
+// "原始前缀 + ASCII marker(...[LogX truncated, dropped N bytes])"后重新落片,
+// 保证落环总长 ≤ max_total_bytes(含逐片 6B 头与片数重算)。
+//   - max_total_bytes = 0 表示不限制(此时与 format_record 等价,但仍受 60KB
+//     用户载荷硬上限约束,超限同样按截断处理);
+//   - 预算不足以容纳 marker 时退化为纯前缀截断(不加 marker);
+//   - 预算连"空 msg 记录"都放不下时返回 kCannotFit;
+//   - 热路径零额外成本:先原样 format_record,仅超限时才进入截断分支。
+// out_truncated = 是否发生截断;out_dropped = 截断丢弃的 msg 字节数(不含 marker 占用)。
+FormatBoundedStatus format_record_bounded(
+    uint8_t level, const char* tag,
+    const uint8_t* payload, uint32_t payload_len,
+    uint64_t ts_ms, uint32_t pid, uint64_t tid,
+    uint8_t* out_buf, uint32_t out_buf_capacity,
+    uint32_t* out_total_bytes,
+    uint32_t max_total_bytes,
+    bool* out_truncated, uint64_t* out_dropped);
+
 // 写一条 LGXP PAD(单条,≤ 20KB);调用方负责循环调用以填满回绕缝。
 // 返回写入 out_buf 的字节数(== 6 + pad_len)。
 uint32_t format_pad(uint8_t* out_buf, uint32_t pad_len);

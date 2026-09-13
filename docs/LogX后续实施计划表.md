@@ -1,6 +1,11 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.11 (2026-09-11 J-04 JNI 临界区安全修复闭环;T5.3 用户指示暂停)  
+> **文档版本**: v1.12 (2026-09-13 B-1 方案B 落地为 T5.5 超长截断保前缀;T5.3 用户指示暂停)  
+> **制定日期**: 2026-09-02  
+> **基准方案**: [LogX 日志库最终实施方案.md](./LogX日志库最终实施方案.md) (v5.2 定稿)  
+> **变更日志**: [CHANGELOG.md](./logx/CHANGELOG.md)  
+>
+> **v1.12 修订说明**: 2026-09-13 **Backlog B-1 方案B (TOO_LARGE 截断保留前缀) 经用户拍板落地为 T5.5**: `logx_write` 超长日志(格式化后超 `max_log_length` 或 >60KB 用户载荷硬上限)不再整条丢弃,改为预算求解截断保留 msg 前缀 + ASCII marker(`...[LogX truncated, dropped N bytes]`,预留 48B)后照常落环,返回 `LOGX_OK`;事件仍为 `LOGX_EV_DROP`/`LOGX_ERR_TOO_LARGE`、msg 改 "log truncated",调用方线程锁外同步发出(J-04 契约不变);`logx_stats_t` 以 E-07 认可方式将 `reserved[0]` 转正为 `truncated_logs`(sizeof 不变,ABI 兼容);顺带修正 **>60KB payload 误报 `LOGX_ERR_INVALID_ARG` 的既有误分类缺陷**;病态小上限(截断到空记录仍放不下)保留 TOO_LARGE 丢弃兜底。三构建矩阵(122/128/141)+压测 4/4 全绿,Android arm64 交叉编译 0 错误。方案 A(NO_SPACE 有界阻塞重试)仍留 Backlog 待决策。
 > **制定日期**: 2026-09-02  
 > **基准方案**: [LogX 日志库最终实施方案.md](./LogX日志库最终实施方案.md) (v5.2 定稿)  
 > **变更日志**: [CHANGELOG.md](./logx/CHANGELOG.md)  
@@ -43,7 +48,7 @@ gantt
 | **M2 恢复与对账** | 对账四分支、k 块回溯、Σraw_len 精确回推、双 Header 容错与不变量收尾、启动 O(1) 缓存定位 | **✅ 100% 已完成** | 截断续写自动跳 1 空隙；单测全绿；崩溃恢复自愈实测通过。 |
 | **M3 压缩与加密** | zstd 单文件版、AES-256-GCM、mbedtls 裁剪、KeyProvider JNI 桥、协程 export、Python 解码工具 | **✅ 核心闭环 / 工具待联调** | `zstd` 与 `AES-256-GCM` 闭环；12B Nonce 安全构造；JNI KeyProvider 全局引用桥接。 |
 | **M4 生产加固与压测** | 降级矩阵（堆缓冲）、保留期清理、50 线程高并发压测、断电/撕裂/时钟跳变故障注入与恢复自愈 | **✅ 100% 已完成** | 堆内存降级自愈；保留期全时机自动清理；50 线程高频竞争压测零死锁/零重复(30w+ logs/s)；50 轮崩溃注入 397/397 日志零丢失；未对齐读写零 SIGBUS；单测 59/59 全绿（后续批次扩充至 127,见 v1.6）。 |
-| **M5 交付与基线** | Android 备份安全规则配置、最低支持 API 21 基线与兼容性测试、性能与包体积基线、接入与密钥管理文档 | **🟡 进行中** (T5.1 ✅ / T5.2 ✅ / T5.4 ✅ 已完成;T5.3 ⏸ 用户指示暂停) | `dataExtractionRules` 配置 (✅ 2026-09-08,见 T5.1);性能/压缩比/so 体积基线报告 (✅ 2026-09-08,见 T5.2);logcat 直通开关 (✅ 2026-09-09,见 T5.4);接入与密钥管理文档 (⏸ T5.3);Release AAR(发布工程动作,随 T5.3 后收尾)。 |
+| **M5 交付与基线** | Android 备份安全规则配置、最低支持 API 21 基线与兼容性测试、性能与包体积基线、接入与密钥管理文档 | **🟡 进行中** (T5.1 ✅ / T5.2 ✅ / T5.4 ✅ / T5.5 ✅ 已完成;T5.3 ⏸ 用户指示暂停) | `dataExtractionRules` 配置 (✅ 2026-09-08,见 T5.1);性能/压缩比/so 体积基线报告 (✅ 2026-09-08,见 T5.2);logcat 直通开关 (✅ 2026-09-09,见 T5.4);接入与密钥管理文档 (⏸ T5.3);Release AAR(发布工程动作,随 T5.3 后收尾)。 |
 
 ---
 
@@ -83,6 +88,7 @@ gantt
 | **T5.2** | 性能基线测试与报告输出 | `docs/benchmark_report.md`, `tests/bench/logx_bench.cpp` | **P2** | **✅ 100% 已完成 (2026-09-08)** | 1. 新增独立基准 harness `tests/bench/logx_bench.cpp`(`LOGX_BUILD_BENCH=ON` 开关,非 ctest),三阶段:单条延迟分布(生产口径+纯路径口径,含失真护栏)/ zstd 开关吞吐与落盘体积(混合负载,NO_SPACE 有界重试可持续口径)/ flush 阻塞耗时;**Windows 桌面 + Redmi K30 Pro 真机双端实测,全部轮次 0 丢弃 0 丢失**;<br>2. 实测:桌面写入 P50 0.2µs(纯路径)/ P99 3.1µs,真机 P50 3.2µs;压缩开关对写路径零影响(实证热路径无 codec 成本);zstd 落盘体积 -38%(1.52x),真机吞吐反超 +48%,桌面 -27%;flush P99 桌面 17ms / 真机 9.4ms;<br>3. so 体积(arm64 strip 后):MinSizeRel 全开 **548.9KB**(超 500KB 目标 10%,归因 zstd 贡献 ~426KB 占 77%,裸核心仅 121KB);判定与回归基线声明见 [benchmark_report.md](./benchmark_report.md)(2µs 目标建议改口径为确定性热路径段,已达成;500KB 目标建议接受 548.9KB 为 v1.0 基线,zstd 源码裁剪列为可选优化)。 |
 | **T5.3** | 接入指南与运维解码文档 | `docs/integration_guide.md`, `README.md` | **P2** | ⏸ 暂停 (用户指示) | 1. 编写接入流程文档（Application 初始化、KeyStore 密钥包裹示例、协程 export 示例）；<br>2. 编写离线解码与线上排障手册。 |
 | **T5.4** | logcat 直通开关 (consoleEcho, 用户需求驱动) | `android/cpp/logx_jni.cpp`, `android/kotlin/LogX.kt`, `android/kotlin-gradle/` | **P2** | **✅ 100% 已完成 (2026-09-09)** | 1. **JNI 层实现**(用户选型): `nativeInit` 追加 `jboolean jConsoleEcho`,进程级 `std::atomic<bool>` 存储(C ABI 零改动;Kotlin 单实例契约下语义匹配);`nativeWrite` 成功后以 2KB 栈缓冲(截断+NUL)调 `__android_log_print`,level 0..5 → VERBOSE..FATAL 六宏映射,激活原死宏;顶层 CMake ANDROID 块补链 `liblog`(readelf NEEDED 实证);<br>2. **镜像语义**: 仅镜像成功落盘记录(logcat 与文件一一对应),丢弃走 ErrorHandler.DROP 不重复;echo 在 Critical/UTFChars 释放前同步完成(指针失效防御);<br>3. **Kotlin 侧**: `Config.consoleEcho: Boolean = false`(追加式;注释注明明文泄露面,生产默认关);external 签名同步;<br>4. **验证**: 交叉编译 0 错误;kotlin-gradle 离线 Gradle 编译 + 纯逻辑单测 **9/9 全绿**;smoke app(Redmi K30 Pro/Android 12)真机端到端:`System.loadLibrary` → init(consoleEcho=true, ZSTD) → 6 条中英文记录,**logcat 6/6 按等级正确镜像、中文完好、SMOKE PASS**。 |
+| **T5.5** | 超长日志截断保前缀(Backlog B-1 方案B,用户拍板) | `core/src/format.cpp`, `core/include/logx_format.h`, `core/src/flusher.cpp`, `core/src/logx_c.cpp`, `core/include/logx_c.h`, `core/include/logx_internal.h` | **P2** | **✅ 100% 已完成 (2026-09-13)** | 1. **语义变更**: 超长日志(格式化后 > `max_log_length`,或 >60KB 用户载荷硬上限——后者顺带修正原误报 `INVALID_ARG` 的误分类缺陷)由"整条丢弃 + `LOGX_ERR_TOO_LARGE`"改为**截断保留 msg 前缀**后照常落环,返回 `LOGX_OK`;<br>2. **预算求解**(`solve_truncated_msg_budget`): 对片数 s 取 `cap(s)=min(20480·s, max_total−6s, 60KB)` 扫描取最优,b = cap − (27+tag);截断 msg = 原始前缀 + ASCII marker(`...[LogX truncated, dropped N bytes]`,预留 48B);预算 <48B 弃 marker 保前缀;落环总长恒 ≤ 上限;<br>3. **新增 `format_record_bounded`**(`format.cpp/format.h`): 热路径仍恰好一次 `format_record`(先原样格式化,仅超限进截断分支);独立 thread_local 拼装缓冲不复用 scratch;`build_records` 返回协议追加 `kBuildRecordsCannotFit`;<br>4. **计数与事件 ABI 兼容**: `logx_stats_t.reserved[0]` → `truncated_logs`(E-07 认可占位,sizeof 不变);事件复用 `LOGX_EV_DROP`/`LOGX_ERR_TOO_LARGE`、msg 改 "log truncated (dropped N bytes)",调用方线程锁外同步发(P1-1/J-04 契约不变);`drop_too_large` 仅病态丢弃路径递增;<br>5. **不新增配置开关**(`logx_config_t` 无 reserved 位,截断 always-on);Kotlin/JNI/Python 解码器零改动;<br>6. **测试**: 改写 E-02/`ErrorMonitoring`/J-04 三处旧丢弃断言,新增 `FormatBounded` 7 项(前缀字节级一致/marker/纯前缀边界/kCannotFit/非法输入/预算扫描 64KB 跨片重组)+ J-04 截断孪生用例;三构建矩阵 122/128/141 单测 + 4/4 压测全绿,Android arm64 交叉编译 0 错误;<br>7. spec §3.1/§5 边界情况/§7 maxLogLength 语义同步修订。 |
 
 ---
 
@@ -145,7 +151,7 @@ gantt
 ### B-1 两条丢弃路径改造评估:NO_SPACE / TOO_LARGE 能否不丢日志
 
 - **记录日期**: 2026-09-08
-- **状态**: ⏸ 待决策(决策点见文末)
+- **状态**: 🔶 拆分推进——**方案B 已拍板落地为 T5.5(2026-09-13,✅)**;方案 A(NO_SPACE 有界阻塞重试)仍 ⏸ 待决策(决策点 1/3 见文末,决策点 2 已随 T5.5 闭环)
 - **背景**: 现行设计遵循 spec §5/§8 "宁丢不脏、绝不阻塞"原则:
   - **NO_SPACE** — staging 空闲不足时整条丢弃:`drop_no_space` 计数 + `LOGX_EV_DROP` 事件 + 返回 `LOGX_ERR_NO_SPACE`(`core/src/logx_c.cpp:435-457`,`Staging::write_records` 返回 `kFull`);
   - **TOO_LARGE** — 单条格式化后超 `maxLogLength` 时整条丢弃:`drop_too_large` 计数 + `LOGX_EV_DROP` 事件 + 返回 `LOGX_ERR_TOO_LARGE`(`core/src/logx_c.cpp:428-432`;init 强制 `max_log_length < 数据区−1`,超长记录物理上放不进环,无"等待腾空间"选项)。

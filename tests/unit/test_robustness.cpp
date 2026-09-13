@@ -1346,7 +1346,8 @@ TEST(Robustness, ErrorHandler_ConcurrentReregistrationNoRace) {
 }
 
 // E-02: 非法输入(level 越界)不再被误分类为 TOO_LARGE,
-// 且 drop_too_large 不递增;真正的超长输入仍走 TOO_LARGE 路径。
+// 且 drop_too_large 不递增;真正超长的输入走 B-1B 方案B 截断保前缀路径
+// (LOGX_OK + truncated_logs 递增),不再整条丢弃。
 TEST(Robustness, WriteInvalidLevel_ClassifiedAsInvalidArg) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_e02_") +
@@ -1363,27 +1364,32 @@ TEST(Robustness, WriteInvalidLevel_ClassifiedAsInvalidArg) {
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     auto* ii = static_cast<Instance*>(inst);
     uint64_t too_large_before = ii->drop_too_large.load();
+    uint64_t truncated_before = ii->truncated_logs.load();
 
     const uint8_t payload[] = "payload";
 
-    // level 越界(负值与 > 5):INVALID_ARG,且不影响超长计数
+    // level 越界(负值与 > 5):INVALID_ARG,且不影响超长/截断计数
     EXPECT_EQ(logx_write(inst, -1, "E02", payload, sizeof(payload) - 1),
               LOGX_ERR_INVALID_ARG);
     EXPECT_EQ(logx_write(inst, 6, "E02", payload, sizeof(payload) - 1),
               LOGX_ERR_INVALID_ARG);
     EXPECT_EQ(ii->drop_too_large.load(), too_large_before);
+    EXPECT_EQ(ii->truncated_logs.load(), truncated_before);
 
     // 空 tag 是合法输入(format_record 允许 tag_len=0),正常写入
     EXPECT_EQ(logx_write(inst, 2, "", payload, sizeof(payload) - 1), LOGX_OK);
     EXPECT_EQ(ii->drop_too_large.load(), too_large_before);
+    EXPECT_EQ(ii->truncated_logs.load(), truncated_before);
 
-    // 真正超长:仍为 TOO_LARGE,drop_too_large 递增
+    // 真正超长(600B vs 上限 500B):B-1B 方案B 截断保前缀,返回 LOGX_OK,
+    // truncated_logs 递增,drop_too_large 不动
     std::string large(600, 'L');
     EXPECT_EQ(logx_write(inst, 2, "E02",
                          reinterpret_cast<const uint8_t*>(large.data()),
                          static_cast<uint32_t>(large.size())),
-              LOGX_ERR_TOO_LARGE);
-    EXPECT_EQ(ii->drop_too_large.load(), too_large_before + 1);
+              LOGX_OK);
+    EXPECT_EQ(ii->drop_too_large.load(), too_large_before);
+    EXPECT_EQ(ii->truncated_logs.load(), truncated_before + 1);
 
     logx_close(inst);
     for (const auto& f : pal.file_list(dir.c_str())) {

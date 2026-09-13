@@ -58,6 +58,20 @@ struct UserRecordHeader {
 // 估算 msg 长度上限:tag 字节数 + msg 字节数(分片前)。
 // 超过 20KB 的日志需要按 LGXE 分片;每片都是完整 6B 头 + 用户数据切片。
 
+// (FM-01) tag 长度有界扫描,format_record / format_record_bounded 共用。
+// 契约:tag 必须是 NUL 终止的 C 字符串(logx_c.h 显式约定;JNI 侧 GetStringUTFRegion
+// 后显式写 '\0')。仅当 tag[0..63] 全非 NUL 时才会读取 tag[64],此时契约保证
+// NUL 位于下标 >= 64 处,tag[64] 必在调用方缓冲区内 —— 扫描不越界。
+// 恰好 64B 无 NUL 的 buffer 属调用方违反 C 字符串契约(与任何 C 字符串 API 同)。
+// 返回 false = tag 非法(NULL 或 >64B)。
+inline bool tag_len_bounded(const char* tag, uint32_t* out_len) {
+    if (!tag) return false;
+    const size_t n = strnlen(tag, 65);
+    if (n == 65) return false;  // >64B 视为非法
+    *out_len = static_cast<uint32_t>(n);
+    return true;
+}
+
 }  // namespace
 
 struct FormatResult {
@@ -87,14 +101,8 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
     if (out_buf_capacity < kMaxRecordTotal) return false;
 
     // ---- 计算 tag 长度 ----
-    // (FM-01) 有界扫描:最多检视 tag[0..64] 共 65 字节。
-    // 契约:tag 必须是 NUL 终止的 C 字符串(logx_c.h 显式约定;JNI 侧 GetStringUTFRegion
-    // 后显式写 '\0')。仅当 tag[0..63] 全非 NUL 时才会读取 tag[64],此时契约保证
-    // NUL 位于下标 >= 64 处,tag[64] 必在调用方缓冲区内 —— 扫描不越界。
-    // 恰好 64B 无 NUL 的 buffer 属调用方违反 C 字符串契约(与任何 C 字符串 API 同)。
-    const size_t n = strnlen(tag, 65);
-    if (n == 65) return false;  // >64B 视为非法
-    const uint32_t tag_len = static_cast<uint32_t>(n);
+    uint32_t tag_len = 0;
+    if (!tag_len_bounded(tag, &tag_len)) return false;
 
     // ---- 内部用户数据(待分片的载荷)----
     // 内部格式:[ts_ms:8][pid:4][tid:8][level:1][taglen:2][tag:N][msglen:4][msg:M]
@@ -156,6 +164,117 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
 
     *out_total_bytes = static_cast<uint32_t>(out - out_buf);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// B-1B 方案B: 超长截断保前缀
+// ---------------------------------------------------------------------------
+
+// 截断 marker(ASCII,追加在保留前缀之后,便于解码侧肉眼识别截断)。
+// dropped 为 uint32 payload 与预算之差,上限 10 位十进制:
+// 28(前缀) + 10(数字) + 7(" bytes]") = 45 ≤ kMarkerReserve(48),预算恒够。
+constexpr uint32_t kMarkerReserve = 48;
+
+// 求解截断后 msg(含 marker 占用)的最大字节数,使落环总长 ≤ max_total:
+//   total(user_total) = user_total + 6·slices,slices = max(1, ⌈user_total/20480⌉)
+//   user_total 同时受 60KB 用户载荷硬上限(format_record 契约)约束。
+// 做法:对片数 s 逐个取 cap(s) = min(20480·s, max_total − 6s, 60KB),b = cap − (27+tag),
+// 取最大者。cap(s) 随 s 先增后减,峰值即最优;最多扫 4 片(64KB 总长 ≤ ~4 片)。
+// 结果偏保守不超过 6·(s−1) ≤ 18B(实际片数可能少于预算片数),不追求逐字节精确。
+// 返回 false = 连"空 msg 记录"(27B 用户头 + tag + 6B 片头)都放不下(病态 max_total)。
+bool solve_truncated_msg_budget(uint32_t max_total, uint32_t tag_len, uint32_t* out_budget) {
+    constexpr uint64_t kUserHdr = 27;
+    constexpr uint64_t kHardUserTotal = 60ull * 1024ull;
+    const uint64_t fixed = kUserHdr + tag_len;
+    *out_budget = 0;
+    if (max_total < fixed + kHeaderLen) return false;  // 空记录(1 片)都放不下
+    uint64_t best = 0;
+    const uint64_t s_scan = (max_total - fixed) / kHeaderLen;
+    for (uint64_t s = 1; s <= s_scan && s <= 4; ++s) {
+        uint64_t cap = static_cast<uint64_t>(max_total) - kHeaderLen * s;  // 落环总长约束
+        if (cap > kMaxSlicePayload * s) cap = kMaxSlicePayload * s;        // 片容量约束
+        if (cap > kHardUserTotal) cap = kHardUserTotal;                    // 60KB 硬上限
+        if (cap <= fixed) continue;
+        const uint64_t b = cap - fixed;
+        if (b > best) best = b;
+    }
+    *out_budget = static_cast<uint32_t>(best);
+    return true;
+}
+
+FormatBoundedStatus format_record_bounded(
+    uint8_t level, const char* tag,
+    const uint8_t* payload, uint32_t payload_len,
+    uint64_t ts_ms, uint32_t pid, uint64_t tid,
+    uint8_t* out_buf, uint32_t out_buf_capacity,
+    uint32_t* out_total_bytes,
+    uint32_t max_total_bytes,
+    bool* out_truncated, uint64_t* out_dropped) {
+    *out_truncated = false;
+    *out_dropped = 0;
+
+    // 输入契约校验与 format_record 一致(非法输入不属于截断范畴,由调用方按
+    // INVALID_ARG 上报;此处先行排除后,format_record 的失败只剩"内容超长"一类)。
+    if (level > 5) return FormatBoundedStatus::kInvalidInput;
+    if (!tag) return FormatBoundedStatus::kInvalidInput;
+    if (!payload && payload_len > 0) return FormatBoundedStatus::kInvalidInput;
+    if (out_buf_capacity < kMaxRecordTotal) return FormatBoundedStatus::kInvalidInput;
+    uint32_t tag_len = 0;
+    if (!tag_len_bounded(tag, &tag_len)) return FormatBoundedStatus::kInvalidInput;
+
+    // 快路径:原样格式化,热路径恰好一次 format_record,零额外成本。
+    if (format_record(level, tag, payload, payload_len, ts_ms, pid, tid,
+                      out_buf, out_buf_capacity, out_total_bytes)) {
+        if (max_total_bytes == 0 || *out_total_bytes <= max_total_bytes) {
+            return FormatBoundedStatus::kOk;  // 未截断
+        }
+    }
+    // 走到此处 = 格式化成功但超 max_total,或 user_total > 60KB 格式化失败
+    // (输入非法已在上方排除)—— 两条路同归截断。
+
+    uint32_t budget = 0;
+    if (!solve_truncated_msg_budget(max_total_bytes, tag_len, &budget)) {
+        return FormatBoundedStatus::kCannotFit;
+    }
+
+    // 预算内拼装"前缀 + marker"。独立 thread_local 缓冲,不复用 format_record
+    // 内部的 scratch(二次调用会覆写);仅截断冷路径触碰,页成本可忽略。
+    static thread_local uint8_t trunc_buf[64 * 1024];
+    const uint8_t* src = payload;
+    uint32_t msg_len = budget;
+    uint32_t prefix_len = budget;
+    if (budget >= kMarkerReserve) {
+        prefix_len = budget - kMarkerReserve;
+        // 防御:prefix 理论上恒 < payload_len(截断触发意味着原记录更长),
+        // 万一求解给出更大预算则钳到 payload,退化为"全量 + marker"。
+        if (prefix_len > payload_len) prefix_len = payload_len;
+        char marker[64];
+        const int m = std::snprintf(marker, sizeof(marker),
+                                    "...[LogX truncated, dropped %llu bytes]",
+                                    static_cast<unsigned long long>(payload_len - prefix_len));
+        if (m <= 0) return FormatBoundedStatus::kInvalidInput;  // 防御:不可达
+        const uint32_t marker_len = (static_cast<uint32_t>(m) > sizeof(marker) - 1)
+                                        ? static_cast<uint32_t>(sizeof(marker) - 1)
+                                        : static_cast<uint32_t>(m);
+        std::memcpy(trunc_buf, payload, prefix_len);
+        std::memcpy(trunc_buf + prefix_len, marker, marker_len);
+        src = trunc_buf;
+        msg_len = prefix_len + marker_len;  // ≤ budget,总长仍 ≤ max_total
+    } else {
+        // 预算不足 48B:保前缀弃 marker(前缀优先),零拷贝直接引用原 payload。
+        prefix_len = budget;
+        src = payload;
+        msg_len = budget;
+    }
+
+    if (!format_record(level, tag, src, msg_len, ts_ms, pid, tid,
+                       out_buf, out_buf_capacity, out_total_bytes)) {
+        // 防御:预算求解已保证 user_total ≤ 60KB 且容量充足,不可达。
+        return FormatBoundedStatus::kInvalidInput;
+    }
+    *out_truncated = true;
+    *out_dropped = static_cast<uint64_t>(payload_len) - prefix_len;
+    return FormatBoundedStatus::kOk;
 }
 
 // 格式化一个 LGXP PAD 记录:payload 全零,cksum 恒为 0。

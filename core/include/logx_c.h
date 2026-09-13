@@ -111,8 +111,10 @@ logx_status_e logx_close(logx_instance_t* inst);
  * tag 必须是 NUL 终止的 C 字符串且有效长度 ≤ 64B(无长度参数,按 C 字符串契约
  * 扫描;恰好 64B 非常终止的 buffer 属未定义输入,将被拒绝);payload 不需要
  * NUL 结尾,长度由 payload_len 显式给出。
- * 返回 LOGX_ERR_NO_SPACE 表示 staging 满(LOGX_EV_DROP);返回 LOGX_ERR_TOO_LARGE
- * 表示超 maxLogLength。 */
+ * 返回 LOGX_ERR_NO_SPACE 表示 staging 满(LOGX_EV_DROP)。
+ * B-1B 方案B: 超 maxLogLength 的日志截断保留前缀后照常写入并返回 LOGX_OK,
+ * 以 LOGX_EV_DROP / LOGX_ERR_TOO_LARGE 事件与 truncated_logs 计数上报;
+ * LOGX_ERR_TOO_LARGE 返回值仅表示"截断到空记录仍放不下"的病态小 maxLogLength。 */
 logx_status_e logx_write(logx_instance_t* inst,
                          int level,
                          const char* tag,
@@ -144,11 +146,12 @@ typedef struct logx_stats {
      * reserved 区,替换保留位会破坏既有二进制(老调用方按旧 sizeof 分配的
      * 缓冲被新实现越界写)。新增字段一律占用 reserved 并同步递减其数量。 */
     uint64_t drop_no_space;      /* staging 空闲不足丢弃 */
-    uint64_t drop_too_large;     /* 单条超 maxLogLength 丢弃 */
+    uint64_t drop_too_large;     /* 单条超 maxLogLength 丢弃(B-1B 后仅病态小上限路径) */
     uint64_t truncated_blocks;    /* 启动恢复截尾块计数 */
     uint64_t pad_records;        /* 回绕垫 PAD 数 */
     uint64_t block_write_errors; /* write 短写/IO 错误计数 */
-    uint64_t reserved[4];        /* 预留给未来统计指标,必须保持全 0 */
+    uint64_t truncated_logs;     /* B-1B: 超长截断保前缀写入计数(占原 reserved[0]) */
+    uint64_t reserved[3];        /* 预留给未来统计指标,必须保持全 0 */
 } logx_stats_t;
 
 void logx_get_stats(logx_instance_t* inst, logx_stats_t* out);

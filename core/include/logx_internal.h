@@ -68,6 +68,7 @@ struct Instance {
     // ---- 统计 ----
     std::atomic<uint64_t> drop_no_space{0};
     std::atomic<uint64_t> drop_too_large{0};
+    std::atomic<uint64_t> truncated_logs{0};   // B-1B: 超长截断保前缀写入计数
     std::atomic<uint64_t> pad_records{0};
     std::atomic<uint64_t> block_write_errors{0};
     std::atomic<uint64_t> truncated_blocks{0};
@@ -93,15 +94,20 @@ inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char
 }
 
 // 格式化一个外部 level(0..5)/tag/payload 为 staging 记录字节序列;
-// 失败原因:level 非法 / tag 非法 / 超 max_log_length。
+// 失败原因:level 非法 / tag 非法 / (kBuildRecordsCannotFit)病态小 max_log_length。
 // out_buf 由调用方提供(kMaxRecordTotal)。
 // E-02: 返回码区分失败类别,便于上层区分"输入非法"与"内容超长":
-//   0 = 成功;> 0 = 格式化后总字节数(超长判定由调用方完成);
-//   < 0 = 格式化失败(输入非法:level 越界 / tag 为空或超长)。
+//   > 0 = 格式化后总字节数(超长时已由 B-1B 方案B 截断保前缀,
+//         out_truncated 标记是否截断、out_dropped 为丢弃字节数,可为 NULL);
+//   < 0 = 格式化失败:kBuildRecordsInvalidInput = 输入非法(level 越界 / tag 为空或超长);
+//         kBuildRecordsCannotFit = 截断到空记录仍超 max_log_length(病态小上限),
+//         由调用方走 TOO_LARGE 丢弃兜底(drop_too_large 仅此路径递增)。
 constexpr int kBuildRecordsInvalidInput = -1;
+constexpr int kBuildRecordsCannotFit    = -2;
 int build_records(Instance* inst, int level, const char* tag,
                   const uint8_t* payload, uint32_t payload_len,
-                  uint8_t* out_buf, uint32_t* out_total_bytes);
+                  uint8_t* out_buf, uint32_t* out_total_bytes,
+                  bool* out_truncated, uint64_t* out_dropped);
 
 // 把一段连续的"拷出流"按记录边界切成多个块(每块 raw ≤ kBlockMaxNormal,
 // 单条 16KB..20KB+6B 头独占一块);返回块数。

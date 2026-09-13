@@ -1197,7 +1197,7 @@ TEST(Flush, HeapDegraded_WritesAndFlushesCorrectly) {
     pal.file_rmdir(dir.c_str());
 }
 
-TEST(ErrorMonitoring, DropEventOnTooLargeAndFull) {
+TEST(ErrorMonitoring, TruncateEventOnTooLarge_PrefixKeptAndCounted) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_drop_") +
                       std::to_string(pal.pid()) + "_" +
@@ -1231,17 +1231,81 @@ TEST(ErrorMonitoring, DropEventOnTooLargeAndFull) {
         }
     }, &tracker);
 
-    // 1) 写入 600B 日志(超 max_log_length 500B)
+    // B-1B 方案B: 写入 600B 日志(超 max_log_length 500B)→ 截断保前缀,
+    // 返回 LOGX_OK 并同步发 "log truncated" 事件,truncated_logs 计数递增。
     std::string large_msg(600, 'L');
     EXPECT_EQ(logx_write(inst, 2, "Tag",
+                         reinterpret_cast<const uint8_t*>(large_msg.data()),
+                         static_cast<uint32_t>(large_msg.size())), LOGX_OK);
+    EXPECT_EQ(tracker.drop_count, 1);
+    EXPECT_EQ(tracker.last_msg.compare(0, 13, "log truncated"), 0);
+
+    logx_stats_t st{};
+    logx_get_stats(inst, &st);
+    EXPECT_EQ(st.truncated_logs, 1u);
+    EXPECT_EQ(st.drop_too_large, 0u);
+
+    // 截断记录真实落环:flush 后 staging 待刷区被消费
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    logx_close(inst);
+
+    // 清理
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        pal.file_unlink(f.c_str());
+    }
+    pal.file_rmdir(dir.c_str());
+}
+
+// B-1B: 病态小 max_log_length(截断到空记录仍放不下)保留 TOO_LARGE 丢弃兜底。
+TEST(ErrorMonitoring, CannotFitDropPath_PreservedForPathologicalLimit) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_cannot_fit_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(s_test_dir_seq.fetch_add(1));
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    // tag "E" (1B) 的最小空记录 = 27(用户头) + 1(tag) + 6(片头) = 34B;
+    // max_log_length=33 连空记录都放不下 → kCannotFit → TOO_LARGE 丢弃兜底。
+    cfg.max_log_length = 33;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 16 * 1024;
+    cfg.compress_algo = kAlgoNone;
+    cfg.encrypt_enable = 0;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    struct DropTracker {
+        int drop_count = 0;
+        std::string last_msg;
+    } tracker;
+    logx_set_error_handler(inst, [](void* user, logx_event_kind_e kind, int, const char* msg) {
+        if (kind == LOGX_EV_DROP) {
+            auto* t = static_cast<DropTracker*>(user);
+            t->drop_count++;
+            t->last_msg = msg ? msg : "";
+        }
+    }, &tracker);
+
+    std::string large_msg(600, 'L');
+    EXPECT_EQ(logx_write(inst, 2, "E",
                          reinterpret_cast<const uint8_t*>(large_msg.data()),
                          static_cast<uint32_t>(large_msg.size())), LOGX_ERR_TOO_LARGE);
     EXPECT_EQ(tracker.drop_count, 1);
     EXPECT_EQ(tracker.last_msg, "log too large");
 
-    logx_close(inst);
+    logx_stats_t st{};
+    logx_get_stats(inst, &st);
+    EXPECT_EQ(st.drop_too_large, 1u);
+    EXPECT_EQ(st.truncated_logs, 0u);
 
-    // 清理
+    logx_close(inst);
     for (const auto& f : pal.file_list(dir.c_str())) {
         pal.file_unlink(f.c_str());
     }

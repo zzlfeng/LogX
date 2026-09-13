@@ -210,3 +210,163 @@ TEST(Format, MultipleWholeRecordsInOneBlock_StreamParsed) {
         EXPECT_EQ(stream_outs[i].size(), 27u + 7u + expected_msg.size());
     }
 }
+// ---------------------------------------------------------------------------
+// B-1B 方案B: format_record_bounded 截断保前缀
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 从内部用户载荷切出 msg 段([27B 头][tag][msg] 的 msg 部分)。
+std::string msg_of(const std::vector<uint8_t>& user, uint32_t tag_len) {
+    return std::string(reinterpret_cast<const char*>(user.data()) + 27 + tag_len,
+                       user.size() - 27 - tag_len);
+}
+
+}  // namespace
+
+TEST(FormatBounded, UnderLimit_NoTruncation) {
+    uint8_t buf[kMaxRecordTotal];
+    uint32_t total = 0;
+    bool truncated = true;
+    uint64_t dropped = 99;
+    // tag "T"(1B): total = 27+1+66+6 = 100 == max_total → 恰好不截断
+    logx::FormatBoundedStatus st = format_record_bounded(
+        2, "T", (const uint8_t*)"hello", 66, 0, 0, 0,
+        buf, sizeof(buf), &total, 100, &truncated, &dropped);
+    ASSERT_EQ(st, FormatBoundedStatus::kOk);
+    EXPECT_FALSE(truncated);
+    EXPECT_EQ(dropped, 0u);
+    EXPECT_EQ(total, 100u);
+}
+
+TEST(FormatBounded, TruncateSingleSlice_PrefixPreservedWithMarker) {
+    std::string big(600, 'L');
+    uint8_t buf[kMaxRecordTotal];
+    uint32_t total = 0;
+    bool truncated = false;
+    uint64_t dropped = 0;
+    logx::FormatBoundedStatus st = format_record_bounded(
+        2, "Tag", (const uint8_t*)big.data(), static_cast<uint32_t>(big.size()),
+        0, 0, 0, buf, sizeof(buf), &total, 500, &truncated, &dropped);
+    ASSERT_EQ(st, FormatBoundedStatus::kOk);
+    ASSERT_TRUE(truncated);
+    // prefix = 600 - dropped;msg = prefix + marker,落环总长必须 ≤ 上限
+    ASSERT_GT(dropped, 0u);
+    EXPECT_LE(total, 500u);
+    const uint32_t prefix_len = 600u - static_cast<uint32_t>(dropped);
+
+    std::vector<uint8_t> user;
+    ASSERT_TRUE(parse_record(buf, total, &user));  // 校验和逐片验证
+    const std::string msg = msg_of(user, 3);
+    // 前缀字节级一致
+    ASSERT_GE(msg.size(), prefix_len);
+    EXPECT_EQ(0, std::memcmp(msg.data(), big.data(), prefix_len));
+    // marker 后缀正确且记录丢弃字节数
+    const std::string suffix = msg.substr(prefix_len);
+    EXPECT_EQ(suffix,
+              "...[LogX truncated, dropped " + std::to_string(dropped) + " bytes]");
+    EXPECT_LE(suffix.size(), 48u);  // marker 定长预算契约
+}
+
+TEST(FormatBounded, TruncateOversixtyKB_MultiSliceRoundTrip) {
+    // 70KB payload:旧实现误报 INVALID_ARG(format_record 直接失败),
+    // B-1B 后并入截断;64KB 上限下为多片记录。
+    std::string big(70 * 1024, 'K');
+    for (uint32_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>('A' + (i % 26));
+    uint8_t buf[kMaxRecordTotal];
+    uint32_t total = 0;
+    bool truncated = false;
+    uint64_t dropped = 0;
+    logx::FormatBoundedStatus st = format_record_bounded(
+        2, "", (const uint8_t*)big.data(), static_cast<uint32_t>(big.size()),
+        0, 0, 0, buf, sizeof(buf), &total, 64 * 1024, &truncated, &dropped);
+    ASSERT_EQ(st, FormatBoundedStatus::kOk);
+    ASSERT_TRUE(truncated);
+    EXPECT_GT(dropped, 0u);
+    EXPECT_LE(total, 64u * 1024u);
+
+    // 多片流式重组:前缀逐字节一致 + marker 后缀
+    std::vector<std::vector<uint8_t>> users;
+    std::vector<uint8_t> carry;
+    ASSERT_TRUE(parse_records_stream(buf, total, &users, &carry));
+    ASSERT_EQ(users.size(), 1u);
+    const uint32_t prefix_len = big.size() - static_cast<uint32_t>(dropped);
+    const std::string msg = msg_of(users[0], 0);
+    ASSERT_GE(msg.size(), prefix_len);
+    EXPECT_EQ(0, std::memcmp(msg.data(), big.data(), prefix_len));
+    EXPECT_EQ(msg.substr(prefix_len),
+              "...[LogX truncated, dropped " + std::to_string(dropped) + " bytes]");
+}
+
+TEST(FormatBounded, NoRoomForMarker_PurePrefix) {
+    // max_total=75,tag "T"(1B): 预算 b = 75-6-27-1 = 41 < 48 → 弃 marker 保前缀
+    std::string big(600, 'M');
+    uint8_t buf[kMaxRecordTotal];
+    uint32_t total = 0;
+    bool truncated = false;
+    uint64_t dropped = 0;
+    logx::FormatBoundedStatus st = format_record_bounded(
+        2, "T", (const uint8_t*)big.data(), static_cast<uint32_t>(big.size()),
+        0, 0, 0, buf, sizeof(buf), &total, 75, &truncated, &dropped);
+    ASSERT_EQ(st, FormatBoundedStatus::kOk);
+    ASSERT_TRUE(truncated);
+    EXPECT_LE(total, 75u);
+    EXPECT_EQ(dropped, 600u - 41u);
+
+    std::vector<uint8_t> user;
+    ASSERT_TRUE(parse_record(buf, total, &user));
+    const std::string msg = msg_of(user, 1);
+    EXPECT_EQ(msg.size(), 41u);
+    EXPECT_EQ(0, std::memcmp(msg.data(), big.data(), 41u));
+    EXPECT_EQ(msg.find("LogX truncated"), std::string::npos);  // 无 marker
+}
+
+TEST(FormatBounded, CannotFit_PathologicalTinyLimit) {
+    // tag "E"(1B): 最小空记录 = 27+1+6 = 34B;33 连空记录都放不下
+    uint8_t buf[kMaxRecordTotal];
+    uint32_t total = 0;
+    bool truncated = false;
+    uint64_t dropped = 0;
+    logx::FormatBoundedStatus st = format_record_bounded(
+        2, "E", (const uint8_t*)"payload", 7, 0, 0, 0,
+        buf, sizeof(buf), &total, 33, &truncated, &dropped);
+    EXPECT_EQ(st, FormatBoundedStatus::kCannotFit);
+    EXPECT_FALSE(truncated);
+    EXPECT_EQ(dropped, 0u);
+}
+
+TEST(FormatBounded, InvalidInputStaysInvalid) {
+    uint8_t buf[kMaxRecordTotal];
+    uint32_t total = 0;
+    bool truncated = false;
+    uint64_t dropped = 0;
+    // level 越界 / tag 非法:与超长无关,仍按非法输入上报
+    EXPECT_EQ(format_record_bounded(6, "T", (const uint8_t*)"m", 1, 0, 0, 0,
+                                    buf, sizeof(buf), &total, 500,
+                                    &truncated, &dropped),
+              FormatBoundedStatus::kInvalidInput);
+    EXPECT_EQ(format_record_bounded(2, nullptr, (const uint8_t*)"m", 1, 0, 0, 0,
+                                    buf, sizeof(buf), &total, 500,
+                                    &truncated, &dropped),
+              FormatBoundedStatus::kInvalidInput);
+    EXPECT_FALSE(truncated);
+}
+
+TEST(FormatBounded, BudgetSweep_TotalAlwaysFitsLimit) {
+    // 一组上限 × 空 tag 扫描:凡可行(≥ 最小空记录 33B)必成功且总长 ≤ 上限;
+    // marker 恒在预算内(实际 marker ≤ 45 ≤ 48)由总长断言兜底验证。
+    std::string big(64 * 1024, 'Z');
+    for (uint32_t max_total = 33u; max_total <= 1200u; max_total += 37u) {
+        uint8_t buf[kMaxRecordTotal];
+        uint32_t total = 0;
+        bool truncated = false;
+        uint64_t dropped = 0;
+        logx::FormatBoundedStatus st = format_record_bounded(
+            2, "", (const uint8_t*)big.data(), static_cast<uint32_t>(big.size()),
+            0, 0, 0, buf, sizeof(buf), &total, max_total, &truncated, &dropped);
+        ASSERT_EQ(st, FormatBoundedStatus::kOk) << "max_total=" << max_total;
+        ASSERT_TRUE(truncated) << "max_total=" << max_total;
+        ASSERT_LE(total, max_total) << "max_total=" << max_total;
+        ASSERT_GT(dropped, 0u) << "max_total=" << max_total;
+    }
+}

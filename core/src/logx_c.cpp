@@ -426,18 +426,32 @@ logx_status_e logx_write(logx_instance_t* h, int level,
 
     // 1) 锁外格式化(包含校验和计算)
     // E-02: 区分"输入非法"与"内容超长"两类失败——非法输入按 INVALID_ARG 上报,
-    // 不再误入 TOO_LARGE 分支;drop_too_large 只在真正的超长路径递增。
+    // 不再误入 TOO_LARGE 分支。
+    // B-1B 方案B: 内容超长(max_log_length 或 60KB 用户载荷硬上限)不再整条丢弃,
+    // 截断保留前缀后照常落环,返回 LOGX_OK;仅病态小上限(截断到空记录仍放不下)
+    // 保留丢弃兜底,drop_too_large 只在该路径递增。
     uint8_t buf[kMaxRecordTotal];
     uint32_t total = 0;
-    int br = build_records(inst, level, tag, payload, payload_len, buf, &total);
+    bool truncated = false;
+    uint64_t dropped_bytes = 0;
+    int br = build_records(inst, level, tag, payload, payload_len, buf, &total,
+                           &truncated, &dropped_bytes);
     if (br == kBuildRecordsInvalidInput) {
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_INVALID_ARG, "invalid log input");
         return LOGX_ERR_INVALID_ARG;
     }
-    if (total > inst->max_log_length) {
+    if (br == kBuildRecordsCannotFit) {
         inst->drop_too_large.fetch_add(1);
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, "log too large");
         return LOGX_ERR_TOO_LARGE;
+    }
+    if (truncated) {
+        inst->truncated_logs.fetch_add(1);
+        // 与丢弃路径同款纪律:调用方线程、锁外同步发事件(P1-1 / J-04 安全性不变)。
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "log truncated (dropped %llu bytes)",
+                      static_cast<unsigned long long>(dropped_bytes));
+        emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, msg);
     }
 
     // 2) 锁内写入 staging
@@ -513,6 +527,7 @@ void logx_get_stats(logx_instance_t* h, logx_stats_t* out) {
     out->truncated_blocks = inst->truncated_blocks.load();
     out->pad_records      = inst->pad_records.load();
     out->block_write_errors = inst->block_write_errors.load();
+    out->truncated_logs   = inst->truncated_logs.load();
     // E-07: 预留位保持零值契约(未来字段占用前必须为零初始化输出)
     for (size_t i = 0; i < sizeof(out->reserved) / sizeof(out->reserved[0]); ++i) {
         out->reserved[i] = 0;

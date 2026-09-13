@@ -9,12 +9,14 @@
 //
 // 本测试无法在桌面端加载 JVM 去复现 JNI 临界区本身,但精确守护 JNI 崩溃所依赖
 // 的 C ABI 核心契约(emit_event 直调语义):
-//   a) 超长 / 环满两条丢日志路径必须"同步 + 在调用方线程"触发 err_fn
+//   a) 超长截断(B-1B 方案B)/ 超长病态丢弃 / 环满三条路径必须
+//      "同步 + 在调用方线程"触发 err_fn
 //      —— 这正是 jni_error_trampoline 能拿到合法 JNI env 的前提;
-//   b) 回调必须拿到正确的 kind/code("log too large" / "staging full");
+//   b) 回调必须拿到正确的 kind/code("log truncated..." / "log too large" /
+//      "staging full");
 //   c) 错误回调执行期间不得死锁,尤其环满路径是在持 inst->mu 前提下触发的
 //      (emit_event 用独立 err_mu,锁序 inst->mu → err_mu,见 logx_internal.h);
-//   d) 单次丢弃后实例生命周期不变,后续日志仍可正常写入。
+//   d) 单次事件后实例生命周期不变,后续日志仍可正常写入。
 // 若将来有人重新引入 Critical 包裹、把错误事件延迟到后台线程、或改锁序,
 // 本测试即回归转红。
 
@@ -98,9 +100,10 @@ void cleanup_dir(const std::string& dir) {
 
 }  // namespace
 
-// J-04 a/b/c/d: TOO_LARGE 丢日志路径。同步、调用方线程、正确 kind/code、
-// 事件后实例可继续写入。
-TEST(J04Regression, TooLarge_ErrHandlerSynchronousOnCallerThread) {
+// J-04 a/b/c/d: 超长截断路径(B-1B 方案B)。同步、调用方线程、正确 kind/code、
+// 事件后实例可继续写入。截断事件与旧丢日志路径同在调用方线程锁外同步发出,
+// JNI 临界区安全性契约不变。
+TEST(J04Regression, TooLargeTruncated_ErrHandlerSynchronousOnCallerThread) {
     Pal& pal = default_pal();
     std::string dir = std::string("logx_test_j04_too_large_") +
                       std::to_string(pal.pid()) + "_" +
@@ -113,9 +116,66 @@ TEST(J04Regression, TooLarge_ErrHandlerSynchronousOnCallerThread) {
         static_cast<ErrorProbe*>(user)->on_event(k, code, msg);
     };
 
-    // max_log_length=256:写一条明显超过的日志确定触发 TOO_LARGE
+    // max_log_length=256:写一条明显超过的日志确定触发截断事件
     logx_config_t cfg = make_cfg(dir.c_str(), staging.c_str(),
                                  /*max_log_len=*/256, /*flush_threshold=*/0,
+                                 &probe, fn);
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    uint64_t caller_tid = pal.tid();
+    std::vector<uint8_t> big(4096, 'A');
+
+    // a) 截断写返回 LOGX_OK(记录已落环,非错误)
+    EXPECT_EQ(logx_write(inst, 2, "J04", big.data(),
+                         static_cast<uint32_t>(big.size())),
+              LOGX_OK);
+
+    // b) kind/code 正确,msg 为截断语义
+    ASSERT_TRUE(probe.saw(LOGX_EV_DROP, LOGX_ERR_TOO_LARGE));
+    // a) 回调在调用方线程触发(同步契约 —— JNI trampoline 靠它拿合法 env)
+    EXPECT_TRUE(probe.saw_on_tid(LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, caller_tid));
+    {
+        std::lock_guard<std::mutex> lk(probe.mu);
+        for (size_t i = 0; i < probe.codes.size(); ++i) {
+            if (probe.codes[i] == LOGX_ERR_TOO_LARGE) {
+                EXPECT_EQ(probe.msgs[i].compare(0, 13, "log truncated"), 0);
+            }
+        }
+    }
+
+    // d) 截断事件后实例仍可写入;truncated_logs 计数佐证
+    const uint8_t ok[] = "still alive";
+    EXPECT_EQ(logx_write(inst, 2, "J04", ok, sizeof(ok) - 1), LOGX_OK);
+    logx_stats_t st{};
+    logx_get_stats(inst, &st);
+    EXPECT_EQ(st.truncated_logs, 1u);
+    EXPECT_EQ(st.drop_too_large, 0u);
+
+    ASSERT_EQ(logx_close(inst), LOGX_OK);
+    cleanup_dir(dir);
+}
+
+// J-04 a/b/c/d: 病态小 max_log_length(截断到空记录仍放不下)保留的
+// TOO_LARGE 丢弃兜底路径。同步、调用方线程、正确 kind/code、事件后实例可继续写入。
+TEST(J04Regression, TooLargeCannotFit_ErrHandlerSynchronousOnCallerThread) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_j04_cannot_fit_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(s_j04_dir_seq.fetch_add(1));
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    ErrorProbe probe;
+    constexpr logx_error_fn fn = [](void* user, logx_event_kind_e k, int code, const char* msg) {
+        static_cast<ErrorProbe*>(user)->on_event(k, code, msg);
+    };
+
+    // tag "J04"(3B) 的最小空记录 = 27+3+6 = 36B;max_log_length=33 连空记录
+    // 都放不下 → kCannotFit → TOO_LARGE 丢弃兜底。
+    logx_config_t cfg = make_cfg(dir.c_str(), staging.c_str(),
+                                 /*max_log_len=*/33, /*flush_threshold=*/0,
                                  &probe, fn);
 
     logx_instance_t* inst = nullptr;
@@ -129,14 +189,27 @@ TEST(J04Regression, TooLarge_ErrHandlerSynchronousOnCallerThread) {
                          static_cast<uint32_t>(big.size())),
               LOGX_ERR_TOO_LARGE);
 
-    // b) kind/code 正确
-    EXPECT_TRUE(probe.saw(LOGX_EV_DROP, LOGX_ERR_TOO_LARGE));
-    // a) 回调在调用方线程触发(同步契约 —— JNI trampoline 靠它拿合法 env)
+    // b) kind/code 与丢弃语义 msg 正确
+    ASSERT_TRUE(probe.saw(LOGX_EV_DROP, LOGX_ERR_TOO_LARGE));
+    // a) 回调在调用方线程触发(同步契约)
     EXPECT_TRUE(probe.saw_on_tid(LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, caller_tid));
+    {
+        std::lock_guard<std::mutex> lk(probe.mu);
+        for (size_t i = 0; i < probe.codes.size(); ++i) {
+            if (probe.codes[i] == LOGX_ERR_TOO_LARGE) {
+                EXPECT_EQ(probe.msgs[i], "log too large");
+            }
+        }
+    }
 
-    // d) 丢弃后实例仍可写入
+    // d) 病态上限下任何记录都放不下:第二条小日志同样 TOO_LARGE(实例存活、
+    //    行为一致),计数累计 drop_too_large=2,truncated_logs 恒 0
     const uint8_t ok[] = "still alive";
-    EXPECT_EQ(logx_write(inst, 2, "J04", ok, sizeof(ok) - 1), LOGX_OK);
+    EXPECT_EQ(logx_write(inst, 2, "J04", ok, sizeof(ok) - 1), LOGX_ERR_TOO_LARGE);
+    logx_stats_t st{};
+    logx_get_stats(inst, &st);
+    EXPECT_EQ(st.drop_too_large, 2u);
+    EXPECT_EQ(st.truncated_logs, 0u);
 
     ASSERT_EQ(logx_close(inst), LOGX_OK);
     cleanup_dir(dir);

@@ -1121,3 +1121,69 @@ adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_st
 >      - **Inv-4（自死锁与饥饿免疫）**：回调嵌套 close 绝不自死锁，所有测试线程在限定超时（如 2000ms）内安全退栈。
 
 
+
+---
+
+## 超长日志截断保前缀: B-1 方案B 落地为 T5.5 (2026-09-13)
+
+> 决策背景:Backlog B-1 评估的三方案中,方案 B(截断保留前缀)经用户拍板实施;
+> 方案 A(NO_SPACE 有界阻塞重试,涉及"绝不阻塞"原则的延迟契约变更)仍留待决策池。
+
+### 1. 语义变更(`core/src/logx_c.cpp` `logx_write`)
+
+- **旧行为**:格式化后总长 > `max_log_length` → 整条丢弃,`drop_too_large` 递增,
+  发 `LOGX_EV_DROP`/`LOGX_ERR_TOO_LARGE`("log too large"),返回 `LOGX_ERR_TOO_LARGE`。
+- **新行为**:超长日志**截断保留 msg 前缀**后照常落环,返回 `LOGX_OK`;事件保留
+  `LOGX_EV_DROP`/`LOGX_ERR_TOO_LARGE` 但 msg 改为 `"log truncated (dropped N bytes)"`,
+  仍为**调用方线程、锁外同步发出**(P1-1/J-04 契约不变);新计数 `truncated_logs` 递增。
+- **真正丢弃仅剩两类边缘场景**:① 病态小 `max_log_length`(截断到空记录仍放不下,
+  `kBuildRecordsCannotFit` 兜底,`drop_too_large` 仅此路径递增);② 磁盘持续 NO_SPACE
+  (方案 A 的待决策范畴)。
+
+### 2. 预算求解与截断实现(`core/src/format.cpp` / `logx_format.h`)
+
+- **`solve_truncated_msg_budget`**:对片数 s ∈ [1,4] 逐一取
+  `cap(s) = min(20480·s, max_total − 6s, 60KB)`,`b = cap − (27 + tag_len)` 取最优;
+  结果保守不超过 6·(s−1) ≤ 18B。60KB 用户载荷硬上限(`format_record` 契约)纳入约束。
+- **截断拼装**:msg = 原始前缀 + ASCII marker `...[LogX truncated, dropped N bytes]`
+  (预算预留 48B,实际 ≤ 45B——dropped ≤ uint32 上限 10 位十进制);预算 < 48B 时弃
+  marker 保前缀;**独立 thread_local 拼装缓冲**,不复用 `format_record` 内部 scratch
+  (二次调用会覆写);预算 < 最小空记录(27+tag+6)时返回 `kCannotFit`。
+- **新增 `format_record_bounded`**(`logx_format.h` 声明,三态结果
+  `FormatBoundedStatus{kOk, kInvalidInput, kCannotFit}`):热路径仍恰好一次
+  `format_record`——先原样格式化,仅超限时才进截断分支,未超限零额外成本;
+  `format_record` 签名与既有语义不动(`test_format.cpp` 11 处调用零波及)。
+
+### 3. 顺带修正的既有误分类缺陷(>60KB payload 误报 INVALID_ARG)
+
+复核中发现:payload > 60KB 时 `format_record` 直接失败(用户载荷硬上限),旧链路把该
+失败归为 `kBuildRecordsInvalidInput`,导致 61KB 以上 payload 以
+`LOGX_ERR_INVALID_ARG`("invalid log input")误报——属"内容超长"而非"输入非法"。
+E-02 测试仅覆盖 level 越界与小幅超限,该区间无断言故漏网。B-1B 将 `format_record`
+失败区分为"输入非法(level/tag/payload 契约,先行排除)"与"内容超长(走截断)"两类,
+>60KB 区间自然并入截断语义。
+
+### 4. 计数与 ABI 兼容(`logx_c.h` / `logx_internal.h`)
+
+- `logx_stats_t.reserved[0]` 按既定 E-07 纪律转正为 `truncated_logs`(超长截断保前缀
+  写入计数),`reserved` 递减为 `[3]`;**sizeof 不变、布局前缀不变**,新旧二进制兼容。
+- 命名区分:既有 `truncated_blocks` 为"启动恢复截尾块计数",新字段 `truncated_logs`
+  为"写入截断保前缀计数",互不混淆。
+- `build_records` 返回协议追加 `kBuildRecordsCannotFit = -2`(内部 API,唯一调用方
+  `logx_write` 同步更新);JNI `nativeGetStats`(5 元素 LongArray)与 Kotlin `Stats`
+  按既定纪律零改动(Kotlin API 不动,后续如需暴露 `truncatedLogs` 为可追加项)。
+
+### 5. 测试与验证
+
+- **改写 3 处旧丢弃断言**:`test_robustness.cpp` E-02(超长段改断言 LOGX_OK + 截断
+  计数)、`test_flusher.cpp` `ErrorMonitoring`(拆为截断用例 + `CannotFitDropPath`
+  病态兜底用例)、`test_j04_regression.cpp`(拆为 `TooLargeTruncated_*` 同步契约用例 +
+  `TooLargeCannotFit_*` 丢弃兜底孪生用例)。
+- **新增 `FormatBounded` 套件 7 项**:前缀字节级一致 + marker 后缀精确匹配、70KB
+  (>60KB 误分类修复路径)跨片流式重组、纯前缀边界(预算 < 48B 弃 marker)、
+  kCannotFit、非法输入不变、33..1200B 上限全扫描(总长恒 ≤ 上限)。
+- **全量结果**:三构建矩阵单测 **122/122 (OFF/OFF) + 128/128 (ON/OFF) + 141/141
+  (ON/ON) 全绿**,压测 4/4 × 3 全绿;Android arm64 (NDK r29) 交叉编译 0 错误,
+  `liblogx.so` 已同步至 `logx-tester` 与 `kotlin-gradle` jniLibs。
+- spec(`LogX日志库最终实施方案.md`)§3.1/§5 边界情况/§7 maxLogLength 语义同步修订;
+  计划表升级 v1.12(T5.5 销号,B-1 拆分:方案B ✅ / 方案A 待决策)。
