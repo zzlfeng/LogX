@@ -1443,3 +1443,40 @@ payload)。至此截断子系统全部数值前提(27/60KB/20480/48/45/61410/614
 三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;Android arm64
 交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。全仓检索 `kHardUserTotal`/局部
 `kMaxSlicePayload` 零残留。
+
+---
+
+## R8 批次: R7 复审 §4 收口 (2026-09-13)
+
+> 复审报告(`code_review_R7_2026-09-13.md`)3 项发现经核实**全部属实**(1×P3 死常量、
+> 1×P3 占位符流程、1 项 T5.5 遗留观察);复审对 R7-1~R7-4 四项落实、单源化完整性、
+> 61410 紧界沿用有效性的确认无异议。
+
+### R8-1 (P3) 删除死常量 `kMaxMsg`
+`UserRecordHeader::kMaxMsg`(60*1024,format.cpp:51)全仓库零引用,且 `UserRecordHeader`
+从未被用作类型(纯文档性声明)——与 R7-4"60KB 统一单源"的声称矛盾,且语义失实
+(真实约束 `user_total = 27 + tag + msg ≤ 60KB`,msg 单独不可能达 60KB,误改此常量
+毫无效果)。删除该常量;结构体补标注"仅作文档用途,序列化直接操作 scratch 缓冲,
+布局以 format_record 内 static_assert 钉住的 kUserHdrSize 表达式为准"——根除
+"未来维护者误以为它能调整上限"的歧义。
+
+### R8-2 (P3) 占位符流程承诺
+`471466a` 曾将字面占位符 `<R7>` 写入提交表哈希列(下一提交即修正,当前表格干净;
+哈希列现全部合规)。根因是写 CHANGELOG 行时 fix 提交哈希未知,却选择了"占位 + 回填"
+两段式。承诺并执行修正后流程:**fix 提交在前,docs 单次提交直接写入真实哈希**
+(本批次即按此执行,R8 行仅一个 docs 提交)。
+
+### R8-3 (§4.3 观察,采纳) 20KB 常量族单源化
+- `logx_staging.h` 的 `kBlockMaxRaw = 20*1024 + 6` → `kMaxSlicePayload + kHeaderLen`
+  (staging.h 新增 `#include "logx_format.h"`,仅含 cstdint/vector,无包含环);
+- `flusher.cpp` 的 `kSingleRecordMaxRaw = 20*1024 + 6` → `= kBlockMaxRaw`
+  (语义同为"单条记录含 6B 头的原始上限",与块上限同源);
+- `format_pad` 的 `20 * 1024` 防御钳制与 `staging.cpp` 回绕 PAD 的
+  `std::min<uint32_t>(20*1024, remain-6)` 字面量 → `kMaxSlicePayload` / `kHeaderLen`
+  (后者连带把裸 `6` 一并绑定)。
+- 至此截断/分片/PAD 子系统全部数值前提(27 / 60KB / 20KB / 6B / 45 / 48 / 61410 /
+  61440)均为单源命名常量,相互以 static_assert 或派生表达式绑定。
+
+### 验证
+三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;Android arm64
+交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。
