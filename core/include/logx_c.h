@@ -47,6 +47,8 @@ typedef enum {
 } logx_event_kind_e;
 
 /* ===== 错误回调 ===== */
+/* msg 仅在回调执行期间有效,回调返回后立即失效;当前实现混合使用字符串字面量
+ * 与栈缓冲,需留存必须自行拷贝,严禁保存该指针。 */
 typedef void (*logx_error_fn)(void* user,
                              logx_event_kind_e kind,
                              int code,

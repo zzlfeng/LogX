@@ -135,12 +135,13 @@ fun MetricsPanel(
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text("dropNoSpace: ${ns.dropNoSpace}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                             Text("dropTooLarge: ${ns.dropTooLarge}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                            Text("truncated: ${ns.truncatedBlocks}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                            Text("truncatedBlocks: ${ns.truncatedBlocks}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                         }
                         Spacer(modifier = Modifier.height(2.dp))
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text("padRecords: ${ns.padRecords}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                             Text("blockWriteErrors: ${ns.blockWriteErrors}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                            Text("truncatedLogs: ${ns.truncatedLogs}", fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                         }
                     } else {
                         Text("LogX 实例未运行，启动后将自动获取 native 原子计数快照", fontSize = 11.sp, color = Color.Gray)

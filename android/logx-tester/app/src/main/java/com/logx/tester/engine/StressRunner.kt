@@ -53,6 +53,7 @@ object StressRunner {
             val tooLargeCount = AtomicLong(0)
             val invalidCount = AtomicLong(0)
             val otherDropCount = AtomicLong(0)
+            val truncatedCount = AtomicLong(0)
 
             // 问题4修复: 使用 Dispatchers.IO.limitedParallelism 支持真正的多物理线程并发
             val dispatcher = Dispatchers.IO.limitedParallelism(threads)
@@ -95,6 +96,7 @@ object StressRunner {
                             is LogXProbe.R.Ok -> okCount.incrementAndGet()
                             is LogXProbe.R.NoSpace -> noSpaceCount.incrementAndGet()
                             is LogXProbe.R.TooLarge -> tooLargeCount.incrementAndGet()
+                            is LogXProbe.R.Truncated -> truncatedCount.incrementAndGet()
                             is LogXProbe.R.Invalid -> invalidCount.incrementAndGet()
                             is LogXProbe.R.OtherDrop -> otherDropCount.incrementAndGet()
                         }
@@ -110,12 +112,13 @@ object StressRunner {
                         if (recordEveryLine || cur % 1000 == 0 || cur == total || cur == 1) {
                             val kind = when (res) {
                                 is LogXProbe.R.Ok -> LineKind.WRITE_OK
-                                is LogXProbe.R.NoSpace, is LogXProbe.R.TooLarge, is LogXProbe.R.Invalid, is LogXProbe.R.OtherDrop -> LineKind.DROP
+                                is LogXProbe.R.NoSpace, is LogXProbe.R.TooLarge, is LogXProbe.R.Truncated, is LogXProbe.R.Invalid, is LogXProbe.R.OtherDrop -> LineKind.DROP
                             }
                             val text = when (res) {
                                 is LogXProbe.R.Ok -> "Stress #$cur OK (${res.nanos / 1000} µs)"
                                 is LogXProbe.R.NoSpace -> "Stress #$cur DROP: staging full"
                                 is LogXProbe.R.TooLarge -> "Stress #$cur DROP: log too large"
+                                is LogXProbe.R.Truncated -> "Stress #$cur TRUNCATE: ${res.msg}"
                                 is LogXProbe.R.Invalid -> "Stress #$cur DROP: invalid input"
                                 is LogXProbe.R.OtherDrop -> "Stress #$cur DROP: ${res.msg}"
                             }
@@ -165,7 +168,9 @@ object StressRunner {
                 val p999 = quantile(validLatencies, 0.999) / 1000.0
                 val max = if (validLatencies.isNotEmpty()) validLatencies.last() / 1000.0 else 0.0
 
-                val drops = noSpaceCount.get() + tooLargeCount.get() + invalidCount.get() + otherDropCount.get()
+                // R4-2: 截断保前缀是有损写入(前缀保留、超出部分丢失), 与丢弃一并判定失真
+                val drops = noSpaceCount.get() + tooLargeCount.get() + invalidCount.get() +
+                    otherDropCount.get() + truncatedCount.get()
                 val distorted = drops > 0
 
                 val metrics = TesterMetrics(
@@ -174,6 +179,7 @@ object StressRunner {
                     dropTooLarge = tooLargeCount.get(),
                     invalidInput = invalidCount.get(),
                     otherDrop = otherDropCount.get(),
+                    truncatedLogs = truncatedCount.get(),
                     latency = LatencyStats(
                         count = actualCompleted,
                         p50Us = p50,

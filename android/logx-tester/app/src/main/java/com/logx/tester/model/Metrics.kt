@@ -17,13 +17,14 @@ data class TesterMetrics(
     val dropTooLarge: Long = 0,
     val invalidInput: Long = 0,
     val otherDrop: Long = 0,
+    val truncatedLogs: Long = 0, // B-1B/T5.5: 截断保前缀的有损写入次数(R4-2)
     val eventDegraded: Long = 0,
     val eventDrop: Long = 0,
     val eventIo: Long = 0,
     val eventRecovery: Long = 0,
     val latency: LatencyStats = LatencyStats(),
     val throughputLogsPerSec: Double = 0.0,
-    val isDistorted: Boolean = false, // 有丢弃时标注数据失真
+    val isDistorted: Boolean = false, // 有丢弃或截断时标注数据失真(截断=有损写入)
     val isInterrupted: Boolean = false, // 压测是否被提前中止
     val nativeStats: LogX.Stats? = null // 问题6: LogX.getStats() 底层诊断快照
 )

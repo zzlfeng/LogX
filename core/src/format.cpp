@@ -172,7 +172,10 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
 
 // 截断 marker(ASCII,追加在保留前缀之后,便于解码侧肉眼识别截断)。
 // dropped 为 uint32 payload 与预算之差,上限 10 位十进制:
-// 28(前缀) + 10(数字) + 7(" bytes]") = 45 ≤ kMarkerReserve(48),预算恒够。
+// "...[LogX truncated, dropped "(28) + 10(数字) + " bytes]"(7) = 45 ≤ kMarkerReserve(48),
+// 预算恒够;marker[64] snprintf 钳制兜底。
+namespace {
+
 constexpr uint32_t kMarkerReserve = 48;
 
 // 求解截断后 msg(含 marker 占用)的最大字节数,使落环总长 ≤ max_total:
@@ -202,6 +205,8 @@ bool solve_truncated_msg_budget(uint32_t max_total, uint32_t tag_len, uint32_t* 
     return true;
 }
 
+}  // namespace
+
 FormatBoundedStatus format_record_bounded(
     uint8_t level, const char* tag,
     const uint8_t* payload, uint32_t payload_len,
@@ -210,8 +215,9 @@ FormatBoundedStatus format_record_bounded(
     uint32_t* out_total_bytes,
     uint32_t max_total_bytes,
     bool* out_truncated, uint64_t* out_dropped) {
-    *out_truncated = false;
-    *out_dropped = 0;
+    // 出参按契约可为 NULL(R4-1):全部赋值走守卫。
+    if (out_truncated) *out_truncated = false;
+    if (out_dropped) *out_dropped = 0;
 
     // 输入契约校验与 format_record 一致(非法输入不属于截断范畴,由调用方按
     // INVALID_ARG 上报;此处先行排除后,format_record 的失败只剩"内容超长"一类)。
@@ -239,7 +245,9 @@ FormatBoundedStatus format_record_bounded(
 
     // 预算内拼装"前缀 + marker"。独立 thread_local 缓冲,不复用 format_record
     // 内部的 scratch(二次调用会覆写);仅截断冷路径触碰,页成本可忽略。
-    static thread_local uint8_t trunc_buf[64 * 1024];
+    // 容量 60KB 即可:msg_len = prefix + marker ≤ budget ≤ cap − (27+tag) ≤ 61440−27
+    // (60KB 是 user_total 硬上限,msg 只是其中扣掉用户头的部分),61440 绰绰有余。
+    static thread_local uint8_t trunc_buf[60 * 1024];
     const uint8_t* src = payload;
     uint32_t msg_len = budget;
     uint32_t prefix_len = budget;
@@ -272,8 +280,8 @@ FormatBoundedStatus format_record_bounded(
         // 防御:预算求解已保证 user_total ≤ 60KB 且容量充足,不可达。
         return FormatBoundedStatus::kInvalidInput;
     }
-    *out_truncated = true;
-    *out_dropped = static_cast<uint64_t>(payload_len) - prefix_len;
+    if (out_truncated) *out_truncated = true;
+    if (out_dropped) *out_dropped = static_cast<uint64_t>(payload_len) - prefix_len;
     return FormatBoundedStatus::kOk;
 }
 

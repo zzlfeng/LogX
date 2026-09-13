@@ -107,8 +107,8 @@ object PresetRegistry {
         Preset(
             id = 8,
             name = "8. 超长 payload",
-            summary = "用户总长 > 60KB 触发 INVALID",
-            expectedOutcome = "写入返回 INVALID (\"invalid log input\")",
+            summary = "用户总长 > 60KB 触发截断保前缀(B-1B/T5.5)",
+            expectedOutcome = "写入返回 OK, 原始前缀保留并追加截断 marker; getStats().truncatedLogs 计数 +1",
             configModifier = {
                 it.copy(
                     compress = LogX.Compress.NONE,
@@ -122,7 +122,7 @@ object PresetRegistry {
             id = 9,
             name = "9. 超 maxLogLength",
             summary = "maxLogLength=16384 + 单条写 30000B",
-            expectedOutcome = "写入返回 TOO_LARGE (\"log too large\")",
+            expectedOutcome = "写入返回 OK(截断保前缀, \"log truncated (dropped N bytes)\")",
             configModifier = {
                 it.copy(maxLogLength = 16384, useCacheDir = false)
             },

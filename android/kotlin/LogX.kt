@@ -80,7 +80,7 @@ object LogX {
     data class Stats(
         /** staging 缓冲区空闲不足导致的日志丢弃次数 */
         val dropNoSpace: Long,
-        /** 单条日志超过 maxLogLength 被丢弃的次数 */
+        /** 病态小 maxLogLength(截断到空记录仍放不下)导致的丢弃次数 */
         val dropTooLarge: Long,
         /** 启动恢复时发现的截尾块计数 */
         val truncatedBlocks: Long,
@@ -88,6 +88,8 @@ object LogX {
         val padRecords: Long,
         /** 写入短写或 IO 错误计数 */
         val blockWriteErrors: Long,
+        /** 超长日志截断保前缀写入次数(有损写入,非丢弃;B-1B/T5.5,R4-2 接线) */
+        val truncatedLogs: Long,
     )
 
     data class Config(
@@ -407,6 +409,7 @@ object LogX {
                 truncatedBlocks = arr[2],
                 padRecords = arr[3],
                 blockWriteErrors = arr[4],
+                truncatedLogs = arr[5],
             )
         }
     }

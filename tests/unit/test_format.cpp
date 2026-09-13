@@ -370,3 +370,28 @@ TEST(FormatBounded, BudgetSweep_TotalAlwaysFitsLimit) {
         ASSERT_GT(dropped, 0u) << "max_total=" << max_total;
     }
 }
+
+// R4-1: out_truncated / out_dropped 按契约可为 NULL,函数内守卫赋值不崩溃。
+TEST(FormatBounded, NullOutParamsTolerated) {
+    uint8_t buf[kMaxRecordTotal];
+    uint32_t total = 0;
+    // 截断路径 + 双 NULL
+    std::string big(600, 'L');
+    EXPECT_EQ(format_record_bounded(2, "Tag", (const uint8_t*)big.data(),
+                                    static_cast<uint32_t>(big.size()),
+                                    0, 0, 0, buf, sizeof(buf), &total, 500,
+                                    nullptr, nullptr),
+              FormatBoundedStatus::kOk);
+    EXPECT_LE(total, 500u);
+    // 未截断路径 + 双 NULL
+    EXPECT_EQ(format_record_bounded(2, "Tag", (const uint8_t*)"ok", 2,
+                                    0, 0, 0, buf, sizeof(buf), &total, 500,
+                                    nullptr, nullptr),
+              FormatBoundedStatus::kOk);
+    // 单 NULL 混用:out_total_bytes 必须非空(容量契约),仅截断出参为 NULL
+    EXPECT_EQ(format_record_bounded(2, "Tag", (const uint8_t*)big.data(),
+                                    static_cast<uint32_t>(big.size()),
+                                    0, 0, 0, buf, sizeof(buf), &total, 500,
+                                    nullptr, nullptr),
+              FormatBoundedStatus::kOk);
+}

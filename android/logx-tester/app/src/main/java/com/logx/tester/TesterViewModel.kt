@@ -227,6 +227,12 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
                 _lastWriteResult.value = "TOO_LARGE (${us} µs)"
                 appendConsoleLine(level = level.name, tag = tag, text = "DROP: log too large (${us} µs)", kind = LineKind.DROP)
             }
+            is LogXProbe.R.Truncated -> {
+                // R4-2: 截断保前缀 = 有损写入成功(记录已落盘), 非丢弃;单列指标并计入失真
+                _metrics.update { it.copy(truncatedLogs = it.truncatedLogs + 1) }
+                _lastWriteResult.value = "TRUNCATED (${us} µs)"
+                appendConsoleLine(level = level.name, tag = tag, text = "TRUNCATE: ${res.msg} (${us} µs)", kind = LineKind.DROP)
+            }
             is LogXProbe.R.Invalid -> {
                 _metrics.update { it.copy(invalidInput = it.invalidInput + 1) }
                 _lastWriteResult.value = "INVALID (${us} µs)"
@@ -359,7 +365,7 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
                     }
                     append("延迟分位数 (µs): P50=${"%.1f".format(lat.p50Us)} | P90=${"%.1f".format(lat.p90Us)} | P99=${"%.1f".format(lat.p99Us)} | P99.9=${"%.1f".format(lat.p999Us)} | Max=${"%.1f".format(lat.maxUs)}")
                     if (resultMetrics.isDistorted) {
-                        append("\n⚠️ 数据失真：本轮有丢弃(NoSpace=${resultMetrics.dropNoSpace}, TooLarge=${resultMetrics.dropTooLarge}, Invalid=${resultMetrics.invalidInput})，吞吐/延迟结论无效！")
+                        append("\n⚠️ 数据失真：本轮有丢弃或截断(NoSpace=${resultMetrics.dropNoSpace}, TooLarge=${resultMetrics.dropTooLarge}, Invalid=${resultMetrics.invalidInput}, Truncated=${resultMetrics.truncatedLogs})，吞吐/延迟结论无效！")
                     }
                 }
                 _stressReport.value = report

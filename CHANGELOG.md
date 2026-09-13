@@ -35,6 +35,7 @@
 | `d19d94e` | fix(kt): N2~N4 状态机闭环：引入 closeLock 消除 Check-Then-Act 状态裂隙、快慢操作分离计数与热路径纯读快速预检 |
 | `9689f22` | fix(kt): N6 方案A——init() 前奏等待与遗留销毁移出 @Synchronized, 消除锁内长等待 |
 | `7621993` | fix(kt): 纠正 init() 内部锁监视器分裂——以 synchronized(this) 替换局部函数 @Synchronized 确保与 close/setErrorHandler 精准互斥 |
+| `9b1af14` | docs: 记录 LogX.kt 状态机复杂度上限备忘与后续并发测试门禁规范 (B-2) |
 | `28acf7f` | feat(core): T5.5 超长日志截断保前缀——B-1 方案B 落地,超长不再整条丢弃(预算求解+marker+truncated_logs 计数,顺带修正 >60KB 误报 INVALID_ARG) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
@@ -1188,3 +1189,70 @@ E-02 测试仅覆盖 level 越界与小幅超限,该区间无断言故漏网。B
   `liblogx.so` 已同步至 `logx-tester` 与 `kotlin-gradle` jniLibs。
 - spec(`LogX日志库最终实施方案.md`)§3.1/§5 边界情况/§7 maxLogLength 语义同步修订;
   计划表升级 v1.12(T5.5 销号,B-1 拆分:方案B ✅ / 方案A 待决策)。
+
+---
+
+## R4 审查批次: 28acf7f/cf08e75 外部审查发现收口 (2026-09-13)
+
+> 审查报告(`code_review_2026-09-13.md`)6 项发现经逐条核实:5 项属实,1 项(P2 影响推断)
+> 不成立——报告称"截断返回 OK 被计入 writeOk、失真告警不触发、压测结论被 silently 判有效",
+> 实际 `LogXProbe` 的 ThreadLocal 同步事件捕获(J-04 契约保证调用方线程)会命中
+> `code == ERR_TOO_LARGE` → `R.TooLarge` → `dropTooLarge` 递增 → `isDistorted = true`,
+> **失真告警照样触发**。但同区域确有方向相反的真实问题:截断(有损写入成功)被误标为
+> `DROP: log too large`。R4-2 按"接线该做、理由修正"落实。
+
+### R4-1 (P1) `format_record_bounded` 出参 NULL 守卫
+`out_truncated`/`out_dropped` 入口与成功出口共 4 处赋值全部加空指针守卫,使
+`logx_internal.h` "可为 NULL" 契约为真;新增 `FormatBounded.NullOutParamsTolerated` 单测
+(截断/未截断/双 NULL/单 NULL 四态)。
+
+### R4-2 (P2) `truncated_logs` Android 接线 + 截断/丢弃语义分流
+- **JNI** (`logx_jni.cpp`): `nativeGetStats` 5→6 元素,追加 `truncated_logs`;
+  "与 logx_stats_t 非 reserved 字段一一对应"注释恢复为真。
+- **Kotlin** (`LogX.kt`): `Stats` 追加 `truncatedLogs` 字段(与 C 结构顺序一致),
+  `dropTooLarge` KDoc 修正为"病态小 maxLogLength 丢弃"语义;`getStats` 解包 `arr[5]`。
+- **LogXProbe**: 新增 `R.Truncated(nanos, msg)`;`ERR_TOO_LARGE` 下按 msg 前缀分流
+  (`"log truncated"` → Truncated / `"log too large"` → TooLarge,仅一词之差);
+  头注释中引用已删除旧代码路径(`total > inst->max_log_length → "log too large"`)的
+  段落改写为 B-1B 三路径现状。
+- **logx-tester**: `TesterMetrics` 加 `truncatedLogs`;`TesterViewModel` 新增 Truncated
+  分支(控制台 `TRUNCATE: log truncated (dropped N bytes)`,DROP 色标=有损语义);
+  `StressRunner` 截断计数并入失真判定(截断=有损,与 bench harness 口径一致),压测报告
+  失真行追加 `Truncated=N`;`MetricsPanel` native 快照区补 `truncatedLogs` 行并澄清
+  `truncatedBlocks` 标签;`Preset 8/9` 期望文案对账截断语义(">60KB 触发 INVALID /
+  返回 TOO_LARGE" → "返回 OK + 截断保前缀")。
+
+### R4-3 (P2) `logx_error_fn` msg 生命周期契约
+`logx_c.h` 回调 typedef 补注释:"msg 仅在回调执行期间有效,返回后即失效;实现混合使用
+字符串字面量与栈缓冲(T5.5 截断路径为栈上 char[64]),需留存必须自行拷贝"。现网唯一
+消费方 `jni_error_trampoline` 经 `make_jstring_utf16` 同步复制,安全。
+
+### R4-4 (P3) 内部符号收入匿名命名空间
+`kMarkerReserve` 与 `solve_truncated_msg_budget` 由 `namespace logx` 外部链接+无声明,
+重开匿名命名空间收编(与同文件 `tag_len_bounded` 风格一致),消除
+`-Wmissing-declarations` 类告警与 ODR 隐患。
+
+### R4-5 (P3) `max_total_bytes == 0` 虚设契约修正
+`logx_format.h` 注释改为实际语义:0 = 不施加 max_total 截断(与 format_record 等价);
+用户载荷 >60KB 硬上限时 `format_record` 无法格式化,返回 `kCannotFit`(不截断)。
+不改行为:该路径仅测试可达(`build_records` 恒传 ≥1)。
+
+### R4-6 (P3) CHANGELOG 提交表补 `9b1af14` 记录行
+`9b1af14`(B-2 冻结备忘)向 CHANGELOG 写入 19 行但未为自己建表格行,按 `d2ab63f`
+同款补齐模式补行,表格历史链接续。
+
+### R4-7 (观察项, 采纳一半) `trunc_buf` 缩至 60KB
+TLS 截断拼装缓冲 64KB → 60KB(证明:msg_len = prefix + marker ≤ budget ≤
+cap − (27+tag) ≤ 61440−27);附 thread_local 惰性提交说明(冷路径不触页,无常驻代价)。
+不采纳与 `scratch` 合并——需把 `format_record` 拆成装配/出片两半,热路径结构改动
+换 4KB 虚拟内存,收益不成立。
+
+### 验证
+- C++ 三构建矩阵:OFF/OFF **123/123**、ON/OFF **129/129**、ON/ON **142/142** 单测 +
+  压测 4/4 ×3 全绿(新增 NULL 出参用例);
+- Android arm64(NDK r29)交叉编译 0 错误,`liblogx.so` 同步双 jniLibs;
+- kotlin-gradle 离线 Gradle `:app:testDebugUnitTest` **BUILD SUCCESSFUL**(纯逻辑单测,
+  LogX.kt 新 Stats 字段编译通过);logx-tester `:app:assembleDebug --offline`
+  **BUILD SUCCESSFUL**(R4-2 全部 Kotlin/Compose 改动编译打包通过);
+- `gradle.properties` 固定 `org.gradle.java.home=JDK 17`(AGP 8.5.1 要求,消除
+  本机 JAVA_HOME=11 导致的构建阻断,Gradle 标准机器级配置)。

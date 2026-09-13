@@ -45,12 +45,14 @@ enum class FormatBoundedStatus {
 // 带截断预算的格式化:格式化后总长超 max_total_bytes 时,把 msg 截断为
 // "原始前缀 + ASCII marker(...[LogX truncated, dropped N bytes])"后重新落片,
 // 保证落环总长 ≤ max_total_bytes(含逐片 6B 头与片数重算)。
-//   - max_total_bytes = 0 表示不限制(此时与 format_record 等价,但仍受 60KB
-//     用户载荷硬上限约束,超限同样按截断处理);
+//   - max_total_bytes = 0 表示不施加 max_total 截断(与 format_record 等价);
+//     但用户载荷 >60KB 硬上限时 format_record 无法格式化,此时返回 kCannotFit
+//     (不截断)——调用方按丢弃兜底处理;
 //   - 预算不足以容纳 marker 时退化为纯前缀截断(不加 marker);
 //   - 预算连"空 msg 记录"都放不下时返回 kCannotFit;
 //   - 热路径零额外成本:先原样 format_record,仅超限时才进入截断分支。
-// out_truncated = 是否发生截断;out_dropped = 截断丢弃的 msg 字节数(不含 marker 占用)。
+// out_truncated = 是否发生截断;out_dropped = 截断丢弃的 msg 字节数(不含 marker 占用);
+// 两者均可为 NULL(忽略对应输出)。
 FormatBoundedStatus format_record_bounded(
     uint8_t level, const char* tag,
     const uint8_t* payload, uint32_t payload_len,

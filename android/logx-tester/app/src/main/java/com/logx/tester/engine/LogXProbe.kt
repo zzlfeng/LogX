@@ -26,10 +26,16 @@ import java.util.concurrent.atomic.AtomicLong
  * 【问题 P2 解决方案 · 强类型错误码映射】:
  * 现已打通 C++ 内核 (logx_c.cpp) 真实错误码透传链路：
  *   - `br == kBuildRecordsInvalidInput` -> `emit_event(inst, LOGX_EV_DROP, LOGX_ERR_INVALID_ARG, "invalid log input")`
- *   - `total > inst->max_log_length`    -> `emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, "log too large")`
+ *   - 超长(> max_log_length 或 >60KB 用户载荷硬上限, B-1B/T5.5) -> 截断保留前缀后
+ *     照常落环并返回 LOGX_OK, 同步事件 `LOGX_EV_DROP / LOGX_ERR_TOO_LARGE`
+ *     ("log truncated (dropped N bytes)") —— 有损写入, 非丢弃
+ *   - 病态小 max_log_length(kBuildRecordsCannotFit) -> 整条丢弃, 同步事件
+ *     `LOGX_EV_DROP / LOGX_ERR_TOO_LARGE` ("log too large")
  *   - `st == Staging::WriteStatus::kFull`-> `emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full")`
  * 上层优先根据 `c.code`（LogX.ERR_NO_SPACE / ERR_TOO_LARGE / ERR_INVALID_ARG）进行严格匹配，
  * 彻底消除了对错误消息文案的脆弱依赖；同时保留文案匹配以向后兼容。
+ * 注意 ERR_TOO_LARGE 下须按 msg 前缀分流: "log truncated" = 截断([R.Truncated]),
+ * "log too large" = 病态丢弃([R.TooLarge]), 二者仅一词之差。
  */
 object LogXProbe {
     data class EventRow(val kind: LogX.EventKind, val code: Int, val msg: String)
@@ -41,6 +47,8 @@ object LogXProbe {
         data class Ok(override val nanos: Long) : R
         data class NoSpace(override val nanos: Long) : R
         data class TooLarge(override val nanos: Long) : R
+        /** 超长截断保前缀(B-1B/T5.5): 有损写入成功, 记录已落盘; [msg] 含丢弃字节数 */
+        data class Truncated(override val nanos: Long, val msg: String) : R
         data class Invalid(override val nanos: Long) : R
         data class OtherDrop(override val nanos: Long, val msg: String) : R
     }
@@ -96,7 +104,10 @@ object LogXProbe {
         return when {
             !c.hit                             -> R.Ok(dt)
             c.code == LogX.ERR_NO_SPACE        -> R.NoSpace(dt)
-            c.code == LogX.ERR_TOO_LARGE       -> R.TooLarge(dt)
+            // R4-2: 截断与病态丢弃同码(ERR_TOO_LARGE), 按 msg 前缀分流
+            c.code == LogX.ERR_TOO_LARGE       ->
+                if (c.msg.startsWith("log truncated")) R.Truncated(dt, c.msg)
+                else R.TooLarge(dt)
             // 兜底处理: code == -1 既对应真实 ERR_INVALID_ARG，也可能是旧 Native 库写死的兜底值
             c.code == LogX.ERR_INVALID_ARG || c.code == -1 -> when {
                 c.msg.contains("staging full")     -> R.NoSpace(dt)
