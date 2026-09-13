@@ -177,4 +177,10 @@ zstd 为 vendor 全量 24 个 .c 文件,未做源码级裁剪。如需严格 <50
 2. **计时器开销未扣除**:真机每条样本含 ~0.4µs 计时器自身成本(2×200ns),已在 §4.2 单列。
 3. **吞吐为"可持续不丢"口径**:混合负载持续灌满 staging 时以有界重试背压,与压测套件的突发注入口径不同。
 4. **spec §9 提及但不在 T5.2 验收内的项未覆盖**:CPU 占用率、JNI 路径 GC 监控(计划表 T5.2 三项验收不含;keyProvider 泄漏已由 v1.7 真机专项覆盖)。如需可作后续可选增补。
+   **2026-09-13 更新**:其中「内存占用 / 延迟抖动 / 热路径零堆分配 / fd-内存泄漏」四项已由 **T5.2 补测批次**(提交 `e67be46`)补齐,详见下条 6;剩余未覆盖项收敛为 **CPU 占用率** 与 **JNI 路径 GC 监控**两项。
 5. **单次采样**:报告数据为单次运行结果;多轮复测中位波动约 ±10%(调度/温度),回归判定时建议取 3 轮中位。
+6. **抖动维度与四项观测门禁已补齐(2026-09-13,T5.2 补测批次)**:
+   - `logx_bench` 的延迟输出(`print_ns_dist`,阶段 A/C 共用)已新增 **stddev / CV / median / MAD / robustCV** 与长尾比(P99/P50、max/P50)。方法学:`classical CV` 会被个别调度抢占样本支配,**robustCV = MAD/P50** 对长尾离群点不敏感,故判"抖动是否病态"应以 robustCV 为准。
+   - 新增单测 `tests/unit/test_observability.cpp`(内存 RSS/PSS 稳态增量有界、抖动 robustCV<5.0 界、CountingPal create/destroy 净 0 泄漏回归)与独立目标 `logx_hotpath_alloc_tests`(常规路径 + 截断路径零堆分配断言)。
+   - **本机参考实测**(Windows / MSVC 14.43 / Release / ZSTD=ON + AESGCM=ON;样本 = 20,000 条 `logx_write`,payload 200B,每 256 条打断 flush):`mean 787~1189ns`、**robustCV 0.125~0.25**、经典 CV 2.5~6.3、`median 400~800ns`、`P99/P50 ≈ 10~17x`、`max 172~358µs`;40,000 条稳态负载后 **ΔRSS = 4096B**;资源 create/destroy 净 0;常规/截断路径堆分配 **0 次 / 0B**。
+   - ⚠️ **§7 基线表尚未随之更新**:上表中的延迟/体积数字沿用既有复跑结果,本批次**未重跑 `logx_bench`**(构建 `logx_bench` 所需的目标在 `build-bench`(VS 生成器),其驱动命令受本机安全策略限制)。**抖动项(robustCV/CV/MAD 与长尾比)的桌面与真机官方基线待下一轮 `logx_bench` 复跑后补入**;上方数字来自单测,口径与 bench 阶段 A 同型但样本量更小,仅供参考。

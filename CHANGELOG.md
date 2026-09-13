@@ -46,6 +46,7 @@
 | `7b2ead6` | refactor(core): R9 收口——PAD 循环裸 6 补齐 + 6B/16KB 常量族全量单源化(复审 1×P3/观察/Nit 属实 + 2 项自查含 60f2365 行补记) |
 | `85f0b31` | refactor(core): R10 收口——recovery.cpp 裸 6 补齐 + 全仓模式穷尽扫描纠偏(复审 3 项属实;Backlog 新增 B-4 平行实现收敛) |
 | `0dc4ebe` | docs(core): R11 收口——注释层裸 6 同步 + 穷尽扫描门禁固化(复审 1×Nit 属实;7 处含同块未列项) |
+| `e67be46` | test(core): 补齐资源占用(RSS/PSS)/延迟抖动(stddev/CV)/热路径零分配/CountingPal 泄漏回归四类用例(收口 §8.4 已知局限 + spec §349 未落实条款;新增独立目标 logx_hotpath_alloc_tests) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -1585,3 +1586,73 @@ stats 数组长度、UTF-8 位运算。
 ### 验证
 三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;Android arm64
 交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。
+
+---
+
+## T5.2 补测批次: 资源占用/延迟抖动/零分配/泄漏回归 (2026-09-13)
+
+> 立项依据:`docs/benchmark_report.md` §8.4 自认"spec §9 提及但不在 T5.2 验收内的项未覆盖:
+> CPU 占用率、JNI 路径 GC 监控";`docs/LogX日志库最终实施方案.md` §349 把"50 线程压测
+> **无 fd/内存泄漏**"列为验收条款 —— 而既有自动化(9,206 行测试代码 / 约 170 用例)中
+> **零内存度量、零抖动量化、零分配计数、零泄漏判定**,属"条款存在、门禁缺失"。本批次
+> 把这些**设计声明与验收条款**变成可回归契约,不改变任何生产代码行为。
+
+### 新增用例
+
+| 文件 / 用例 | 固化契约 | 判定条件 |
+|---|---|---|
+| `test_observability.cpp`<br>`Observability.MemoryRssPss_BoundedGrowthAcrossWriteCycles` | 稳态循环后 RSS/PSS 增量有界 | 预热+稳定期取基线 → 40k 条负载后复测,**Δ < 16MB** |
+| 同上<br>`Observability.LatencyJitter_StddevCvWithinSanityBound` | 热路径写入延迟抖动合理 | 输出 stddev/CV/median/MAD/robustCV + 长尾比;**robustCV < 5.0**、CV < 50.0、P99/P50 < 100x |
+| 同上<br>`LeakRegression.CountingPal_NoResourceLeakAcrossOpenCloseCycles` | Pal 层资源 create/destroy 净 0 | 6 轮 open→写→flush→close 后 fd/mmap/mutex/ev/thread **各自净 0**;含反假通过断言 + OS 级 fd 数交叉验证 |
+| `test_hotpath_alloc.cpp`(独立目标 `logx_hotpath_alloc_tests`)<br>`HotPathAlloc.LogxWrite_ZeroHeapAllocationOnCallerThread` | 常规写入热路径零堆分配 | 调用线程 400 条 → **0 次 / 0B** |
+| 同上<br>`HotPathAlloc.TruncatedPath_ZeroHeapAllocationOnCallerThread` | 截断路径(T5.5/T5.6 新增分支)零堆分配 | 调用线程 100 条 → **0 次 / 0B** |
+
+### 实测数据(Windows / MSVC 14.43 / Release / ZSTD=ON + AESGCM=ON)
+
+| 维度 | 实测 |
+|---|---|
+| 内存 | RSS `11747328 → 11751424` B(**Δ = 4096B**,基本持平);Windows 无 PSS 概念 → 该子项降级"仅报告不判定" |
+| 抖动 | mean 787~1189ns;**经典 CV 2.5~6.3**(被极少数 OS 抢占样本放大,max 172~358µs) vs **robustCV 0.125~0.25**;P99/P50 ≈ 10~17x |
+| 泄漏 | fd 12/12、mmap 6/6、mutex 6/6、ev 6/6、thread 6/6 —— **净 0** |
+| 零分配 | 常规路径 **0 次 / 0B**;截断路径 **0 次 / 0B** |
+
+抖动一行印证判据取舍:单次调度抢占足以把经典 CV 抬到 6.3,而 MAD 口径稳在 0.25 ——
+故**断言只用 robustCV**,经典 CV 仅作灾难性护栏(直接断言经典 CV 必然 flaky)。
+
+### 关键实现要点
+
+1. **零分配探针用 `thread_local` 计数**(非全局):口径 = "仅当前调用线程",天然隔离 Flusher
+   后台线程的压缩/路径拼接分配;thread_local POD 常量初始化自身零分配。未启用计数时
+   透传 `malloc/free`,行为与默认分配器等价。
+2. **必须设"仪器自检"**:先故意 `new char[64]` 并断言被捕获(用 `volatile` 汇指针阻断
+   allocator elision),否则替换一旦失效,"零分配"断言将退化为永真;窗口内另断言写入返回
+   `LOGX_OK`(截断用例还断言 `truncated_logs` 按预期增长),证明热路径真被执行。
+3. **零分配探针独立成可执行目标**:避免替换全局分配器改变 `logx_unit_tests` 其余用例的运行环境。
+4. **内存用例取"稳态增量"**:预热+稳定期后取基线再测增量,对一次性增长(TLS/线程栈/分配器
+   arena)天然免疫,只捕捉逐轮泄漏。
+5. **陷阱记录(易错)**:`logx_config_t{}` 零初始化的 `flush_threshold = 0`,语义是"**禁用**
+   按阈值自动唤醒"(E-06),**不是**"取默认 8KB";长循环不加节拍会填满 127KB 环
+   (`kDataSizeDefault = 128KB − 128`)触发 `LOGX_ERR_NO_SPACE`。用例已显式置 `UINT32_MAX`
+   并配合 256 条/次显式 flush。
+
+### `logx_bench.cpp` 抖动维度扩展
+`print_ns_dist` 增 stddev / CV / median / MAD / robustCV 与长尾比(P99/P50、max/P50),
+文件头方法论同步(分位数刻画长尾量级、离散度刻画稳定性,二者互补)。
+
+### 发现既有失败(非本批次引入,已立 Backlog B-5)
+`Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing`(`test_robustness.cpp:1785`)本机失败:
+对**非空目录** `file_rmdir` 返回 `0`(期望 -1)、errno 未置 `ENOTEMPTY`(为 0)、随后
+`file_unlink(occupied.bin)` 返回 `-1`(文件找不到)。**归因证据**:用 `cl.exe` 手工链接一个
+**仅含 `test_robustness.cpp` + `logx_core.lib`、零本次改动**的探针 exe,复现同一失败 →
+确认为既有缺陷(Windows PAL 的 `RemoveDirectoryA/DeleteFileA` 与该用例的 POSIX errno
+期望不符),与本次改动无关。详见计划表 Backlog **B-5**。
+
+### 验证
+本机 **Windows / MSVC 14.43 / Release / ZSTD=ON + AESGCM=ON**(即 142 基线的全开矩阵)实跑:
+`logx_hotpath_alloc_tests` **2/2 通过**;`logx_unit_tests` **145 项 144 通过**
+(142 既有 + 3 新增;唯一失败即上述既有项,已证明与本批次无关)。
+
+**本批次未覆盖/未复跑**:① 另两个构建矩阵(OFF/OFF、ZSTD=ON + AESGCM=OFF)、压测 4/4、
+Android arm64 交叉编译;② 新增用例的 **Linux/Android 平台分支**(`/proc/self/statm` RSS、
+`smaps_rollup` PSS、OS 级 fd 计数)本机为 Windows 故**既未编译也未运行**,需在真机/交叉
+矩阵复跑时一并确认。

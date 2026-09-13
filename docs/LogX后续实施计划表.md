@@ -1,6 +1,13 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.21 (2026-09-13 R11 批次:R10 复审收口——注释层裸 6 同步+穷尽扫描门禁固化;T5.3 用户指示暂停)  
+> **文档版本**: v1.22 (2026-09-13 T5.2 补测批次:资源占用/抖动/零分配/泄漏回归四类用例,收口 §8.4 局限与 spec §349 条款;T5.3 用户指示暂停)  
+>
+> **v1.22 修订说明**: 2026-09-13 **T5.2 补测批次**(提交 `e67be46`,**非审查批次**;收口 `benchmark_report.md` §8.4 已知局限 + spec §349 未落实条款): 既有自动化(约 170 用例 / 9,206 行测试代码)对"**内存占用、延迟抖动、热路径零堆分配、fd/内存泄漏**"四项**零覆盖**——§8.4 自认未覆盖 CPU 占用率与 JNI 路径 GC 监控,spec §349「50 线程压测无 fd/内存泄漏」条款在自动化中**无任何 fd/内存计数断言**(压测仅有数据完整性断言),属"条款存在、门禁缺失"。**本批次把设计声明与验收条款变成可回归契约,零生产代码改动**:
+> ① 新增 `tests/unit/test_observability.cpp`——`MemoryRssPss_BoundedGrowthAcrossWriteCycles`(预热+稳定期取基线,40k 条后 RSS/PSS 稳态增量 < 16MB;Linux/Android 走 `/proc/self/statm` + `smaps_rollup`,Windows 走 psapi,缺失平台降级"仅报告不判定")、`LatencyJitter_StddevCvWithinSanityBound`(输出 stddev/CV/median/MAD/robustCV 与长尾比;因**经典 CV 对单次 OS 抢占极敏感**,断言以 **robustCV<5.0** 为准、CV<50.0 仅作灾难护栏)、`LeakRegression.CountingPal_NoResourceLeakAcrossOpenCloseCycles`(CountingPal 包装 `default_pal()`,仅在真实成功时计数 fd/mmap/mutex/ev/thread 的 create/destroy,6 轮 open→写→flush→close 后断言**各自净 0**;含"计数链路确实被走到"反假通过断言与 OS 级 fd 数交叉验证);
+> ② 新增 `tests/unit/test_hotpath_alloc.cpp`(**独立目标** `logx_hotpath_alloc_tests`,避免替换分配器影响既有 142 用例)——替换全局 `operator new/new[]` 及其 delete,以 **thread_local** 计数(口径=仅当前线程,天然隔离 Flusher 后台线程分配),**含仪器自检**(故意 `new char[64]` 并断言被捕获,`volatile` 汇指针阻断 allocator elision,否则"零分配"断言会退化为永真),常规路径(400 条)与**截断路径**(100 条,T5.5/T5.6 新增分支)窗口内均断言 **0 次/0B**;
+> ③ `tests/bench/logx_bench.cpp` 的 `print_ns_dist` 增 stddev/CV/median/MAD/robustCV 与长尾比(P99/P50、max/P50),文件头方法论同步(分位数刻画长尾量级、离散度刻画稳定性,二者互补);
+> ④ `tests/unit/CMakeLists.txt` 接入新文件、WIN32 链 `psapi`、新增并 ctest 注册 `logx_hotpath_alloc_tests`。
+> **本机实测**(Windows / MSVC 14.43 / Release / ZSTD=ON + AESGCM=ON,即 142 基线全开矩阵):RSS `11747328→11751424` B(**Δ=4096B**);**robustCV 0.125~0.25**(经典 CV 2.5~6.3,被极少数抢占放大);资源 fd/mmap/mutex/ev/thread **净 0**;零分配 **0 次/0B**(常规+截断);`logx_hotpath_alloc_tests` **2/2**、`logx_unit_tests` **145 项 144 通过**(142 既有 + 3 新增)。**§5 验收清单**新增四项门禁;**Backlog 新增 B-5**(既有失败 `Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing`,已用"仅含 test_robustness.cpp + logx_core"的零改动独立探针 exe 证明与本批次无关)。**未复跑**:另两个构建矩阵(OFF/OFF、ZSTD=ON+AESGCM=OFF)、压测 4/4、Android arm64 交叉编译;新增用例的 Linux/Android 平台分支本机**既未编译也未运行**,需真机/交叉矩阵复跑确认。
 >
 > **v1.21 修订说明**: 2026-09-13 **R11 批次**(对象 `code_review_R10_2026-09-13.md` §4,审查 85f0b31/3605829): 唯一发现 1×Nit **属实**——6 处核心注释仍以裸 `6` 表达记录头语义(flusher.cpp:310 范围下界、staging.cpp:315/329 PAD 块内、format.cpp:201/205 求解器注释、logx_format.h:69 format_pad 契约),其中 2 处位于刚统一的块内;R10-2 既立"注释随实现同步"先例则应执行完整,7 处(含同块复审未列的 format.cpp:203 `− 6s`,同一模式一并)同步 `kHeaderLen`;编号列表项 "6."/spec §6 章节引用/"6B" 人类单位表述/字段偏移/错误码/数组长度/位运算按既定判据豁免。**流程固化(复审 §六建议采纳)**——"按模式穷尽扫描"固化为每批次收口门禁,清单一并覆盖注释层,判据:记录头语义裸 `6`(不带 B 单位)在代码与注释中零残留。复审对 R10-1/R10-2/R10-3 落实、"零残留"代码层独立复核成立、decoder/tests 保留前提、提交表行存在性的确认无异议(§4.2 两疑点复审自证不成立)。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。
 >
@@ -165,6 +172,7 @@ gantt
 - [x] ✅ **崩溃注入与 50 轮随机阶段崩溃循环自愈压测**: Staging 未落盘强杀 100% 挽回，磁盘撕裂尾块安全截断，50 轮多阶段随机崩溃循环 397/397 日志 100% 复原（T4.5 实测通过）。
 - [x] ✅ **未对齐访问与时钟跳变仿真**: 奇数内存地址读写整型与编解码零 SIGBUS；23:59:59 跨日平滑归档轮转与时钟回拨接管验证通过（T4.5 实测通过）。
 - [x] ✅ **性能基线报告已输出** (2026-09-08,T5.2):单条日志写入实测桌面 P50 0.2µs(纯路径口径,确定性热路径段达成 2µs 量级目标;整调用口径 P99 3.1µs 未达,归因计时器开销与调度尾部,见 [benchmark_report.md](./benchmark_report.md) §4);zstd 体积 -38% / so 体积 548.9KB(strip,MinSizeRel)等全部实测数据与回归基线声明已归档。
+- [x] ✅ **资源占用与抖动量化 + 零分配 + 泄漏回归四类观测门禁** (2026-09-13,T5.2 补测批次,提交 `e67be46`):① **内存占用**——RSS/PSS 稳态增量有界(预热+稳定期取基线,40k 条后实测 **ΔRSS=4096B** < 16MB 阈值;Windows 走 psapi,Linux/Android 走 `/proc/self/statm` + `smaps_rollup`,缺失平台降级"仅报告不判定");② **延迟抖动量化**——输出 stddev/CV/median/MAD/robustCV 与长尾比(P99/P50、max/P50),断言以 **robustCV<5.0** 为准(实测 robustCV 0.125~0.25 vs 经典 CV 2.5~6.3;经典 CV 对单次 OS 抢占极敏感,仅作灾难护栏);③ **热路径零堆分配由"设计声明"升级为可执行守护**——替换全局 `operator new` + thread_local 计数 + 仪器自检(防替换失效致断言永真),常规路径与截断路径窗口内均实测 **0 次/0B**;④ **spec §349「50 线程压测无 fd/内存泄漏」条款落地为可回归断言**——CountingPal 统计 fd/mmap/mutex/ev/thread 的 create/destroy 配对,6 轮 open→写→flush→close 后**净 0**,并以 OS 级 fd 数独立交叉验证。新增 `tests/unit/test_observability.cpp` 与独立目标 `logx_hotpath_alloc_tests`(2/2)、`logx_unit_tests` 145 项 144 通过。**已知遗留**:`Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing` 既有失败(见 Backlog B-5),已证明与本批次无关。
 
 ---
 
@@ -226,3 +234,21 @@ gantt
   - **A. 收敛共享原语**: 将"记录长度探测 / 按记录边界步进扫描"收敛为共享实现(候选位置 `logx_format.cpp` 或独立 `record_scan.cpp`),flusher/recovery 以参数差异化(magic 校验开关、终止符/校验回调等);波及写/恢复两条关键路径,需等价性论证 + 全量回归。
   - **B. 维持平行实现**: 接受重复,以"裸 `6`(记录头语义)模式穷尽扫描"作为批次收口流程门禁(R10 已执行一次)防再漂移;零回归风险。
 - **决策点**: 等价性论证成本 vs 长期漂移风险;两处语义差异(magic 校验时机/终止符语义)能否无损参数化;若选 A,可顺势把记录头布局断言扩展到扫描原语。
+
+### B-5 Windows PAL 目录/文件删除 errno 语义与单测期望不符(既有失败)
+
+- **记录日期**: 2026-09-13
+- **状态**: ⏸ 待决策(**既有缺陷**,非 T5.2 补测批次引入;由补测批次跑全量矩阵时暴露)
+- **现象**: 用例 `Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing`(`tests/unit/test_robustness.cpp:1785`)在 Windows/MSVC 下**稳定失败**(单跑亦失败),四处断言与实测:
+  1. 对**非空目录** `file_rmdir(dir2)` 返回 **0**(期望 -1);
+  2. 随之 `errno` 为 **0**(期望 `ENOTEMPTY` = 41);
+  3. 随后 `file_unlink(dir2/occupied.bin)` 返回 **-1**(期望 0,该文件应存在);
+  4. 最后 `file_rmdir(dir2)` 返回 **-1**(期望 0,该目录应仍在)。
+  自洽解释是该序列中 `dir2` 与其中新建的 `occupied.bin` 在 rmdir 之前即已不生效/不可见 —— 即 Windows 分支 `file_mkdirs` → `file_open(OPEN_ALWAYS)` → `file_write` → `file_close` → `file_rmdir` 的组合行为与用例假设不符(`file_open` 返回 fd ≥ 0 且 `file_write` 返回 1,故非"创建失败"这样简单)。细节待方案 A 实测定位。
+- **归因证据(已排除"本次改动引入")**: 用 `cl.exe` 手工链接一个**仅含 `test_robustness.cpp` + `logx_core.lib`、不含任何本次改动文件**的探针 exe(自带 3 行 gtest main,`/MD /utf-8`),单跑该用例**复现同一失败** → 确认为既有缺陷。该手法可复用于今后一切"失败是否本次引入"的判别。
+- **影响**: 本机全开矩阵 `logx_unit_tests` 为 **145 项 144 通过**(唯一失败即此项)。该用例本身为平台语义用例(注释明示"Windows 转译 `ERROR_DIR_NOT_EMPTY` → `ENOTEMPTY`"),故不影响 Android/Linux 路径;但**"Windows 桌面单测全绿"这一基线声称在本机不成立**,后续引用该基线时须扣除。
+- **候选方案**:
+  - **A. 修 PAL**: 复核 `core/src/pal_win32.cpp` 中 `file_open`(`CreateFileA` + `_open_osfhandle`)、`file_unlink`/`file_rmdir`(`DeleteFileA`/`RemoveDirectoryA` + `translate_win32`)在"相对路径 → 目录内新建文件 → 立即删除"序列下的实际行为与各调用点 `GetLastError`,据实修正实现或 errno 映射。
+  - **B. 修用例**: 若确属 Windows 语义差异(非实现缺陷),把用例的 Windows 期望改为平台分支,并在注释中显式记录差异与依据。
+  - **C. 暂缓**: 接受该项在 Windows 桌面矩阵长期红,仅在报告/CHANGELOG 中标注。
+- **决策点**: 先判定"实现缺陷 vs 用例表述缺陷"(方案 A 的实测定位);若涉及 `translate_win32` 的 errno 契约,需同步 `logx_pal.h` 的接口文档。
