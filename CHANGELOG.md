@@ -40,7 +40,7 @@
 | `3278844` | fix(core,android): R5 复审批次收口——R4 外部复审 6 项发现闭环(6实0误;java.home 迁出仓库/真四态单测/文案限定/元数据去重/口径精确化/getStats 守卫/marker 常量化+static_assert) |
 | `f3b64c8` | feat(core,android): T5.6 事件种类扩展——截断独立事件 LOGX_EV_TRUNCATED(B-3 方案B;Kotlin EventKind/LogXProbe kind 分类/tester 接线/测试同步) |
 | `de00d84` | fix(core): R6 收口——static_assert 下界修正(61346→61410,R5-7 引入的偏松 64B)+ T5.6 迁移提示补记 |
-| `<R7>` | fix(core): R7 收口——常量绑定权威定义处/CHANGELOG R5-7 勘误/kMaxSlicePayload 遮蔽清理/kHardUserTotal 重复删除(复审 3 项属实+1 自纠) |
+| `9c84c5d` | fix(core): R7 收口——常量绑定权威定义处/CHANGELOG R5-7 勘误/kMaxSlicePayload 遮蔽清理/kHardUserTotal 重复删除(复审 3 项属实+1 自纠) |
 | `28acf7f` | feat(core): T5.5 超长日志截断保前缀——B-1 方案B 落地,超长不再整条丢弃(预算求解+marker+truncated_logs 计数,顺带修正 >60KB 误报 INVALID_ARG) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
