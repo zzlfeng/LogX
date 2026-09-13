@@ -1708,3 +1708,41 @@ Linux/Android 分支未编译未运行):双方共同局限,待真机/CI 复跑�
 ### 验证
 三构建矩阵 **126/126 + 132/132 + 145/145** 单测 + hotpath **2/2 ×3** + ctest **4/4** +
 压测 **4/4 ×3** 全绿;Android arm64 无待办(core 未变);`logx_bench` 编译通过。
+
+---
+
+## 补记: 安卓真机验证——F5 Android 分支闭环 (2026-09-13)
+
+> 用户指示在当前连接设备上实跑全量测试用例。设备 **Redmi Note 2**(hermes,
+> Android 5.0.2 / **API 21**,arm64-v8a)——比历史真机(Redmi K30 Pro)老得多,
+> 恰好构成对老版本 Android 兼容性的实证。纯验证运行,零代码改动。
+
+### 构建方式
+新增本地 `build-android-tests` 目录(不入库):NDK r26.1 + `ANDROID_PLATFORM=android-21`
+(降低编译平台以启用全部 bionic 符号版本防护,保证 API 21 可加载)、ZSTD + AES-GCM
+全开(等同桌面全开矩阵口径)、GTest 1.14 FetchContent 交叉编译,产物静态自包含。
+二进制留存设备 `/data/local/tmp/logx_tests/` 供复用;测试临时目录已清理。
+
+### 实跑结果(全绿)
+
+| 套件 | 设备 | 桌面对照 |
+|---|---|---|
+| `logx_unit_tests` | **146/146** | 145/145 |
+| `logx_hotpath_alloc_tests` | **2/2** | 2/2 |
+| `logx_stress_tests` | **4/4** | 4/4 |
+| `logx_crash_fork_tests` | **3/3** | 3/3 |
+
+多出的 1 项为 `ArmCe_HardwarePathOnDevice`(C-04 的 ARMv8 Crypto Extensions
+**设备专属用例**,桌面 x86 无此分支)——通过。
+
+### F5 Android 分支闭环(T5.2 观测用例首次真机编译+运行)
+- 内存: 40k 条稳态负载后 **ΔRSS = 16KB / ΔPSS = 0**(无泄漏);
+- 泄漏: Pal 层 create/destroy 全部净 0(fd 12/12、mmap/mutex/ev/thread 各 6/6),
+  OS 级 fd 数交叉验证 **17 → 17**;
+- 零分配: 常规 400 条与截断 100 条窗口 **0 次 / 0B**;
+- 抖动: 中位 8.7µs(2015 年 SoC,慢于桌面属预期)、**robustCV = 0.026**(界 5.0)、
+  CV 0.914(护栏 50)、P99/P50 = 6.98x(界 100)。
+
+### 局限更新
+F5 仅余 **Linux 桌面分支**未编译未运行(本机无 Linux 环境,待 Linux/CI);计划表
+R12 行 F5 表述已同步(v1.24)。
