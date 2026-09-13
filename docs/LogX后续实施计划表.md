@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.14 (2026-09-13 R5 复审批次:R4 外部复审 6 项发现闭环(6 实 0 误);T5.3 用户指示暂停)  
+> **文档版本**: v1.15 (2026-09-13 T5.6 落地:Backlog B-3 经用户拍板选方案B,截断独立事件种类 LOGX_EV_TRUNCATED;T5.3 用户指示暂停)  
+>
+> **v1.15 修订说明**: 2026-09-13 **T5.6 事件种类扩展(B-3 方案B,用户拍板)**: `logx_event_kind_e` 追加 `LOGX_EV_TRUNCATED = 5`,截断路径事件由 `DROP/TOO_LARGE` 改为 `TRUNCATED/LOGX_OK`(kind 承载"有损写入成功"语义,返回值仍为 `LOGX_OK`),消除 R5-3 记录的文案耦合;病态丢弃独占 `DROP/TOO_LARGE`。波及:Kotlin `EventKind.TRUNCATED` + `onNativeError` kindInt=5 映射;LogXProbe 按 kind 分类(Capture 增 kind 字段,`eventTruncatedCount` 独立计数),tester `Metrics.eventTruncated`/控制台/MetricsPanel 接线;C++ 三处测试断言与纯逻辑映射单测同步。枚举追加 ABI 安全(按值传递)。三矩阵 123/129/142 + 压测 4/4×3 全绿;kotlin-gradle/logx-tester 构建通过。
 >
 > **v1.14 修订说明**: 2026-09-13 **R5 复审批次**(对象 `code_review_R4_2026-09-13.md`,审查 516d091/5828b3f): 6 项新发现**全部属实**(上一轮 5 项闭环结论与"1 误"证伪亦经复审确认)。收口:R5-1 `org.gradle.java.home` 机器路径迁出仓库至用户级 `~/.gradle/gradle.properties`(异构机器/CI 可移植性);R5-2 截断出参单测改真四态(补 `(&t,nullptr)`/`(nullptr,&d)` 混用态);R5-3 LogXProbe 头注释"彻底消除文案依赖"改限定表述(ERR_TOO_LARGE 共码分流为已知文本耦合);R5-4 计划表头部元数据三元组去重;R5-5 60KB 硬上限口径精确化(user_total = 27B 头 + tag + payload,长 tag 提前触限);R5-6 `getStats()` 长度守卫(旧 .so + 新 Kotlin 版本错配优雅降级 null);R5-7 marker 常量化 `kMarkerHead/kMarkerTail` + 两条 `static_assert` 固化截断缓冲安全前提 + "绰绰有余"改精确余量表述。**Backlog 新增 B-3**(截断/病态丢弃共用 ERR_TOO_LARGE 事件码的文案耦合,候选独立错误码,待决策)。三矩阵 123/129/142 + 压测 4/4×3 全绿;kotlin-gradle 与 logx-tester 构建通过。
 > **制定日期**: 2026-09-02  
@@ -92,6 +94,7 @@ gantt
 | **T5.5** | 超长日志截断保前缀(Backlog B-1 方案B,用户拍板) | `core/src/format.cpp`, `core/include/logx_format.h`, `core/src/flusher.cpp`, `core/src/logx_c.cpp`, `core/include/logx_c.h`, `core/include/logx_internal.h` | **P2** | **✅ 100% 已完成 (2026-09-13)** | 1. **语义变更**: 超长日志(格式化后 > `max_log_length`,或 >60KB 用户载荷硬上限——后者顺带修正原误报 `INVALID_ARG` 的误分类缺陷)由"整条丢弃 + `LOGX_ERR_TOO_LARGE`"改为**截断保留 msg 前缀**后照常落环,返回 `LOGX_OK`;<br>2. **预算求解**(`solve_truncated_msg_budget`): 对片数 s 取 `cap(s)=min(20480·s, max_total−6s, 60KB)` 扫描取最优,b = cap − (27+tag);截断 msg = 原始前缀 + ASCII marker(`...[LogX truncated, dropped N bytes]`,预留 48B);预算 <48B 弃 marker 保前缀;落环总长恒 ≤ 上限;<br>3. **新增 `format_record_bounded`**(`format.cpp/format.h`): 热路径仍恰好一次 `format_record`(先原样格式化,仅超限进截断分支);独立 thread_local 拼装缓冲不复用 scratch;`build_records` 返回协议追加 `kBuildRecordsCannotFit`;<br>4. **计数与事件 ABI 兼容**: `logx_stats_t.reserved[0]` → `truncated_logs`(E-07 认可占位,sizeof 不变);事件复用 `LOGX_EV_DROP`/`LOGX_ERR_TOO_LARGE`、msg 改 "log truncated (dropped N bytes)",调用方线程锁外同步发(P1-1/J-04 契约不变);`drop_too_large` 仅病态丢弃路径递增;<br>5. **不新增配置开关**(`logx_config_t` 无 reserved 位,截断 always-on);Kotlin/JNI/Python 解码器零改动;<br>6. **测试**: 改写 E-02/`ErrorMonitoring`/J-04 三处旧丢弃断言,新增 `FormatBounded` 7 项(前缀字节级一致/marker/纯前缀边界/kCannotFit/非法输入/预算扫描 64KB 跨片重组)+ J-04 截断孪生用例;三构建矩阵 122/128/141 单测 + 4/4 压测全绿,Android arm64 交叉编译 0 错误;<br>7. spec §3.1/§5 边界情况/§7 maxLogLength 语义同步修订。 |
 | **R4** | T5.5 外部审查批次收口(`code_review_2026-09-13.md`) | `core/src/format.cpp`, `core/include/logx_format.h`, `core/include/logx_c.h`, `android/cpp/logx_jni.cpp`, `android/kotlin/LogX.kt`, `android/logx-tester/*` | **P2** | **✅ 100% 已完成 (2026-09-13)** | 6 项发现 5 实 1 误(P2 影响推断经 LogXProbe 同步事件捕获机制证伪,修正理由后仍接线):**R4-1** 出参 NULL 守卫 + 四态单测;**R4-2** `truncated_logs` Android 全链路接线(JNI 6 元素、Kotlin `Stats.truncatedLogs`、`R.Truncated` 按 msg 前缀与病态丢弃分流、tester 截断单列指标并入失真判定、Preset 8/9 与 MetricsPanel 对账);**R4-3** `logx_error_fn` msg 生命周期契约(栈缓冲/字面量混合,留存须拷贝);**R4-4** `kMarkerReserve`/`solve_truncated_msg_budget` 收入匿名命名空间;**R4-5** `max_total_bytes==0` 契约注释改实际语义(60KB 超限 → kCannotFit 不截断);**R4-6** CHANGELOG 补 `9b1af14` 行;**R4-7** `trunc_buf` 64KB→60KB(上界证明),不采纳合并 scratch。验证:三矩阵 123/129/142 + 压测 4/4×3,kotlin-gradle 单测与 logx-tester assembleDebug 通过,arm64 交叉编译 0 错误。 |
 | **R5** | R4 外部复审批次收口(`code_review_R4_2026-09-13.md`) | `android/kotlin-gradle/gradle.properties`, `tests/unit/test_format.cpp`, `core/src/format.cpp`, `core/include/logx_format.h`, `android/kotlin/LogX.kt`, `android/logx-tester/*/LogXProbe.kt` | **P3** | **✅ 100% 已完成 (2026-09-13)** | 复审 6 项 6 实 0 误:**R5-1** `org.gradle.java.home` 机器路径迁出仓库→用户级 `~/.gradle/gradle.properties`(README 补 JDK17 定位说明,异构机器/CI 可移植性恢复);**R5-2** 截断出参单测改真四态(补 `(&t,nullptr)`/`(nullptr,&d)` 两混用态);**R5-3** LogXProbe"彻底消除文案依赖"改限定表述(ERR_TOO_LARGE 共码分流=已知文本耦合,根治候选 Backlog B-3);**R5-4** 计划表头部三元组去重(3 份→1 份);**R5-5** 60KB 硬上限口径精确化(user_total=27B 头+tag+payload);**R5-6** `getStats()` 加 `arr.size < 6` 守卫(版本错配优雅降级 null);**R5-7** marker 常量化 `kMarkerHead/kMarkerTail`(snprintf 引用常量,字面量与断言绑定)+ 两条 `static_assert` 固化 `kMarkerReserve`/`kTruncBufSize` 安全前提 + 余量措辞精确化(最坏写入 61407,余量 33B)。复审对上轮 5 项闭环、`trunc_buf` 缩容穷举证明、ABI 72B 不变的确认无异议。 |
+| **T5.6** | 事件种类扩展:截断独立事件种类(Backlog B-3 方案B,用户拍板) | `core/include/logx_c.h`, `core/src/logx_c.cpp`, `android/kotlin/LogX.kt`, `android/logx-tester/*` | **P2** | **✅ 100% 已完成 (2026-09-13)** | 1. **C ABI**:`logx_event_kind_e` 追加 `LOGX_EV_TRUNCATED = 5`(枚举追加按值传递,ABI 安全);截断路径事件 `emit_event(LOGX_EV_TRUNCATED, LOGX_OK, "log truncated (dropped N bytes)")`——kind 承载"有损写入成功"语义,code 取 LOGX_OK,返回值不变;病态丢弃独占 `DROP/TOO_LARGE`,R5-3 文案耦合消除;<br>2. **Kotlin**:`EventKind.TRUNCATED` + `onNativeError` kindInt=5 映射(未识别码仍兜底 IO);<br>3. **tester**:LogXProbe `Capture` 增 kind 字段、分类改 kind 优先(不再依赖 msg 前缀)、`eventTruncatedCount` 独立计数;`Metrics.eventTruncated`/压测外指标流转/控制台事件流(DROP 色标)/MetricsPanel 展示行接线;<br>4. **测试**:test_flusher 截断过滤器、test_j04 截断孪生用例改 `(TRUNCATED, LOGX_OK)` 断言;LogXPureLogicTest 扩 kindInt=5 映射;<br>5. spec §3.1 同步;B-3 销号。三矩阵 123/129/142 + 压测 4/4×3 全绿;kotlin-gradle/logx-tester 构建通过;arm64 交叉 0 错误。 |
 
 ---
 
@@ -185,13 +188,13 @@ gantt
   1. **当前模块冻结**: 严禁在无并发自动化测试防护下凭静态推演对 `LogX.kt` 生命周期与同步机制做主观微调；
   2. **准入门禁**: 后续若需改动，必须先在 JVM 侧编写多线程高频交错压测套件（或 OpenJDK jcstress），严格对齐四大核心不变量（句柄有效性杜绝 UAF、nativeClose 物理互斥、单例状态单调一致性、回调嵌套 close 免疫自死锁）。
 
-### B-3 截断与病态丢弃共用 ERR_TOO_LARGE 事件码的文案耦合(R5-3 根治候选)
+### B-3 截断与病态丢弃共用 ERR_TOO_LARGE 事件码的文案耦合(已闭环为 T5.6)
 
 - **记录日期**: 2026-09-13
-- **状态**: ⏸ 待决策
+- **状态**: ✅ 已拍板落地(2026-09-13,用户选**方案 B** 独立事件种类,详见阶段三 T5.6 行)
 - **背景**: B-1B/T5.5 采纳"事件复用 `LOGX_EV_DROP` + `LOGX_ERR_TOO_LARGE` code、仅 msg 文案区分"的零 ABI 变更方案后,下游按事件分类时对 `ERR_TOO_LARGE` 必须依赖 `msg` 前缀(`"log truncated"` / `"log too large"`)分流——`logx-tester` 的 `LogXProbe` 即因此存在文本耦合(头注释已限定表述,见 R5-3),与"按错误码严格匹配、消除文案脆弱依赖"的探针原则冲突。
 - **候选方案**:
   - **A. 独立事件错误码** `LOGX_ERR_TRUNCATED = -11`(枚举追加,ABI 安全):截断路径事件 code 改为新码,返回值维持 `LOGX_OK`;波及 Kotlin 无(不映射该码)、现有按 `ERR_TOO_LARGE` 过滤的监控需迁移口径(截断事件将从其过滤器中消失,须同步通告)。
-  - **B. 新增独立事件种类** `LOGX_EV_TRUNCATED = 5`:`logx_event_kind_e` 追加,语义更显性;波及 Kotlin `EventKind` 枚举映射与探针 `when` 分支。
+  - **B. 新增独立事件种类** `LOGX_EV_TRUNCATED = 5`:`logx_event_kind_e` 追加,语义更显性;波及 Kotlin `EventKind` 枚举映射与探针 `when` 分支。**← 已采纳**
   - **C. 维持现状**:文案分流已满足当前唯一消费方,接受耦合。
 - **决策点**: 是否存在 B-1B 设想之外的第三方监控按 `ERR_TOO_LARGE` 过滤截断事件(迁移成本);`-11` 码值与 `LOGX_EV_TRUNCATED` 枚举序位一经发布即冻结;spec §5/§8 事件表需随决策同步。

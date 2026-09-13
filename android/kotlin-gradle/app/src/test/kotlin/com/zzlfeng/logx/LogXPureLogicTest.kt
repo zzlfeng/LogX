@@ -51,7 +51,8 @@ class LogXPureLogicTest {
         try {
             for ((i, expected) in listOf(
                 LogX.EventKind.DEGRADED, LogX.EventKind.DROP,
-                LogX.EventKind.IO, LogX.EventKind.RECOVERY
+                LogX.EventKind.IO, LogX.EventKind.RECOVERY,
+                LogX.EventKind.TRUNCATED  // B-3 方案B/T5.6: kindInt=5
             ).withIndex()) {
                 LogX.onNativeError(i + 1, -3, "m")
                 assertEquals(expected, got.last().first)
@@ -59,7 +60,7 @@ class LogXPureLogicTest {
             // 未识别 kindInt 兜底为 IO
             LogX.onNativeError(99, -3, "m")
             assertEquals(LogX.EventKind.IO, got.last().first)
-            assertEquals(5, got.size)
+            assertEquals(6, got.size)
         } finally {
             LogX.setErrorHandler(null)
         }

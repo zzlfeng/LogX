@@ -1312,3 +1312,47 @@ tag + payload,长 tag 会提前触限)",与 `format_record` 实际门槛一致�
   用户级配置生效,R5-1 得证);logx-tester `:app:assembleDebug --offline`
   **BUILD SUCCESSFUL**;
 - Android arm64 交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。
+
+---
+
+## T5.6 事件种类扩展: 截断独立事件 LOGX_EV_TRUNCATED (2026-09-13, B-3 方案B)
+
+> 用户在 B-3 三个候选方案中拍板**方案 B(新增独立事件种类)**。枚举追加按值传递,
+> ABI 安全;`logx_stats_t` 零改动(72B 不变),返回值语义零变化(截断仍返回 LOGX_OK)。
+
+### 1. C ABI 与核心(`logx_c.h` / `logx_c.cpp`)
+
+- `logx_event_kind_e` 追加 **`LOGX_EV_TRUNCATED = 5`**(有损写入成功,非丢弃)。
+- 截断路径事件由 `emit_event(LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, ...)` 改为
+  `emit_event(LOGX_EV_TRUNCATED, LOGX_OK, "log truncated (dropped N bytes)")`:
+  kind 承载语义,code 取 `LOGX_OK`——截断不是错误;返回值仍为 `LOGX_OK`,
+  `truncated_logs` 计数与调用方线程锁外同步契约(P1-1/J-04)不变。
+- 病态小上限丢弃独占 `LOGX_EV_DROP / LOGX_ERR_TOO_LARGE`("log too large"),
+  R5-3 记录的下游文案耦合消除。
+
+### 2. Kotlin 与 tester 接线
+
+- **`LogX.kt`**:`EventKind.TRUNCATED` + `onNativeError` kindInt=5 映射
+  (未识别码仍兜底 IO)。
+- **`LogXProbe`**:`Capture` 增 `kind` 字段;`onEvent` 增 TRUNCATED 分支
+  (`eventTruncatedCount` 独立计数 + 哨兵捕获);`write()` 分类改 **kind 优先**
+  (`c.kind == TRUNCATED → R.Truncated`),不再依赖 msg 前缀,头注释对账。
+- **logx-tester**:`Metrics.eventTruncated` + `TesterViewModel` 指标流转 +
+  控制台事件流(TRUNCATED 用 DROP 色标=有损语义)+ `MetricsPanel` 展示行。
+
+### 3. 测试同步
+
+- `test_flusher` 截断用例事件过滤器改 `LOGX_EV_TRUNCATED`;
+- `test_j04` 截断孪生用例改 `(LOGX_EV_TRUNCATED, LOGX_OK)` 断言(kind+code 双确认,
+  同步契约与调用方线程断言保持);
+- `LogXPureLogicTest` EventKind 映射扩 kindInt=5 → TRUNCATED(断言数 5→6)。
+
+### 4. 文档对账
+
+spec §3.1 截断事件表述同步;计划表升 v1.15(T5.6 销号、B-3 ✅ 闭环)。
+
+### 验证
+
+三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;
+kotlin-gradle 离线单测与 logx-tester `assembleDebug` BUILD SUCCESSFUL;
+Android arm64 交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。

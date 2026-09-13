@@ -44,6 +44,8 @@ typedef enum {
     LOGX_EV_DROP     = 2,   /* 单条 / 块被丢弃 */
     LOGX_EV_IO       = 3,   /* 磁盘/文件系统错误 */
     LOGX_EV_RECOVERY = 4,   /* 启动恢复告警(截尾/作废重建/丢失计数) */
+    LOGX_EV_TRUNCATED = 5,  /* B-3 方案B/T5.6: 超长截断保前缀写入(有损写入成功,
+                             * 非丢弃;code 取 LOGX_OK,语义由 kind 承载) */
 } logx_event_kind_e;
 
 /* ===== 错误回调 ===== */
@@ -115,8 +117,9 @@ logx_status_e logx_close(logx_instance_t* inst);
  * NUL 结尾,长度由 payload_len 显式给出。
  * 返回 LOGX_ERR_NO_SPACE 表示 staging 满(LOGX_EV_DROP)。
  * B-1B 方案B: 超 maxLogLength 的日志截断保留前缀后照常写入并返回 LOGX_OK,
- * 以 LOGX_EV_DROP / LOGX_ERR_TOO_LARGE 事件与 truncated_logs 计数上报;
- * LOGX_ERR_TOO_LARGE 返回值仅表示"截断到空记录仍放不下"的病态小 maxLogLength。 */
+ * 以 LOGX_EV_TRUNCATED 事件(code 取 LOGX_OK,kind 承载语义)与 truncated_logs
+ * 计数上报;LOGX_ERR_TOO_LARGE 返回值仅表示"截断到空记录仍放不下"的病态小
+ * maxLogLength(事件仍为 LOGX_EV_DROP / LOGX_ERR_TOO_LARGE)。 */
 logx_status_e logx_write(logx_instance_t* inst,
                          int level,
                          const char* tag,

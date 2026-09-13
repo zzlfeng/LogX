@@ -20,6 +20,7 @@ data class TesterMetrics(
     val truncatedLogs: Long = 0, // B-1B/T5.5: 截断保前缀的有损写入次数(R4-2)
     val eventDegraded: Long = 0,
     val eventDrop: Long = 0,
+    val eventTruncated: Long = 0, // B-3 方案B/T5.6: TRUNCATED 事件计数(有损写入)
     val eventIo: Long = 0,
     val eventRecovery: Long = 0,
     val latency: LatencyStats = LatencyStats(),

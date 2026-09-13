@@ -9,11 +9,10 @@
 //
 // 本测试无法在桌面端加载 JVM 去复现 JNI 临界区本身,但精确守护 JNI 崩溃所依赖
 // 的 C ABI 核心契约(emit_event 直调语义):
-//   a) 超长截断(B-1B 方案B)/ 超长病态丢弃 / 环满三条路径必须
-//      "同步 + 在调用方线程"触发 err_fn
+//   a) 超长截断(B-1B 方案B, 事件种类 LOGX_EV_TRUNCATED)/ 超长病态丢弃 /
+//      环满三条路径必须"同步 + 在调用方线程"触发 err_fn
 //      —— 这正是 jni_error_trampoline 能拿到合法 JNI env 的前提;
-//   b) 回调必须拿到正确的 kind/code("log truncated..." / "log too large" /
-//      "staging full");
+//   b) 回调必须拿到正确的 kind/code(TRUNCATED/OK / DROP/TOO_LARGE / NO_SPACE);
 //   c) 错误回调执行期间不得死锁,尤其环满路径是在持 inst->mu 前提下触发的
 //      (emit_event 用独立 err_mu,锁序 inst->mu → err_mu,见 logx_internal.h);
 //   d) 单次事件后实例生命周期不变,后续日志仍可正常写入。
@@ -132,14 +131,15 @@ TEST(J04Regression, TooLargeTruncated_ErrHandlerSynchronousOnCallerThread) {
                          static_cast<uint32_t>(big.size())),
               LOGX_OK);
 
-    // b) kind/code 正确,msg 为截断语义
-    ASSERT_TRUE(probe.saw(LOGX_EV_DROP, LOGX_ERR_TOO_LARGE));
+    // b) kind/code 正确:截断走独立事件种类 LOGX_EV_TRUNCATED,code 取 LOGX_OK
+    //    (B-3 方案B/T5.6,与病态丢弃的 DROP/TOO_LARGE 按 kind 天然分流)
+    ASSERT_TRUE(probe.saw(LOGX_EV_TRUNCATED, LOGX_OK));
     // a) 回调在调用方线程触发(同步契约 —— JNI trampoline 靠它拿合法 env)
-    EXPECT_TRUE(probe.saw_on_tid(LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, caller_tid));
+    EXPECT_TRUE(probe.saw_on_tid(LOGX_EV_TRUNCATED, LOGX_OK, caller_tid));
     {
         std::lock_guard<std::mutex> lk(probe.mu);
-        for (size_t i = 0; i < probe.codes.size(); ++i) {
-            if (probe.codes[i] == LOGX_ERR_TOO_LARGE) {
+        for (size_t i = 0; i < probe.kinds.size(); ++i) {
+            if (probe.kinds[i] == static_cast<int>(LOGX_EV_TRUNCATED)) {
                 EXPECT_EQ(probe.msgs[i].compare(0, 13, "log truncated"), 0);
             }
         }

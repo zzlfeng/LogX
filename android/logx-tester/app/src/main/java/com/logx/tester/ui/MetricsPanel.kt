@@ -107,6 +107,7 @@ fun MetricsPanel(
             Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("DEGRADED: ${metrics.eventDegraded}", fontSize = 12.sp, color = Color(0xFFF57C00))
                 Text("DROP: ${metrics.eventDrop}", fontSize = 12.sp, color = Color(0xFFD32F2F))
+                Text("TRUNCATED: ${metrics.eventTruncated}", fontSize = 12.sp, color = Color(0xFFD32F2F))
                 Text("IO: ${metrics.eventIo}", fontSize = 12.sp, color = Color(0xFF7B1FA2))
                 Text("RECOVERY: ${metrics.eventRecovery}", fontSize = 12.sp, color = Color(0xFF1976D2))
             }

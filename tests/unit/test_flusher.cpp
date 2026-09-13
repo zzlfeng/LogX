@@ -1224,7 +1224,8 @@ TEST(ErrorMonitoring, TruncateEventOnTooLarge_PrefixKeptAndCounted) {
     } tracker;
 
     logx_set_error_handler(inst, [](void* user, logx_event_kind_e kind, int, const char* msg) {
-        if (kind == LOGX_EV_DROP) {
+        // B-3 方案B/T5.6: 截断用独立事件种类 LOGX_EV_TRUNCATED 承载
+        if (kind == LOGX_EV_TRUNCATED) {
             auto* t = static_cast<DropTracker*>(user);
             t->drop_count++;
             t->last_msg = msg ? msg : "";
@@ -1232,7 +1233,7 @@ TEST(ErrorMonitoring, TruncateEventOnTooLarge_PrefixKeptAndCounted) {
     }, &tracker);
 
     // B-1B 方案B: 写入 600B 日志(超 max_log_length 500B)→ 截断保前缀,
-    // 返回 LOGX_OK 并同步发 "log truncated" 事件,truncated_logs 计数递增。
+    // 返回 LOGX_OK 并同步发 TRUNCATED 事件,truncated_logs 计数递增。
     std::string large_msg(600, 'L');
     EXPECT_EQ(logx_write(inst, 2, "Tag",
                          reinterpret_cast<const uint8_t*>(large_msg.data()),

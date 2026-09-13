@@ -60,7 +60,9 @@ object LogX {
     }
     enum class Level(val v: Int) { V(0), D(1), I(2), W(3), E(4), F(5) }
 
-    enum class EventKind { DEGRADED, DROP, IO, RECOVERY }
+    enum class EventKind { DEGRADED, DROP, IO, RECOVERY, TRUNCATED }
+    // B-3 方案B/T5.6: TRUNCATED = 超长截断保前缀写入(有损写入成功,非丢弃,
+    // 事件 code 取 LOGX_OK),与 DROP/病态丢弃按 kind 天然分流
     fun interface ErrorHandler {
         fun onError(kind: EventKind, code: Int, message: String)
     }
@@ -361,6 +363,7 @@ object LogX {
             2 -> EventKind.DROP
             3 -> EventKind.IO
             4 -> EventKind.RECOVERY
+            5 -> EventKind.TRUNCATED
             else -> EventKind.IO
         }
         try {

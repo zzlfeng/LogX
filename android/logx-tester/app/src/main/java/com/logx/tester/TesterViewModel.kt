@@ -91,6 +91,7 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
             LogXProbe.eventSink.collect { ev ->
                 val kind = when (ev.kind) {
                     LogX.EventKind.DROP -> LineKind.DROP
+                    LogX.EventKind.TRUNCATED -> LineKind.DROP // 有损写入,与丢弃同色标
                     LogX.EventKind.DEGRADED -> LineKind.DEGRADED
                     LogX.EventKind.IO -> LineKind.IO
                     LogX.EventKind.RECOVERY -> LineKind.RECOVERY
@@ -113,6 +114,7 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
                     old.copy(
                         eventDegraded = LogXProbe.eventDegradedCount.get(),
                         eventDrop = LogXProbe.eventDropCount.get(),
+                        eventTruncated = LogXProbe.eventTruncatedCount.get(),
                         eventIo = LogXProbe.eventIoCount.get(),
                         eventRecovery = LogXProbe.eventRecoveryCount.get(),
                         nativeStats = LogX.getStats() ?: old.nativeStats

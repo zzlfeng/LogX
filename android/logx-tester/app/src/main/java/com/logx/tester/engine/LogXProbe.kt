@@ -27,21 +27,19 @@ import java.util.concurrent.atomic.AtomicLong
  * 现已打通 C++ 内核 (logx_c.cpp) 真实错误码透传链路：
  *   - `br == kBuildRecordsInvalidInput` -> `emit_event(inst, LOGX_EV_DROP, LOGX_ERR_INVALID_ARG, "invalid log input")`
  *   - 超长(> max_log_length 或 >60KB 用户载荷硬上限, B-1B/T5.5) -> 截断保留前缀后
- *     照常落环并返回 LOGX_OK, 同步事件 `LOGX_EV_DROP / LOGX_ERR_TOO_LARGE`
- *     ("log truncated (dropped N bytes)") —— 有损写入, 非丢弃
+ *     照常落环并返回 LOGX_OK, 同步事件 `LOGX_EV_TRUNCATED`(code 取 LOGX_OK,
+ *     msg "log truncated (dropped N bytes)") —— 有损写入, 非丢弃
  *   - 病态小 max_log_length(kBuildRecordsCannotFit) -> 整条丢弃, 同步事件
  *     `LOGX_EV_DROP / LOGX_ERR_TOO_LARGE` ("log too large")
  *   - `st == Staging::WriteStatus::kFull`-> `emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full")`
- * 上层优先根据 `c.code`（LogX.ERR_NO_SPACE / ERR_TOO_LARGE / ERR_INVALID_ARG）进行严格匹配：
- * 对 NO_SPACE / INVALID_ARG 已彻底消除对错误消息文案的依赖（文案匹配仅作向后兼容兜底）。
- * 已知文本耦合（R5-3 限定表述）: ERR_TOO_LARGE 下截断/病态丢弃两态共用同一错误码，
- * 暂按 msg 前缀分流（见下），根治须引入独立事件错误码（Backlog B-3，待拍板）。
- * 注意 ERR_TOO_LARGE 下须按 msg 前缀分流: "log truncated" = 截断([R.Truncated]),
- * "log too large" = 病态丢弃([R.TooLarge]), 二者仅一词之差。
+ * 上层优先根据 `c.kind` + `c.code`（LogX.ERR_NO_SPACE / ERR_TOO_LARGE / ERR_INVALID_ARG）
+ * 进行严格匹配，彻底消除了对错误消息文案的脆弱依赖（文案匹配仅作向后兼容兜底）。
+ * B-3 方案B/T5.6: 截断改用独立事件种类 LOGX_EV_TRUNCATED 承载, R5-3 记录的
+ * "ERR_TOO_LARGE 共码须按 msg 前缀分流"文本耦合已消除。
  */
 object LogXProbe {
     data class EventRow(val kind: LogX.EventKind, val code: Int, val msg: String)
-    class Capture { var hit = false; var code = 0; var msg = "" }
+    class Capture { var hit = false; var kind: LogX.EventKind? = null; var code = 0; var msg = "" }
     private val slot = ThreadLocal<Capture?>()
 
     sealed interface R {
@@ -60,12 +58,14 @@ object LogXProbe {
     val eventDropCount = AtomicLong(0)
     val eventIoCount = AtomicLong(0)
     val eventRecoveryCount = AtomicLong(0)
+    val eventTruncatedCount = AtomicLong(0)
 
     fun resetEventCounts() {
         eventDegradedCount.set(0)
         eventDropCount.set(0)
         eventIoCount.set(0)
         eventRecoveryCount.set(0)
+        eventTruncatedCount.set(0)
     }
 
     private val _eventSink = MutableSharedFlow<EventRow>(
@@ -82,6 +82,17 @@ object LogXProbe {
                 eventDropCount.incrementAndGet()
                 slot.get()?.let {
                     it.hit = true
+                    it.kind = kind
+                    it.code = code
+                    it.msg = msg
+                }
+            }
+            LogX.EventKind.TRUNCATED -> {
+                // B-3 方案B/T5.6: 截断=有损写入成功, 独立事件种类;计入哨兵供分类
+                eventTruncatedCount.incrementAndGet()
+                slot.get()?.let {
+                    it.hit = true
+                    it.kind = kind
                     it.code = code
                     it.msg = msg
                 }
@@ -105,11 +116,11 @@ object LogXProbe {
         // 问题 P2 修复: 优先按 Native 错误码常量强类型匹配，同时彻底解决 code == -1 兜底分支死代码问题
         return when {
             !c.hit                             -> R.Ok(dt)
+            // B-3 方案B/T5.6: 截断独立事件种类, 按 kind 分流(文案耦合消除)
+            c.kind == LogX.EventKind.TRUNCATED -> R.Truncated(dt, c.msg)
             c.code == LogX.ERR_NO_SPACE        -> R.NoSpace(dt)
-            // R4-2: 截断与病态丢弃同码(ERR_TOO_LARGE), 按 msg 前缀分流
-            c.code == LogX.ERR_TOO_LARGE       ->
-                if (c.msg.startsWith("log truncated")) R.Truncated(dt, c.msg)
-                else R.TooLarge(dt)
+            // 走到此处的 TOO_LARGE = 病态小上限丢弃(B-3 后截断不再占用该码)
+            c.code == LogX.ERR_TOO_LARGE       -> R.TooLarge(dt)
             // 兜底处理: code == -1 既对应真实 ERR_INVALID_ARG，也可能是旧 Native 库写死的兜底值
             c.code == LogX.ERR_INVALID_ARG || c.code == -1 -> when {
                 c.msg.contains("staging full")     -> R.NoSpace(dt)

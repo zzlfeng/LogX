@@ -447,11 +447,14 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     }
     if (truncated) {
         inst->truncated_logs.fetch_add(1);
-        // 与丢弃路径同款纪律:调用方线程、锁外同步发事件(P1-1 / J-04 安全性不变)。
+        // B-3 方案B/T5.6: 截断用独立事件种类 LOGX_EV_TRUNCATED 承载(code 取
+        // LOGX_OK——有损写入成功,非错误),消除与病态丢弃(DROP/TOO_LARGE)共用
+        // 错误码导致的下游文案耦合。与丢弃路径同款纪律:调用方线程、锁外同步
+        // 发事件(P1-1 / J-04 安全性不变)。
         char msg[64];
         std::snprintf(msg, sizeof(msg), "log truncated (dropped %llu bytes)",
                       static_cast<unsigned long long>(dropped_bytes));
-        emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, msg);
+        emit_event(inst, LOGX_EV_TRUNCATED, LOGX_OK, msg);
     }
 
     // 2) 锁内写入 staging
