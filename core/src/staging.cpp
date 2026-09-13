@@ -310,16 +310,16 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total,
         consumed = pad + total;
         // 检查空闲是否够放下 PAD + 本条
         if (free < pad + total) return WriteStatus::kFull;
-        if (pad >= 6) {
+        if (pad >= kHeaderLen) {
             // 写入 LGXP PAD 占满至环尾:可连续多条,每条 = 6B 头 + payload(≤ 20KB);
             // payload = 剩余字节 - 6,保证不越界。
             uint32_t pos = w;
-            while (pos + 6 <= data_size_) {
+            while (pos + kHeaderLen <= data_size_) {
                 uint32_t remain = data_size_ - pos;
                 uint32_t this_pad = std::min<uint32_t>(kMaxSlicePayload, remain - kHeaderLen);
                 format_pad(data_base_ + pos, this_pad);
                 if (out_pad_records) (*out_pad_records)++;
-                pos += 6 + this_pad;
+                pos += kHeaderLen + this_pad;
             }
             if (pos < data_size_) {
                 std::memset(data_base_ + pos, 0, data_size_ - pos);

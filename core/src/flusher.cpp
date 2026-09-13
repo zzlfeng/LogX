@@ -21,23 +21,24 @@
 #include <vector>
 
 #include "logx_format.h"
+#include "logx_staging.h"  // kBlockMaxRaw / kBlockMaxNormal(块上限单源,R9 直含;先例 codec.cpp)
 
 namespace logx {
 
 namespace {
 
-constexpr uint32_t kNormalBlockMax = 16 * 1024;
+constexpr uint32_t kNormalBlockMax = kBlockMaxNormal;  // 常规块 raw 上限(16KB,单源 staging.h,R9 去重)
 constexpr uint32_t kSingleRecordMaxRaw = kBlockMaxRaw;  // 与块上限同源(20KB+6B,R8 去重)
 
 // put_u32_le 见 logx_internal.h(测试可见)
 
 // 在 raw 流里看下一条记录的字节数(头+payload);不足返回 0。
 uint32_t peek_record_len(const uint8_t* p, uint32_t off, uint32_t total) {
-    if (total - off < 6) return 0;
+    if (total - off < kHeaderLen) return 0;
     uint16_t magic = uint16_t(p[off + 2]) | (uint16_t(p[off + 3]) << 8);
     if (magic != kMagicEntry && magic != kMagicPad) return 0;
     uint32_t len = uint32_t(p[off]) | (uint32_t(p[off + 1]) << 8);
-    uint32_t sz = 6 + len;
+    uint32_t sz = kHeaderLen + len;
     if (off + sz > total) return 0;
     return sz;
 }
@@ -49,7 +50,7 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
     uint32_t pos = 0;
     while (pos < total) {
         uint32_t blk_begin = pos;
-        if (total - pos < 6) {
+        if (total - pos < kHeaderLen) {
             // 缝残留 < 6B:归入本块并封块;消费侧按"距段尾 <6B 跳过"处理
             out->push_back({blk_begin, total - blk_begin});
             break;
@@ -69,7 +70,7 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
         // 普通累计:沿记录边界累加,加下一条超过 16KB 则封块
         uint32_t cur = pos;
         while (cur < total) {
-            if (total - cur < 6) { cur = total; break; }
+            if (total - cur < kHeaderLen) { cur = total; break; }
             uint32_t rec = peek_record_len(raw, cur, total);
             if (rec == 0) { cur = total; break; }
             if (cur + rec - blk_begin > kNormalBlockMax && cur > blk_begin) break;
@@ -308,7 +309,7 @@ bool block_header_plausible(const uint8_t bhdr[34], uint64_t file_remaining_byte
 
     // 6. raw_len 范围防御: [6, kBlockMaxRawPlausible]
     uint32_t raw_len = get_u32(bhdr + 10);
-    if (raw_len < 6 || raw_len > kBlockMaxRawPlausible) return false;
+    if (raw_len < kHeaderLen || raw_len > kBlockMaxRawPlausible) return false;
 
     // 7. payload_len 范围防御
     uint32_t payload_len = get_u32(bhdr + 14);
