@@ -312,7 +312,7 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total,
         if (free < pad + total) return WriteStatus::kFull;
         if (pad >= kHeaderLen) {
             // 写入 LGXP PAD 占满至环尾:可连续多条,每条 = 6B 头 + payload(≤ 20KB);
-            // payload = 剩余字节 - 6,保证不越界。
+            // payload = 剩余字节 - kHeaderLen,保证不越界。
             uint32_t pos = w;
             while (pos + kHeaderLen <= data_size_) {
                 uint32_t remain = data_size_ - pos;
@@ -326,7 +326,7 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total,
             }
             w = 0;
         } else {
-            // pad < 6:无记录可写,留零回绕;消费侧按"距段尾 <6B 跳过"。
+            // pad < kHeaderLen:无记录可写,留零回绕;消费侧按"距段尾 <6B 跳过"。
             // 必须严格清零残留的 1..5 字节, 杜绝旧轮次内存脏数据!
             if (pad > 0) {
                 std::memset(data_base_ + w, 0, pad);

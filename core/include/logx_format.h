@@ -66,7 +66,7 @@ FormatBoundedStatus format_record_bounded(
     bool* out_truncated, uint64_t* out_dropped);
 
 // 写一条 LGXP PAD(单条,≤ 20KB);调用方负责循环调用以填满回绕缝。
-// 返回写入 out_buf 的字节数(== 6 + pad_len)。
+// 返回写入 out_buf 的字节数(== kHeaderLen + pad_len)。
 uint32_t format_pad(uint8_t* out_buf, uint32_t pad_len);
 
 // 解析一段 LGXE 序列(单条记录的所有分片,跨 PAD 仍连续)。

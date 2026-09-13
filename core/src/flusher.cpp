@@ -307,7 +307,7 @@ bool block_header_plausible(const uint8_t bhdr[34], uint64_t file_remaining_byte
     if (seqno == 0) return false;
     if (has_prev_seqno && seqno <= prev_seqno) return false;
 
-    // 6. raw_len 范围防御: [6, kBlockMaxRawPlausible]
+    // 6. raw_len 范围防御: [kHeaderLen, kBlockMaxRawPlausible]
     uint32_t raw_len = get_u32(bhdr + 10);
     if (raw_len < kHeaderLen || raw_len > kBlockMaxRawPlausible) return false;
 

@@ -198,11 +198,11 @@ static_assert(kMarkerReserve >= sizeof(kMarkerHead) - 1 + kMaxU32Digits + sizeof
 //  消除 R6-1 引入的重复常量。)
 
 // 求解截断后 msg(含 marker 占用)的最大字节数,使落环总长 ≤ max_total:
-//   total(user_total) = user_total + 6·slices,slices = max(1, ⌈user_total/20480⌉)
+//   total(user_total) = user_total + kHeaderLen·slices,slices = max(1, ⌈user_total/20480⌉)
 //   user_total 同时受 60KB 用户载荷硬上限(format_record 契约)约束。
-// 做法:对片数 s 逐个取 cap(s) = min(20480·s, max_total − 6s, 60KB),b = cap − (27+tag),
+// 做法:对片数 s 逐个取 cap(s) = min(20480·s, max_total − kHeaderLen·s, 60KB),b = cap − (27+tag),
 // 取最大者。cap(s) 随 s 先增后减,峰值即最优;最多扫 4 片(64KB 总长 ≤ ~4 片)。
-// 结果偏保守不超过 6·(s−1) ≤ 18B(实际片数可能少于预算片数),不追求逐字节精确。
+// 结果偏保守不超过 kHeaderLen·(s−1) ≤ 18B(实际片数可能少于预算片数),不追求逐字节精确。
 // 返回 false = 连"空 msg 记录"(27B 用户头 + tag + 6B 片头)都放不下(病态 max_total)。
 bool solve_truncated_msg_budget(uint32_t max_total, uint32_t tag_len, uint32_t* out_budget) {
     const uint64_t fixed = kUserHdrSize + tag_len;
