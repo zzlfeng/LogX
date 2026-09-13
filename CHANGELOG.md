@@ -1352,8 +1352,48 @@ tag + payload,长 tag 会提前触限)",与 `format_record` 实际门槛一致�
 
 spec §3.1 截断事件表述同步;计划表升 v1.15(T5.6 销号、B-3 ✅ 闭环)。
 
+### 迁移提示(R6-2 补记,B-3 决策点"须同步通告"的落实)
+
+外部若按 `kind == LOGX_EV_DROP`（或 DROP + `LOGX_ERR_TOO_LARGE` 组合）过滤截断相关
+事件，自 T5.6 起**截断事件不再出现在该过滤器中**（DROP 仅余病态小上限丢弃与
+NO_SPACE），须改订阅 `LOGX_EV_TRUNCATED`（code 取 LOGX_OK）；按 kind 全量订阅或仅
+关心丢弃的消费方不受影响。本仓库 tester 已同步（LogXProbe 按 kind 分类）。
+
 ### 验证
 
 三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;
 kotlin-gradle 离线单测与 logx-tester `assembleDebug` BUILD SUCCESSFUL;
 Android arm64 交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。
+
+---
+
+## R6 批次: T5.6 复审 §5 收口 (2026-09-13)
+
+> 复审报告(`code_review_R5_T56_2026-09-13.md`)§5.1 经独立复算**属实**(R5-7 引入,
+> 属"收口观察项时引入新缺陷");§5.2 观察采纳。复审对其余各项(枚举 ABI 安全、kind
+> 分类文案耦合根除、压测事件处理器/Kotlin ordinal 不适用判定、五处表述一致)的确认无异议。
+
+### R6-1 (P3) `static_assert` 下界修正(61346 → 61410)
+- **缺陷**:R5-7 第二条断言 `kTruncBufSize >= 61440 − 27 − 64 − 48 + 45 = 61346`,
+  误减 tag 上限 64。`budget = cap − (27 + tag_len)` 随 tag_len **单调递减**,缓冲取
+  最坏须按 **tag_len = 0**(空 tag 合法可达):真实最坏 msg_len = (61440−27) − 48 + 45
+  = **61410**。原断言下,`kTruncBufSize` 缩至 [61346, 61409] 仍可通过编译,而 tag=0 +
+  10 位十进制 dropped 场景将 `memcpy` 61365B 进更小的缓冲——写穿,防护失效。
+- **修正**:断言改 `kTruncBufSize >= kHardUserTotal − kUserHdrSize − kMarkerReserve
+  + (sizeof(kMarkerHead)−1 + kMaxU32Digits + sizeof(kMarkerTail)−1)`(下界 61410,
+  当前 61440 满足,余量 30B);`kUserHdrSize`(27)/`kHardUserTotal`(61440) 自求解器
+  函数局部上提至匿名命名空间共用,消除魔法数重复。
+- **注释统一**:trunc_buf 声明处注释重写为解析口径 61410/余量 30B;旧"61407/33B"
+  源自未覆盖 ≥1e9 dropped(payload 边界点最大 500000)的穷举扫描——marker 恒 <45B,
+  已注明取代。
+
+### R6-2 (P3 观察) T5.6 迁移提示补记
+CHANGELOG T5.6 章节补"迁移提示"小节:外部按 `kind == LOGX_EV_DROP`(或 DROP+TOO_LARGE
+组合)过滤截断事件的消费方,自 T5.6 起不再收到截断事件(仅余病态丢弃与 NO_SPACE),
+须改订阅 `LOGX_EV_TRUNCATED`;全量订阅或仅关心丢弃者不受影响。落实 B-3 决策点
+"截断事件将从原过滤器消失,须同步通告"。
+
+### 验证
+三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿(收紧后的
+static_assert 编译通过,即 61440 ≥ 61410 得证);Android arm64 交叉编译 0 错误,
+`liblogx.so` 同步双 jniLibs。本批次无 Kotlin 改动,kotlin-gradle/logx-tester 无需重建。

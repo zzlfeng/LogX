@@ -183,6 +183,11 @@ constexpr uint32_t kMaxU32Digits = 10;
 static_assert(kMarkerReserve >= sizeof(kMarkerHead) - 1 + kMaxU32Digits + sizeof(kMarkerTail) - 1,
               "kMarkerReserve must cover head + max uint32 digits + tail");
 
+// 用户载荷布局常量(求解器与 kTruncBufSize 断言共用,R6-1 自函数局部上提):
+// user_total = kUserHdrSize(27B 头) + tag_len + payload,硬上限 kHardUserTotal(60KB)。
+constexpr uint32_t kUserHdrSize = 27;
+constexpr uint32_t kHardUserTotal = 60u * 1024u;
+
 // 求解截断后 msg(含 marker 占用)的最大字节数,使落环总长 ≤ max_total:
 //   total(user_total) = user_total + 6·slices,slices = max(1, ⌈user_total/20480⌉)
 //   user_total 同时受 60KB 用户载荷硬上限(format_record 契约)约束。
@@ -191,9 +196,7 @@ static_assert(kMarkerReserve >= sizeof(kMarkerHead) - 1 + kMaxU32Digits + sizeof
 // 结果偏保守不超过 6·(s−1) ≤ 18B(实际片数可能少于预算片数),不追求逐字节精确。
 // 返回 false = 连"空 msg 记录"(27B 用户头 + tag + 6B 片头)都放不下(病态 max_total)。
 bool solve_truncated_msg_budget(uint32_t max_total, uint32_t tag_len, uint32_t* out_budget) {
-    constexpr uint64_t kUserHdr = 27;
-    constexpr uint64_t kHardUserTotal = 60ull * 1024ull;
-    const uint64_t fixed = kUserHdr + tag_len;
+    const uint64_t fixed = kUserHdrSize + tag_len;
     *out_budget = 0;
     if (max_total < fixed + kHeaderLen) return false;  // 空记录(1 片)都放不下
     uint64_t best = 0;
@@ -210,13 +213,16 @@ bool solve_truncated_msg_budget(uint32_t max_total, uint32_t tag_len, uint32_t* 
     return true;
 }
 
-// 截断拼装缓冲容量:须容纳最坏 msg_len = budget_max − kMarkerReserve + 45,
-// 其中 budget_max = 61440(user_total 硬上限) − 27(用户头) − 64(tag 上限)。
+// 截断拼装缓冲容量(R6-1 修正下界):budget = cap − (kUserHdrSize + tag_len) 随
+// tag_len 单调递减,缓冲取最坏须按 tag_len = 0(空 tag 合法可达),不得减 tag 上限
+// —— R5-7 首版误减 64 使断言偏松(61346 < 真实最坏 61410),失去防护意义。
+// 最坏 msg_len = (kHardUserTotal − kUserHdrSize) − kMarkerReserve + 45 = 61410,
+// 对 kTruncBufSize(61440) 余量 30B。
 constexpr uint32_t kTruncBufSize = 60 * 1024;
 static_assert(kTruncBufSize >=
-                  60u * 1024u - 27u - 64u - kMarkerReserve +
+                  kHardUserTotal - kUserHdrSize - kMarkerReserve +
                   (sizeof(kMarkerHead) - 1 + kMaxU32Digits + sizeof(kMarkerTail) - 1),
-              "trunc_buf must hold worst-case truncated msg (prefix + max marker)");
+              "trunc_buf must hold worst-case msg (prefix + max marker, tag_len=0)");
 
 }  // namespace
 
@@ -258,10 +264,12 @@ FormatBoundedStatus format_record_bounded(
 
     // 预算内拼装"前缀 + marker"。独立 thread_local 缓冲,不复用 format_record
     // 内部的 scratch(二次调用会覆写);仅截断冷路径触碰,页成本可忽略。
-    // 容量论证(R5-7,余量精确化):最坏 msg_len = prefix(≤ budget−48) + marker(≤45)
-    // ≤ budget − 3 ≤ (61440 − 27 − 64tag) − 3 = 61346;实际最坏写入 61407(max_total
-    // = 61458, tag=0),对 61440 余量 33B —— 安全依赖下方 static_assert 固化的
-    // "marker ≤ 45" 与 "payload 为 uint32_t" 两条前提,任一变更须重审本容量。
+    // 容量论证(R6-1 修正):最坏 msg_len = prefix(≤ budget−48) + marker(≤45)
+    // ≤ budget − 3 ≤ (61440 − 27 − 0tag) − 3 = 61410(tag 取最坏 0,非上限 64),
+    // 对 61440 余量 30B —— 安全依赖 static_assert 固化的"marker ≤ 45"与
+    // "payload 为 uint32_t"两条前提,任一变更须重审本容量。
+    // (R5-7 旧注释的 61407/33B 源自未覆盖 ≥1e9 dropped 的穷举扫描——marker
+    // 未达 45B,已由解析上界 61410/30B 取代。)
     static thread_local uint8_t trunc_buf[kTruncBufSize];
     const uint8_t* src = payload;
     uint32_t msg_len = budget;
