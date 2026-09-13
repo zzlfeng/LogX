@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "logx_pal.h"
+#include "logx_format.h"  // kMaxSlicePayload / kHeaderLen(kBlockMaxRaw 派生源)
 
 namespace logx {
 
@@ -227,7 +228,7 @@ private:
 // 块格式(spec §3.2)常量。块写入与解码共用。
 constexpr uint32_t kBlockHeaderSize = 4 + 1 + 1 + 4 + 4 + 4 + 4 + 12;  // magic+ver+flag+seqno+raw+payload+crc+nonce = 34B (S-03)
 constexpr uint32_t kBlockGcmTagSize = 16;
-constexpr uint32_t kBlockMaxRaw = 20 * 1024 + 6;            // 单条独占一块上限(含 6B 记录头)
+constexpr uint32_t kBlockMaxRaw = kMaxSlicePayload + kHeaderLen;  // 单条独占一块上限(20KB + 6B 记录头,R8 派生单源)
 constexpr uint32_t kBlockMaxNormal = 16 * 1024;             // 常规块 ≤ 16KB raw
 constexpr uint32_t kFileHeaderSize = 32;
 constexpr uint32_t kMagicFile = 0x4658474c;                  // 'LGXF'

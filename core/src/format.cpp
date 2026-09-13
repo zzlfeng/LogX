@@ -46,9 +46,10 @@ inline void put_u64(uint8_t* p, uint64_t v) {
 // [ts_ms:8][pid:4][tid:8][level:1][taglen:2][tag:N][msglen:4][msg:M]
 //
 // 这是加密后磁盘上 / 导出明文文件里的实际格式,不是 staging 6B 头。
+// 仅作文档用途,序列化直接操作 scratch 缓冲;布局以 format_record 内
+// static_assert 钉住的 kUserHdrSize 表达式为准,60KB 上限单源 kMaxUserPayload。
 struct UserRecordHeader {
     static constexpr uint32_t kMaxTag = 64;
-    static constexpr uint32_t kMaxMsg = 60 * 1024;  // 配合 64KB 单条上限
 
     uint64_t ts_ms;
     uint32_t pid;
@@ -320,7 +321,7 @@ FormatBoundedStatus format_record_bounded(
 // 格式化一个 LGXP PAD 记录:payload 全零,cksum 恒为 0。
 // 单一 PAD 长度上限 20KB;若 total_pad > 20KB,需要循环调用。
 uint32_t format_pad(uint8_t* out_buf, uint32_t pad_len) {
-    if (pad_len > 20 * 1024) pad_len = 20 * 1024;  // 防御性
+    if (pad_len > kMaxSlicePayload) pad_len = kMaxSlicePayload;  // 防御性
     put_u16(out_buf, static_cast<uint16_t>(pad_len));
     put_u16(out_buf + 2, kMagicPad);
     out_buf[4] = 0;

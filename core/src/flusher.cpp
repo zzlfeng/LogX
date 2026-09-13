@@ -27,7 +27,7 @@ namespace logx {
 namespace {
 
 constexpr uint32_t kNormalBlockMax = 16 * 1024;
-constexpr uint32_t kSingleRecordMaxRaw = 20 * 1024 + 6;
+constexpr uint32_t kSingleRecordMaxRaw = kBlockMaxRaw;  // 与块上限同源(20KB+6B,R8 去重)
 
 // put_u32_le 见 logx_internal.h(测试可见)
 

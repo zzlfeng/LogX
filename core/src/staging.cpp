@@ -316,7 +316,7 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total,
             uint32_t pos = w;
             while (pos + 6 <= data_size_) {
                 uint32_t remain = data_size_ - pos;
-                uint32_t this_pad = std::min<uint32_t>(20 * 1024, remain - 6);
+                uint32_t this_pad = std::min<uint32_t>(kMaxSlicePayload, remain - kHeaderLen);
                 format_pad(data_base_ + pos, this_pad);
                 if (out_pad_records) (*out_pad_records)++;
                 pos += 6 + this_pad;
