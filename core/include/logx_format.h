@@ -46,7 +46,8 @@ enum class FormatBoundedStatus {
 // "原始前缀 + ASCII marker(...[LogX truncated, dropped N bytes])"后重新落片,
 // 保证落环总长 ≤ max_total_bytes(含逐片 6B 头与片数重算)。
 //   - max_total_bytes = 0 表示不施加 max_total 截断(与 format_record 等价);
-//     但用户载荷 >60KB 硬上限时 format_record 无法格式化,此时返回 kCannotFit
+//     但内部用户数据超 60KB 硬上限时(user_total = 27B 用户头 + tag + payload,
+//     长 tag 会提前触限,见 format_record 契约)无法格式化,此时返回 kCannotFit
 //     (不截断)——调用方按丢弃兜底处理;
 //   - 预算不足以容纳 marker 时退化为纯前缀截断(不加 marker);
 //   - 预算连"空 msg 记录"都放不下时返回 kCannotFit;

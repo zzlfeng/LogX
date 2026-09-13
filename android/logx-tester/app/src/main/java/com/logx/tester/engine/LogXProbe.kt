@@ -32,8 +32,10 @@ import java.util.concurrent.atomic.AtomicLong
  *   - 病态小 max_log_length(kBuildRecordsCannotFit) -> 整条丢弃, 同步事件
  *     `LOGX_EV_DROP / LOGX_ERR_TOO_LARGE` ("log too large")
  *   - `st == Staging::WriteStatus::kFull`-> `emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full")`
- * 上层优先根据 `c.code`（LogX.ERR_NO_SPACE / ERR_TOO_LARGE / ERR_INVALID_ARG）进行严格匹配，
- * 彻底消除了对错误消息文案的脆弱依赖；同时保留文案匹配以向后兼容。
+ * 上层优先根据 `c.code`（LogX.ERR_NO_SPACE / ERR_TOO_LARGE / ERR_INVALID_ARG）进行严格匹配：
+ * 对 NO_SPACE / INVALID_ARG 已彻底消除对错误消息文案的依赖（文案匹配仅作向后兼容兜底）。
+ * 已知文本耦合（R5-3 限定表述）: ERR_TOO_LARGE 下截断/病态丢弃两态共用同一错误码，
+ * 暂按 msg 前缀分流（见下），根治须引入独立事件错误码（Backlog B-3，待拍板）。
  * 注意 ERR_TOO_LARGE 下须按 msg 前缀分流: "log truncated" = 截断([R.Truncated]),
  * "log too large" = 病态丢弃([R.TooLarge]), 二者仅一词之差。
  */

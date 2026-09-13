@@ -171,12 +171,17 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
 // ---------------------------------------------------------------------------
 
 // 截断 marker(ASCII,追加在保留前缀之后,便于解码侧肉眼识别截断)。
-// dropped 为 uint32 payload 与预算之差,上限 10 位十进制:
-// "...[LogX truncated, dropped "(28) + 10(数字) + " bytes]"(7) = 45 ≤ kMarkerReserve(48),
-// 预算恒够;marker[64] snprintf 钳制兜底。
 namespace {
 
+// 截断 marker 拆为头/尾常量并与 kMarkerReserve 用 static_assert 绑定(R5-7):
+// 最坏长度 = 头 28 + 10(payload 为 uint32_t,丢弃字节数 ≤ 10 位十进制) + 尾 7 = 45 ≤ 48;
+// marker[64] snprintf 钳制兜底。
+constexpr char kMarkerHead[] = "...[LogX truncated, dropped ";
+constexpr char kMarkerTail[] = " bytes]";
 constexpr uint32_t kMarkerReserve = 48;
+constexpr uint32_t kMaxU32Digits = 10;
+static_assert(kMarkerReserve >= sizeof(kMarkerHead) - 1 + kMaxU32Digits + sizeof(kMarkerTail) - 1,
+              "kMarkerReserve must cover head + max uint32 digits + tail");
 
 // 求解截断后 msg(含 marker 占用)的最大字节数,使落环总长 ≤ max_total:
 //   total(user_total) = user_total + 6·slices,slices = max(1, ⌈user_total/20480⌉)
@@ -204,6 +209,14 @@ bool solve_truncated_msg_budget(uint32_t max_total, uint32_t tag_len, uint32_t* 
     *out_budget = static_cast<uint32_t>(best);
     return true;
 }
+
+// 截断拼装缓冲容量:须容纳最坏 msg_len = budget_max − kMarkerReserve + 45,
+// 其中 budget_max = 61440(user_total 硬上限) − 27(用户头) − 64(tag 上限)。
+constexpr uint32_t kTruncBufSize = 60 * 1024;
+static_assert(kTruncBufSize >=
+                  60u * 1024u - 27u - 64u - kMarkerReserve +
+                  (sizeof(kMarkerHead) - 1 + kMaxU32Digits + sizeof(kMarkerTail) - 1),
+              "trunc_buf must hold worst-case truncated msg (prefix + max marker)");
 
 }  // namespace
 
@@ -245,9 +258,11 @@ FormatBoundedStatus format_record_bounded(
 
     // 预算内拼装"前缀 + marker"。独立 thread_local 缓冲,不复用 format_record
     // 内部的 scratch(二次调用会覆写);仅截断冷路径触碰,页成本可忽略。
-    // 容量 60KB 即可:msg_len = prefix + marker ≤ budget ≤ cap − (27+tag) ≤ 61440−27
-    // (60KB 是 user_total 硬上限,msg 只是其中扣掉用户头的部分),61440 绰绰有余。
-    static thread_local uint8_t trunc_buf[60 * 1024];
+    // 容量论证(R5-7,余量精确化):最坏 msg_len = prefix(≤ budget−48) + marker(≤45)
+    // ≤ budget − 3 ≤ (61440 − 27 − 64tag) − 3 = 61346;实际最坏写入 61407(max_total
+    // = 61458, tag=0),对 61440 余量 33B —— 安全依赖下方 static_assert 固化的
+    // "marker ≤ 45" 与 "payload 为 uint32_t" 两条前提,任一变更须重审本容量。
+    static thread_local uint8_t trunc_buf[kTruncBufSize];
     const uint8_t* src = payload;
     uint32_t msg_len = budget;
     uint32_t prefix_len = budget;
@@ -257,9 +272,10 @@ FormatBoundedStatus format_record_bounded(
         // 万一求解给出更大预算则钳到 payload,退化为"全量 + marker"。
         if (prefix_len > payload_len) prefix_len = payload_len;
         char marker[64];
-        const int m = std::snprintf(marker, sizeof(marker),
-                                    "...[LogX truncated, dropped %llu bytes]",
-                                    static_cast<unsigned long long>(payload_len - prefix_len));
+        const int m = std::snprintf(marker, sizeof(marker), "%s%llu%s",
+                                    kMarkerHead,
+                                    static_cast<unsigned long long>(payload_len - prefix_len),
+                                    kMarkerTail);
         if (m <= 0) return FormatBoundedStatus::kInvalidInput;  // 防御:不可达
         const uint32_t marker_len = (static_cast<uint32_t>(m) > sizeof(marker) - 1)
                                         ? static_cast<uint32_t>(sizeof(marker) - 1)

@@ -403,6 +403,9 @@ object LogX {
     fun getStats(): Stats? {
         return executeOp { h ->
             val arr = nativeGetStats(h) ?: return@executeOp null
+            // R5-6: 版本错配(旧 .so + 新 Kotlin)时优雅降级为 null,而非 AIOOBE;
+            // 与"init 之前或 close 之后调用返回 null"的既有契约口径一致。
+            if (arr.size < 6) return@executeOp null
             Stats(
                 dropNoSpace = arr[0],
                 dropTooLarge = arr[1],

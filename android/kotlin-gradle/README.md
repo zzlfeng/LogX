@@ -32,5 +32,7 @@ gradle :app:assembleDebug        # smoke APK (需 jniLibs 已放入预编译 so)
 
 要求: Gradle 8.9+、JDK 17、Android SDK (compileSdk 34)。
 注: 本机 PATH 上的 gradle 若为 4.10.2 等旧版会解析失败,请用
-`~/.gradle/wrapper/dists/gradle-8.9-all/*/gradle-8.9/bin/gradle.bat`
-并设 `JAVA_HOME` 指向 JDK 17。
+`~/.gradle/wrapper/dists/gradle-8.9-all/*/gradle-8.9/bin/gradle.bat`。
+JDK 17 定位方式任选其一:设 `JAVA_HOME` 环境变量,或在**用户级**
+`~/.gradle/gradle.properties` 配 `org.gradle.java.home=<JDK17 路径>`
+(R5-1: 机器特定路径不入仓库,避免异构机器/CI 构建失败)。

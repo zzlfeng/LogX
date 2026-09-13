@@ -1257,3 +1257,57 @@ cap − (27+tag) ≤ 61440−27);附 thread_local 惰性提交说明(冷路径�
   **BUILD SUCCESSFUL**(R4-2 全部 Kotlin/Compose 改动编译打包通过);
 - `gradle.properties` 固定 `org.gradle.java.home=JDK 17`(AGP 8.5.1 要求,消除
   本机 JAVA_HOME=11 导致的构建阻断,Gradle 标准机器级配置)。
+
+---
+
+## R5 复审批次: 516d091/5828b3f 外部复审发现收口 (2026-09-13)
+
+> 复审报告(`code_review_R4_2026-09-13.md`)6 项新发现经逐条核实**全部属实**(6 实 0 误);
+> 复审同时确认上一轮 R4 的 5 项闭环结论、"1 误"证伪成立、`trunc_buf` 缩容 19,795,743 组
+> 穷举安全、`logx_stats_t` 72B ABI 不变——均无异议。
+
+### R5-1 (P2) 机器绝对路径迁出仓库
+R4 批次将 `org.gradle.java.home=D\:/DevEnv/Java/jdk-17.0.4.1` 提交进
+`kotlin-gradle/gradle.properties`,异构机器/CI 必然构建失败。R5-1 将该行迁至**用户级**
+`~/.gradle/gradle.properties`(机器特定配置的标准归属),仓库文件还原,kotlin-gradle
+README 补 JDK 17 定位说明(JAVA_HOME 或用户级 java.home 二选一)。本机构建经重跑验证
+不受影响。
+
+### R5-2 (P3) 截断出参单测改真四态
+`NullOutParamsTolerated` 第三个断言与第一个逐字节相同(双 NULL)却注释"单 NULL 混用"。
+改为两个真实混用态:`(&truncated, nullptr)` 断言 `kOk && truncated==true`;
+`(nullptr, &dropped)` 断言 `kOk && dropped>0`。
+
+### R5-3 (P3) LogXProbe 头注释限定表述
+"彻底消除了对错误消息文案的脆弱依赖"与 `ERR_TOO_LARGE` 下按 `msg` 前缀分流的实现矛盾。
+改为限定表述:NO_SPACE / INVALID_ARG 已消除文案依赖;ERR_TOO_LARGE 截断/病态丢弃共码
+分流为**已知文本耦合**,根治候选立案 **Backlog B-3**(独立事件错误码/事件种类,待决策)。
+
+### R5-4 (P3) 计划表头部元数据去重
+历次版本修订在修订说明块中重复带入"制定日期/基准方案/变更日志"三元组(累积 3 份),去重
+保留 1 份。
+
+### R5-5 (P3) 60KB 硬上限口径精确化
+`logx_format.h` "用户载荷 >60KB" 改为 "内部用户数据超 60KB(`user_total` = 27B 用户头 +
+tag + payload,长 tag 会提前触限)",与 `format_record` 实际门槛一致。
+
+### R5-6 (P3) `getStats()` 长度守卫
+解包前加 `if (arr.size < 6) return@executeOp null`:旧 `.so` + 新 Kotlin 版本错配时
+优雅降级为 null(与"init 前/close 后返回 null"既有契约一致),不再抛
+`ArrayIndexOutOfBoundsException`。
+
+### R5-7 (观察项) marker 常量化 + static_assert 固化安全前提
+`trunc_buf` 缩至 60KB 后余量仅 33B,安全性依赖"marker ≤ 45B"与"payload 为 uint32_t"
+两条未固化前提。R5-7:marker 拆为 `kMarkerHead[]`/`kMarkerTail[]` 常量并经
+`snprintf("%s%llu%s")` 引用(字面量与断言绑定);两条 `static_assert` 固化
+`kMarkerReserve`(45 ≤ 48)与 `kTruncBufSize`(最坏 msg 61346 ≤ 61440)不变量;
+注释"绰绰有余"改为精确表述(最坏写入 61407B @ max_total=61458/tag=0,余量 33B,前提变更
+须重审容量)。
+
+### 验证
+- C++ 三构建矩阵:OFF/OFF **123/123**、ON/OFF **129/129**、ON/ON **142/142** 单测 +
+  压测 4/4 ×3 全绿;
+- kotlin-gradle 离线 `:app:testDebugUnitTest` **BUILD SUCCESSFUL**(仓库无 java.home,
+  用户级配置生效,R5-1 得证);logx-tester `:app:assembleDebug --offline`
+  **BUILD SUCCESSFUL**;
+- Android arm64 交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。

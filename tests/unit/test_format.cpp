@@ -388,10 +388,20 @@ TEST(FormatBounded, NullOutParamsTolerated) {
                                     0, 0, 0, buf, sizeof(buf), &total, 500,
                                     nullptr, nullptr),
               FormatBoundedStatus::kOk);
-    // 单 NULL 混用:out_total_bytes 必须非空(容量契约),仅截断出参为 NULL
+    // 混用态 1:只要 out_truncated(out_dropped 为 NULL),截断标记可观测
+    bool truncated_only = false;
     EXPECT_EQ(format_record_bounded(2, "Tag", (const uint8_t*)big.data(),
                                     static_cast<uint32_t>(big.size()),
                                     0, 0, 0, buf, sizeof(buf), &total, 500,
-                                    nullptr, nullptr),
+                                    &truncated_only, nullptr),
               FormatBoundedStatus::kOk);
+    EXPECT_TRUE(truncated_only);
+    // 混用态 2:只要 out_dropped(out_truncated 为 NULL),丢弃字节数可观测
+    uint64_t dropped_only = 0;
+    EXPECT_EQ(format_record_bounded(2, "Tag", (const uint8_t*)big.data(),
+                                    static_cast<uint32_t>(big.size()),
+                                    0, 0, 0, buf, sizeof(buf), &total, 500,
+                                    nullptr, &dropped_only),
+              FormatBoundedStatus::kOk);
+    EXPECT_GT(dropped_only, 0u);
 }
