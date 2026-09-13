@@ -32,6 +32,8 @@ add_executable(logx_unit_tests
     test_jni_string.cpp
     test_j04_regression.cpp
     test_review_p1_p4.cpp
+    # 资源占用(RSS/PSS)、延迟抖动(stddev/CV)与 Pal 层泄漏回归
+    test_observability.cpp
 )
 target_link_libraries(logx_unit_tests
     PRIVATE
@@ -42,6 +44,11 @@ target_link_libraries(logx_unit_tests
 if(NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(logx_unit_tests PRIVATE Threads::Threads)
+endif()
+if(WIN32)
+    # test_observability.cpp 用 GetProcessMemoryInfo 采集 WorkingSet(RSS 等价量);
+    # MSVC 下该符号位于 psapi.lib
+    target_link_libraries(logx_unit_tests PRIVATE psapi)
 endif()
 target_include_directories(logx_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
@@ -54,6 +61,33 @@ target_include_directories(logx_unit_tests PRIVATE
 add_test(NAME logx_unit_tests COMMAND logx_unit_tests)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(logx_unit_tests PRIVATE -Wall -Wextra)
+endif()
+
+# ---------------------------------------------------------------------------
+# 热路径"零堆分配"探针。
+# test_hotpath_alloc.cpp 替换全局 operator new / new[] 及其 delete(线程局部计数),
+# 故**独立成可执行文件** —— 避免改变 logx_unit_tests 其余 140+ 用例的分配器行为。
+# 该目标不依赖 psapi 等平台库;计数口径为"仅当前调用线程"。
+# ---------------------------------------------------------------------------
+add_executable(logx_hotpath_alloc_tests
+    test_hotpath_alloc.cpp
+)
+target_link_libraries(logx_hotpath_alloc_tests
+    PRIVATE
+    logx_core
+    GTest::gtest
+    GTest::gtest_main
+)
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(logx_hotpath_alloc_tests PRIVATE Threads::Threads)
+endif()
+target_include_directories(logx_hotpath_alloc_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/core/include
+)
+add_test(NAME logx_hotpath_alloc_tests COMMAND logx_hotpath_alloc_tests)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(logx_hotpath_alloc_tests PRIVATE -Wall -Wextra)
 endif()
 
 # 真机解码联调驱动器 (M5/T3.4): 生产配置引擎产日志 → 导出 → adb pull →

@@ -1,7 +1,8 @@
 // logx_bench.cpp - T5.2 性能基线基准 harness。
 //
 // 三阶段基准(验收项见 docs/LogX后续实施计划表.md T5.2 与 docs/benchmark_report.md):
-//   A. 单条写入延迟分布:单线程 Native 热路径 logx_write,P50/P90/P99/P99.9/max;
+//   A. 单条写入延迟分布:单线程 Native 热路径 logx_write,P50/P90/P99/P99.9/max
+//      + 抖动维度(stddev/CV/MAD/robustCV 与长尾比);
 //      分别以 compress_algo = none / zstd 各跑一轮(压缩在 Flusher 线程执行,
 //      预期写入热路径延迟与压缩开关无关,此处一并实证)。
 //   B. 开/关 zstd 压缩的纯写吞吐与落盘体积对比(混合变长 payload,80% 文本 +
@@ -18,6 +19,9 @@
 //   - 全程核对 drop_no_space / drop_too_large / block_write_errors,非零即宣告该轮
 //     数据失真(结果无效),防止环满丢弃污染延迟/吞吐/体积结论;
 //   - 计时 std::chrono::steady_clock(与既有测试一致),开头附带计时器开销实测;
+//   - 延迟输出同时给出**抖动维度**:stddev / CV(stddev/mean) / MAD / robustCV
+//     (MAD/P50) 与长尾比(P99/P50、max/P50)。分位数刻画长尾量级,离散度刻画
+//     稳定性,二者互补;robustCV 对个别调度抢占样本不敏感,更适合判"抖动是否病态";
 //   - 输出目录按 run_N 递增唯一化,避免历史文件污染落盘体积统计;每轮测完即清理
 //     日志文件压缩磁盘占用(真机 /data 空间紧张)。
 
@@ -144,15 +148,48 @@ uint64_t percentile(const std::vector<uint64_t>& sorted, double p) {
 }
 
 void print_ns_dist(const char* label, std::vector<uint64_t>& v) {
+    if (v.empty()) {
+        printf("  %s: (无样本)\n", label);
+        return;
+    }
     std::sort(v.begin(), v.end());
+
+    const double n = static_cast<double>(v.size());
     double mean = 0;
     for (uint64_t x : v) mean += static_cast<double>(x);
-    mean /= static_cast<double>(v.size());
-    uint64_t p50 = percentile(v, 50);
-    uint64_t p90 = percentile(v, 90);
-    uint64_t p99 = percentile(v, 99);
-    uint64_t p999 = percentile(v, 99.9);
-    uint64_t mx = v.back();
+    mean /= n;
+
+    // 离散度(抖动)维度:标准差与变异系数 CV = stddev/mean。
+    // 分位数刻画长尾量级,离散度刻画"稳定性"——两者互补,缺一不可。
+    double var = 0;
+    for (uint64_t x : v) {
+        const double d = static_cast<double>(x) - mean;
+        var += d * d;
+    }
+    var /= n;   // 总体方差(描述本批样本,非从样本推断总体)
+    const double sd = std::sqrt(var);
+    const double cv = mean > 0 ? sd / mean : 0.0;
+
+    const uint64_t p50 = percentile(v, 50);
+    const uint64_t p90 = percentile(v, 90);
+    const uint64_t p99 = percentile(v, 99);
+    const uint64_t p999 = percentile(v, 99.9);
+    const uint64_t mx = v.back();
+
+    // 稳健离散度:MAD(中位绝对偏差)与 robustCV = MAD/P50。
+    // 经典 stddev/CV 会被个别调度抢占样本放大,稳健量对长尾离群点不敏感,
+    // 因此更适合作为"抖动是否病态"的判据(见 tests/unit/test_observability.cpp)。
+    std::vector<uint64_t> dev;
+    dev.reserve(v.size());
+    const long long med = static_cast<long long>(p50);
+    for (uint64_t x : v)
+        dev.push_back(static_cast<uint64_t>(
+            std::llabs(static_cast<long long>(x) - med)));
+    std::sort(dev.begin(), dev.end());
+    const uint64_t mad = percentile(dev, 50);
+    const double robust_cv =
+        p50 > 0 ? static_cast<double>(mad) / static_cast<double>(p50) : 0.0;
+
     printf("  %s (n=%llu):\n", label, static_cast<unsigned long long>(v.size()));
     printf("    mean  = %9llu ns (%8.3f us)\n", (unsigned long long)mean, mean / 1000.0);
     printf("    P50   = %9llu ns (%8.3f us)\n", (unsigned long long)p50, p50 / 1000.0);
@@ -160,6 +197,13 @@ void print_ns_dist(const char* label, std::vector<uint64_t>& v) {
     printf("    P99   = %9llu ns (%8.3f us)\n", (unsigned long long)p99, p99 / 1000.0);
     printf("    P99.9 = %9llu ns (%8.3f us)\n", (unsigned long long)p999, p999 / 1000.0);
     printf("    max   = %9llu ns (%8.3f us)\n", (unsigned long long)mx, mx / 1000.0);
+    printf("    ---- 抖动(jitter) ----\n");
+    printf("    stddev  = %9.1f ns    CV(stddev/mean)     = %.3f\n", sd, cv);
+    printf("    MAD     = %9llu ns    robustCV(MAD/P50)   = %.3f\n",
+           (unsigned long long)mad, robust_cv);
+    printf("    长尾比: P99/P50 = %.2fx    max/P50 = %.2fx\n",
+           p50 ? static_cast<double>(p99) / static_cast<double>(p50) : 0.0,
+           p50 ? static_cast<double>(mx) / static_cast<double>(p50) : 0.0);
 }
 
 // ---- 实例与失真护栏 ----
