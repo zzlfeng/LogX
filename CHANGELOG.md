@@ -42,6 +42,8 @@
 | `de00d84` | fix(core): R6 收口——static_assert 下界修正(61346→61410,R5-7 引入的偏松 64B)+ T5.6 迁移提示补记 |
 | `9c84c5d` | fix(core): R7 收口——常量绑定权威定义处/CHANGELOG R5-7 勘误/kMaxSlicePayload 遮蔽清理/kHardUserTotal 重复删除(复审 3 项属实+1 自纠) |
 | `28acf7f` | feat(core): T5.5 超长日志截断保前缀——B-1 方案B 落地,超长不再整条丢弃(预算求解+marker+truncated_logs 计数,顺带修正 >60KB 误报 INVALID_ARG) |
+| `60f2365` | refactor(core): R8 收口——死常量 kMaxMsg 清理 + 20KB 常量族单源化(复审 3 项属实;本行系 1904cfb 漏加,R9 补记) |
+| `7b2ead6` | refactor(core): R9 收口——PAD 循环裸 6 补齐 + 6B/16KB 常量族全量单源化(复审 1×P3/观察/Nit 属实 + 2 项自查含 60f2365 行补记) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -1476,6 +1478,46 @@ payload)。至此截断子系统全部数值前提(27/60KB/20480/48/45/61410/614
   (后者连带把裸 `6` 一并绑定)。
 - 至此截断/分片/PAD 子系统全部数值前提(27 / 60KB / 20KB / 6B / 45 / 48 / 61410 /
   61440)均为单源命名常量,相互以 static_assert 或派生表达式绑定。
+
+### 验证
+三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;Android arm64
+交叉编译 0 错误,`liblogx.so` 同步双 jniLibs。
+
+---
+
+## R9 批次: R8 复审 §4 收口 (2026-09-13)
+
+> 复审报告(`code_review_R8_2026-09-13.md`,对象 60f2365/1904cfb)1 项 P3 + 1 项观察 +
+> 1 项 Nit 经核实**全部属实**;复审对 R8-1/R8-2 落实、R8-3 数值零变化、包含图/守卫/
+> 可见性的确认无异议。本轮另自查出 2 项复审未及问题(1 项同类遗漏 + 1 项复审误判)。
+
+### R9-1 (P3) PAD 回绕循环"部分替换"补齐
+R8-3 在 staging.cpp 回绕 PAD 块内仅把 `remain - 6` 换为 `remain - kHeaderLen`,同块
+另有 3 处同概念裸 `6` 未动:`pad >= 6`(阈值)、`pos + 6 <= data_size_`(循环界)、
+`pos += 6 + this_pad`(步进)——块内口径自相矛盾。3 处一并绑定 `kHeaderLen`。
+
+### R9-2 (审查未及,同类自查) flusher.cpp 5 处同概念裸 `6` 补齐
+全量扫描发现 flusher.cpp 另有 5 处同为"6B 记录头"概念的裸字面量:
+peek_record_len 的 `total - off < 6` / `sz = 6 + len`,split_impl 的两处循环界
+`total - pos < 6` / `total - cur < 6`,块解析防御 `raw_len < 6`——一并绑定
+`kHeaderLen`。R8 文档"6B 全部单源"的声称至此才完全成立。staging.cpp:111/122
+(`flags@6`)与 flusher.cpp:120/264/305(`seqno@6`/`date@6`)为**块/文件头字段偏移**,
+与 6B 记录头概念不同,保留(与复审 §4.1 说明一致)。
+
+### R9-3 (§4.2 观察,采纳) 16KB 常量族单源化
+flusher.cpp 的 `kNormalBlockMax = 16 * 1024` → `= kBlockMaxNormal`
+(logx_staging.h:232),与 R8-3 的 20KB 族同款处理。单源清单增至
+27 / 60KB / 20KB / **16KB** / 6B / 45 / 48 / 61410 / 61440。
+
+### R9-4 (§4.3 Nit,采纳) flusher.cpp 直含 logx_staging.h
+`kBlockMaxRaw`/`kBlockMaxNormal` 此前经 logx_internal.h 传递包含可见;补
+`#include "logx_staging.h"`(codec.cpp:22 已有同款先例),依赖显式化。
+
+### R9-5 (自纠,复审误判) R8 提交表行漏加,补记
+`1904cfb` 提交信息声称"补 60f2365 提交记录行",但其 37 行 diff 仅含 R8 章节正文,
+提交记录表并无该行——R8 复审"哈希列全部合规、真实哈希行已写入"的结论失准(仅核对
+无占位/无重复,未核对行存在性)。本轮于提交表补记 `60f2365` 行。R8-2 承诺的
+"fix 提交在前、docs 单次提交带真实哈希"流程本身继续有效并沿用。
 
 ### 验证
 三构建矩阵 **123/123 + 129/129 + 142/142** 单测 + 压测 4/4 ×3 全绿;Android arm64
