@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.19 (2026-09-13 R9 批次:R8 复审收口——PAD 循环裸 6 补齐/6B+16KB 常量族全量单源化/包含显式化;T5.3 用户指示暂停)  
+> **文档版本**: v1.20 (2026-09-13 R10 批次:R9 复审收口——recovery.cpp 裸 6 补齐/全仓模式穷尽扫描纠偏/Backlog B-4;T5.3 用户指示暂停)  
+>
+> **v1.20 修订说明**: 2026-09-13 **R10 批次**(对象 `code_review_R9_2026-09-13.md` §3,审查 7b2ead6/2aa6984): 1×P3 + 1 观察 + 1 Nit 经核实**全部属实**(复审对 R9-1/R9-3/R9-4 落实、R9-5 自纠成立——含其对 R8"哈希行已写入"误判的确认与教训——均无异议)。**§3.1 属实**——R9-2 的"全量扫描"实际仅覆盖 5 个 TU,漏 `recovery.cpp`(我方扫描清单遗漏,声称失准);`recovery.cpp:37/39/59/67/91` 5 处同概念裸 `6`(probe_record 下界/步长、ring_scan 循环界/全零终止符、cksum 载荷起点)绑定 `kHeaderLen`(该 TU 经 logx_internal.h 传递本已可见,纯遗漏);**本批起改为按模式全仓穷尽扫描**(core/src+include 全部 14 文件 + android/cpp):修复后 C++ 核心记录头语义裸 `6` 零残留,余下命中均为字段偏移(flags@6/seqno@6/date@6)、错误码 -6、stats 数组长度、UTF-8 位运算等不同概念;tests/decoder 字面量**有意保留**(单测钉死线上格式/Python 跨语言镜像,decoder 已有 `BLOCK_RAW_MIN = 6` 命名常量);**§3.3 采纳**——`logx_internal.h:219` 注释 `[6,…]` → `[kHeaderLen,…]`;**§3.2 观察采纳**——Backlog 新增 **B-4**(收敛 flusher/recovery 平行记录扫描实现——常量三度遗漏的结构性根因,待决策)。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。
 >
 > **v1.19 修订说明**: 2026-09-13 **R9 批次**(对象 `code_review_R8_2026-09-13.md` §4,审查 60f2365/1904cfb): 1×P3 + 1 观察 + 1 Nit 经核实**全部属实**(复审对 R8-1/R8-2 落实、R8-3 数值零变化、包含图/守卫/可见性的确认无异议)。**§4.1 属实**——R8-3 在 staging.cpp 回绕 PAD 块仅替换 1/4 处同概念裸 `6`(`remain - kHeaderLen` 已换;`pad >= 6` 阈值/`pos + 6 <= data_size_` 循环界/`pos += 6 + this_pad` 步进三处遗留),块内口径自相矛盾,3 处补齐 `kHeaderLen`;**审查未及的同类自查**——flusher.cpp 尚有 5 处同概念裸 `6`(peek_record_len `total - off < 6`/`sz = 6 + len`、split_impl 两处循环界、块防御 `raw_len < 6`)一并绑定,"6B 单源"声称至此完全成立(staging:111/122 `flags@6`、flusher:120/264/305 `seqno@6/date@6` 为块/文件头字段偏移,概念不同,保留,与复审 §4.1 说明一致);**§4.2 观察采纳**——`kNormalBlockMax = kBlockMaxNormal`(16KB 常量族,同 R8-3 款式);**§4.3 Nit 采纳**——flusher.cpp 直含 `logx_staging.h`(此前经 logx_internal.h 传递可见;codec.cpp:22 已有先例)。单源清单:27/60KB/20KB/16KB/6B/45/48/61410/61440。**自纠 1 项(复审误判)**——`1904cfb` 提交信息声称"补 60f2365 提交记录行",但其 37 行 diff 仅含 R8 章节正文,提交记录表并无该行;R8 复审"哈希列全部合规、真实哈希行已写入"的结论失准(仅核对无占位/无重复,未核对行存在性),本轮于 CHANGELOG 提交表补记 `60f2365` 行。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。
 >
@@ -107,6 +109,7 @@ gantt
 | **R7** | R6 复审收口(`code_review_R6_2026-09-13.md` §3) | `core/src/format.cpp`, `core/include/logx_format.h`, `CHANGELOG.md` | **P3** | **✅ 100% 已完成 (2026-09-13)** | **R7-1(§3.1,属实)**: `format_record` 权威定义处改用 `kUserHdrSize`/`kMaxUserPayload`,并以 `static_assert(kUserHdrSize == 8+4+8+1+2+4)` 把用户头布局表达式钉在定义处(布局变更→编译期失配),断言前提与真实门槛绑定;**R7-2(§3.2,属实)**: CHANGELOG R5-7 节补内联勘误(61346/61407/33B→61410/30B,历史原文保留);**R7-3(§3.3,属实)**: 删除 `format_record` 局部 `kMaxSlicePayload` 对头文件常量的遮蔽(T5.5 遗留);**R7-4(自纠)**: 删除 R6-1 引入的 `kHardUserTotal`——与头文件既有 `kMaxUserPayload`(此前零引用)重复,60KB 上限统一单源。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。 |
 | **R8** | R7 复审收口(`code_review_R7_2026-09-13.md` §4) | `core/src/format.cpp`, `core/include/logx_staging.h`, `core/src/flusher.cpp`, `core/src/staging.cpp` | **P3** | **✅ 100% 已完成 (2026-09-13)** | **R8-1(§4.1,属实)**: 删除零引用死常量 `UserRecordHeader::kMaxMsg`(60*1024,语义失实——msg 单独不可能达 60KB),结构体标注"仅作文档用途,布局以 static_assert 钉住的 kUserHdrSize 表达式为准";**R8-2(§4.2,属实)**: `471466a` 占位符 `<R7>` 入库为流程瑕疵,承诺"fix 提交在前、docs 单次提交带真实哈希"(本批次即按此执行);**R8-3(§4.3,采纳)**: 20KB 常量族单源化——`kBlockMaxRaw = kMaxSlicePayload + kHeaderLen`(logx_staging.h 新增 logx_format.h 包含,无环)、`kSingleRecordMaxRaw = kBlockMaxRaw`、format_pad/staging 回绕 PAD 两处 `20*1024` 字面量改 `kMaxSlicePayload`(staging 处连带 6 → kHeaderLen)。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。 |
 | **R9** | R8 复审收口(`code_review_R8_2026-09-13.md` §4) | `core/src/staging.cpp`, `core/src/flusher.cpp` | **P3** | **✅ 100% 已完成 (2026-09-13)** | **R9-1(§4.1,属实)**: R8-3 在回绕 PAD 块仅替换 1/4 处同概念裸 `6`,其余 3 处(`pad >= 6` 阈值/`pos + 6 <= data_size_` 循环界/`pos += 6 + this_pad` 步进)补齐 `kHeaderLen`;**R9-2(审查未及,同类自查)**: flusher.cpp 另有 5 处同概念裸 `6`(peek_record_len ×2 / split_impl ×2 / `raw_len < 6` 防御)一并绑定——"6B 单源"声称至此完全成立(块/文件头字段偏移 flags@6/seqno@6/date@6 概念不同,保留);**R9-3(§4.2,采纳)**: `kNormalBlockMax = kBlockMaxNormal` 16KB 常量族单源;**R9-4(§4.3,采纳)**: flusher.cpp 直含 `logx_staging.h`(IWYU,codec.cpp:22 先例);**R9-5(自纠,复审误判)**: `1904cfb` 声称"补 60f2365 提交记录行"但其 diff 未含该行,复审"哈希列全部合规"结论失准,本轮补记该行。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。 |
+| **R10** | R9 复审收口(`code_review_R9_2026-09-13.md` §3) | `core/src/recovery.cpp`, `core/include/logx_internal.h` | **P3** | **✅ 100% 已完成 (2026-09-13)** | **R10-1(§3.1,属实)**: R9-2"全量扫描"漏 `recovery.cpp`(仅扫 5 个 TU),其 5 处同概念裸 `6`(probe_record ×2 / ring_scan 循环界 + 全零终止符 / cksum 载荷起点)绑定 `kHeaderLen`(TU 内本已可见,纯遗漏);本批起改**按模式全仓穷尽扫描**(14 个 C++ 文件 + android/cpp),修复后记录头语义裸 `6` 零残留,余下命中均为字段偏移/错误码/数组长度/位运算等不同概念,tests/decoder 字面量有意保留(格式钉死/跨语言镜像);**R10-2(§3.3,采纳)**: `logx_internal.h:219` 注释 `[6,…]` 同步 `[kHeaderLen,…]`;**R10-3(§3.2,观察采纳)**: Backlog 新增 B-4(收敛平行记录扫描实现——三度遗漏结构性根因,待决策)。三矩阵 123/129/142 + 压测 4/4×3 全绿,arm64 交叉 0 错误。 |
 
 ---
 
@@ -210,3 +213,13 @@ gantt
   - **B. 新增独立事件种类** `LOGX_EV_TRUNCATED = 5`:`logx_event_kind_e` 追加,语义更显性;波及 Kotlin `EventKind` 枚举映射与探针 `when` 分支。**← 已采纳**
   - **C. 维持现状**:文案分流已满足当前唯一消费方,接受耦合。
 - **决策点**: 是否存在 B-1B 设想之外的第三方监控按 `ERR_TOO_LARGE` 过滤截断事件(迁移成本);`-11` 码值与 `LOGX_EV_TRUNCATED` 枚举序位一经发布即冻结;spec §5/§8 事件表需随决策同步。
+
+### B-4 收敛 flusher/recovery 平行记录扫描实现(R9 复审根因观察)
+
+- **记录日期**: 2026-09-13
+- **状态**: ⏸ 待决策
+- **背景**: `flusher.cpp` 的 `peek_record_len`/`split_impl` 与 `recovery.cpp` 的 `probe_record`/`ring_scan` 为语义几乎相同的两份平行实现(记录长度探测 + raw 流按记录边界扫描),仅细节不同(peek 多验 magic;ring_scan 带 6B 全零终止符判定与 cksum 校验)。常量单源化因此三度遗漏(R8-3 staging 块内部分替换 → R9-1 补;R9-2 补 flusher 漏 recovery → R10-1 补),该重复是结构性根因。
+- **候选方案**:
+  - **A. 收敛共享原语**: 将"记录长度探测 / 按记录边界步进扫描"收敛为共享实现(候选位置 `logx_format.cpp` 或独立 `record_scan.cpp`),flusher/recovery 以参数差异化(magic 校验开关、终止符/校验回调等);波及写/恢复两条关键路径,需等价性论证 + 全量回归。
+  - **B. 维持平行实现**: 接受重复,以"裸 `6`(记录头语义)模式穷尽扫描"作为批次收口流程门禁(R10 已执行一次)防再漂移;零回归风险。
+- **决策点**: 等价性论证成本 vs 长期漂移风险;两处语义差异(magic 校验时机/终止符语义)能否无损参数化;若选 A,可顺势把记录头布局断言扩展到扫描原语。

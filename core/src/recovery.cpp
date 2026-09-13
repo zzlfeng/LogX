@@ -34,9 +34,9 @@ namespace {
 // 读 raw 区里一条记录,返回该记录的字节数(头+payload);0 表示到达尾部/失败。
 // 跨回绕处理由 caller 保证 raw 是连续 buffer。
 uint32_t probe_record(const uint8_t* raw, uint32_t off, uint32_t total) {
-    if (total - off < 6) return 0;
+    if (total - off < kHeaderLen) return 0;
     uint32_t len = uint32_t(raw[off]) | (uint32_t(raw[off + 1]) << 8);
-    uint32_t sz = 6 + len;
+    uint32_t sz = kHeaderLen + len;
     if (off + sz > total) return 0;
     return sz;
 }
@@ -56,7 +56,7 @@ uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
     uint32_t pos = f;
     uint32_t valid_end = f;
     while (pos < total) {
-        if (total - pos < 6) {
+        if (total - pos < kHeaderLen) {
             // 缝残留 < 6B:不识别为记录,跳过(并归零收尾);保留为撕裂尾巴。
             *out_valid_end = valid_end;
             *out_truncated_tail = total - pos;
@@ -64,7 +64,7 @@ uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
         }
         // 6B 全零终止符?
         bool all_zero = true;
-        for (uint32_t i = 0; i < 6; ++i) if (raw[pos + i] != 0) { all_zero = false; break; }
+        for (uint32_t i = 0; i < kHeaderLen; ++i) if (raw[pos + i] != 0) { all_zero = false; break; }
         if (all_zero) {
             *out_valid_end = valid_end;
             *out_truncated_tail = 0;
@@ -88,7 +88,7 @@ uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
             return pos;
         }
         if (magic == kMagicEntry) {
-            uint8_t actual = cksum1(raw + pos + 6, payload_len);
+            uint8_t actual = cksum1(raw + pos + kHeaderLen, payload_len);
             if (actual != cksum_byte) {
                 *out_valid_end = valid_end;
                 *out_truncated_tail = total - pos;
