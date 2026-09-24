@@ -132,9 +132,7 @@ long append_block_raw(int fd,
     frame.reserve(34 + enc.payload.size());
     frame.insert(frame.end(), hdr, hdr + 34);
     frame.insert(frame.end(), enc.payload.begin(), enc.payload.end());
-    if (enc.enc_ok) {
-        // encode_block 已把 [cipher | tag] 合并到 enc.payload 尾部 16B,这里不再追加
-    }
+    // encode_block 已把 [cipher | tag] 合并到 enc.payload 尾部 16B (enc_ok 时),此处无需额外追加 tag
     // 5) 写盘
     long n = inst->pal->file_write(fd, frame.data(), frame.size());
     if (n != static_cast<long>(frame.size())) {
