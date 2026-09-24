@@ -184,9 +184,10 @@ public:
         // 该路径在 retention 扫盘与快照统计中高频调用。
         WIN32_FILE_ATTRIBUTE_DATA fad;
         if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return -1;
-        // 64 位拼接低/高 32 位(避免经 LARGE_INTEGER 中转的符号歧义)
-        return (static_cast<int64_t>(fad.nFileSizeHigh) << 32) |
-               static_cast<int64_t>(fad.nFileSizeLow);
+        // 64 位无符号拼接高/低 32 位，杜绝有符号移位与按位或的静态检查歧义
+        uint64_t sz = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) |
+                      static_cast<uint64_t>(fad.nFileSizeLow);
+        return static_cast<int64_t>(sz);
     }
     int file_fsync(int fd) override {
         HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
