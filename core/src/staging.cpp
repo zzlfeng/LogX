@@ -239,8 +239,6 @@ bool Staging::open(RecoveryState* state, bool* recovered) {
     return true;
 }
 
-bool Staging::map_and_validate_locked() { return base_ != nullptr; }
-
 void Staging::commit_header_locked(uint32_t seqno, uint32_t f, uint32_t w,
                                    const AppendTargetCache* target) {
     Header h;

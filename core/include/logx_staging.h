@@ -204,7 +204,6 @@ public:
     void set_pal(Pal* p) { pal_ = p; }
 
 private:
-    bool map_and_validate_locked();
     void read_header(const uint8_t* p, Header* out) const;
     uint32_t compute_header_crc(const uint8_t* p) const;
     bool pick_header(Header* out, AppendTargetCache* out_target) const;
