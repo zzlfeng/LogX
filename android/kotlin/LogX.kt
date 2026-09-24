@@ -100,6 +100,11 @@ object LogX {
         val level: Level = Level.I,
         val retentionDays: Int = 7,
         val maxFileSize: Long = 10L * 1024 * 1024,
+        /**
+         * 单条日志长度上限。超长将被自动截断保前缀落盘。
+         * 建议 >= 97（用户头 27B + 最大 Tag 64B + 片头 6B）；
+         * 若配置病态小值（< 97），单条日志写入时若连空记录都无法容纳，将触发 DROP / LOGX_ERR_TOO_LARGE 丢弃兜底。
+         */
         val maxLogLength: Int = 64 * 1024,
         // E-06: 0 = 禁用按阈值自动唤醒(纯手动 flush 控制);-1 = 取默认 8KB;
         // 其它值 = 字节阈值。JNI 层以 -1 映射 C ABI 的 UINT32_MAX 默认哨兵。
@@ -289,6 +294,9 @@ object LogX {
                 }
                 require(config.maxLogLength < 128 * 1024 - 128 - 1) {
                     "maxLogLength must be < (dataSize - 1) = 130943"
+                }
+                require(config.maxLogLength > 0) {
+                    "maxLogLength must be > 0"
                 }
 
                 minLevel = config.level

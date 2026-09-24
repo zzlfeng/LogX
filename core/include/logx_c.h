@@ -30,7 +30,7 @@ typedef enum {
     LOGX_ERR_STATE           = -2,   /* init 前调用 / 重复 init / 已 close */
     LOGX_ERR_IO              = -3,   /* 文件 / mmap / 刷盘失败 */
     LOGX_ERR_NO_SPACE        = -4,   /* staging 满 */
-    LOGX_ERR_TOO_LARGE       = -5,   /* 单条超过 maxLogLength */
+    LOGX_ERR_TOO_LARGE       = -5,   /* 单条放不下(截断到空记录仍超出病态小 maxLogLength) */
     LOGX_ERR_CODEC           = -6,   /* 编解码失败 */
     LOGX_ERR_NOMEM           = -7,
     LOGX_ERR_NOT_FOUND       = -8,   /* export 时段无文件 */
