@@ -48,6 +48,13 @@
 | `0dc4ebe` | docs(core): R11 收口——注释层裸 6 同步 + 穷尽扫描门禁固化(复审 1×Nit 属实;7 处含同块未列项) |
 | `e67be46` | test(core): 补齐资源占用(RSS/PSS)/延迟抖动(stddev/CV)/热路径零分配/CountingPal 泄漏回归四类用例(收口 §8.4 已知局限 + spec §349 未落实条款;新增独立目标 logx_hotpath_alloc_tests) |
 | `c7ef489` | docs(test): R12 收口——T5.2 补测批次审查发现修正(B-5 定性纠偏为间歇性/§349→L349 编号/bench 限制表述删除/补批次表行) |
+| `c07f979` | fix(export): 块损坏分支清空 carry_slice_buf 杜绝跨块错乱拼接 (R13 N-2) |
+| `0adfc55` | docs(api): 统一 LOGX_ERR_TOO_LARGE 注释与 Kotlin 层配置下界说明 (R13 N-1/N-5) |
+| `9ad0db3` | docs(flusher): 明确 sum_raw_len_since 失败路径出参归零契约 (R13 N-3) |
+| `314804f` | refactor(staging): 清理未使用的私有死函数 map_and_validate_locked (R13 N-7) |
+| `f7fb069` | fix(pal/win32): file_size_path 改用无符号 64 位拼接防止符号移位 (R13 N-6) |
+| `b41e67c` | style(flusher): 移除 append_block_raw 中无实际操作的空 if 分支 (R13 N-8) |
+| `c84dca1` | fix(format): trunc_buf 拼装前增加运行时容量不可达越界防御 (R13 N-4) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -1746,3 +1753,42 @@ Linux/Android 分支未编译未运行):双方共同局限,待真机/CI 复跑�
 ### 局限更新
 F5 仅余 **Linux 桌面分支**未编译未运行(本机无 Linux 环境,待 Linux/CI);计划表
 R12 行 F5 表述已同步(v1.24)。
+
+---
+
+## R13 全量源码审查批次收口 (2026-09-25)
+
+> 依据《logx 全量源码审查报告 (R13)》（`code_review_R13_2026-09-24.md`）审查发现与复核结论（§10 核对表），执行“逐项修复 -> 独立审查 -> 单独提交”工作流。
+> 本批次共收口 8 项发现（包含 1 项 P2 真实隐患、1 项 P2 契约对齐、6 项 P3 规范与防御性加固），并新增针对跨块碎片清理的单元测试。全量 146/146 单测 100% 通过。
+
+### 修复条目与审查说明
+
+#### 1. N-2 (原 P2-2) export 损坏块分支清空 `carry_slice_buf` (提交 `c07f979`)
+- **根因**: `logx_c.cpp` 的 `decode_one_file` 在遇到块 CRC 损坏或解码失败跳过坏块时，未调用 `carry_slice_buf.clear()`。若前一块末尾含第一片（`is_first`），损坏块之后恰好出现后半分片（`is_last`），可能导致跨越损坏块发生非法拼接。
+- **修复**: 在 CRC 校验失败与解码失败两大跳过分支中显式增加 `carry_slice_buf.clear()`。
+- **测试**: 在 `tests/unit/test_review_p1_p4.cpp` 中新增 `ReviewFixesTest.R13_N2_ExportCorruptedBlockClearsCarrySliceBuf` 专用测试用例，实测验证坏块截断隔离有效。
+
+#### 2. N-1 / N-5 (原 P1-1 / P3-2) `max_log_length` 注释与 Kotlin 校验对齐 (方案 B, 提交 `0adfc55`)
+- **裁决**: 经评估，`max_log_length < 97` 时已有 `kBuildRecordsCannotFit` 路径安全捕获并上报 `LOGX_EV_DROP` / `LOGX_ERR_TOO_LARGE` 事件并计数，且现有单测 `CannotFitDropPath_PreservedForPathologicalLimit` 专用于保护此兜底路径。按用户选定“方案 B”：保持当前运行时防御设计。
+- **修复**:
+  - `core/include/logx_c.h:33`: 将 `LOGX_ERR_TOO_LARGE` 简短注释修改为 `/* 单条放不下(截断到空记录仍超出病态小 maxLogLength) */`，与后文详细契约消除自相矛盾；
+  - `android/kotlin/LogX.kt`: 补充 `maxLogLength` 推荐值（>= 97B）及病态小值行为文档，并在 `init` 中增加 `require(config.maxLogLength > 0)` 边界校验。
+
+#### 3. N-3 (原 P2-1) `sum_raw_len_since` 失败路径出参契约明确 (提交 `9ad0db3`)
+- **修复**: 在 `core/include/logx_internal.h` 中修正过时的 `found_*` 参数名（已重命名为 `out_last_block_*`），并补充明确契约：“返回 false 时，`*out_bytes` 与两个 `*out_last_block_*` 均重置为 0”。源码实现 `flusher.cpp:920` 已在入口完成清零，契约与实现闭环。
+
+#### 4. N-7 (原 P3-4) 清除私有未用死函数 `map_and_validate_locked` (提交 `314804f`)
+- **修复**: `core/include/logx_staging.h` 与 `core/src/staging.cpp` 中的 `map_and_validate_locked()` 全仓 0 引用，彻底移除。
+
+#### 5. N-6 (原 P3-3) `pal_win32.cpp` 文件大小拼装改用 `uint64_t` 无符号移位 (提交 `f7fb069`)
+- **修复**: 将 `fad.nFileSizeHigh` 和 `nFileSizeLow` 转为 `uint64_t` 进行左移 32 位及按位或，最后转为 `int64_t` 返回，彻底杜绝针对有符号整数的移位与按位或静态分析歧义。
+
+#### 6. N-8 (原 P3-5) `flusher.cpp` 移除空 `if (enc.enc_ok)` 块 (提交 `b41e67c`)
+- **修复**: 将 `flusher.cpp:136` 中仅包含注释的空 `if` 控制块移除，改为单行架构注释，消除语法异味。
+
+#### 7. N-4 (原 P3-1) `format.cpp` `trunc_buf` 运行时容量越界防御 (提交 `c84dca1`)
+- **修复**: 在 `format.cpp:298` 的 `std::memcpy(trunc_buf, ...)` 之前补充 `if (prefix_len + marker_len > sizeof(trunc_buf)) return FormatBoundedStatus::kInvalidInput;` 不可达防御性校验，与全文件其他不可达防御风格保持一致。
+
+### 全量验证
+- **构建环境**: Windows / MSVC 17.13.5 (x64) Release, ZSTD + AES-GCM 全开
+- **单测结果**: `logx_unit_tests.exe` **146 / 146 测试全绿 (0 失败)**（含新增 R13-N2 跨块清理单测）。
