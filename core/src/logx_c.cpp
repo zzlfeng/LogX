@@ -135,6 +135,7 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
             char line[128];
             std::snprintf(line, sizeof(line), "[seq=%u crc fail]\n", seqno);
             out_lines->push_back(line);
+            carry_slice_buf.clear();
             off += block_size;
             continue;
         }
@@ -147,6 +148,7 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
             char line[128];
             std::snprintf(line, sizeof(line), "[seq=%u decode fail]\n", seqno);
             out_lines->push_back(line);
+            carry_slice_buf.clear();
             off += block_size;
             continue;
         }
