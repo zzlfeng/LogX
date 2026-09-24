@@ -297,6 +297,7 @@ FormatBoundedStatus format_record_bounded(
         const uint32_t marker_len = (static_cast<uint32_t>(m) > sizeof(marker) - 1)
                                         ? static_cast<uint32_t>(sizeof(marker) - 1)
                                         : static_cast<uint32_t>(m);
+        if (prefix_len + marker_len > sizeof(trunc_buf)) return FormatBoundedStatus::kInvalidInput;  // 防御:不可达
         std::memcpy(trunc_buf, payload, prefix_len);
         std::memcpy(trunc_buf + prefix_len, marker, marker_len);
         src = trunc_buf;
