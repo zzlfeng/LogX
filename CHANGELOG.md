@@ -52,8 +52,8 @@
 | `0adfc55` | docs(api): 统一 LOGX_ERR_TOO_LARGE 注释与 Kotlin 层配置下界说明 (R13 N-1/N-5) |
 | `9ad0db3` | docs(flusher): 明确 sum_raw_len_since 失败路径出参归零契约 (R13 N-3) |
 | `314804f` | refactor(staging): 清理未使用的私有死函数 map_and_validate_locked (R13 N-7) |
-| `f7fb069` | fix(pal/win32): file_size_path 改用无符号 64 位拼接防止符号移位 (R13 N-6) |
-| `b41e67c` | style(flusher): 移除 append_block_raw 中无实际操作的空 if 分支 (R13 N-8) |
+| `f7fb069` | fix(pal/win32): file_size_path 改用无符号 64 位拼接防止符号移位 (R13 N-8，提交误标 N-6) |
+| `b41e67c` | style(flusher): 移除 append_block_raw 中无实际操作的空 if 分支 (R13 N-6，提交误标 N-8) |
 | `c84dca1` | fix(format): trunc_buf 拼装前增加运行时容量不可达越界防御 (R13 N-4) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
@@ -1780,11 +1780,11 @@ R12 行 F5 表述已同步(v1.24)。
 #### 4. N-7 (原 P3-4) 清除私有未用死函数 `map_and_validate_locked` (提交 `314804f`)
 - **修复**: `core/include/logx_staging.h` 与 `core/src/staging.cpp` 中的 `map_and_validate_locked()` 全仓 0 引用，彻底移除。
 
-#### 5. N-6 (原 P3-3) `pal_win32.cpp` 文件大小拼装改用 `uint64_t` 无符号移位 (提交 `f7fb069`)
-- **修复**: 将 `fad.nFileSizeHigh` 和 `nFileSizeLow` 转为 `uint64_t` 进行左移 32 位及按位或，最后转为 `int64_t` 返回，彻底杜绝针对有符号整数的移位与按位或静态分析歧义。
+#### 5. N-8 (原 P3-5, 提交误标 N-6) `pal_win32.cpp` 文件大小拼装改用 `uint64_t` 无符号移位 (提交 `f7fb069`)
+- **修复**: 将 `fad.nFileSizeHigh` 和 `nFileSizeLow` 转为 `uint64_t` 进行左移 32 位及按位或，最后转为 `int64_t` 返回，彻底杜绝针对有符号整数的移位与按位或静态分析歧义。（注：编号勘误，R13 §9.3 映射为 N-8 / 原 P3-5）。
 
-#### 6. N-8 (原 P3-5) `flusher.cpp` 移除空 `if (enc.enc_ok)` 块 (提交 `b41e67c`)
-- **修复**: 将 `flusher.cpp:136` 中仅包含注释的空 `if` 控制块移除，改为单行架构注释，消除语法异味。
+#### 6. N-6 (原 P3-3, 提交误标 N-8) `flusher.cpp` 移除空 `if (enc.enc_ok)` 块 (提交 `b41e67c`)
+- **修复**: 将 `flusher.cpp:136` 中仅包含注释的空 `if` 控制块移除，改为单行架构注释，消除语法异味。（注：编号勘误，R13 §9.3 映射为 N-6 / 原 P3-3）。
 
 #### 7. N-4 (原 P3-1) `format.cpp` `trunc_buf` 运行时容量越界防御 (提交 `c84dca1`)
 - **修复**: 在 `format.cpp:298` 的 `std::memcpy(trunc_buf, ...)` 之前补充 `if (prefix_len + marker_len > sizeof(trunc_buf)) return FormatBoundedStatus::kInvalidInput;` 不可达防御性校验，与全文件其他不可达防御风格保持一致。
