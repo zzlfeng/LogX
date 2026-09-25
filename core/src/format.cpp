@@ -126,6 +126,8 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
     //     风险并反复触碰新内存页;thread_local 存放于堆段, 每线程仅一份且复用。
     //   - 多线程写并发(业务线程)正是本库常态, thread_local 天然无竞争。
     // 注意:此缓冲仅在本函数内使用, 不返回指针, 出栈后内容由下次调用覆盖。
+    // 内存总账: 本函数 TLS scratch 64KB + format_record_bounded 的 trunc_buf 60KB，
+    // 同线程常驻 ≈124KB（N 线程即 ×N）；Android/JNI 侧另有 tls_payload_buf ≤64KB（logx_jni.cpp:366-368）。
     static thread_local uint8_t scratch[64 * 1024];
     if (user_total > sizeof(scratch)) return false;
     uint8_t* w = scratch;
