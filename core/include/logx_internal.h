@@ -237,8 +237,9 @@ std::string scan_dir_for_target(Instance* inst);
 
 // k 块回溯:从 target_path 中 seqno = upto_seqno(不含)之后的第一块开始,
 // 逐块累加 raw_len 直到文件尾(最后一个有效块),返回 Σraw_len。
-// out_last_block_* 输出最后一个有效块的起止偏移;文件 IO 或块损坏失败返回 false(调用方按
-// 长度异常处理)。契约保证: 返回 false 时,*out_bytes 与 *out_last_block_* 均重置为 0。
+// out_last_block_* 输出最后一个有效块的起止偏移;仅文件打开失败或文件小于 32B 文件头时
+// 返回 false(此时三个出参均为 0);循环内遇块损坏或短读则提前终止并返回 true,
+// 出参携带终止前的部分累加结果与最后有效块起止(宁丢不脏,与 scan_one 纪律一致)。
 // spec §4.3 S_file > S_hdr 分支:"取 seqno ∈ (S_hdr, S_file]
 // 的块累加 raw_len,F = (F + Σraw_len) mod 数据区大小"。
 bool sum_raw_len_since(Instance* inst, const std::string& target_path,
