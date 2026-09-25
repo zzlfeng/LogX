@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.26 (2026-09-25 R14 审查收口: D-1~D-5 闭环, sum_raw_len_since 契约修正, TLS 总账补齐, 编号对齐与 B-6 留痕)  
+> **文档版本**: v1.27 (2026-09-25 R15 审查收口: E-1 R13 报告 §11 就地勘误(仓库外落盘), E-2 B-6 背景句更正)  
+>
+> **v1.27 修订说明**: 2026-09-25 **R15 批次**（对象 `code_review_R15_2026-09-25.md`，收口 R14 审查发现 E-1/E-2，均为文档级、零行为变化）：**E-1(Nit)**: `code_review_R13_2026-09-24.md` §11.1 两行 N-6/N-8 编号就地勘误（原文保留、权威映射回锚 §9.3）+ §11.2 补收口口径更正行（仓库外落盘不入库）；**E-2(Nit)**: B-6 背景句“`logx_open` 仅校验 `==0`”更正为“无下界校验（仅 `==0` 与两条上界，`logx_c.cpp:292-301`）”。至此 R13→R14→R15 三轮审查链完全闭合（0 代码遗留；B-6 为用户裁决待决策项）。
 >
 > **v1.26 修订说明**: 2026-09-25 **R14 批次**（对象 `code_review_R14_2026-09-25.md`，收口 R13 修复批次审查发现 D-1~D-5）：**D-1(P3)**: 纠正 `logx_internal.h` 中 `sum_raw_len_since` 契约注释，如实描述文件 IO 失败返回 false、块损坏返回 true 携带部分和；**D-3(P3)**: `format.cpp` 补齐同线程 scratch 64KB + trunc_buf 60KB ≈ 124KB/线程 TLS 内存总账注释；**D-2(P3)**: C 头文件 `logx_c.h` 补齐 `max_log_length >= 97` 建议，Backlog 增设 **B-6** 留痕；**D-4(Nit)**: 统一全仓 CHANGELOG、计划表与 R13 报告中 N-6（flusher 空 if）与 N-8（pal_win32 移位）的权威标号映射；**D-5(Nit)**: 纠正测试范围表述为“Windows 桌面矩阵 146/146 全绿（Linux/Android 未复跑）”。
 >
@@ -132,6 +134,7 @@ gantt
 | **R12** | T5.2 补测批次审查收口(自审 `e67be46`/`51e2c47`) | `tests/unit/test_observability.cpp`, `docs/benchmark_report.md`, `docs/LogX后续实施计划表.md` | **P2** | **✅ 100% 已完成 (2026-09-13)** | **R12-1(P2)**: B-5 定性纠偏——复现性证据(同日 R11 基线 142/142 全绿含本用例/10 连跑 10/10/三矩阵 126/132/145 全绿)证明非确定性语义缺陷,改口径"间歇性失败(复现条件未知)",新增前置稳定性复现协议(命中 ≥2 次方可投入方案 A/B/C),探针判别手法保留(含义收窄为代码无关性);**R12-2(Nit)**: "spec §349"→"实施方案 L349"(第 349 行非章节号),现行文本修正 test 注释 3 处+§5 清单 ④,历史文本以 CHANGELOG 内联勘误覆盖;**R12-3(Nit)**: benchmark_report "安全策略限制"表述删除(bench 构建实测通过),改"未重跑属刻意延后";**R12-4**: 补 T5.2 补测批次表行;F4(RAII 清理守卫)维持观察不实施,F5 经 R12补 真机验证 **Android 分支闭环**(详见 CHANGELOG 补记;仅余 Linux 桌面分支待 Linux 环境/CI)。三矩阵 126/132/145 + hotpath 2/2×3 + 压测 4/4×3 全绿,arm64 无待办,bench 编译通过。 |
 | **R13** | 全量源码审查批次收口 (`code_review_R13_2026-09-24.md`) | `core/src/logx_c.cpp`, `core/include/logx_c.h`, `core/include/logx_internal.h`, `core/include/logx_staging.h`, `core/src/staging.cpp`, `core/src/pal_win32.cpp`, `core/src/flusher.cpp`, `core/src/format.cpp`, `android/kotlin/LogX.kt`, `tests/unit/test_review_p1_p4.cpp` | **P2** | **✅ 100% 已完成 (2026-09-25)** | 审查 8 项全部收口: **N-2(P2)** 块损坏清空 `carry_slice_buf` + 补跨块回归单测; **N-1/N-5(P2/P3)** 方案 B 统一头文件契约注释与 Kotlin 校验; **N-3(P3)** 钉死失败路径出参归零契约; **N-7(P3)** 清理死函数 `map_and_validate_locked`; **N-8(P3)** 拼装大小改无符号 64 位移位（提交误标 N-6）; **N-6(P3)** 移除空 `if` 块（提交误标 N-8）; **N-4(P3)** `trunc_buf` 增运行时不可达越界防御。Windows 桌面矩阵增至 **146/146 全绿**（Linux/Android 未复跑）。 |
 | **R14** | R13 修复批次审查收口 (`code_review_R14_2026-09-25.md`) | `core/include/logx_internal.h`, `core/src/format.cpp`, `core/include/logx_c.h`, `CHANGELOG.md`, `docs/LogX后续实施计划表.md`, `code_review_R13_2026-09-24.md` | **P3** | **✅ 100% 已完成 (2026-09-25)** | 5 项审查发现闭环: **D-1(P3)** 修正 `sum_raw_len_since` 契约注释（坏块返回 true 携带部分累加值）; **D-3(P3)** `format.cpp` 补齐同线程 scratch 64KB + trunc_buf 60KB ≈ 124KB/线程 TLS 内存总账注释; **D-2(P3)** C 头文件 `logx_c.h` 补齐 `max_log_length >= 97` 建议，Backlog 增设 B-6 留痕; **D-4/D-5(Nit)** 勘误 N-6/N-8 编号错挂并修正矩阵测试范围表述。 |
+| **R15** | R14 修复批次审查收口 (`code_review_R15_2026-09-25.md`) | `docs/LogX后续实施计划表.md`, `code_review_R13_2026-09-24.md`(仓库外落盘) | **Nit** | **✅ 100% 已完成 (2026-09-25)** | 2 项发现闭环: **E-1(Nit)** R13 报告 §11.1 `f7fb069`/`b41e67c` 两行 N-6/N-8 编号就地勘误（原文保留、映射回锚 §9.3）+ §11.2 补收口口径更正行; **E-2(Nit)** B-6 背景句更正为"`logx_open` 无下界校验（仅 `==0` 与两条上界）"。均为文档级改动零行为变化，至此 R13→R14→R15 三轮审查链完全闭合，0 代码遗留。 |
 
 ---
 
@@ -271,5 +274,5 @@ gantt
 
 - **记录日期**: 2026-09-25 (R13 用户裁决 / R14 复核留痕)
 - **状态**: ⏸ 待决策 (用户裁决暂不实施，按方案 B 文档化收口)
-- **背景**: `format.cpp:208-210` 求解器要求 `max_total >= 33 + tag_len`。C 侧 `logx_open` 仅校验 `max_log_length == 0`，若配置 `[1, 96]` 范围值：`[1, 32]` 对任何 tag 必丢；`[33, 96]` 对长 tag 必丢。当前通过 `kBuildRecordsCannotFit` 走 `LOGX_EV_DROP` / `LOGX_ERR_TOO_LARGE` 运行时兜底防御并增加 `drop_too_large` 计数。
+- **背景**: `format.cpp:208-210` 求解器要求 `max_total >= 33 + tag_len`。C 侧 `logx_open` 无下界校验（仅 `==0` 与 `> kMaxRecordTotal`、`>= kDataSizeDefault` 两条上界，`logx_c.cpp:292-301`；R15 E-2 措辞更正），若配置 `[1, 96]` 范围值：`[1, 32]` 对任何 tag 必丢；`[33, 96]` 对长 tag 必丢。当前通过 `kBuildRecordsCannotFit` 走 `LOGX_EV_DROP` / `LOGX_ERR_TOO_LARGE` 运行时兜底防御并增加 `drop_too_large` 计数。
 - **现行处置**: 用户选定“方案 B”：保持当前运行时防御设计，头文件与 Kotlin KDoc 对齐建议值（`>= 97`）；若后续确定在 C 侧引入 `< 97` fail-fast 校验（返回 `INVALID_ARG`），需连带改写现有测试 `test_flusher.cpp:1262-1306`（`CannotFitDropPath_PreservedForPathologicalLimit`）并上提 `kMaxTag`。
