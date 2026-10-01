@@ -186,7 +186,10 @@ TEST(ReviewFixesTest, R13_N2_ExportCorruptedBlockClearsCarrySliceBuf) {
     auto make_slice = [](uint8_t flags, const std::string& data) -> std::vector<uint8_t> {
         uint16_t len = static_cast<uint16_t>(data.size());
         uint8_t cksum = 0;
-        for (uint8_t b : data) cksum = static_cast<uint8_t>(cksum + b);
+        // 记录级校验和必须与核心 cksum1 同算法(XOR 折叠, format.cpp):
+        // R16 F-1 曾误用加法, 使 slice 在记录级校验即失败、is_first/is_last
+        // 碎片从未进入 carry_slice_buf, N-2 的跨块拼接场景从未被构造。
+        for (uint8_t b : data) cksum = static_cast<uint8_t>(cksum ^ b);
         std::vector<uint8_t> buf(kHeaderLen + len);
         put_u16(buf.data() + 0, len);
         put_u16(buf.data() + 2, kMagicEntry);
