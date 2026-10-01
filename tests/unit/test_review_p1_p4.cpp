@@ -154,10 +154,15 @@ TEST(ReviewFixesTest, R13_N2_ExportCorruptedBlockClearsCarrySliceBuf) {
     std::string staging_file = dir + "/staging.mmap";
 
     // 1) 先打开实例 (避免启动扫描与修复影响我们要构造的特定测试文件)
+    // retention_days 拉满: 构造的 20260920.log 是历史日期, 默认保留期 7 天
+    // 会使 export 前 flusher 的跨天 retention 清理把它删掉 → 快照空 →
+    // LOGX_ERR_NOT_FOUND (测试时序炸弹, 2026-09-27 后爆发; 同类先例
+    // test_flusher.cpp:414 "36500 长期保留")。
     logx_config_t cfg{};
     cfg.log_dir = dir.c_str();
     cfg.staging_path = staging_file.c_str();
     cfg.max_log_length = 64 * 1024;
+    cfg.retention_days = 36500;
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
