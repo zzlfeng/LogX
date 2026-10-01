@@ -139,20 +139,22 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     }
 
     JNIEnv* env = nullptr;
+    bool need_detach = false;
     jint getEnvRes = ctx->jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
     if (getEnvRes == JNI_EDETACHED) {
 #if defined(__ANDROID__)
-        if (ctx->jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            return nullptr;
+        if (ctx->jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+            need_detach = true;
         }
 #else
-        if (ctx->jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) {
-            return nullptr;
+        if (ctx->jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) == JNI_OK) {
+            need_detach = true;
         }
 #endif
     } else if (getEnvRes != JNI_OK || !env) {
         return nullptr;
     }
+    if (!env) return nullptr;
 
     jbyteArray jKeyArr = static_cast<jbyteArray>(
         env->CallObjectMethod(ctx->g_provider, ctx->mid_get_key, static_cast<jint>(kid))
@@ -166,10 +168,18 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     if (jKeyArr) {
         jsize len = env->GetArrayLength(jKeyArr);
         if (len == 32) {
+            // 密钥先拷入 thread_local 缓冲(纯 C++ 存储, detach 不影响其生存期),
+            // 调用方在 trampoline 返回后继续读取该指针是安全的。
             env->GetByteArrayRegion(jKeyArr, 0, 32, reinterpret_cast<jbyte*>(g_tls_key_buf));
             res = g_tls_key_buf;
         }
         env->DeleteLocalRef(jKeyArr);
+    }
+    // R16 F-3: 与 jni_error_trampoline 对称——本线程 attach 的必须在本线程
+    // detach, 否则 Flusher 线程退出时 ART 报 attached-thread 未 detach 告警。
+    // 已 attach 的调用方线程(GetEnv==JNI_OK)不做 detach。
+    if (need_detach) {
+        ctx->jvm->DetachCurrentThread();
     }
     return res;
 }
