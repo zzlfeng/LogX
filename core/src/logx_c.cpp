@@ -11,6 +11,7 @@
 #include "logx_internal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -56,14 +57,20 @@ bool write_all_lines(Instance* inst, int fd, const std::vector<std::string>& lin
 
 // E-04: 临时明文文件按 日期 + PID + 随机数 命名——同一天多分卷/多次导出/
 // 并发导出各自持有独立临时文件,消除 O_TRUNC 互踩覆盖。
-std::string make_tmp_path(const std::string& log_dir, uint32_t date) {
-    Pal& pal = default_pal();
+// R16 F-6: 随机数/时间/PID 统一走 inst->pal(PAL 注入测试下行为一致);
+// CSPRNG 失败回退原子递增计数器而非时间戳——同进程内严格单调不撞名,
+// 与 PAL 契约"严禁低熵回退"(logx_pal.h)对齐。该值仅保证文件名唯一性,
+// 非加密用途(加密侧 salt 的 CSPRNG 失败是 fail-fast 拒绝,见 flusher.cpp)。
+std::string make_tmp_path(Instance* inst, uint32_t date) {
+    static std::atomic<uint32_t> s_tmp_name_seq{0};
     uint32_t rnd = 0;
-    if (!pal.random_bytes(&rnd, sizeof(rnd))) rnd = static_cast<uint32_t>(pal.wallclock_ms());
+    if (!inst->pal->random_bytes(&rnd, sizeof(rnd))) {
+        rnd = s_tmp_name_seq.fetch_add(1, std::memory_order_relaxed);
+    }
     char buf[160];
     std::snprintf(buf, sizeof(buf), "%s/.tmp_export_%u_%lu_%08x",
-                  log_dir.c_str(), date,
-                  static_cast<unsigned long>(pal.pid()), rnd);
+                  inst->log_dir.c_str(), date,
+                  static_cast<unsigned long>(inst->pal->pid()), rnd);
     return std::string(buf);
 }
 
@@ -153,22 +160,22 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
             continue;
         }
         // 把 raw 流按 LGXE 重组并还原"内部用户载荷"(支持单块多条记录与跨块分片流式解析)。
+        // parse_records_stream 恒返回 true(损坏容灾在函数内部完成, 见 logx_format.h 契约)。
         std::vector<std::vector<uint8_t>> users;
-        if (parse_records_stream(raw.data(), raw.size(), &users, &carry_slice_buf)) {
-            static const char hex[] = "0123456789abcdef";
-            for (const auto& user : users) {
-                std::string hexline;
-                hexline.reserve(user.size() * 2 + 32);
-                char prefix[64];
-                std::snprintf(prefix, sizeof(prefix), "seq=%u raw=%u ", seqno, raw_len);
-                hexline.append(prefix);
-                for (uint8_t b : user) {
-                    hexline.push_back(hex[b >> 4]);
-                    hexline.push_back(hex[b & 0xf]);
-                }
-                hexline.push_back('\n');
-                out_lines->push_back(std::move(hexline));
+        parse_records_stream(raw.data(), raw.size(), &users, &carry_slice_buf);
+        static const char hex[] = "0123456789abcdef";
+        for (const auto& user : users) {
+            std::string hexline;
+            hexline.reserve(user.size() * 2 + 32);
+            char prefix[64];
+            std::snprintf(prefix, sizeof(prefix), "seq=%u raw=%u ", seqno, raw_len);
+            hexline.append(prefix);
+            for (uint8_t b : user) {
+                hexline.push_back(hex[b >> 4]);
+                hexline.push_back(hex[b & 0xf]);
             }
+            hexline.push_back('\n');
+            out_lines->push_back(std::move(hexline));
         }
         off += block_size;
     }
@@ -242,7 +249,7 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
         uint32_t tmp_date = 0;
         uint16_t tmp_split = 0;
         if (!parse_log_filename(s.path, &tmp_date, &tmp_split)) continue;
-        std::string tmp = make_tmp_path(inst->log_dir, tmp_date);
+        std::string tmp = make_tmp_path(inst, tmp_date);
         // O_CREAT | O_TRUNC:先创建,再截断到 0
         int fd = inst->pal->file_open(tmp.c_str(), true, false);
         if (fd < 0) {

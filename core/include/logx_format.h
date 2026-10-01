@@ -77,7 +77,9 @@ bool parse_record(const uint8_t* recs, uint32_t recs_len,
 
 // 流式解析一段 LGXE 序列(单块内可能包含多条独立整记录与/或连续分片)。
 // out_user_payloads = 成功还原的完整"内部用户载荷"列表。
-// 返回 false = 格式严重损坏(magic 错 / 校验和失败 / 结构截断)。
+// 恒返回 true:损坏容灾(magic 失配重同步 FM-02 / 长度越界滑 6B FM-04 /
+// cksum 失败跳整条)均在函数内部按"宁丢不脏"完成,不以返回值上报损坏;
+// 跨块 carry_slice_buf 在任何损坏分支被清空,杜绝残片错拼(R13 N-2)。
 bool parse_records_stream(const uint8_t* recs, uint32_t recs_len,
                           std::vector<std::vector<uint8_t>>* out_user_payloads,
                           std::vector<uint8_t>* carry_slice_buf = nullptr);
