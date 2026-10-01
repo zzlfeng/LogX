@@ -331,7 +331,10 @@ Staging::WriteStatus Staging::write_records(const uint8_t* recs, uint32_t total,
             }
             w = 0;
         }
-        // 重新计算 free(没变,但 w 改了)
+        // 回绕后 w 归零, free 相应缩小 pad 字节(free_new = free_old - pad,
+        // 由上方 kFull 前置检查 free >= pad + total 保证不取模回绕)。
+        // 下方判断在该前提下恒假, 属防御守卫: 前置检查若被未来改动削弱,
+        // 此处仍拦住越界写而非静默覆写未读数据。
         free = (f + data_size_ - w - 1) % data_size_;
         if (total > free) return WriteStatus::kFull;
     } else if (total > free) {
