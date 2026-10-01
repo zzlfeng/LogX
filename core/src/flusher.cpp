@@ -594,6 +594,9 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
         c->current_path.clear();
         c->current_date = today;
         c->current_split = 0;
+        // R16 F-5: 昨日尾文件的 size 不跨天沿用——若保留, 跨天后首个
+        // ensure_append_target 会误判已达切分阈值, 当日首文件从 .log.1 起写。
+        c->current_size = 0;
         retention_cleanup_impl(inst);
     }
 
