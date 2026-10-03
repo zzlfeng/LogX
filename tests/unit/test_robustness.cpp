@@ -1972,4 +1972,84 @@ TEST(Robustness, ErrUserPerInstance_IsolationAcrossClose) {
     pal.file_rmdir(dir_b.c_str());
 }
 
+// R18 §六门禁项 2: 时钟推后 20 年的 retention 双向纪律回归。
+//
+// R17 曾发现单测时序炸弹(历史日期文件被 retention 清理误删), 当时的门禁建议是
+// "逐条 grep yyyymmdd 字面量核对 cfg"——但字面量 grep 只能防住"已知形状", 防不住
+// 变体(换个日期、换个注入方式就漏)。本用例把防线从"grep 防守"转为"用例防守":
+//
+// 场景: 用 MockClockPal 把时钟从 2026-09-03 直接推后 20 年到 2046-09-03,
+// 触发 retention_cleanup_impl。此时构造四类文件, 按"相对推后后的 now"各应
+// 受到不同处置, 本用例逐类锁定:
+//
+//   A 远古 20200101(now-26 年) —— 严格早于 now-retention → **必删**
+//   B 期内 20460830(now-4 天)  —— 未超期                 → **必留**
+//   C 当天 20460903(d == now)   —— 严格保护(flusher.cpp:520 的 d < now 守卫) → **必留**
+//   D 未来 20460910(d >  now)   —— 严格保护(时钟漂移)   → **必留**
+//
+// ②(C/D 保护面)正是 R17 事故的防御面: 若清理只做"老就删"而不保护当天与未来,
+// 一次时钟回拨/漂移就会把用户当天刚写的日志整批误删——R17 事故的形态正是
+// "该留的被删了"。①(A 必删)则防止"保护过头演化成永不清理"的反向退化,
+// 二者同时断言以杜绝空洞绿。
+TEST(Robustness, RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtectsTodayAndFuture) {
+    MockClockPal mock_pal(&default_pal());
+    std::string dir = std::string("logx_test_r18_retention_") +
+                      std::to_string(mock_pal.pid()) + "_" +
+                      std::to_string(s_test_dir_seq.fetch_add(1));
+    mock_pal.file_mkdirs(dir.c_str());
+    std::string st_path = dir + "/staging.mmap";
+
+    // 固定起始日期后推后 20 年, 避免用例随真实日历漂移
+    mock_pal.set_clock(20260903, 120000);
+    const uint32_t kFuture = 20460903;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = st_path.c_str();
+    cfg.max_log_length = 4096;
+    cfg.retention_days = 7;  // 保留期短于推后跨度, 确保 A 落入超期区
+
+    logx_instance_t* inst = nullptr;
+    cfg.pal_override = &mock_pal;  // 必须在 logx_open 前定型(消除注入竞态)
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 推后时钟到 2046-09-03, 再按"相对新 now"构造四类文件
+    mock_pal.set_clock(kFuture, 120000);
+
+    struct Case { const char* name; const char* fname; bool should_survive; };
+    const Case cases[] = {
+        {"A ancient (expired)",  "20200101.log", false},
+        {"B within retention",  "20460830.log", true},
+        {"C today (protected)", "20460903.log", true},
+        {"D future (protected)", "20460910.log", true},
+    };
+    for (const auto& cs : cases) {
+        std::string p = dir + "/" + cs.fname;
+        int fd = mock_pal.file_open(p.c_str(), true, false);
+        ASSERT_GE(fd, 0) << cs.name;
+        ASSERT_EQ(mock_pal.file_write(fd, "payload", 7), 7) << cs.name;
+        mock_pal.file_close(fd);
+        ASSERT_GT(mock_pal.file_size_path(p.c_str()), 0) << cs.name;
+    }
+
+    // 触发 retention 清理(与 Flusher 启动/跨天同一条路径)
+    retention_cleanup(static_cast<Instance*>(inst));
+
+    for (const auto& cs : cases) {
+        int64_t sz = mock_pal.file_size_path((dir + "/" + cs.fname).c_str());
+        if (cs.should_survive) {
+            EXPECT_GT(sz, 0) << cs.name << " must NOT be deleted by retention";
+        } else {
+            EXPECT_LT(sz, 0) << cs.name << " must be deleted after 20-year clock jump";
+        }
+    }
+
+    logx_close(inst);
+
+    for (const auto& f : mock_pal.file_list(dir.c_str())) {
+        mock_pal.file_unlink(f.c_str());
+    }
+    mock_pal.file_rmdir(dir.c_str());
+}
+
 } // namespace

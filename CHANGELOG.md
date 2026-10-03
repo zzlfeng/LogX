@@ -56,6 +56,13 @@
 | `b41e67c` | style(flusher): 移除 append_block_raw 中无实际操作的空 if 分支 (R13 N-6，提交误标 N-8) |
 | `c84dca1` | fix(format): trunc_buf 拼装前增加运行时容量不可达越界防御 (R13 N-4) |
 | `0185aa6` | docs: R15 审查批次收口——计划表 v1.27 与 B-6 背景句更正 (R15 E-2;E-1 R13 报告 §11.1 编号就地勘误与 §11.2 收口口径更正系仓库外落盘,不入库) |
+| `151294a` | fix(test): make_slice 校验和改 XOR 折叠与核心 cksum1 对齐, 恢复 N-2 回归屏障 (R16 F-1) |
+| `93f6f9c` | fix(flusher): 跨天分支重置 current_size, 防当日首文件误从 .log.1 起写 (R16 F-5) |
+| `61bd5e1` | fix(jni): key_provider trampoline 补 attach/detach 对称 (R16 F-3) |
+| `082cc5a` | fix(core): parse_records_stream 契约对齐恒真语义; make_tmp_path 统一 inst->pal 并以原子计数替换低熵回退 (R16 F-2/F-6) |
+| `d80cd9d` | docs(staging): 纠正 write_records 回绕路径 free 注释并定位恒假防御守卫 (R16 F-4) |
+| `795ec73` | fix(test): R13_N2 用例补超长保留期, 消除历史日期文件被 retention 清理的时序炸弹 (R17 F-1) |
+| `a507030` | fix(flusher): append_block 已存在文件分支回读文件头 salt, 杜绝未初始化栈内存落盘 (R18 F-1;含 poison_r18_stack 栈毒化回归屏障) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -1793,3 +1800,94 @@ R12 行 F5 表述已同步(v1.24)。
 ### 全量验证
 - **构建环境**: Windows / MSVC 17.13.5 (x64) Release, ZSTD + AES-GCM 全开
 - **单测结果**: `logx_unit_tests.exe` **146 / 146 测试全绿 (0 失败)**（含新增 R13-N2 跨块清理单测）。
+
+## R14 / R15 批次: R13 修复审查文档级收口 (2026-09-25)
+
+- **R14 D-1 / D-3 (P3)**: 纠正 `logx_internal.h` 中 `sum_raw_len_since` 契约注释（如实描述 IO 失败返回 false、坏块返回 true 携带部分累加值）；`format.cpp` 补齐同线程 scratch 64KB + trunc_buf 60KB ≈ 124KB/线程 TLS 内存总账注释。
+- **R14 D-2 (P3)**: `logx_c.h` 补齐 `max_log_length >= 97` 建议（用户头 27B + 最大 Tag 64B + 片头 6B），Backlog 增设 B-6 留痕待裁决。
+- **R14 D-4 / D-5 (Nit)**: 统一 N-6（flusher 空 if）/ N-8（pal_win32 移位）的权威标号映射；纠正测试范围表述为"Windows 桌面矩阵 146/146 全绿（Linux/Android 未复跑）"。
+- **R15 E-1 / E-2 (Nit)**: R13 报告 §11.1 两行编号就地勘误（原文保留、映射回锚 §9.3）；B-6 背景句更正为"`logx_open` 无下界校验（仅 `==0` 与两条上界）"。均为文档级、零行为变化。
+- 至此 R13→R14→R15 三轮审查链完全闭合（0 代码遗留）。
+
+## R16 批次: R15 修复批次审查收口 (2026-09-30)
+
+> 审查对象 `code_review_R16_2026-09-30.md`，提交 `151294a`…`d80cd9d`。R18 复核确认六项**全部属实闭环且无引入性缺陷**。
+
+| 编号 | 级别 | 位置 | 内容 | 提交 |
+|---|---|---|---|---|
+| F-1 | P3 | `test_review_p1_p4.cpp` | `make_slice` 校验和改 **XOR 折叠**与核心 `cksum1`（`format.cpp`）对齐——原误用加法，致 slice 在记录级校验即失败、`is_first`/`is_last` 碎片从未进入 `carry_slice_buf`，N-2 的跨块拼接场景从未真正被构造（**空洞绿**） | `151294a` |
+| F-2 | P3 | `logx_format.h` / `logx_c.cpp` | `parse_records_stream` 契约改为"恒返回 true + 损坏容灾内部完成"，并删除 `logx_c.cpp:165` 恒真 if 死分支 | `082cc5a` |
+| F-3 | P3 | `logx_jni.cpp` | `key_provider` trampoline 补 attach/detach 对称（与 `jni_error_trampoline` 同模式），避免 Flusher 线程退出时 ART 报未 detach 告警 | `61bd5e1` |
+| F-4 | P3 | `staging.cpp` | 纠正回绕路径 `free` 注释（原称"free 没变"失实，实为 `free_new = free_old − pad`）并标明下方判断属恒假防御守卫 | `d80cd9d` |
+| F-5 | P3 | `flusher.cpp` | 跨天分支补 `current_size = 0`，防昨日尾文件 size 跨天沿用导致当日首文件误从 `.log.1` 起写 | `93f6f9c` |
+| F-6 | P3 | `logx_c.cpp` | `make_tmp_path` 的随机数/时间/PID 统一走 `inst->pal`；CSPRNG 失败回退**原子递增计数器**而非时间戳，与 PAL 契约"严禁低熵回退"对齐 | `082cc5a` |
+
+## R17 批次: R16 修复批次审查 (2026-10-01)
+
+> 审查对象 `code_review_R17_2026-10-01.md`，HEAD `d80cd9d`。R16 六项经逐条独立复核**全部属实闭环**，零引入性缺陷；本轮新发现 1×P3（测试层）。
+
+- **F-1 (P3, 提交 `795ec73`) 单测时序炸弹**：`R13_N2_ExportCorruptedBlockClearsCarrySliceBuf` 手工构造历史日期文件 `20260920.log`，未设 `retention_days` → 默认 7 天 → export 前 Flusher 跨天 retention 清理将其删除 → `take_snapshot` 为空 → `LOGX_ERR_NOT_FOUND(-8)`，回调 0 次。**2026-09-27 后必然爆发**，恰在 R16 审查日期之前。修法：补 `cfg.retention_days = 36500`（先例 `test_flusher.cpp:414`），断言不变。
+- **为何此前未被发现**：R16 审查当日（09-30）该用例尚未失效（保质期至 09-27 届满），R16 未跑或未察觉。经临时 worktree 在 `a0d0d9d` 上复现同样失败，排除本批引入。
+- **教训（已固化为 R18-1 门禁）**：单测凡构造/依赖"历史日期"日志文件，须显式设超长保留期。
+
+## R18 批次: R17 修复批次审查 + 两条门禁固化 (2026-10-04)
+
+> 审查对象 `code_review_R18_2026-10-04.md`，审查 `795ec73`。R17 F-1 经**撤销对照实验**确认是承载性修复（改回 `retention_days = 7` 精确复现 `-8`，改回即绿），非掩盖式"改了就绿"。
+
+### 修复条目
+
+#### 1. F-1 (P2, 提交 `a507030`) `append_block` 未初始化栈内存落盘
+
+- **根因**：`flusher.cpp:861` 的 `uint8_t salt[8]` 仅在两条分支被赋值——`file_salt` 非空时 `memcpy`、`sz == 0`（新建）时 `random_bytes`。当调用方传 `file_salt == nullptr` **且**目标文件已存在（`sz > 0`）时，`salt` 全程未被赋值，却仍经 `write_and_record` → `append_block_raw` 的 `memcpy(hdr + 22, salt, 8)` 写入块头；加密路径还会用它派生 GCM nonce（`make_nonce`）。
+- **实测复现**（构造对照程序，5/5 次稳定）：块 0（显式 salt）正确；块 1 侥幸取到上次的 seed salt（**栈巧合**）；块 2 立即暴露为栈垃圾 `98 8C 79 4A F9 7F 00 00`。
+- **定级 P2 的依据**：全仓 7 个调用点（`test_recovery.cpp` 5 处 + 声明）**均传非空 salt**，生产 Flusher 主循环走 `open_or_create_append_target`（其 `out_salt` 两条分支均无条件赋值，无此缺陷），故当前**无生产影响路径**；但缺陷客观且写盘可观测。
+- **修复**：补 `else` 分支从文件头回读 salt 复用，与 `open_or_create_append_target` 同一纪律；顺带消除"仅 `file_salt` 非空时才校验一致性"的分支不对称。附注释更正：原文称"测试 / 上层（导出离线回放）"，实为**仅单元测试**。
+- **次生影响（推断）**：若该路径在加密开启时被复用，写侧 nonce 用垃圾 salt 而读侧 `decode_one_file` 固定用文件头 salt，失配将致 GCM 认证失败 → 该块永久不可解（静默数据丢失）。
+
+#### 2. N-1 (Nit, 同批修正) `append_block` 注释与实际调用面不符
+
+原文称"测试 / 上层（导出离线回放）用此接口"，但全仓无任何"上层/导出"调用点。已改为"仅单元测试用此接口绕过 Flusher 主循环（全仓调用点均传非空 `file_salt`）"，避免后续维护者误以为存在生产调用方而降低审慎。
+
+### 门禁固化（零生产代码改动）
+
+#### R18-1 测试保质期判据（替代 R17 的字面量 grep 建议）
+
+R17 建议"grep 测试文件中 `yyyymmdd = 20` 开头的字面量，逐一核对 cfg"。本轮执行后发现该判据**不够精确**——字面量 grep 只能防住已知形状，防不住变体。固化后的精确判据：
+
+> 当且仅当用例**同时**满足三条件时，必须显式设 `cfg.retention_days = 36500`：
+> **(a)** 构造/依赖的 `YYYYMMDD` 为真实过去日期；
+> **(b)** 经 `logx_open` 启动真实 Flusher 线程（未经 `MockClockPal` 注入时钟）；
+> **(c)** 断言依赖该文件内容。
+>
+> 三条件缺一即安全：绕开 Flusher 直调 core 函数（`test_recovery` / `test_codec` / `test_flusher` 的栈上 `Instance` 用例）、经 `MockClockPal` 保持时钟自洽（`test_robustness` 时钟跳变用例）、或日期本就在测 retention 清理本身（`test_flusher:478-605`）。
+
+R18 据此对全仓 **45 处** `20[0-9]{6}\.log` 命中逐一核对，**无第二例**。为把防线从"grep 已知形状"转为"用例覆盖变体"，新增：
+
+- `Robustness.RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtectsTodayAndFuture`（`tests/unit/test_robustness.cpp`）：用 `MockClockPal` 把时钟从 `20260903` 推后 20 年到 `20460903`，构造四类文件并逐类锁定 retention **双向纪律**——远古 `20200101`（now−26 年）**必删** / 期内 `20460830`（now−4 天）**必留** / 当天 `20460903`（`d == now`）**必留** / 未来漂移 `20460910`（`d > now`）**必留**。后者两项正是 R17 事故的防御面（时钟回拨/漂移不得误删当天日志），前者防止"保护过头演化成永不清理"的反向退化。
+- **变异测试双向验证**：移除阈值循环的 `--days`（使清理过激、阈值恒等于 now）→ 用例 ✅ 报红；恢复 → ✅ 绿。
+- **附带发现（记录不改）**：变异实验另证 `retention_cleanup_impl` 的 `d < yyyymmdd_now` 守卫是**恒冗余条件**——阈值循环恒有 `threshold ≤ yyyymmdd_now`，故 `d < threshold` 已蕴含 `d < yyyymmdd_now`。该行保留不动（显式表达意图、且提供纵深防御），仅记录此事实。
+
+#### R18-2 反空洞绿判据
+
+> 凡针对**未初始化内存**或**取值巧合正确**的回归测试，写完**必须撤销被测修复跑一遍，见红方算建立屏障**；这类测试的默认状态极易是"绿得毫无意义"。
+
+R18 实测踩中：首版 `Flush.AppendBlock_NullSaltOnExistingFile_ReusesFileHeaderSalt` **在修复被撤销的情况下依然全绿**——上一次 `append_block(seed_salt)` 恰把 `seed_salt` 留在同一栈槽，未初始化的 `salt` 读到的正是这份残留，断言因**栈巧合**成立。与 R16 F-1（`make_slice` 校验和误用加法，致被测路径从未执行）同型。
+
+**破除手法**：两次调用之间插入 `noinline` 栈毒化助手，以大数组覆写目标栈区为毒值——
+```cpp
+__declspec(noinline) void poison_r18_stack() {
+    volatile uint8_t junk[4096];
+    for (size_t i = 0; i < sizeof(junk); ++i) junk[i] = 0xCC;
+    (void)junk;
+}
+```
+毒化后撤销修复稳定报红（`memcmp` 返回 1，块头 salt 为 `0xCC…`），恢复修复即绿。
+
+### 全量验证
+
+- **构建环境**：Windows / MSVC 14.43 (x64) Release，`LOGX_WITH_ZSTD=ON` + `LOGX_WITH_AESGCM=ON`
+- **单测**：`logx_unit_tests.exe` **147 / 147 全绿**（146 既有 + R18 新增 1 条 F-1 回归屏障 + 1 条 retention 门禁用例）
+- **热路径**：`logx_hotpath_alloc_tests.exe` **2 / 2 全绿**（常规与截断路径均 0 次堆分配）
+- **压力**：`logx_stress_tests.exe` **4 / 4 全绿**（含 50 轮崩溃注入对账 397/397）
+- **对照实验**：A 撤销 R17 F-1 → 复现 `-8`；B 构造 `append_block(nullptr salt, 已有文件)` → 5/5 复现栈垃圾；C 撤销 R18 F-1 + 毒化 → 回归测试报红；D 变异 `--days` → retention 用例报红
+- **未复跑**：另两个构建矩阵（OFF/OFF、ZSTD=ON+AESGCM=OFF）、Android arm64 交叉编译、真机（沿用既有共同局限）
