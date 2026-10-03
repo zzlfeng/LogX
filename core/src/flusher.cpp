@@ -848,7 +848,7 @@ bool append_block(Instance* inst,
                   uint64_t* out_block_end_offset) {
     if (!inst || !inst->log_dir.size()) return false;
     // 单文件模式:按 hint 路径写;若文件不存在则创建并写 32B 文件头。
-    // 测试 / 上层 (导出离线回放) 用此接口绕过 Flusher 主循环。
+    // 仅单元测试用此接口绕过 Flusher 主循环(全仓调用点均传非空 file_salt)。
     (void)kid;
     uint32_t yyyymmdd = 0, hhmmss = 0;
     inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
@@ -868,6 +868,11 @@ bool append_block(Instance* inst,
             inst->pal->file_close(fd);
             return false;
         }
+    } else {
+        // R18 F-1: 已存在文件且调用方未给 salt 时, 必须回读文件头 salt 复用。
+        // 旧实现此分支不赋值 salt, 未初始化栈内容会被写进块头 hdr+22
+        // (加密路径还会用它派生 GCM nonce), 属未初始化内存落盘。
+        if (inst->pal->file_pread(fd, salt, 8, 12) != 8) { inst->pal->file_close(fd); return false; }
     }
     if (sz == 0) {
         if (!write_file_header(inst, fd, yyyymmdd, inst->kid, salt)) {

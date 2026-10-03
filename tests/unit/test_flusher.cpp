@@ -2265,3 +2265,76 @@ TEST(Flush, Export_RejectsInvalidCalendarDates) {
     pal.file_rmdir(dir.c_str());
     pal.file_unlink(staging.c_str());
 }
+
+// R18 F-1 回归屏障: append_block 以 file_salt=nullptr 追加到"已存在"文件时,
+// 块头 salt 域(hdr+22)必须回读并复用文件头 salt(hdr+12), 不得把未初始化栈内存落盘。
+//
+// 关键(避免 R16 F-1 式"空洞绿"): 未初始化栈读的取值依赖调用现场, 上一次
+// append_block(seed_salt) 恰好把 seed_salt 留在同一栈槽, 会让"不修也绿"。
+// 故在两次 append_block 之间调用 __declspec(noinline) 的 poison 助手,
+// 用大数组把该栈区覆写成 0xCC, 使未初始化 salt 必然读到毒值而非 seed_salt。
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+void poison_r18_stack() {
+    volatile uint8_t junk[4096];
+    for (size_t i = 0; i < sizeof(junk); ++i) junk[i] = 0xCC;
+    (void)junk;
+}
+
+TEST(Flush, AppendBlock_NullSaltOnExistingFile_ReusesFileHeaderSalt) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_r18_salt_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(s_test_dir_seq.fetch_add(1));
+    pal.file_mkdirs(dir.c_str());
+
+    Instance inst{};
+    inst.log_dir = dir;
+    inst.pal = &pal;
+    inst.compress_algo = kAlgoNone;
+    inst.encrypt_enable = false;
+    inst.kid = 1;
+
+    auto rec = make_entry(64);
+
+    // 1) 首次调用传显式 salt 建文件(合法路径, 落 32B 文件头)
+    uint8_t seed_salt[8] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22};
+    uint64_t s0 = 0, e0 = 0;
+    ASSERT_TRUE(append_block(&inst, seed_salt, 1, rec.data(),
+                              static_cast<uint32_t>(rec.size()),
+                              /*seqno=*/1, /*flag=*/0, &s0, &e0));
+
+    // 2) 毒化调用栈后, 以 file_salt=nullptr 追加到已存在文件 —— 命中 R18 F-1 分支
+    poison_r18_stack();
+    uint64_t s1 = 0, e1 = 0;
+    ASSERT_TRUE(append_block(&inst, nullptr, 1, rec.data(),
+                              static_cast<uint32_t>(rec.size()),
+                              /*seqno=*/2, /*flag=*/0, &s1, &e1));
+
+    // 3) 读回两个块头的 salt 域, 均须等于文件头 salt
+    uint32_t ymd = 0, hms = 0;
+    pal.wallclock_date(&ymd, &hms);
+    int fd = pal.file_open(make_log_path(dir, ymd, 0).c_str(), false, false);
+    ASSERT_GE(fd, 0);
+
+    uint8_t fhdr[32];
+    ASSERT_EQ(pal.file_pread(fd, fhdr, 32, 0), 32);
+    EXPECT_EQ(0, std::memcmp(fhdr + 12, seed_salt, 8));  // 文件头 salt 未被污染
+
+    // 块 0(显式 salt)与块 1(nullptr salt)的块头 salt 都必须等于文件头 salt。
+    // 块 1 是回归屏障所在: 未修复时此处为 0xCC… 毒值, 断言必红。
+    const uint64_t blk_size = e0 - s0;
+    for (int i = 0; i < 2; ++i) {
+        uint8_t bhdr[34];
+        ASSERT_EQ(pal.file_pread(fd, bhdr, 34, s0 + static_cast<uint64_t>(i) * blk_size), 34);
+        EXPECT_EQ(0, std::memcmp(bhdr + 22, fhdr + 12, 8))
+            << "block#" << i << " salt must reuse file header salt, not uninitialized stack";
+    }
+    pal.file_close(fd);
+
+    for (const auto& f : pal.file_list(dir.c_str())) pal.file_unlink(f.c_str());
+    pal.file_rmdir(dir.c_str());
+}
