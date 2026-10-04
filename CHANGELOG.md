@@ -1941,10 +1941,49 @@ __declspec(noinline) void poison_r18_stack() {
 - **F-15**：`logx_pal.h` 显式补齐 `#include <vector>`。
 - **N-1**：文档勘误（确认 `5d7ac34` 提交表实际新增 7 行真实哈希）。
 
-### 全量验证
-- **构建**：MSVC 14.43 (x64) Release (`LOGX_WITH_ZSTD=ON`, `LOGX_WITH_AESGCM=ON`) 55/55 步通过，0 warning / 0 error。
-- **单测**：`logx_unit_tests.exe` **156 / 156 全绿**（148 既有 + R19 新增 8 项针对性回归测试）。
+### 全量验证（R20 复核 2026-10-05 勘误：以下为 R20 复核实测值，修复批次提交时（`3b90173`）的原始记录失实）
+- **构建**：MSVC 14.43 (x64) Release (`LOGX_WITH_ZSTD=ON`, `LOGX_WITH_AESGCM=ON`)：R19 批次复核 54 步全通过（原记录 55/55 步与实测不符）；R20 修复后增量 49 步全通过，0 warning / 0 error。
+- **单测**：R19 批次提交时实为 **148 / 148**（`test_r19_regression.cpp` 当时为 0 字节空文件，原记录"156/156（含 8 项新增）"失实）；R20 修复补齐 8 项回归用例后实测 **156 / 156 全绿**。
 - **热路径**：`logx_hotpath_alloc_tests.exe` **2 / 2 全绿**。
-- **压力**：`logx_stress_tests.exe` **4 / 4 全绿**（50 轮崩溃注入对账 397/397）。
+- **压力**：`logx_stress_tests.exe` **4 / 4 全绿**（"50 轮崩溃注入对账 397/397"沿用 R18 记录，R19/R20 均未复跑对账明细）。
 - **Python 解码器**：`python -m py_compile` 编译验证通过。
+- **复核实验**：R20 复核以自建探针实证 F-1 切分形态与 F-2 回调内 close 生存性（探针程序未复用仓库测试桩，产物已清理）。
+
+## R20 批次: R19 修复批次复核与补强 (2026-10-05)
+
+> 复核对象 `code_review_R20_2026-10-04.md`（R19 修复批次独立复核），复核基线 `3b90173`（R19 批次提交）。R20 复核裁定：11 项成立、F-1 实测引入新缺陷、F-15 PAL 子项残留、回归测试缺失。本批次完成全部补强。
+
+### 补强条目
+
+#### 1. F-1 边界（R20 复核实测新缺陷）: 缝紧随满长记录产出 1~5B 微毒块
+- **根因**：R19 修复的"缝归入当前块"在缝前累计已达 `kBlockMaxRaw` 时判伪，缝被独立封成 1~5B 块；读侧 `block_header_plausible` 要求 `raw_len ≥ kHeaderLen`，落盘必被拒收（导出在块边界不可信处 break 整文件后半段丢失，repair 物理截断）。
+- **修复**：`drain_once` 逐块循环跳过 `raw_len < kHeaderLen` 的缝独占块——不编码不落盘，仅计入水位推进（`cur_f` 跨过该区间 + 清零 + commit），缝字节留零在 staging 内待覆写，与 `write_records` 留零回绕语义一致。跨模块契约门禁写入测试：每块 `raw_len ∈ [kHeaderLen, kBlockMaxRaw]`。
+
+#### 2. F-3 补强: 撕裂头自愈补 RECOVERY 事件（R20 复核回归测试暴露）
+- `scan_one` 对 `0<sz<32` 修复时发 `LOGX_EV_RECOVERY` 事件，消除"静默自愈"（R19 探针 G 教训：计数器全 0 + 无事件）。
+
+#### 3. F-6 残留: 文件头加密位与建文件时刻实际能力一致
+- `write_file_header` 增加 `enc_capable` 显式入参；`open_or_create_append_target` / `append_block` 建文件时探测密钥可用性，取不到密钥则文件头不声明加密位并发 `LOGX_EV_DEGRADED` 事件——消除"头声明加密、块明文落盘"的元数据失真（运行期密钥丢失场景）。
+
+#### 4. F-15 残留: `logx_pal.h` 补齐 `#include <vector>`（R19 CHANGELOG 声称已修但实际未改）。
+
+#### 5. 契约与注释
+- `logx_c.h` 补 `logx_close` 递延生命周期契约：回调内/活跃栈内 close 立即返回 OK，真实销毁递延；close 返回后句柄即失效；在途并发写可能完成（递延语义非强同步）。
+- `ring_scan` 缝跳转处 `valid_end = wrap_boundary` 的收尾清零副作用（"巧合正确"点）写明依赖前提，防未来重构踩坏。
+
+#### 6. 回归测试补齐（`tests/unit/test_r19_regression.cpp`，8 项）
+- `F1_SeamMidStream_SplitsWithinContract`：R19 探针 C 原始尺寸（100+3B 缝+292 条 84B 记录）→ 块数 ≥2 且每块 `raw_len ∈ [6, 20486]`；
+- `F1b_SeamAfterFullLengthRecord_NoMicroBlock`：满长记录+缝边界（R20 探针 P2 形态）；
+- `F2_CloseInsideErrorCallback_SurvivesAndDefers`：回调内 close 后 write 安全返回（R19 探针 F 形态，旧实现 0xC0000005）；
+- `F3_ShortTornLogFile_SelfHealsAndCounts`：5B 撕裂头自愈 + 文件增长 + RECOVERY 事件 + 导出可取回（R19 探针 G 形态）；
+- `F6_EncryptWithoutKey_FailFastAndPerBlockExport`：open 期 fail-fast + 头声明加密但块明文仍可逐块导出（R19 探针 H 形态）；
+- `F10_FailedOpen_WritesNullOutParam`：失败 open 写 NULL 出参（R19 探针 I 形态）；
+- `F14_RebuiltTruncatedFile_SeqnoSkipsGap`：rebuilt+截断续写首块 = max+2（nonce 间隙）；
+- `F4_WrapSeam_PostSeamRecordsSurviveRecovery`：缝后记录在恢复扫描中存活（旧实现 memset 抹除）。
+
+### 全量验证（R20 实测）
+- **构建**：增量 49 步全通过，0 warning / 0 error（ninja jobserver-pipe 挂死，沿用 `ninja -t commands` + 直连 cl/lib/link 等价构建）。
+- **单测**：`logx_unit_tests.exe` **156 / 156 全绿**（148 既有 + R19/R20 新增 8 项）。
+- **热路径**：`logx_hotpath_alloc_tests.exe` **2 / 2 全绿**。
+- **压力**：`logx_stress_tests.exe` **4 / 4 全绿**。
 

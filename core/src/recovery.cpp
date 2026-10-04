@@ -58,7 +58,14 @@ uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
     uint32_t valid_end = f;
     while (pos < total) {
         if (wrap_boundary > 0 && pos < wrap_boundary && (wrap_boundary - pos < kHeaderLen)) {
-            // 缝残留 < 6B: 位于回绕点, 跳过缝进入第二段继续扫描 (R19 F-4)
+            // 缝残留 < 6B: 位于回绕点, 跳过缝进入第二段继续扫描 (R19 F-4)。
+            // 注记 (R20 复核): 此处 valid_end = wrap_boundary 有一个被依赖的
+            // 副作用——扫描从 f 起步且首记录未及缝时, valid_end 直接跳到缝
+            // 之后, §6 收尾清零会因此跳过 [valid_end, wrap_boundary) 段。该
+            // 跳过恰好无害的前提: 这段本就是"未提交、待补刷"的数据
+            // (run_recovery 的 flushed_len 提交窗口), 补刷由 Flusher 按记录
+            // 边界重新扫描处理。若改动扫描起点语义或收尾清零策略, 必须重验
+            // 该前提(见 run_recovery §5/§6 注记)。
             pos = wrap_boundary;
             valid_end = wrap_boundary;
             continue;

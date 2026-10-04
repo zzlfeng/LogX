@@ -296,13 +296,19 @@ bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uin
 
 // 写 32B 文件头(magic + ver + flag + date + kid + salt + reserved + crc)。
 // 仅在"新建文件"时调用。
+// R20 复核 (F-6 残留): flag 的加密位与"建文件时刻的实际加密能力"一致——
+// encrypt_enable=1 但 key_provider 建文件时刻取不到密钥时, 本文件的块注定
+// 全部降级为明文落盘, 文件头不得声明加密(否则导出/外部分析按头判定该文件
+// 为密文, 元数据失真)。开/关由调用方以 enc_capable 显式传入, 保证"文件头
+// 声明 == 预期块形态"的单一决策点。
 bool write_file_header(Instance* inst, int fd,
-                        uint32_t date, uint16_t kid, const uint8_t salt[8]) {
+                        uint32_t date, uint16_t kid, const uint8_t salt[8],
+                        bool enc_capable) {
     uint8_t hdr[32];
     std::memset(hdr, 0, sizeof(hdr));
     put_u32_le(hdr + 0, kMagicFile);
     hdr[4] = 1;     // ver
-    hdr[5] = make_flag(inst->compress_algo, inst->encrypt_enable != 0);     // flag
+    hdr[5] = make_flag(inst->compress_algo, enc_capable);     // flag
     put_u32_le(hdr + 6, date);
     put_u16(hdr + 10, kid);
     std::memcpy(hdr + 12, salt, 8);
@@ -393,6 +399,10 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
         if (sz > 0 && repair) {
             inst->pal->file_truncate(fd, 0);
             r.truncated = true;
+            // R20 复核: 自愈必须可见(R19 探针 G 的教训之一是"计数器全 0 +
+            // 无事件"), 否则调用方无法区分"正常空文件"与"撕裂头被修复"。
+            emit_event(inst, LOGX_EV_RECOVERY, -1,
+                       "torn file header (0<sz<32); truncated to empty for rewrite");
         }
         inst->pal->file_close(fd);
         r.ok = true;
@@ -511,7 +521,17 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
             inst->pal->file_close(fd);
             return -1;
         }
-        if (!write_file_header(inst, fd, date, inst->kid, salt)) {
+        // R20 复核 (F-6 残留): 建文件时刻探测密钥可用性, 文件头加密位与
+        // "本文件预期块形态"一致。encrypt_enable=1 但此刻取不到密钥 → 本
+        // 文件的块将全部明文落盘(drain_once 降级纪律), 头不得声明加密。
+        bool enc_capable = true;
+        if (inst->encrypt_enable != 0 &&
+            (!inst->key_provider || !inst->key_provider(inst->kid, inst->key_user))) {
+            enc_capable = false;
+            emit_event(inst, LOGX_EV_DEGRADED, -1,
+                       "key unavailable at file creation; file header written without encrypted bit");
+        }
+        if (!write_file_header(inst, fd, date, inst->kid, salt, enc_capable)) {
             inst->pal->file_close(fd); return -1;
         }
         std::memcpy(out_salt, salt, 8);
@@ -734,6 +754,27 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     for (const auto& blk : blocks) {
         if (blk.raw_len == 0) continue;
 
+        // R20 复核 (F-1 边界): 缝紧随满长记录时 split_impl 会产出 1~5B 的
+        // "缝独占块"(缝归入当前块会超出 kBlockMaxRaw 硬上限, 只能独立封块)。
+        // 该块不含任何记录数据(缝本就是 write_records 留零回绕的填充), 而
+        // 读侧 block_header_plausible 要求 raw_len >= kHeaderLen, 落盘必被
+        // 拒收(导出在块边界不可信处 break, repair 物理截断)。
+        // 处置: 不编码不落盘, 仅计入水位推进(cur_f 跨过该区间, 随后的
+        // zero_range_locked/commit 正常执行), 缝字节留零在 staging 内直到该
+        // 区域被新写入覆写——与 write_records 留零回绕的既有语义一致。
+        if (blk.raw_len < kHeaderLen) {
+            inst->pal->mutex_lock(inst->mu);
+            inst->staging->zero_range_locked(cur_f, blk.raw_len);
+            uint32_t new_f = (cur_f + blk.raw_len) % inst->staging->data_size();
+            uint32_t latest_w = get_u32(inst->staging->raw_base() + 16);
+            inst->staging->commit_header_locked(
+                get_u32(inst->staging->raw_base() + 8), new_f, latest_w, &atc);
+            inst->pal->mutex_unlock(inst->mu);
+            inst->flushed_bytes_total.fetch_add(blk.raw_len, std::memory_order_relaxed);
+            cur_f = new_f;
+            continue;
+        }
+
         // 取 key(可空)
         const uint8_t* key = nullptr;
         if ((flag & kFlagEncrypted) && inst->key_provider) {
@@ -929,7 +970,16 @@ bool append_block(Instance* inst,
         if (inst->pal->file_pread(fd, salt, 8, 12) != 8) { inst->pal->file_close(fd); return false; }
     }
     if (sz == 0) {
-        if (!write_file_header(inst, fd, yyyymmdd, inst->kid, salt)) {
+        // R20 复核 (F-6 残留): 与 open_or_create_append_target 同款纪律,
+        // 建文件时刻探测密钥, 文件头加密位与预期块形态一致。
+        bool enc_capable = true;
+        if (inst->encrypt_enable != 0 &&
+            (!inst->key_provider || !inst->key_provider(inst->kid, inst->key_user))) {
+            enc_capable = false;
+            emit_event(inst, LOGX_EV_DEGRADED, -1,
+                       "key unavailable at file creation; file header written without encrypted bit");
+        }
+        if (!write_file_header(inst, fd, yyyymmdd, inst->kid, salt, enc_capable)) {
             inst->pal->file_close(fd); return false;
         }
         if (inst->pal->file_fsync(fd) != 0) {
