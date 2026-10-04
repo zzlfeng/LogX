@@ -78,7 +78,7 @@ typedef struct logx_config {
     uint16_t kid;
 
     /* (kid)->32B 裸密钥;返回 NULL 表示该 KID 不可解。
-     * 实现必须可应答历史 KID;init(恢复解密)与 export 路径均会调用。 */
+     * 实现必须可应答当前及历史 KID; open(校验当前 KID 可用性)与 export(逐块解密)路径均会调用。 */
     const uint8_t* (*key_provider)(uint16_t kid, void* user);
 
     void* user;                  /* 透传给 key_provider */

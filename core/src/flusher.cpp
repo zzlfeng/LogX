@@ -43,6 +43,17 @@ uint32_t peek_record_len(const uint8_t* p, uint32_t off, uint32_t total) {
     return sz;
 }
 
+// 探测 pos 起始处是否为回绕缝 (1..5 字节 0 且其后有合法记录)
+static uint32_t probe_wrap_seam(const uint8_t* raw, uint32_t pos, uint32_t total) {
+    for (uint32_t s = 1; s < kHeaderLen && pos + s < total; ++s) {
+        if (raw[pos + s - 1] != 0) break;
+        if (peek_record_len(raw, pos + s, total) > 0) {
+            return s;
+        }
+    }
+    return 0;
+}
+
 // ---- §A 块切分 ----
 uint32_t split_impl(const uint8_t* raw, uint32_t total,
                     std::vector<PendingBlock>* out) {
@@ -57,9 +68,18 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
         }
         uint32_t first = peek_record_len(raw, pos, total);
         if (first == 0) {
-            // 撕裂尾部:封块到 total(其中可能有半条记录被丢)
-            out->push_back({blk_begin, total - blk_begin});
-            break;
+            uint32_t seam = probe_wrap_seam(raw, pos, total);
+            if (seam > 0) {
+                // 回绕缝独立封块, 缝后记录在下一块开启
+                out->push_back({blk_begin, seam});
+                pos += seam;
+                continue;
+            }
+            // 撕裂尾部:封块到 total, 但硬上限不超过 kBlockMaxRaw (R19 F-1 兜底)
+            uint32_t take = std::min(total - blk_begin, static_cast<uint32_t>(kBlockMaxRaw));
+            out->push_back({blk_begin, take});
+            pos += take;
+            continue;
         }
         if (first > kSingleRecordMaxRaw) {
             // 单条独占一块
@@ -70,14 +90,37 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
         // 普通累计:沿记录边界累加,加下一条超过 16KB 则封块
         uint32_t cur = pos;
         while (cur < total) {
-            if (total - cur < kHeaderLen) { cur = total; break; }
+            if (total - cur < kHeaderLen) {
+                if (total - blk_begin <= kBlockMaxRaw) {
+                    cur = total;
+                }
+                break;
+            }
             uint32_t rec = peek_record_len(raw, cur, total);
-            if (rec == 0) { cur = total; break; }
+            if (rec == 0) {
+                uint32_t seam = probe_wrap_seam(raw, cur, total);
+                if (seam > 0) {
+                    // 回绕缝归入当前块并在此封块 (R19 F-1), 缝后记录另起新块
+                    if (cur + seam - blk_begin <= kBlockMaxRaw) {
+                        cur += seam;
+                    }
+                    break;
+                }
+                // 撕裂尾部: 封块, 但不得超过 kBlockMaxRaw 硬上限
+                uint32_t remain = total - cur;
+                uint32_t allowed = (blk_begin + kBlockMaxRaw > cur) ? (blk_begin + kBlockMaxRaw - cur) : 0;
+                cur += std::min(remain, allowed);
+                break;
+            }
             if (cur + rec - blk_begin > kNormalBlockMax && cur > blk_begin) break;
             cur += rec;
         }
-        out->push_back({blk_begin, cur - blk_begin});
-        pos = cur;
+        if (cur > blk_begin) {
+            out->push_back({blk_begin, cur - blk_begin});
+            pos = cur;
+        } else {
+            break;
+        }
     }
     return static_cast<uint32_t>(out->size());
 }
@@ -206,13 +249,13 @@ int durability_sync(Instance* inst, uint64_t* out_sync_time_ms) {
 
 // ---- §C 文件路径 / 清理 ----
 std::string make_log_path(const std::string& dir, uint32_t yyyymmdd, uint16_t split) {
-    char buf[128];
+    char buf[64];
     if (split == 0) {
-        std::snprintf(buf, sizeof(buf), "%s/%08u.log", dir.c_str(), yyyymmdd);
+        std::snprintf(buf, sizeof(buf), "/%08u.log", yyyymmdd);
     } else {
-        std::snprintf(buf, sizeof(buf), "%s/%08u.log.%u", dir.c_str(), yyyymmdd, static_cast<unsigned>(split));
+        std::snprintf(buf, sizeof(buf), "/%08u.log.%u", yyyymmdd, static_cast<unsigned>(split));
     }
-    return std::string(buf);
+    return dir + buf;
 }
 
 bool parse_log_filename(const std::string& path_or_name, uint32_t* out_date, uint16_t* out_split) {
@@ -346,7 +389,11 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
     }
     r.last_block_end_offset = static_cast<uint64_t>(sz);
     if (sz < 32) {
-        // 文件过短,视为空文件(允许;将由 write_file_header 覆盖)
+        // 文件过短,视为坏头/可修复(R19 F-3)
+        if (sz > 0 && repair) {
+            inst->pal->file_truncate(fd, 0);
+            r.truncated = true;
+        }
         inst->pal->file_close(fd);
         r.ok = true;
         r.seqno = 0;
@@ -450,6 +497,11 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
     if (fd < 0) return -1;
     int64_t sz = inst->pal->file_size(fd);
     if (sz < 0) { inst->pal->file_close(fd); return -1; }
+    if (sz > 0 && sz < 32) {
+        // R19 F-3: 1~31B 头部撕裂损坏, 截断为空文件并重写文件头
+        inst->pal->file_truncate(fd, 0);
+        sz = 0;
+    }
     if (sz == 0) {
         // 新建:写 32B 头
         uint8_t salt[8];
@@ -538,14 +590,15 @@ struct FlusherCtx {
 
 void close_current(FlusherCtx* c, Pal* pal) {
     if (c->current_fd >= 0) {
-        if (pal->file_fsync(c->current_fd) != 0) {
-            if (c->inst) emit_event(c->inst, LOGX_EV_IO, -1, "close file fsync failed");
-        }
-        pal->file_close(c->current_fd);
+        int fd_to_close = c->current_fd;
         c->current_fd = -1;
         if (c->inst) {
-            c->inst->active_log_fd.store(-1);
+            c->inst->active_log_fd.store(-1, std::memory_order_release);
         }
+        if (pal->file_fsync(fd_to_close) != 0) {
+            if (c->inst) emit_event(c->inst, LOGX_EV_IO, -1, "close file fsync failed");
+        }
+        pal->file_close(fd_to_close);
     }
 }
 
@@ -701,6 +754,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
             if (fd != kAppendTargetSplitExhausted) {
                 emit_event(inst, LOGX_EV_IO, -1, "append target open failed");
             }
+            inst->block_write_errors.fetch_add(1);
             // 不再尝试,清零 cur_f..(cur_f+blk.raw_len) 以维持不变量
             inst->pal->mutex_lock(inst->mu);
             inst->staging->zero_range_locked(cur_f, blk.raw_len);
@@ -985,7 +1039,11 @@ bool sum_raw_len_since(Instance* inst, const std::string& target_path,
 
 void* flusher_main(void* arg) {
     Instance* inst = static_cast<Instance*>(arg);
+    inst->flusher_tid.store(inst->pal->tid(), std::memory_order_release);
     flusher_loop(inst);
+    if (inst->close_on_flusher.load(std::memory_order_acquire)) {
+        destroy_instance(inst, /*is_flusher_thread=*/true);
+    }
     return nullptr;
 }
 

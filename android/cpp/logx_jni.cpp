@@ -340,11 +340,11 @@ Java_com_zzlfeng_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong hand
     delete static_cast<JniErrorContext*>(inst_err_ctx);
 }
 
-JNIEXPORT void JNICALL
+JNIEXPORT jint JNICALL
 Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong handle,
                                        jint level, jstring jTag,
                                        jbyteArray jPayload) {
-    if (!handle || !jTag) return;
+    if (!handle || !jTag) return LOGX_ERR_INVALID_ARG;
     auto* inst = reinterpret_cast<logx_instance_t*>(handle);
 
     // 1) Tag 读取: 使用栈缓冲区 + GetStringUTFRegion 避免堆分配
@@ -362,7 +362,7 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
     } else {
         tag_ptr = env->GetStringUTFChars(jTag, nullptr);
     }
-    if (!tag_ptr) return;
+    if (!tag_ptr) return LOGX_ERR_NOMEM;
 
     // 2) Payload 读取: 优先使用栈缓冲 + GetByteArrayRegion 避免堆分配与 GC 阻塞。
     // [CheckJNI 安全保障]: 严禁使用 GetPrimitiveArrayCritical。当 staging 环形缓冲写满(kFull)、
@@ -419,13 +419,13 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
     if (tag_ptr && tag_ptr != tag_buf) {
         env->ReleaseStringUTFChars(jTag, tag_ptr);
     }
+    return static_cast<jint>(wrc);
 }
 
-JNIEXPORT void JNICALL
+JNIEXPORT jint JNICALL
 Java_com_zzlfeng_logx_LogX_nativeFlush(JNIEnv* /*env*/, jclass /*clazz*/, jlong handle) {
-    if (handle != 0) {
-        logx_flush(reinterpret_cast<logx_instance_t*>(handle));
-    }
+    if (handle == 0) return LOGX_ERR_STATE;
+    return static_cast<jint>(logx_flush(reinterpret_cast<logx_instance_t*>(handle)));
 }
 
 JNIEXPORT jint JNICALL

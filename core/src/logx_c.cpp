@@ -88,24 +88,9 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
     std::memcpy(salt, hdr + 12, 8);
     const uint8_t* key32 = nullptr;
     bool key_lookup_attempted = false;
-    bool file_encrypted = flag_encrypted(hdr[5]);
-    if (file_encrypted) {
-        key_lookup_attempted = true;
-        if (!inst->key_provider) {
-            emit_event(inst, LOGX_EV_DEGRADED, -1, "export: no key provider for encrypted file");
-            out_lines->push_back("[skipped: no key provider]\n");
-            inst->pal->file_close(fd);
-            return true;
-        }
+    if (inst->key_provider) {
         key32 = inst->key_provider(kid_in_file, inst->key_user);
-        if (!key32) {
-            emit_event(inst, LOGX_EV_DEGRADED, -1, "export: missing key for kid");
-            char line[128];
-            std::snprintf(line, sizeof(line), "[skipped: kid=%u missing key]\n", kid_in_file);
-            out_lines->push_back(line);
-            inst->pal->file_close(fd);
-            return true;
-        }
+        key_lookup_attempted = true;
     }
     uint64_t off = 32;
     std::vector<uint8_t> carry_slice_buf;
@@ -135,6 +120,15 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
             if (!key32 && !key_lookup_attempted && inst->key_provider) {
                 key_lookup_attempted = true;
                 key32 = inst->key_provider(kid_in_file, inst->key_user);
+            }
+            if (!key32) {
+                emit_event(inst, LOGX_EV_DEGRADED, -1, "export: missing key for kid");
+                char line[128];
+                std::snprintf(line, sizeof(line), "[skipped: kid=%u missing key (seq=%u)]\n", kid_in_file, seqno);
+                out_lines->push_back(line);
+                carry_slice_buf.clear();
+                off += block_size;
+                continue;
             }
         }
         // CRC 校验(payload)
@@ -290,12 +284,57 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
     return final_status;
 }
 
+namespace {
+
+struct OpGuard {
+    Instance* inst;
+    ~OpGuard() {
+        if (!inst) return;
+        int rem = inst->active_ops.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (rem == 0 && inst->close_pending.load(std::memory_order_acquire)) {
+            destroy_instance(inst, /*is_flusher_thread=*/false);
+        }
+    }
+};
+
+}  // namespace
+
+void destroy_instance(Instance* inst, bool is_flusher_thread) {
+    if (!inst) return;
+    // 先做一次同步 flush,确保 staging 全部落块(仅非 Flusher 线程可调用, 杜绝自死锁)
+    if (!is_flusher_thread) {
+        flush_blocking(inst);
+    }
+    // 再让 Flusher 退出
+    inst->flusher_exit.store(true, std::memory_order_release);
+    if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
+    if (inst->flusher_thread && !is_flusher_thread) {
+        inst->pal->thread_join(inst->flusher_thread);
+        inst->flusher_thread = nullptr;
+    }
+    delete inst->staging;
+    inst->staging = nullptr;
+    if (inst->flush_event) {
+        inst->pal->ev_destroy(inst->flush_event);
+        inst->flush_event = nullptr;
+    }
+    if (inst->mu) {
+        inst->pal->mutex_destroy(inst->mu);
+        inst->mu = nullptr;
+    }
+    delete inst;
+}
+
 // ---- C ABI 实现 ----
 
 extern "C" {
 
 logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
-    if (!cfg || !cfg->log_dir || !cfg->staging_path || !out_inst) {
+    if (!out_inst) {
+        return LOGX_ERR_INVALID_ARG;
+    }
+    *out_inst = nullptr;  // R19 F-10: 失败返回全部按契约写 NULL
+    if (!cfg || !cfg->log_dir || !cfg->staging_path) {
         return LOGX_ERR_INVALID_ARG;
     }
     if (cfg->max_log_length == 0) {
@@ -330,6 +369,12 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
 #endif
     if (cfg->encrypt_enable != 0 && !cfg->key_provider) {
         return LOGX_ERR_INVALID_ARG;  // 开启加密却未提供 key_provider
+    }
+    if (cfg->encrypt_enable != 0 && cfg->key_provider) {
+        // R19 F-6: 开启加密时在 open 期对 kid 进行探测调用，若无对应密钥则 fail-fast 拒绝启动
+        if (!cfg->key_provider(cfg->kid, cfg->user)) {
+            return LOGX_ERR_INVALID_ARG;
+        }
     }
     Instance* inst = new Instance();
     inst->log_dir = cfg->log_dir;
@@ -410,19 +455,27 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
 logx_status_e logx_close(logx_instance_t* h) {
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return LOGX_ERR_INVALID_ARG;
-    // 先做一次同步 flush,确保 staging 全部落块(此期间 Flusher 仍在跑)
-    flush_blocking(inst);
-    // 再让 Flusher 退出
-    inst->flusher_exit.store(true);
-    if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
-    if (inst->flusher_thread) {
-        inst->pal->thread_join(inst->flusher_thread);
+    if (inst->closing.exchange(true, std::memory_order_acq_rel)) {
+        return LOGX_OK;
     }
-    delete inst->staging;
-    inst->staging = nullptr;
-    if (inst->flush_event) inst->pal->ev_destroy(inst->flush_event);
-    if (inst->mu) inst->pal->mutex_destroy(inst->mu);
-    delete inst;
+    uint64_t current_tid = inst->pal->tid();
+    bool on_flusher = (inst->flusher_tid.load(std::memory_order_acquire) == current_tid);
+    if (on_flusher) {
+        // R19 F-2: 处于 Flusher 线程内部，实施递延由 flusher_main 退出时销毁，杜绝 join 自身死锁
+        inst->close_on_flusher.store(true, std::memory_order_release);
+        inst->flusher_exit.store(true, std::memory_order_release);
+        if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
+        return LOGX_OK;
+    }
+    if (inst->in_callback.load(std::memory_order_acquire) > 0 ||
+        inst->active_ops.load(std::memory_order_acquire) > 0) {
+        // R19 F-2: 处于调用方线程的回调或活跃调用栈内部，实施递延销毁，由最外层 OpGuard 析构完成
+        inst->close_pending.store(true, std::memory_order_release);
+        inst->flusher_exit.store(true, std::memory_order_release);
+        if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
+        return LOGX_OK;
+    }
+    destroy_instance(inst, false);
     return LOGX_OK;
 }
 
@@ -430,8 +483,12 @@ logx_status_e logx_write(logx_instance_t* h, int level,
                          const char* tag, const uint8_t* payload, uint32_t payload_len) {
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return LOGX_ERR_STATE;
+    if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
     if (!inst->staging) return LOGX_ERR_STATE;
     if (!tag) return LOGX_ERR_INVALID_ARG;
+
+    inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
+    OpGuard guard{inst};
 
     // 1) 锁外格式化(包含校验和计算)
     // E-02: 区分"输入非法"与"内容超长"两类失败——非法输入按 INVALID_ARG 上报,
@@ -447,12 +504,12 @@ logx_status_e logx_write(logx_instance_t* h, int level,
                            &truncated, &dropped_bytes);
     if (br == kBuildRecordsInvalidInput) {
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_INVALID_ARG, "invalid log input");
-        return LOGX_ERR_INVALID_ARG;
+        return inst->closing.load(std::memory_order_acquire) ? LOGX_OK : LOGX_ERR_INVALID_ARG;
     }
     if (br == kBuildRecordsCannotFit) {
         inst->drop_too_large.fetch_add(1);
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, "log too large");
-        return LOGX_ERR_TOO_LARGE;
+        return inst->closing.load(std::memory_order_acquire) ? LOGX_OK : LOGX_ERR_TOO_LARGE;
     }
     if (truncated) {
         inst->truncated_logs.fetch_add(1);
@@ -464,6 +521,13 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         std::snprintf(msg, sizeof(msg), "log truncated (dropped %llu bytes)",
                       static_cast<unsigned long long>(dropped_bytes));
         emit_event(inst, LOGX_EV_TRUNCATED, LOGX_OK, msg);
+        if (inst->closing.load(std::memory_order_acquire)) {
+            return LOGX_OK;
+        }
+    }
+
+    if (inst->closing.load(std::memory_order_acquire)) {
+        return LOGX_OK;
     }
 
     // 2) 锁内写入 staging
@@ -480,12 +544,6 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         inst->staged_bytes_total.fetch_add(consumed, std::memory_order_relaxed);
         uint32_t f, snap;
         uint32_t pending = inst->staging->snapshot_pending(&f, &snap);
-        // E-06 复审修正:flush_threshold == 0 表示"禁用按阈值自动唤醒"。
-        // 旧判定 pending >= flush_threshold 在阈值 0 时因 pending >= 0 恒真,
-        // 退化为每条写入均唤醒 Flusher——语义精确反转。
-        // 守卫必须放在阈值上(threshold > 0)而非 pending 上:写入成功后
-        // pending 恒 > 0,对 pending 加前置条件是死代码,拦不住恒真分支。
-        // 阈值 0 时的落盘节奏由 Flusher 自身的 kFlushDebounceMs 轮询兜底。
         need_wake = inst->flush_threshold > 0 && pending >= inst->flush_threshold;
     } else if (st == Staging::WriteStatus::kFull) {
         inst->drop_no_space.fetch_add(1);
@@ -499,6 +557,10 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full");
     }
 
+    if (inst->closing.load(std::memory_order_acquire)) {
+        return LOGX_OK;
+    }
+
     if (need_wake) inst->pal->ev_signal(inst->flush_event);
     return st == Staging::WriteStatus::kOk ? LOGX_OK : LOGX_ERR_NO_SPACE;
 }
@@ -506,6 +568,9 @@ logx_status_e logx_write(logx_instance_t* h, int level,
 logx_status_e logx_flush(logx_instance_t* h) {
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return LOGX_ERR_STATE;
+    if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
+    inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
+    OpGuard guard{inst};
     return flush_blocking(inst) ? LOGX_OK : LOGX_ERR_TIMEOUT;
 }
 
@@ -513,7 +578,10 @@ logx_status_e logx_export(logx_instance_t* h, const char* from, const char* to,
                           logx_export_cb cb, void* cb_user) {
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return LOGX_ERR_STATE;
+    if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
     if (!from || !to) return LOGX_ERR_INVALID_ARG;
+    inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
+    OpGuard guard{inst};
     ExportRequest req;
     req.from = from; req.to = to; req.cb = cb; req.cb_user = cb_user;
     return export_range(inst, req);

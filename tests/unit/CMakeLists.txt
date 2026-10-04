@@ -32,6 +32,7 @@ add_executable(logx_unit_tests
     test_jni_string.cpp
     test_j04_regression.cpp
     test_review_p1_p4.cpp
+    test_r19_regression.cpp
     # 资源占用(RSS/PSS)、延迟抖动(stddev/CV)与 Pal 层泄漏回归
     test_observability.cpp
 )

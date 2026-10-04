@@ -72,6 +72,14 @@ struct Instance {
     std::atomic<uint64_t> pad_records{0};
     std::atomic<uint64_t> block_write_errors{0};
     std::atomic<uint64_t> truncated_blocks{0};
+
+    // ---- 实例生命周期与错误回调重入防护 (R19 F-2) ----
+    std::atomic<int> active_ops{0};
+    std::atomic<int> in_callback{0};
+    std::atomic<bool> closing{false};
+    std::atomic<bool> close_pending{false};
+    std::atomic<bool> close_on_flusher{false};
+    std::atomic<uint64_t> flusher_tid{0};
 };
 
 constexpr uint32_t kFlushBlockingTimeoutMs = 5000;
@@ -83,7 +91,10 @@ constexpr uint32_t kFlushDebounceMs = 75;
 // E-01: 快照读取 err_fn/err_user 在 err_mu 保护下完成,消除与
 // logx_set_error_handler 并发注册的数据竞争;回调本身在锁外执行,
 // 避免回调内再注册 handler 或再打事件造成死锁。
+// R19 F-2: in_callback 跟踪回调调用深度, 供 logx_close 检测重入并实施递延销毁。
 inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char* msg) {
+    if (!inst) return;
+    inst->in_callback.fetch_add(1, std::memory_order_acq_rel);
     inst->err_mu.lock();
     logx_error_fn fn = inst->err_fn;
     void* user = inst->err_user;
@@ -91,6 +102,7 @@ inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char
     if (fn) {
         fn(user, k, code, msg ? msg : "");
     }
+    inst->in_callback.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 // 格式化一个外部 level(0..5)/tag/payload 为 staging 记录字节序列;
@@ -255,6 +267,9 @@ void retention_cleanup(Instance* inst);
 
 // flush 同步:阻塞至当前 staging 全部落块提交。
 bool flush_blocking(Instance* inst);
+
+// 实例销毁实现 (R19 F-2): is_flusher_thread 为 true 时绝不 join 自身
+void destroy_instance(Instance* inst, bool is_flusher_thread);
 
 // Flusher 线程入口。
 void* flusher_main(void* arg);

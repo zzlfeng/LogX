@@ -105,8 +105,12 @@ def decompress(algo: int, payload: bytes) -> bytes:
         # 解出超过 MAX_BLOCK_RAW 即判畸形 (防 zip bomb 过度分配)。
         d = zlib.decompressobj()
         out = d.decompress(payload, MAX_BLOCK_RAW + 1)
-        if not d.eof and len(out) > MAX_BLOCK_RAW:
+        if len(out) > MAX_BLOCK_RAW:
             raise RuntimeError(f"decompressed output exceeds {MAX_BLOCK_RAW}B")
+        if not d.eof:
+            out += d.flush()
+            if not d.eof:
+                raise RuntimeError("zlib stream did not reach EOF")
         if len(out) > MAX_BLOCK_RAW:
             raise RuntimeError(f"decompressed output exceeds {MAX_BLOCK_RAW}B")
         return out
@@ -276,7 +280,7 @@ class DecodedBlockResult:
 
 def decode_block_raw(bhdr: bytes, payload: bytes, tag: Optional[bytes],
                      flag: int, raw_len: int, kid_keys: Dict[int, bytes],
-                     kid_in_file: int) -> DecodedBlockResult:
+                     kid_in_file: int, file_salt: bytes) -> DecodedBlockResult:
     """解码单块。错误时 error 字段以固定前缀分类 (D-03):
     'crc32 mismatch' / 'gcm fail' / 'decompress fail' / 'missing key' ——
     上层据此生成与 C++ 导出一致的占位行 ([seq=N crc fail] / [seq=N decode fail])。
@@ -299,7 +303,8 @@ def decode_block_raw(bhdr: bytes, payload: bytes, tag: Optional[bytes],
         key = kid_keys.get(kid_in_file)
         if key is None:
             return DecodedBlockResult(seqno, raw_len, error=f"missing key for kid={kid_in_file}")
-        nonce = bhdr[22:34]  # salt[8] + seqno_be[4]
+        # R19 F-15: Nonce 由文件头 salt[8] + seqno_be[4] 派生, 对齐 C++ make_nonce
+        nonce = file_salt + struct.pack('>I', seqno)
         try:
             ct_with_tag = payload + (tag or b'')
             plain = decrypt_gcm(key, bytes(nonce), bytes(ct_with_tag))
@@ -311,6 +316,9 @@ def decode_block_raw(bhdr: bytes, payload: bytes, tag: Optional[bytes],
         raw = decompress(algo, plain)
     except Exception as e:
         return DecodedBlockResult(seqno, raw_len, error=f"decompress fail: {e}")
+    # R19 F-15: raw_len 与解压输出长度交叉校验, 对齐 C++ decode_block
+    if len(raw) != raw_len:
+        return DecodedBlockResult(seqno, raw_len, error=f"raw_len mismatch: expected {raw_len} != actual {len(raw)}")
     return DecodedBlockResult(seqno, raw_len, raw_bytes=raw)
 
 # 块头严检常量 (对齐 C++ F-05 block_header_plausible)
@@ -321,11 +329,12 @@ BLOCK_VER = 1
 BLOCK_RAW_MIN = 6
 BLOCK_LEN_MAX = 16 * 1024 * 1024
 
-def block_header_plausible(bhdr: bytes, file_remaining: int) -> Optional[Tuple[int, int, int, int]]:
+def block_header_plausible(bhdr: bytes, file_remaining: int,
+                           prev_seqno: int = 0, has_prev_seqno: bool = False) -> Optional[Tuple[int, int, int, int]]:
     """(D-02) 块头结构严检,对齐 C++ F-05 block_header_plausible。
 
     校验项与 C++ 逐一对应: magic / 版本 / flag 保留位 / 算法编号 /
-    seqno > 0 / raw_len ∈ [6, 16MB] / payload_len ∈ (0, 16MB] /
+    seqno > 0 且严格单调递增 / raw_len ∈ [6, 16MB] / payload_len ∈ (0, 16MB] /
     未压缩时 payload_len == raw_len / 块大小不越过文件尾。
     合法返回 (seqno, raw_len, payload_len, block_size);
     结构损坏返回 None —— 块边界自描述于块头,此时无法定位下一块,必须终止
@@ -345,6 +354,9 @@ def block_header_plausible(bhdr: bytes, file_remaining: int) -> Optional[Tuple[i
         return None
     seqno = get_u32(bhdr, 6)
     if seqno == 0:
+        return None
+    # R19 F-15: seqno 严格单调递增校验
+    if has_prev_seqno and seqno <= prev_seqno:
         return None
     raw_len = get_u32(bhdr, 10)
     if raw_len < BLOCK_RAW_MIN or raw_len > BLOCK_LEN_MAX:
@@ -368,8 +380,12 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
       - 块级解码失败 (payload CRC / GCM / 解压 / 缺 key) → errors 记录后
         跳过该块继续,文件后半部分照常解码,绝不截断。
     """
-    with open(path, 'rb') as f:
-        data = f.read()
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        return [], [f"{path}: open/read failed: {e}"]
+
     if len(data) < 32:
         return [], [f"{path}: file too short (<32B)"]
     try:
@@ -382,14 +398,18 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
     reassembler = RecordReassembler()
 
     off = 32
+    prev_seqno = 0
+    has_prev_seqno = False
     while off + BLOCK_HEADER_SIZE <= len(data):
         bhdr = data[off:off+BLOCK_HEADER_SIZE]
-        hdr = block_header_plausible(bhdr, len(data) - off)
+        hdr = block_header_plausible(bhdr, len(data) - off, prev_seqno, has_prev_seqno)
         if hdr is None:
             # 结构损坏:与 C++ 一致终止扫描 (块边界已不可信)
             errors.append(f"{path} off={off}: bad block header; stop scanning file")
             break
         seqno, raw_len, payload_len, block_size = hdr
+        prev_seqno = seqno
+        has_prev_seqno = True
         flag = bhdr[5]
 
         payload = data[off+BLOCK_HEADER_SIZE:off+BLOCK_HEADER_SIZE+payload_len]
@@ -398,7 +418,7 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
                if (flag & FLAG_ENCRYPTED) else None
 
         blk_res = decode_block_raw(bhdr, payload, tag, flag, raw_len,
-                                   kid_keys, fh.kid)
+                                   kid_keys, fh.kid, fh.salt)
         if blk_res.error:
             # 块级解码失败:跳过该块继续 (对齐 C++ 导出路径占位行行为)
             kind = blk_res.error.split(':', 1)[0]
@@ -422,6 +442,11 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
             if not carry_ok:
                 reassembler.drop_carry()
         off += block_size
+
+    trailing_len = len(data) - off
+    if trailing_len > 0:
+        # R19 F-15: 块尾 <34B 撕裂残片输出警告
+        errors.append(f"{path}: trailing torn tail ({trailing_len}B < {BLOCK_HEADER_SIZE}B)")
     return user_records, errors
 
 # ---------------- 内部用户载荷 → 可读行 ----------------
@@ -453,6 +478,15 @@ def parse_kid_map(s: str) -> Dict[int, bytes]:
         out[kid] = key
     return out
 
+def log_file_sort_key(filename: str) -> Tuple[int, int]:
+    base = os.path.basename(filename)
+    m = re.match(r'^(\d{8})\.log(?:\.(\d+))?$', base)
+    if not m:
+        return (0, 0)
+    date = int(m.group(1))
+    split = int(m.group(2)) if m.group(2) else 0
+    return (date, split)
+
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(description="LogX 离线日志解码工具")
     ap.add_argument('log_dir', help="日志存储目录")
@@ -464,14 +498,22 @@ def main(argv: List[str]) -> int:
 
     kid_keys = parse_kid_map(args.kid_map) if args.kid_map else {}
 
-    if not os.path.exists(args.log_dir):
-        print(f"[error] log_dir not found: {args.log_dir}", file=sys.stderr)
+    # R19 F-9: 校验目录合法性, 区分普通文件与不存在
+    if not os.path.isdir(args.log_dir):
+        print(f"[error] log_dir not a valid directory: {args.log_dir}", file=sys.stderr)
         return 1
 
-    files = sorted(
-        os.path.join(args.log_dir, n) for n in os.listdir(args.log_dir)
-        if re.match(r'^\d{8}\.log(\.\d+)?$', n)
-    )
+    try:
+        dir_entries = os.listdir(args.log_dir)
+    except OSError as e:
+        print(f"[error] failed to list log_dir: {e}", file=sys.stderr)
+        return 1
+
+    matched_names = [n for n in dir_entries if re.match(r'^\d{8}\.log(\.\d+)?$', n)]
+    # R19 F-8: 按 (date, split) 数值排序, 避免 .log.10 排在 .log.2 之前
+    matched_names.sort(key=log_file_sort_key)
+    files = [os.path.join(args.log_dir, n) for n in matched_names]
+
     if args.from_date: files = [p for p in files if os.path.basename(p)[:8] >= args.from_date]
     if args.to_date:   files = [p for p in files if os.path.basename(p)[:8] <= args.to_date]
 
@@ -500,7 +542,14 @@ def main(argv: List[str]) -> int:
             out_fh = sys.stdout
             out_path = None
 
-        user_payloads, errors = decode_file_records(path, kid_keys)
+        # R19 F-9: 捕获单文件解码异常(如删除竞争/权限/不可读), 避免整轮脚本崩溃中断
+        try:
+            user_payloads, errors = decode_file_records(path, kid_keys)
+        except Exception as e:
+            print(f"[{date}] {path}: unhandled decode error: {e}", file=sys.stderr)
+            rc = 2
+            continue
+
         for err in errors:
             print(f"[{date}] {err}", file=sys.stderr)
             rc = 2

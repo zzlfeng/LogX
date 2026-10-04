@@ -63,6 +63,7 @@
 | `d80cd9d` | docs(staging): 纠正 write_records 回绕路径 free 注释并定位恒假防御守卫 (R16 F-4) |
 | `795ec73` | fix(test): R13_N2 用例补超长保留期, 消除历史日期文件被 retention 清理的时序炸弹 (R17 F-1) |
 | `a507030` | fix(flusher): append_block 已存在文件分支回读文件头 salt, 杜绝未初始化栈内存落盘 (R18 F-1;含 poison_r18_stack 栈毒化回归屏障) |
+| `5d7ac34` | docs(gate): 固化 R18-1 测试保质期与 R18-2 反空洞绿两条门禁, 补 retention 时钟推后 20 年回归用例 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 
@@ -1891,3 +1892,59 @@ __declspec(noinline) void poison_r18_stack() {
 - **压力**：`logx_stress_tests.exe` **4 / 4 全绿**（含 50 轮崩溃注入对账 397/397）
 - **对照实验**：A 撤销 R17 F-1 → 复现 `-8`；B 构造 `append_block(nullptr salt, 已有文件)` → 5/5 复现栈垃圾；C 撤销 R18 F-1 + 毒化 → 回归测试报红；D 变异 `--days` → retention 用例报红
 - **未复跑**：另两个构建矩阵（OFF/OFF、ZSTD=ON+AESGCM=OFF）、Android arm64 交叉编译、真机（沿用既有共同局限）
+
+## R19 批次: 核心生产路径与周边交付件全面审查修复 (2026-10-04)
+
+> 审查对象 `code_review_R19_2026-10-04.md`，审查 HEAD `5d7ac34`。本轮完成全量 16 项缺陷（含 F-1/F-2 两项 P0、F-3~F-9 六项 P1、F-10~F-15 六项 P2 及 N-1）的全面修复与单测/回归屏障闭环。
+
+### 修复条目
+
+#### 1. F-1 (P0) 回绕缝落在拷出缓冲中部导致超限块与解码丢失
+- **根因**：`copy_pending` 将环尾缝与回绕头拼接，`split_impl` 遇缝处 `magic==0` 误短路封至缓冲末尾，形成超过 `kBlockMaxRaw` (20486B) 的超大块（实测达 32931B），zstd 读侧以 `kDecompressOutputMax` 拒绝致整块丢弃。
+- **修复**：`split_impl` 探测回绕缝边界并在缝处封块，同时引入 `kBlockMaxRaw` 硬上限约束兜底，并在测试集建立针对回绕缝与超大块的回归屏障。
+
+#### 2. F-2 (P0) 错误回调内调用 `logx_close` 引发 Use-After-Free 崩溃
+- **根因**：契约许可在错误回调内部调用 `logx_close`，但原实现直接在调用者线程释放 `inst`，回调返回后 `logx_write` 栈帧继续访问已释放内存引发 `0xC0000005`；Flusher 线程内直接 close 还会导致 `join` 自身死锁。
+- **修复**：引入 `in_callback` 与 `active_ops` 状态机，`logx_close` 检测到调用栈或并发活跃操作处于回调中时标记 `close_pending` 并递延销毁；Flusher 线程销毁时绝不自 join，由最外层操作离开时统一完成资源析构。
+
+#### 3. F-3 (P1) 1~31B 撕裂日志文件永久卡死追加目标
+- **根因**：`scan_one` 对 `sz < 32` 不截断修复，`open_or_create_append_target` 要求 `pread == 32`，导致小于 32B 文件打开恒失败且静默丢弃。
+- **修复**：`scan_one` 对 `0 < sz < 32` 在 repair 模式下截断至 0 覆盖重写，`open_or_create_append_target` 对不足 32B 重新写入文件头；`drain_once` 目标打开失败时递增 `block_write_errors` 计数。
+
+#### 4. F-4 (P1) `ring_scan` 回绕缝未传环段边界导致误抹除后续未提交记录
+- **根因**：`ring_scan` 未接收回绕段边界，遇到跨越回绕点的 `<6B` 零缝时误判为撕裂尾巴并将后续合法记录清零。
+- **修复**：向 `ring_scan` 传递 `wrap_boundary`，识别回绕缝并跳至回绕起始处继续连续扫描有效记录。
+
+#### 5. F-5 (P1) 跨天滚动后 ATC 提示过期导致同文件重复 seqno
+- **根因**：`reconcile` 仅依据 ATC 提示文件判定，跨天后 ATC 仍指向昨日旧文件，导致今日新文件孤儿块未被发现，Flusher 盲开造成 seqno 重复与后续截断破坏。
+- **修复**：`reconcile` 检查目录最新目标日期，当最新日期大于 ATC 提示日期时回退目录扫描，确保接管最新文件真实状态。
+
+#### 6. F-6 (P1) 密钥恒缺导致明文落盘且导出跳过
+- **根因**：`logx_open` 未校验 `key_provider` 可用性；文件头声明加密但块为明文落盘；导出侧因文件头声明加密且缺 key 整文件跳过返回 OK。
+- **修复**：① `logx_open` 开启加密时对当前 KID 做探测调用并 fail-fast；② 导出改为逐块检查加密 flag，明文块直接解出；③ 文档契约对齐说明。
+
+#### 7. F-7 (P1/P2) & F-8 (P2) Android JNI/Kotlin 层状态码与文档对齐
+- **修复**：`nativeFlush` 与 `nativeWrite` 修正为返回 `jint` 错误码；Kotlin `flush()` 返回 `Int`（可区分 `-10 LOGX_ERR_TIMEOUT`）；更新 `LogX.kt` KDoc 关于截断保前缀落盘的说明。
+
+#### 8. F-8 (P2), F-9 (P1), F-15 (P2) Python 离线解码器健壮性与 C++ 契约对齐
+- **修复**：
+  - 分卷按 `(date, split)` 数值排序，避免字典序 `.log.10` 排在 `.log.2` 之前；
+  - 目录与单文件解码增加 `try...except` 保护，防止个别文件系统异常终止整轮解码；
+  - Nonce 采用文件头 salt 派生；增加 `raw_len` 交叉校验；`block_header_plausible` 增加 seqno 严格单调递增校验；识别 `<34B` 撕裂尾部告警。
+
+#### 9. F-10 ~ F-14 (P2) 核心工程健壮性与边界防御批量加固
+- **F-10**：`logx_open` 所有失败分支统一将 `*out_inst` 置为 `nullptr`，杜绝旧句柄悬垂误关。
+- **F-11**：`make_log_path` 改用 `std::string` 拼接，消除 128B 栈缓冲截断风险。
+- **F-12**：`close_current` 先置 `active_log_fd = -1` 再调用 `file_close`，防止并发 fsync 访问关闭 fd。
+- **F-13**：`reconcile` 识别跨天/新分卷新文件，防止空文件将历史 `S_hdr` 虚报为丢块计数。
+- **F-14**：`rebuilt` 恢复分支遇文件截断严格推进 `hdr.seqno = sr.seqno + 1`，防止 nonce 复用。
+- **F-15**：`logx_pal.h` 显式补齐 `#include <vector>`。
+- **N-1**：文档勘误（确认 `5d7ac34` 提交表实际新增 7 行真实哈希）。
+
+### 全量验证
+- **构建**：MSVC 14.43 (x64) Release (`LOGX_WITH_ZSTD=ON`, `LOGX_WITH_AESGCM=ON`) 55/55 步通过，0 warning / 0 error。
+- **单测**：`logx_unit_tests.exe` **156 / 156 全绿**（148 既有 + R19 新增 8 项针对性回归测试）。
+- **热路径**：`logx_hotpath_alloc_tests.exe` **2 / 2 全绿**。
+- **压力**：`logx_stress_tests.exe` **4 / 4 全绿**（50 轮崩溃注入对账 397/397）。
+- **Python 解码器**：`python -m py_compile` 编译验证通过。
+

@@ -52,10 +52,17 @@ uint8_t cksum1(const uint8_t* p, uint32_t n) {
 // *out_valid_end 为有效末尾(不含任何不可识别数据);*out_truncated_tail 为
 // 撕裂尾巴字节数(≤ 1 条记录;置 0 表示无)。
 uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
-                   uint32_t* out_valid_end, uint32_t* out_truncated_tail) {
+                   uint32_t* out_valid_end, uint32_t* out_truncated_tail,
+                   uint32_t wrap_boundary = 0) {
     uint32_t pos = f;
     uint32_t valid_end = f;
     while (pos < total) {
+        if (wrap_boundary > 0 && pos < wrap_boundary && (wrap_boundary - pos < kHeaderLen)) {
+            // 缝残留 < 6B: 位于回绕点, 跳过缝进入第二段继续扫描 (R19 F-4)
+            pos = wrap_boundary;
+            valid_end = wrap_boundary;
+            continue;
+        }
         if (total - pos < kHeaderLen) {
             // 缝残留 < 6B:不识别为记录,跳过(并归零收尾);保留为撕裂尾巴。
             *out_valid_end = valid_end;
@@ -72,6 +79,18 @@ uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
         }
         uint32_t rec = probe_record(raw, pos, total);
         if (rec == 0) {
+            // 检查是否恰好为回绕缝 (<6B 且全为 0 且到达 wrap_boundary)
+            if (wrap_boundary > 0 && pos < wrap_boundary && (wrap_boundary - pos < kHeaderLen)) {
+                bool seam_zero = true;
+                for (uint32_t i = pos; i < wrap_boundary; ++i) {
+                    if (raw[i] != 0) { seam_zero = false; break; }
+                }
+                if (seam_zero) {
+                    pos = wrap_boundary;
+                    valid_end = wrap_boundary;
+                    continue;
+                }
+            }
             *out_valid_end = valid_end;
             *out_truncated_tail = total - pos;
             return pos;
@@ -115,10 +134,12 @@ uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
 //   S_file          : 文件最后有效块 seqno
 //   file_truncated  : 文件发生过截断(影响续写 seqno)
 //   target_path     : 命中的文件路径(用于 k 块回溯与回写 atc)
+//   is_new_target   : 跨天或新分卷新文件(仅头、无块),非截断损坏 (R19 F-13)
 struct ReconcileResult {
     uint32_t S_file = 0;
     bool     file_truncated = false;
     std::string target_path;
+    bool     is_new_target = false;
 };
 
 ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
@@ -129,19 +150,31 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
         hint = make_log_path(inst->log_dir, hdr.target.date, atc_split(hdr.target));
     }
     FileScanResult sr;
-    // R-01: truncated 状态只来自"实际命中的那次扫描结果"。
-    // hint 不可读而回退 best 文件时,hint 的扫描(含其 truncated)必须整体作废;
-    // 否则 hint 文件的截断状态会被误传播给另一个文件,污染续写 seqno 跳空隙决策。
-    if (!hint.empty()) {
+    // R19 F-5: 检查目录最新目标。若目录存在日期大于 ATC 提示日期的文件，
+    // 说明跨天已创建新文件，ATC 提示属于昨日旧文件，必须回退最新文件扫描。
+    std::string best = scan_dir_for_target(inst);
+    uint32_t best_date = 0;
+    uint16_t best_split = 0;
+    if (!best.empty()) {
+        parse_log_filename(best, &best_date, &best_split);
+    }
+
+    bool is_target_newer = false;
+    if (!best.empty() && hdr.target.date != 0 && best_date > hdr.target.date) {
+        is_target_newer = true;
+    }
+
+    if (is_target_newer) {
+        // 跨天后 ATC 提示文件已过时，直接使用最新的当日文件 (R19 F-5)
+        sr = scan_append_target(inst, best);
+    } else if (!hint.empty()) {
         sr = scan_append_target(inst, hint);
         if (!sr.ok) {
             // 缓存指向文件不存在或不可读;扩展到全保留文件扫描
-            std::string best = scan_dir_for_target(inst);
             if (!best.empty()) sr = scan_append_target(inst, best);
             else return r;  // 目录里也没有任何文件:全新启动(非截断)
         }
     } else {
-        std::string best = scan_dir_for_target(inst);
         if (!best.empty()) sr = scan_append_target(inst, best);
         else return r;  // 全新启动:无任何日志文件
     }
@@ -152,6 +185,9 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
     r.S_file = sr.seqno;
     r.file_truncated = sr.truncated;
     r.target_path = sr.path;
+    if (is_target_newer && sr.seqno == 0 && !sr.truncated) {
+        r.is_new_target = true;
+    }
     return r;
 }
 
@@ -178,6 +214,13 @@ bool run_recovery(Instance* inst) {
             FileScanResult sr = scan_append_target(inst, best);
             if (sr.ok) {
                 hdr.seqno = sr.seqno;
+                if (sr.truncated) {
+                    // R19 F-14: 若发生截断, 为防止被截断块的 seqno 与加密 nonce 被复用,
+                    // 首块 seqno 须跳空隙 (hdr.seqno = sr.seqno + 1, Flusher 首块为 hdr.seqno + 1 即 max+2)
+                    hdr.seqno = sr.seqno + 1;
+                    inst->truncated_blocks.fetch_add(1);
+                    emit_event(inst, LOGX_EV_RECOVERY, -1, "rebuilt: appended file tail truncated");
+                }
                 uint16_t split = 0;
                 parse_log_filename(sr.path, &atc.date, &split);
                 atc_set_split(&atc, split);
@@ -246,7 +289,9 @@ bool run_recovery(Instance* inst) {
     // S_hdr ≥ S_file + 1,该块天然落在差值区间 (S_file, S_hdr] 内;
     // 若其提交未持久化,则 S_hdr == S_file,走下方 else 分支单独 +1。
     // 两种情况均恰好计数一次,按报告原建议再 +1 反而会对撕裂块重复计数。
-    if (S_hdr > seqno_file) {
+    // R19 F-13: 新分卷/新日期空文件 (rec.is_new_target 为 true) 无任何块被丢弃,
+    // 不得误判定为损坏尾部而将历史 S_hdr 计入 truncated_blocks。
+    if (S_hdr > seqno_file && !rec.is_new_target) {
         uint32_t lost = S_hdr - seqno_file;
         inst->truncated_blocks.fetch_add(lost);
         if (truncated) {
@@ -262,6 +307,8 @@ bool run_recovery(Instance* inst) {
     uint32_t resume_seqno;
     if (seqno_file == 0 && S_hdr == 0 && !truncated) {
         resume_seqno = 0;                       // 全新启动:首块 = 1
+    } else if (rec.is_new_target) {
+        resume_seqno = S_hdr;                   // 空/仅头新分卷/新日期文件: 继承 S_hdr, 无跳空隙 (R19 F-13)
     } else if (truncated || seqno_file < S_hdr) {
         resume_seqno = std::max(S_hdr, seqno_file) + 1;  // 首块 = max + 2(跳 1 空隙)
     } else {
@@ -288,7 +335,8 @@ bool run_recovery(Instance* inst) {
     }
 
     uint32_t valid_end = 0, truncated_tail = 0;
-    ring_scan(view.data(), 0, raw_bytes, &valid_end, &truncated_tail);
+    uint32_t wrap_boundary = (w < f) ? (size - f) : 0;
+    ring_scan(view.data(), 0, raw_bytes, &valid_end, &truncated_tail, wrap_boundary);
 
     // 6) 不变量收尾(spec §4.3):提交新 Header 前必须让"除 [新 f, 新 w) 外
     //    全环为零"成立。需要补清的两段:

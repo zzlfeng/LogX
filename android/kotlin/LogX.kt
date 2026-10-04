@@ -25,7 +25,7 @@ import kotlinx.coroutines.withContext
  *     高版本系统特性 (如 API 28+ Application.getProcessName) 均内置 API 21 降级回退分支。
  *
  * 注意:
- *   - 单条日志上限 64KB (格式化后); 超过被丢弃 + 打点。
+ *   - 单条日志上限由 maxLogLength 与 60KB 用户载荷硬上限约束; 超长截断保前缀落盘并触发 TRUNCATED 事件。
  *   - 首次 init 之前调用任何写接口一律丢弃 + 计数。
  *   - KeyProvider 返回 null → 该 KID 不可解, export 跳过该文件但不中断。
  *   - consoleEcho (T5.4) 开启时每条成功落盘记录由 JNI 层镜像到 logcat,
@@ -381,27 +381,27 @@ object LogX {
         }
     }
 
-    fun v(tag: String, msg: String) = log(Level.V, tag, msg.toByteArray())
-    fun d(tag: String, msg: String) = log(Level.D, tag, msg.toByteArray())
-    fun i(tag: String, msg: String) = log(Level.I, tag, msg.toByteArray())
-    fun w(tag: String, msg: String) = log(Level.W, tag, msg.toByteArray())
-    fun e(tag: String, msg: String) = log(Level.E, tag, msg.toByteArray())
-    fun f(tag: String, msg: String) = log(Level.F, tag, msg.toByteArray())
+    fun v(tag: String, msg: String): Int = log(Level.V, tag, msg.toByteArray())
+    fun d(tag: String, msg: String): Int = log(Level.D, tag, msg.toByteArray())
+    fun i(tag: String, msg: String): Int = log(Level.I, tag, msg.toByteArray())
+    fun w(tag: String, msg: String): Int = log(Level.W, tag, msg.toByteArray())
+    fun e(tag: String, msg: String): Int = log(Level.E, tag, msg.toByteArray())
+    fun f(tag: String, msg: String): Int = log(Level.F, tag, msg.toByteArray())
 
-    fun log(level: Level, tag: String, payload: ByteArray) {
+    fun log(level: Level, tag: String, payload: ByteArray): Int {
         // P3-3: 方案 A: Kotlin 层前置过滤, 彻底消除不符合等级日志的 JNI 栈跨越与内存开销
-        if (level.v < minLevel.v) return
+        if (level.v < minLevel.v) return ERR_OK
 
-        executeOp { h ->
+        return executeOp { h ->
             nativeWrite(h, level.v, tag, payload)
-        }
+        } ?: ERR_STATE
     }
 
-    /** 阻塞至进入时刻的目标水位落盘提交。退后台 / onStop 调用。 */
-    fun flush() {
-        executeOp { h ->
+    /** 阻塞至进入时刻的目标水位落盘提交。退后台 / onStop 调用。返回 ERR_OK (0) 或状态码 (如 -10 ERR_TIMEOUT)。 */
+    fun flush(): Int {
+        return executeOp { h ->
             nativeFlush(h)
-        }
+        } ?: ERR_STATE
     }
 
     /**
@@ -497,8 +497,8 @@ object LogX {
     ): Long
     @JvmStatic private external fun nativeClose(handle: Long)
     @JvmStatic private external fun nativeWrite(handle: Long, level: Int,
-                                                 tag: String, payload: ByteArray)
-    @JvmStatic private external fun nativeFlush(handle: Long)
+                                                 tag: String, payload: ByteArray): Int
+    @JvmStatic private external fun nativeFlush(handle: Long): Int
     @JvmStatic private external fun nativeExport(handle: Long, from: String, to: String,
                                                  cb: ExportCallback): Int
     @JvmStatic private external fun nativeGetStats(handle: Long): LongArray?
