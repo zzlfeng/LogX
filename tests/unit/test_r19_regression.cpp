@@ -1006,3 +1006,70 @@ TEST(R19Regression, ReadSideAcceptanceDomain_SeqnoFlagAndCapacityGuards) {
     make_block_header(b, 5, 64, 0, 0, salt);
     EXPECT_FALSE(ok(1 << 20, 0, false));
 }
+
+TEST(R19Regression, F7_MicroBlockNotSeamPadding_DropsAndEmitsRecoveryEvent) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r21_f7_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.retention_days = 36500;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 0;
+    cfg.compress_algo = 0;
+    cfg.encrypt_enable = 0;
+    EventProbe probe;
+    cfg.err_fn = [](void* user, logx_event_kind_e k, int c, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, c, m);
+    };
+    cfg.err_user = &probe;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    Instance* ii = static_cast<Instance*>(inst);
+    const uint32_t data_size = ii->staging->data_size();
+    auto w_now = [&]() { return get_u32(ii->staging->raw_base() + 16); };
+    
+    // First, measure overhead
+    const uint32_t kMsg = 512;
+    const char* kTag = "F7Test";
+    std::vector<uint8_t> msg(kMsg, 'M');
+    ASSERT_EQ(logx_write(inst, 2, kTag, msg.data(), kMsg), LOGX_OK);
+    const uint32_t rec_len = w_now();
+    const uint32_t overhead = rec_len - kMsg;
+
+    // We want to leave a micro block of 3 bytes at the end.
+    const uint32_t kSeam = 3;
+    const uint32_t budget = data_size - kSeam - rec_len;
+    const uint32_t n_full = (budget - (overhead + 1)) / rec_len;
+    for (uint32_t i = 0; i < n_full; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, kTag, msg.data(), kMsg), LOGX_OK);
+    }
+    const uint32_t tail = budget - n_full * rec_len;
+    std::vector<uint8_t> tmsg(tail - overhead, 'T');
+    ASSERT_EQ(logx_write(inst, 2, kTag, tmsg.data(), static_cast<uint32_t>(tmsg.size())), LOGX_OK);
+    
+    // Check that we have exactly kSeam bytes left
+    ASSERT_EQ(w_now(), data_size - kSeam);
+    
+    // Now trigger a wrap-around write so the seam is left behind
+    std::vector<uint8_t> rmsg(50, 'R');
+    ASSERT_EQ(logx_write(inst, 2, kTag, rmsg.data(), static_cast<uint32_t>(rmsg.size())), LOGX_OK);
+    
+    // Now inject a dirty byte into the seam padding to simulate bit-flip
+    ii->staging->data_base()[data_size - 1] = 0xAA;
+    
+    // Flush
+    logx_flush(inst);
+    
+    // We expect LOGX_EV_RECOVERY
+    EXPECT_TRUE(probe.saw_msg_substring("sub-header block is not seam padding; dropped"));
+    EXPECT_EQ(ii->seam_blocks_skipped.load(), 1);
+
+    logx_close(inst);
+    cleanup_dir(dir);
+}

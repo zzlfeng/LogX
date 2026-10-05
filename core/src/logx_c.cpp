@@ -117,10 +117,6 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
         std::vector<uint8_t> tag(16);
         if (enc) {
             if (inst->pal->file_pread(fd, tag.data(), 16, off + 34 + payload_len) != 16) break;
-            if (!key32 && !key_lookup_attempted && inst->key_provider) {
-                key_lookup_attempted = true;
-                key32 = inst->key_provider(kid_in_file, inst->key_user);
-            }
             if (!key32) {
                 emit_event(inst, LOGX_EV_DEGRADED, -1, "export: missing key for kid");
                 char line[128];
