@@ -138,6 +138,12 @@ staging 内记录统一格式(条目与 PAD),头部 6B(所有多字节读写均�
 
 文件头 32B:`[magic LGXF:4B][ver:1B][flag:1B][date:4B][KID:2B][盐:8B][reserved:8B][头CRC:4B]`,CRC 覆盖前 28B。**盐在每次创建文件时随机生成**(非派生、非固定),与 seqno 共同保证 nonce 唯一。
 
+**文件头 flag 的加密位语义 = 本文件的加密能力，创建时一次性锁定（R21 F-5）**:
+- 新建文件时探测一次 `keyProvider(kid)`:取到密钥 → 置位;取不到 → **不置位**并发 `LOGX_EV_DEGRADED`("key unavailable at file creation; this file stays plaintext until rollover")。续写已存在文件时**回读该文件头的加密位**作为能力，不得改口。
+- 锁定后，本文件生命周期内（直至按天/按大小轮换）**所有块的实际形态必须与该位一致**:头未置位 ⇒ 即便密钥稍后恢复可用，本文件后续块也一律明文落盘（`drain_once` 逐块以 `encrypt_enable && 本文件能力` 组装 flag）；缺钥降级只影响当块，不得把降级状态泄漏到后续块或后续文件。
+- 由此建立不变量:**`encrypt_enable` 开启期间，"文件头声明 == 本文件全部块形态"**。读端（C++ 导出 / `scan_one` / Python decoder）仍一律按**块头** flag 逐块判定，文件头该位属元数据（供外部工具快速分类），不参与解密决策——这是历史文件（头声明加密但含明文降级块）仍可逐块导出的原因（R19 F-6 修复②）。
+- 加密能力探测是 `keyProvider` 的第三类调用点（另两类为 open 期 fail-fast 与 export 逐块解密），运行在 **Flusher 后台线程**，频率为"每文件一次"；JNI 实现须自行 attach/detach。契约详见 `logx_c.h`。
+
 Block(自包含,流式排列):
 
 ```
@@ -152,6 +158,8 @@ Block(自包含,流式排列):
 ```
 
 **块由完整记录组成**(条目与 PAD 均不得被块边界切开,但同一条日志的分片可以分布在连续多个块中——>20KB 的日志必然如此):从拷出流头部沿记录边界累积,加入下一条记录会超限则封块;**回绕缝处距段尾 <6B 的零残留无条件跳过、归入当前块 raw_len 并在该处封块**(§3.1);常规块 raw_len ≤ 16KB,单条 16~20KB 的记录(含 PAD)独占一块,块 raw_len 上限 = 20KB + 6B 记录头。因此 **raw_len 永远记录边界对齐**(缝残留随块封边)——恢复对账据此推进 flushed_len 后,扫描必然从记录边界开始,Σraw_len 与 flushed_len 的推进严格一致。解码按"连续分片段"跨块重组(块按序消费,段内允许出现 PAD 被跳过;块尾 <6B 零残留直接忽略)。
+
+**缝无法归入当前块时的处置（R20 F-1 / R21 F-7）**:「缝归入当前块」有两个例外——① 缝前累计已达块上限 20KB+6B（缝紧随一条满长记录），归入会突破 `kBlockMaxRaw`;② 待刷窗口本身就以缝开头（上一次刷盘正好停在缝前，`flushed_len == data_size - 缝长`）。两种情况下切分器只能把 1~5B 缝**独立封块**。该微块**绝不落盘**:读侧 `block_header_plausible` 要求 `raw_len ≥ kHeaderLen`(6B)，微块一旦写入文件，导出会在块边界不可信处 break（丢整文件后半段）、repair 会物理截断其后全部数据。故 `drain_once` 对 `raw_len < kHeaderLen` 的块**不编码不落盘**，只推进水位（`cur_f` 跨过该区间 + 清零 + commit，且不消耗 seqno ⇒ 块序号连续无洞），缝字节留零在 staging 内待新写入覆写——与 `write_records` 的留零回绕语义一致，无数据丢失。跳过前**就地校验该区间确为全零**（"缝必为纯零"是本处置不丢数据的前提，不依赖推演）：全零属常态，只递增内部计数器 `seam_blocks_skipped`（每次 `pad<6` 回绕一次，不发事件以免刷屏）；非全零说明前提被破，按「宁丢不脏」丢弃这最多 5B 无法成头的残片并**发 `LOGX_EV_RECOVERY`** 明示。跳过块同样计入 `flushed_bytes_total`——该计数是 `flush_blocking` 的进度代理，不计入会使纯缝刷盘空转到超时误报。跨模块契约的门禁在两侧都有用例：写侧 `F1b`(切分层场景钉死)/`F1c`(落盘层独立遍历块链)，读侧 `ReadSideAcceptanceDomain_RawLenBounds`(1~5B 逐值必拒、`== kHeaderLen` 必收)。
 
 `raw_len` 必须保留——它让恢复逻辑在"块已写入但 header 未提交"的窗口里,能精确算出 staging 中哪段已落盘。
 

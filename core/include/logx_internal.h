@@ -72,6 +72,11 @@ struct Instance {
     std::atomic<uint64_t> pad_records{0};
     std::atomic<uint64_t> block_write_errors{0};
     std::atomic<uint64_t> truncated_blocks{0};
+    // R21 F-7: 回绕缝独占微块(raw_len < kHeaderLen, 落盘必被读侧拒收)被 drain_once
+    // 跳过的次数。常态事件(每次 pad<6B 回绕一次), 故只计数不发事件; 用途是让
+    // "缝被正常跳过"与"缝被误吞了数据"在运行期/测试里可区分——回归用例据此钉死
+    // 场景真的走到了跳过分支。内部字段, 不进 logx_stats_t(零 ABI 影响)。
+    std::atomic<uint64_t> seam_blocks_skipped{0};
 
     // ---- 实例生命周期与错误回调重入防护 (R19 F-2) ----
     std::atomic<int> active_ops{0};
@@ -216,19 +221,24 @@ bool append_block(Instance* inst,
 struct FileScanResult {
     uint32_t seqno = 0;
     bool     truncated = false;     // 是否发生过截断(为真时续写 seqno 跳 1)
+    // 末块起/止偏移: 由 scan_one 产出, 仅 recovery.cpp 的 rebuilt 分支消费
+    // (经 safe_assign_atc_offsets 写回 AppendTargetCache)。
+    // R21 N-2 更正: 原注释称"recovery 用 last_block_offset + atc.last_block_end_offset
+    // 区间信息补齐 bytes_since_hint"——不成立。AppendTargetCache 的两个 offset 被
+    // commit_header_locked 持久化进 staging Header 后**全仓无读取方**(recovery 只消费
+    // target.date 与 atc_split(target)); Σraw_len 的回推实际由 sum_raw_len_since 独立
+    // 重扫文件完成, 不依赖任何缓存偏移。同名的 bytes_since_hint 字段则既无生产者
+    // 也无消费者, 已随本次更正删除。
     uint64_t last_block_offset = 0;
     uint64_t last_block_end_offset = 0;
-    // 对账用:k 块回溯过程中逐块累加的 raw_len 总和
-    // (= seqno ∈ (S_hdr, S_file] 各块 raw_len 之和;仅 S_file > S_hdr 分支消费)。
-    // scan 从缓存命中点续扫时只累加新读到的块,缓存命中块本身不在此列,
-    // 因此 recovery 用 last_block_offset + atc.last_block_end_offset 区间信息补齐。
-    uint64_t bytes_since_hint = 0;
     bool     ok = false;
     std::string path;              // 命中文件路径
 };
 // 校验 34B 块头字段合理性 (F-05)。
 // 校验项: magic、ver=1、flag 保留位全 0、压缩算法有效性(且与编译宏匹配)、
-// seqno 严格单调递增 (seqno > prev_seqno)、raw_len ∈ [kHeaderLen, kSingleRecordMaxRaw]、
+// seqno 严格单调递增 (seqno > prev_seqno)、raw_len ∈ [kHeaderLen, kBlockMaxRawPlausible]
+// (下界 kHeaderLen=6 正是 R20/R21 F-1 "缝独占微块不得落盘"的读侧依据; 上界是 16MB
+// 的防御性常数, **不是**写侧的 kBlockMaxRaw=20486——写侧更严, 二者刻意不同源)、
 // payload_len 合理范围及无压缩时 payload_len == raw_len、block_size <= file_remaining_bytes。
 // 校验通过返回 true, 并在 out 参数中返回解析后的字段; 校验失败返回 false。
 bool block_header_plausible(const uint8_t bhdr[34], uint64_t file_remaining_bytes,

@@ -1953,6 +1953,13 @@ __declspec(noinline) void poison_r18_stack() {
 
 > 复核对象 `code_review_R20_2026-10-04.md`（R19 修复批次独立复核），复核基线 `3b90173`（R19 批次提交）。R20 复核裁定：11 项成立、F-1 实测引入新缺陷、F-15 PAL 子项残留、回归测试缺失。本批次完成全部补强。
 
+> **⚠️ R21 勘误（2026-10-05，原文保留、就地更正）**：本批次三项产品修复（F-1 微块跳过 / F-3 自愈事件 / F-6 `enc_capable`）经 R21 撤销对照实验证明**当时零回归屏障**——把三项修复全部撤销后，156 单测 + 4 压力 + 2 热路径**全绿**。据此更正本段四处失实表述：
+> 1. 下文 #1 末句「跨模块契约门禁写入测试：每块 `raw_len ∈ [kHeaderLen, kBlockMaxRaw]`」——**实际只有写侧单边自检**：`F1b` 仅调 `split_into_blocks`，从未触及修复点 `drain_once`，且其唯一相关断言 `any_micro || blocks.size() >= 2` 是恒真析取；读侧 `block_header_plausible` 当时全仓零直测。
+> 2. 下文 #6 声称 8 项用例「撤销对应修复即可复红」——**从未做过该实验**。实测 `F1b`（恒真断言 + 测错层次）、`F3` 的 RECOVERY 断言（被 `recovery.cpp:308` 同类事件顶包）、`F6②`（用 `encrypt_enable=0`，`enc_capable` 分支一行未执行）、`F14`（全新 staging ⇒ `rebuilt=false`，R19 F-14 所在分支从未执行）四项撤销后仍绿。
+> 3. 下文「构建：增量 49 步」口径不可复现（R21 全量重建实测 56 步、单文件增量 6~7 步），且「ninja jobserver-pipe 挂死」在 R21 **未复现**：`MSYS_NO_PATHCONV=1 cmd.exe /c build_tmp.bat` 正常跑完全量。挂死记录疑为 Git Bash 把 `/c` 路径转换成 `C:\`、`cmd.exe` 空转 rc=0 所致（详见 `code_review_R21_2026-10-05.md` §五·3）。
+> 4. R20 附带风险（R21 发现）：因该轮以手工 `cl.exe` 绕过 ninja 编译，`build-full` 的 ninja 依赖日志与磁盘 `.obj` 失配，**改头文件不再触发重编**（实测 `logx_internal.h` 结构体布局变更后 `logx_c.cpp.obj` 未重建）。R21 起凡涉及头文件改动一律 `ninja -t clean` 全量重建。
+> 本批次产品修复本身经 R21 逐路径推演**均成立**（F-1 跳过不丢数据、seqno 不消耗、`flushed_bytes_total` 计入是 `flush_blocking` 进度代理的必要项），失实仅限测试与验证记录层面。补强见下文 R21 章节。
+
 ### 补强条目
 
 #### 1. F-1 边界（R20 复核实测新缺陷）: 缝紧随满长记录产出 1~5B 微毒块
@@ -1987,3 +1994,74 @@ __declspec(noinline) void poison_r18_stack() {
 - **热路径**：`logx_hotpath_alloc_tests.exe` **2 / 2 全绿**。
 - **压力**：`logx_stress_tests.exe` **4 / 4 全绿**。
 
+## R21 批次: R20 修复批次复核与补强 (2026-10-05)
+
+> 复核对象 `code_review_R21_2026-10-05.md`（R20 修复批次 `69f274d` 独立复核），复核基线 `69f274d`。R21 裁定：**产品代码侧 0 新缺陷**（R20 三项修复逐路径推演均成立，11 条疑点追查后排除）；**测试侧 1×P2 + 6×P3**——撤销 R20 全部三项产品修复后 156+4+2 全绿，即上一批「补齐 8 项回归」对其自身修复点建立的有效屏障为 0。本批次完成全部补强，并按 R18-2 门禁对每项新屏障做撤销对照实验 + 正向对照。
+
+### 补强条目
+
+#### 1. F-1 回归屏障落地（R21 F-2，P2 主项）
+- **`F1b` 恒真断言修正 + 改名**：`F1b_SeamAfterFullLengthRecord_NoMicroBlock` → `F1b_..._SplitPinsSeamOnlyBlock`。旧断言 `EXPECT_TRUE(any_micro || blocks.size() >= 2)` 后半支恒成立（等于无断言），且微块被 `kept` 过滤后才断言区间（同义反复）。新版钉死场景有效性 `EXPECT_TRUE(bb.any_micro)` + 块序列精确形态 `[20486][3][2500]`。定位调整为「切分层场景钉死」，不再冒充落盘层防线。
+- **新增 `F1c_WrapSeamAtPendingHead_MicroBlockNeverReachesDisk`（落盘层，真正的 F-1 防线）**：精确填环到 `w == data_size-3` → flush → 再写一条触发 `pad=3<6` 留零回绕 → 待刷窗口正好以缝开头。断言三件事：① `seam_blocks_skipped` 增量恰为 1（场景真的走到跳过分支）；② **独立遍历**落盘文件块链（刻意不复用 `block_header_plausible`，避免用读侧实现验证读侧结论的循环论证），每块 `raw_len ∈ [kHeaderLen, kBlockMaxRaw]`；③ 缝后那条记录真的落盘（`blks.back().raw_len == rec_len`）且 seqno 连续无洞。撤销 `drain_once` 跳过分支后实测复红两条：计数为 0，且 `raw_len` 断言报 `actual: 3 vs 6`——**3B 微块确实进了文件**。
+- 该场景同时隐式验证了「跳过块必须计入 `flushed_bytes_total`」：不计入则 `flush_blocking` 进度代理不足，flush 直接超时返回 `LOGX_ERR_TIMEOUT`。
+
+#### 2. F-14 用例真走 rebuilt 分支（R21 F-3，加密 nonce 安全）
+- 旧版在**全新** staging 上 `new Staging`：全零 Header 区使 `Staging::open` 判 `fresh=true` ⇒ `rebuilt=false`（`staging.cpp:220-231`），`run_recovery` 走常规路径，**R19 F-14 所在的 rebuilt 分支（`recovery.cpp:216-242`）从未执行**；实测把 `hdr.seqno = sr.seqno + 1` 改回 `sr.seqno` 旧用例照样绿（`resume_seqno` 由 `recovery.cpp:319-320` 的 `max+1` 凑巧同为 3）。
+- 新版毒化双 Header 区（`[0,128)` 写 `0xFF`）⇒ `pick_header` 失败且 `fresh=false` ⇒ `rebuilt=true`；块序号改 5/6 + 撕裂 7（`S_file=6`），断言 `resume_seqno == 7`。
+- **新增路径判别断言**：rebuilt 分支 `commit(seqno, 0, 0)` ⇒ `flushed_len == 0`；常规路径按 `Σraw_len` 回推 ⇒ `flushed_len == 128`。两者数字不同，杜绝「同一个 7 被两条路径同时满足」而互相掩盖。
+- **新增 `F14b_NormalPathTruncatedFile_ResumeSeqnoMaxPlusOne`** 孪生用例钉死常规路径（`resume = max(S_hdr,S_file)+1`、`flushed_len == 128`）。
+
+#### 3. F-3 事件断言改按文案（R21 F-4）
+- `EventProbe` 一直在采集 `msgs` 却从不使用；`saw_kind(LOGX_EV_RECOVERY)` 被 `recovery.cpp:308`「appended file tail truncated」同类事件顶包 ⇒ 撤销 `scan_one` 的新事件仍绿。新增 `saw_msg_substring()` / `count_kind()`，F3 改为断言站点专属文案 `"truncated to empty for rewrite"`，并删除同一断言连同同一句失败消息的重复第二份（R21 N-3）。
+
+#### 4. F-6 文件级加密能力锁定（R21 F-5，用户拍板方案 A）
+- R20 只堵了「头声明加密、块明文」的正向失真，**反向竞态仍在**：建文件时无钥 → 头声明明文，随后密钥恢复 → `drain_once` 取到钥写出**密文块**。三个读端（`decode_one_file` / `scan_one` / `logx_decode.py`）均按块头 flag 逐块判定，故不致命，但文件头元数据仍失真。
+- 修复：`open_or_create_append_target` 增加 `out_enc_capable` 出参——新建文件取建文件时刻的探测结果，**已存在文件取其文件头 flag 的加密位**（续写不得改口）；结果存入 `FlusherCtx::current_enc_capable`，`drain_once` 逐块以 `encrypt_enable && current_enc_capable` 组装 flag。自此「文件头声明 == 本文件全部块形态」在 `encrypt_enable` 开启期间成为不变量。DEGRADED 文案改为明示「本文件保持明文直至轮换」。
+- **新增 `F6b_EncCapabilityLockedAtFileCreation_BlocksStayPlaintext`**：有状态 `key_provider`（第 1 次 open 探测给钥、第 2 次建文件探测返回 NULL、之后恢复给钥），断言文件头 bit0=0 **且所有块头 bit0=0**、DEGRADED 文案命中（兼作探测窗口漂移的哨兵）、导出可解。撤销能力锁定后实测复红。
+
+#### 5. 附带发现并修复: 缺钥降级状态在同一轮 drain 内跨块泄漏
+- 旧实现在 `drain_once` **循环外**算一次 `flag`，缺钥时就地 `flag &= ~kFlagEncrypted`——该变量被同一轮 drain 的后续块沿用（含中途轮换到别的文件之后的块）；且因加密位已清、`if (flag & kFlagEncrypted)` 守卫不再成立，**后续块静默降级、连 DEGRADED 事件都不再发**。泄漏范围止于本轮 drain（`flag` 是 `drain_once` 局部量，下一轮重新探测），**非进程级**。随 #4 改为逐块重算，降级只影响当块、每块各自发事件。
+- 逐块重算会把 `key_provider` 调用频次从「每轮 drain 一次」放大到「每块一次」；Android 侧它是 JNI trampoline，Flusher 线程每次调用都要 `AttachCurrentThread`/`DetachCurrentThread`（重量级）。故按 **(本轮 drain, fd)** 缓存密钥、换文件（跨天/切分）即失效重取：既消除跨块泄漏，又不放大 JNI 调用次数。
+
+#### 6. F-6 撕裂头自愈双站点语义统一（R21 F-6）
+- `open_or_create_append_target` 的 `0<sz<32` 截断分支此前**无事件、无计数**（只有 `scan_one` 补了），与 R20「自愈必须可见」的立论不一致。就地补 `LOGX_EV_RECOVERY`，文案带站点名 `"torn file header at append-target open"` 以便定位。
+- **无专属回归用例**（如实记录）：该分支需「文件在 reconcile 扫描之后、Flusher 打开之前变为撕裂」的崩溃窗口才可达——`scan_dir_for_target`(repair=false) 选出目标后必经 `scan_append_target`(repair=true) 先行修复，公共 API 无法确定性构造，且 `open_or_create_append_target` 未在 `logx_internal.h` 暴露。属一行可观测性对齐，零行为变化。
+
+#### 7. F-7 微块跳过的前提校验与观测（R21 F-7，用户拍板方案 A）
+- 跳过分支会 `zero_range_locked` + 推进 `f`，即**销毁最多 5B 数据**，其前提「`raw_len<6` ⇒ 必为纯零缝」此前只靠推演。现就地校验：全零 → 常态跳过（只计数不发事件，避免每次回绕刷屏）；非全零 → 按「宁丢不脏」丢弃但**发 `LOGX_EV_RECOVERY`** 明示（绝不落盘：落盘会让读侧在此截断、殃及其后全部数据）。
+- 新增 `Instance::seam_blocks_skipped`（内部 `atomic`，**不进 `logx_stats_t`**，零 ABI 影响），供运行期区分「缝被正常跳过」与「缝被误吞数据」，并作为 F1c 的场景有效性判据。
+
+#### 8. 契约与注释（N-1 / N-2 / N-4 / N-5）
+- `logx_c.h` `key_provider` 契约补齐**第三类调用点**（建文件/开追加目标时探测，运行于 Flusher 后台线程，JNI 实现须自行 attach/detach），并写明指针所有权（调用方不释放、库侧不缓存）与各调用点频率。
+- `logx_internal.h`：`block_header_plausible` 的 `raw_len` 上界注释由 `kSingleRecordMaxRaw` 更正为实际的 `kBlockMaxRawPlausible`(16MB)，并写明「读侧上界刻意宽于写侧 `kBlockMaxRaw`，二者不同源」+「下界 `kHeaderLen` 是 F-1 处置的读侧依据」；`FileScanResult` 处删除失实注释（原称 recovery 用 `last_block_offset` 补齐 `bytes_since_hint`——实际 `AppendTargetCache` 的两个 offset 被持久化后**全仓无读取方**，Σraw_len 回推由 `sum_raw_len_since` 独立重扫完成），并删除**既无生产者也无消费者**的死字段 `bytes_since_hint`。
+- 测试助手 `make_entry` 的 cksum 由 payload 尾移到 offset 5，对齐生产布局 `[len:2][magic:2][flags:1][cksum:1][payload]`（XOR 折叠，对齐 `cksum1`）。旧布局下合成记录不可被 `parse_records_stream` 解码，凡日后要断言「内容可解」的用例都会失真。
+- `F14/F14b` 的硬编码历史日期 `20260831` 就地留痕：两用例均不经 `logx_open`、无 Flusher 线程，按 R18-1 三条件判据条件 (b)(c) 不成立，不受 retention 清理影响。
+
+#### 9. 读侧接受域直测（N-2 后半，跨模块门禁的读侧半边）
+- 新增 `ReadSideAcceptanceDomain_RawLenBounds` 与 `ReadSideAcceptanceDomain_SeqnoFlagAndCapacityGuards`：`block_header_plausible` 此前**全仓零直测**，而 R20/R21 的全部 F-1 处置都以「读侧拒绝 `raw_len < kHeaderLen`」为立论依据。现把接受域两侧钉死——`raw_len` 1~5 逐值必拒 / `== kHeaderLen` 必收 / `== kBlockMaxRaw` 必收（写读重叠区）/ `> 16MB` 必拒；另覆盖 seqno 严格单调、flag 保留位、加密块 16B tag 容量、未压缩 `payload_len == raw_len`、`block_size` 越文件尾。
+
+### 撤销对照实验（R18-2 门禁强制步骤）
+
+一次构建内同时撤销 4 处修复，**恰好** 4 个用例复红、其余 9 个 R19Regression 用例与全量 157 项保持绿（即这 4 项是各自修复的唯一屏障）：
+
+| 撤销项 | 复红用例 | 失败断言 |
+|---|---|---|
+| `drain_once` 微块跳过分支 | `F1c` | `seam_blocks_skipped` 增量为 0；块头 `raw_len` **actual: 3 vs 6** |
+| 文件级能力锁定（flag 改回只看 `encrypt_enable`） | `F6b` | 块头 bit0 = 1（明文声明文件里出现密文块） |
+| `scan_one` 的 RECOVERY 事件 | `F3` | `saw_msg_substring("truncated to empty for rewrite")` 为假 |
+| `recovery.cpp` rebuilt 分支 `sr.seqno + 1` | `F14` | `resume_seqno` 6 ≠ 7（`F14b` 常规路径不受影响，保持绿） |
+
+**正向对照**（证明 harness 能复红、排除「撤销未生效/二进制陈旧」）：R21 复核阶段已实测撤销 R19 F-10（删 `*out_inst = nullptr`）→ `F10` 红、撤销 R19 F-4（`ring_scan` 传 0）→ `F4` 红。`F2`（回调内 close）未纳入撤销实验：撤销表现为 `0xC0000005` 崩溃而非断言失败，会污染同批结果，其有效性为静态判定。
+
+### 全量验证（R21 实测）
+- **构建**：MSVC 14.43 /std:c++17 /utf-8 /O2 /MD，`LOGX_WITH_ZSTD=ON` + `LOGX_WITH_AESGCM=ON`。命令 `MSYS_NO_PATHCONV=1 cmd.exe /c build_tmp.bat`（**ninja 未挂死**，R19/R20 的挂死记录已在上文勘误）。因本批改动了头文件（含 `Instance`/`FileScanResult` 结构体布局），按新固化的 R21-2 纪律执行 `ninja -t clean` + **全量重建 56 步**；收尾再 `touch` 全部 logx 源与头重建 **24 步**，两次均 `ninja` 退出码 0，`warning C`/`error C`/`error LNK`/`fatal error` 命中数 **0**。（注：以 `grep -i "error"` 粗筛会误命中 `/showIncludes` 打出的 `zstd_errors.h`、`system_error`、`__msvc_system_error_abi.hpp` 等文件名，须按 MSVC 诊断格式精确匹配。）
+- **单测**：`logx_unit_tests.exe` **161 / 161 全绿**（156 既有 + R21 新增 5 项：`F1c` / `F6b` / `F14b` / 读侧接受域 2 项）。
+- **热路径**：`logx_hotpath_alloc_tests.exe` **2 / 2**。**压力**：`logx_stress_tests.exe` **4 / 4**。**崩溃 fork**：`logx_crash_fork_tests.exe` **3 / 3**。
+- **撤销对照实验二次复验**：`key_provider` 缓存改动落地后重跑同一组 4 项撤销，结果与首轮一致——恰好 `F1c`/`F3`/`F6b`/`F14` 复红、其余 9 项 R19Regression 用例保持绿。实验改动以 `cp` 备份还原，`grep -rn "R21 EXPERIMENT" core/ tests/` 归零确认无残留，还原后 `git status` 仅含本批 7 个预期文件（`core/src/recovery.cpp` 无 diff）。
+- **未复跑**（沿用既有共同局限）：Android arm64 交叉编译与真机、另两个构建矩阵（ZSTD/AESGCM 关闭组合）、Python 解码器运行期（本轮未改 decoder）。
+- **构建卫生**：因 R20 手工 `cl.exe` 绕过 ninja，`build-full` 的头文件依赖已失配（改 `logx_internal.h` 结构体布局后 `logx_c.cpp.obj` 未重建）。本轮涉及头文件改动，故一律 clean 全量重建；`build-full/clean_build.bat` 为本次新增的本地辅助脚本（构建目录内，不入库）。
+
+### 遗留与转 Backlog
+- **B-7**（新）：R20 §四 的「F-5 同日多分卷孤儿块漏检」——`reconcile` 仅按 `date` 比较，同一天内 ATC 落后于最新分卷时孤儿块漏检仍在。
+- **B-8**（新）：R20 §四 的「F-13 新文件 + 崩溃留下部分块且 Header 未提交」组合下 `S_hdr > seqno_file` 仍会虚报 `truncated_blocks`。
+- 文档收口：计划表补 R19/R20/R21 三批收口行（升版 v1.29）；spec §3 文件头 flag 语义写入「文件级能力锁定」。

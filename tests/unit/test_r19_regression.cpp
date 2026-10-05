@@ -1,22 +1,33 @@
-// test_r19_regression.cpp - R19 批次回归测试 + R20 复核回归。
+// test_r19_regression.cpp - R19 批次回归测试 + R20/R21 复核回归。
 //
-// 覆盖:
-//   [R19 F-1]  回绕缝在拷出缓冲中部 + 缝后积压 > kBlockMaxRaw → 块数 ≥ 2,
+// 覆盖(括号内为"撤销该修复 → 本用例复红"的对应关系, R21 已逐条做撤销对照实验):
+//   [R19 F-1]  F1_SeamMidStream_SplitsWithinContract
+//              回绕缝在拷出缓冲中部 + 缝后积压 > kBlockMaxRaw → 块数 ≥ 2,
 //              每块 raw_len ∈ [kHeaderLen, kBlockMaxRaw](写侧产出 == 读侧可收)
-//   [R20-F1b]  缝紧随满长记录(kBlockMaxRaw)→ 禁止产出 1~5B "缝独占块"
-//              (读侧 raw_len < kHeaderLen 必拒: 导出 break / repair 截断)
-//   [R19 F-2]  错误回调内 logx_close → 安全返回,后续 write 不 UAF(契约许可路径)
-//   [R19 F-3]  预置 5B 撕裂 <today>.log → 写入/flush 可自愈,文件头重写,
-//              事件可见,导出可取回
-//   [R19 F-6]  encrypt=1 + 密钥恒缺 → open 期 fail-fast;失败 open 写 NULL 出参;
-//              文件头声明加密但块明文 → 导出逐块判定仍可解(R20 残留修复)
-//   [R19 F-10] logx_open 失败 → *out_inst = NULL(防误关旧实例)
-//   [R19 F-14] rebuilt + 文件尾截断 → 续写首块 seqno 跳空隙(防 nonce 复用)
-//   [R19 F-4]  回绕缝在环坐标扫描中不被误抹除(ring_scan wrap_boundary)
+//   [R20 F-1]  F1b_SeamAfterFullLengthRecord_NoMicroBlock(切分层: 钉死场景确实
+//              产出 1~5B 缝独占块)+ F1c_WrapSeamAtPendingHead_MicroBlockNeverReachesDisk
+//              (落盘层: 缝独占块绝不进文件, 靠 drain_once 的跳过分支)
+//   [R19 F-2]  F2_CloseInsideErrorCallback_SurvivesAndDefers
+//              错误回调内 logx_close → 安全返回, 后续 write 不 UAF(旧实现 0xC0000005;
+//              撤销表现为崩溃而非断言失败, 故未纳入撤销实验)
+//   [R19 F-3 + R20 事件] F3_ShortTornLogFile_SelfHealsAndCounts
+//              预置 5B 撕裂 <today>.log → 自愈 + 文件增长 + **按事件文案**断言
+//              (只比 kind 会被 recovery.cpp 的同类 RECOVERY 事件顶包, R21 F-4)
+//   [R19 F-6]  F6_EncryptWithoutKey_FailFastAndPerBlockExport(open 期 fail-fast /
+//              头声明加密但块明文仍可逐块导出)
+//   [R21 F-5]  F6b_EncCapabilityLockedAtFileCreation_BlocksStayPlaintext
+//              建文件时无钥 → 文件头不置加密位, 且**密钥随后恢复**也不得写出密文块
+//   [R19 F-10] F10_FailedOpen_WritesNullOutParam
+//   [R19 F-14] F14_RebuiltTruncatedFile_SeqnoSkipsGap(毒化双 Header → 真走 rebuilt
+//              分支)+ F14b_NormalPathTruncatedFile_ResumeSeqnoMaxPlusOne(常规路径孪生)
+//   [R19 F-4]  F4_WrapSeam_PostSeamRecordsSurviveRecovery
+//   [R21 N-2]  ReadSideAcceptanceDomain_*: 读侧 block_header_plausible 接受域直测
+//              ("raw_len < kHeaderLen 必拒"是上面全部 F-1 处置的立论依据, 此前零覆盖)
 //
-// 反"空洞绿"纪律: 各"修复后必须绿"的断言目标均对应 R19 报告探针 C/D/F/G/I、
-// R20 复核探针 P2 实测过的失败形态——撤销对应修复即可复红(实验证据存档于
-// code_review_R19/R20_2026-10-04.md §五·验证记录)。
+// 反"空洞绿"纪律(计划表 §4 R18-2): 本文件每项用例均在 R21 批次做过撤销对照实验,
+// 并配正向对照(撤销 R19 F-10 / F-4 确认本 harness 能复红)。R21 之前的版本声称
+// "撤销对应修复即可复红"但从未实验, 实测 F1b/F3(事件)/F6(能力锁定)/F14 四项
+// 撤销后全绿——详见 code_review_R21_2026-10-05.md §二。
 
 #include "logx_internal.h"
 #include "logx_c.h"
@@ -38,7 +49,12 @@ namespace {
 
 static std::atomic<uint64_t> s_r19_dir_seq{0};
 
-// 构造一条 LGXE 记录(whole 分片),cksum 按 8 位折叠。
+// 构造一条 LGXE 记录(whole 分片), 布局与生产 format_record 严格一致:
+//   [len:2][magic:2][flags:1][cksum:1][payload:len]  → 总长 = kHeaderLen + pl
+// cksum 为 payload 的 8 位 XOR 折叠(对齐 format.cpp 的 cksum1;R16 F-1 教训:
+// 不能用加法)。R21 N-4 更正: 旧实现把 cksum 追加在 payload **之后**, 与生产布局
+// 不符, 合成记录因此不可被 parse_records_stream 解码——凡日后要断言"内容可解"
+// 的用例都会失真, 故此处对齐。
 std::vector<uint8_t> make_entry(uint32_t pl, uint8_t fill) {
     std::vector<uint8_t> r;
     r.push_back(pl & 0xff);
@@ -47,8 +63,9 @@ std::vector<uint8_t> make_entry(uint32_t pl, uint8_t fill) {
     r.push_back(static_cast<uint8_t>(kMagicEntry >> 8));
     r.push_back(0x00);              // flags: whole
     uint8_t c = 0;
-    for (uint32_t i = 0; i < pl; ++i) { r.push_back(fill); c ^= fill; }
-    r.push_back(c);
+    for (uint32_t i = 0; i < pl; ++i) c ^= fill;
+    r.push_back(c);                 // cksum @ offset 5 (记录头内, 非 payload 尾)
+    for (uint32_t i = 0; i < pl; ++i) r.push_back(fill);
     return r;
 }
 
@@ -113,6 +130,18 @@ struct EventProbe {
         std::lock_guard<std::mutex> lk(mu);
         return std::find(kinds.begin(), kinds.end(), k) != kinds.end();
     }
+    // R21 F-4: 只比 kind 的断言会被**同类事件**顶包(F3 的 RECOVERY 断言即被
+    // recovery.cpp:308「appended file tail truncated」满足, 撤销被测修复仍绿)。
+    // 凡"某个特定站点发了事件"的断言一律走本方法按文案定位。
+    bool saw_msg_substring(const char* sub) const {
+        std::lock_guard<std::mutex> lk(mu);
+        for (const auto& m : msgs) if (m.find(sub) != std::string::npos) return true;
+        return false;
+    }
+    size_t count_kind(int k) const {
+        std::lock_guard<std::mutex> lk(mu);
+        return static_cast<size_t>(std::count(kinds.begin(), kinds.end(), k));
+    }
 };
 
 // 写 32B 合法文件头。
@@ -126,6 +155,72 @@ void write_file_header_bytes(int fd, uint32_t date, const uint8_t salt[8]) {
     put_u32_le(hdr + 28, crc32_update(0, hdr, 28));
     Pal& pal = default_pal();
     ASSERT_EQ(pal.file_write(fd, hdr, 32), 32);
+}
+
+// <YYYYMMDD>.log 路径(split 0 无后缀, 与 make_log_path 一致)。
+std::string day_log_path(const std::string& dir, uint32_t date) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "%08u.log", static_cast<unsigned>(date));
+    return dir + "/" + name;
+}
+
+struct DiskBlock {
+    uint64_t off = 0;
+    uint32_t seqno = 0;
+    uint32_t raw_len = 0;
+    uint32_t payload_len = 0;
+    uint8_t  flag = 0;
+};
+
+// 独立遍历落盘文件的块链: 从 32B 文件头之后逐块取 34B 头, 按 flag 推算块长前进。
+// **刻意不复用 block_header_plausible**——用读侧实现去验证读侧结论是循环论证
+// (它会在第一个非法块处静默 break, 恰好把缺陷藏起来)。
+// 返回 false = 链中途断掉(magic 不符 / 块长越过文件尾 / 尾部有残字节)。
+bool scan_disk_blocks(const std::string& path, std::vector<DiskBlock>* out) {
+    Pal& pal = default_pal();
+    int fd = pal.file_open(path.c_str(), false, false);
+    if (fd < 0) return false;
+    int64_t sz = pal.file_size(fd);
+    if (sz < 32) { pal.file_close(fd); return false; }
+    uint64_t off = 32;
+    while (off + 34 <= static_cast<uint64_t>(sz)) {
+        uint8_t b[34];
+        if (pal.file_pread(fd, b, 34, off) != 34) break;
+        if (get_u32(b) != kMagicBlock) { pal.file_close(fd); return false; }
+        DiskBlock d;
+        d.off = off;
+        d.flag = b[5];
+        d.seqno = get_u32(b + 6);
+        d.raw_len = get_u32(b + 10);
+        d.payload_len = get_u32(b + 14);
+        uint64_t bsize = 34ULL + d.payload_len +
+                         ((d.flag & kFlagEncrypted) ? 16ULL : 0ULL);
+        if (bsize < 34 || off + bsize > static_cast<uint64_t>(sz)) {
+            pal.file_close(fd); return false;
+        }
+        out->push_back(d);
+        off += bsize;
+    }
+    pal.file_close(fd);
+    return off == static_cast<uint64_t>(sz);   // 必须恰好走到文件尾(无残尾)
+}
+
+// 构造 34B 块头(读侧接受域直测用; payload/CRC 由调用方按需另行布置)。
+void make_block_header(uint8_t out[34], uint32_t seqno, uint32_t raw_len,
+                       uint32_t payload_len, uint8_t flag, const uint8_t salt[8]) {
+    std::memset(out, 0, 34);
+    put_u32_le(out + 0, kMagicBlock);
+    out[4] = 1;
+    out[5] = flag;
+    put_u32_le(out + 6,  seqno);
+    put_u32_le(out + 10, raw_len);
+    put_u32_le(out + 14, payload_len);
+    put_u32_le(out + 18, 0);        // crc: block_header_plausible 不校验 CRC
+    std::memcpy(out + 22, salt, 8);
+    out[30] = static_cast<uint8_t>((seqno >> 24) & 0xff);
+    out[31] = static_cast<uint8_t>((seqno >> 16) & 0xff);
+    out[32] = static_cast<uint8_t>((seqno >> 8) & 0xff);
+    out[33] = static_cast<uint8_t>(seqno & 0xff);
 }
 
 }  // namespace
@@ -155,10 +250,14 @@ TEST(R19Regression, F1_SeamMidStream_SplitsWithinContract) {
 }
 
 // ============================================================
-// R20 复核: 缝紧随满长记录 → drain 侧必须跳过 1~5B 缝独占块
-// (split 产出覆盖完整的块列;真实防线在 drain_once 的 <kHeaderLen 分支)
+// R20 复核: 缝紧随满长记录 → 切分层必然产出 1~5B "缝独占块"。
+// 本用例钉死**场景有效性**(撤销 R19 缝封块修复 / 改动 kBlockMaxRaw 关系时复红);
+// 真正的处置防线在 drain_once 的 <kHeaderLen 跳过分支, 由 F1c 在落盘层守护。
+// R21 F-2 更正: 旧版名为 NoMicroBlock 却从不断言"无微块", 唯一相关断言
+// `any_micro || blocks.size() >= 2` 是恒真析取(后半支永远成立), 且微块被显式
+// 过滤后才断言区间——撤销 R20 修复本用例照样绿。
 // ============================================================
-TEST(R19Regression, F1b_SeamAfterFullLengthRecord_NoMicroBlock) {
+TEST(R19Regression, F1b_SeamAfterFullLengthRecord_SplitPinsSeamOnlyBlock) {
     std::vector<uint8_t> raw;
     {
         auto r = make_entry(kBlockMaxRaw - kHeaderLen, 0xC3);
@@ -169,26 +268,144 @@ TEST(R19Regression, F1b_SeamAfterFullLengthRecord_NoMicroBlock) {
         auto r = make_entry(44, 0xD4);
         raw.insert(raw.end(), r.begin(), r.end());
     }
+    ASSERT_EQ(raw.size(), static_cast<size_t>(kBlockMaxRaw) + 3 + 50 * 50);
     std::vector<PendingBlock> blocks;
     split_into_blocks(raw.data(), static_cast<uint32_t>(raw.size()), &blocks);
-    // 切分器允许产出缝独占块(它不知道 drain 的兜底策略), 但必须:
-    // ① 覆盖完整缓冲 ② 无超上限块 ③ 剔除缝独占块后其余块全部可读。
+
     BlockBounds bb = analyze_blocks(blocks);
+    // ① 覆盖完整缓冲、② 无超上限块
     EXPECT_EQ(bb.covered, raw.size());
     EXPECT_FALSE(bb.any_oversize);
-    std::vector<PendingBlock> kept;
+    // ③ 场景有效性: 必须真的产出 1~5B 缝独占块, 否则本用例什么都没测
+    EXPECT_TRUE(bb.any_micro)
+        << "scenario must produce a 1~5B seam-only block (full-length record + seam); "
+           "without it F1b/F1c exercise nothing";
+    // ④ 块序列形态钉死: [满长记录][3B 缝][50 条小记录]
+    ASSERT_EQ(blocks.size(), 3u);
+    EXPECT_EQ(blocks[0].raw_len, static_cast<uint32_t>(kBlockMaxRaw));
+    EXPECT_EQ(blocks[1].raw_len, 3u);            // 缝独占块
+    EXPECT_EQ(blocks[2].raw_len, 50u * 50u);
+    // ⑤ 除缝独占块外, 其余块全部落在读侧接受域 [kHeaderLen, kBlockMaxRaw]
     for (const auto& blk : blocks) {
-        if (blk.raw_len >= kHeaderLen) kept.push_back(blk);
-    }
-    EXPECT_FALSE(kept.empty());
-    for (const auto& blk : kept) {
+        if (blk.raw_len < kHeaderLen) continue;
         EXPECT_GE(blk.raw_len, kHeaderLen);
         EXPECT_LE(blk.raw_len, kBlockMaxRaw);
     }
-    // 钉死"至少有一个 1..5B 候选块被该场景触发"(保证场景有效性,
-    // 撤销 F-1 缝封块修复或改动 drain 兜底前提时, 本断言提示场景失效)。
-    EXPECT_TRUE(bb.any_micro || blocks.size() >= 2)
-        << "scenario must exercise the seam-after-full-record boundary";
+}
+
+// ============================================================
+// R20 F-1 的**落盘层**防线(R21 新增): 待刷窗口以 1~5B 留零缝开头时,
+// drain_once 必须跳过缝独占块——不编码、不落盘, 只推进水位。
+// 撤销 drain_once 的 `raw_len < kHeaderLen` 分支 → 3B 块进文件 → 本用例复红
+// (块头 raw_len 下界断言 + seam_blocks_skipped 计数断言双重捕获)。
+// 场景构造: 填满环到 w == data_size-3 → flush(f 追平 w) → 再写一条 →
+// write_records 触发 pad=3<6 留零回绕 → 下一次 drain 的窗口正好以缝开头。
+// ============================================================
+TEST(R19Regression, F1c_WrapSeamAtPendingHead_MicroBlockNeverReachesDisk) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r21_f1c_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    uint32_t today = 0, hhmmss = 0;
+    pal.wallclock_date(&today, &hhmmss);
+
+    EventProbe probe;
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.retention_days = 36500;   // R18-1: 真实 Flusher + 断言依赖文件内容
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 0;
+    cfg.compress_algo = 0;
+    cfg.encrypt_enable = 0;
+    cfg.err_fn = [](void* user, logx_event_kind_e k, int c, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, c, m);
+    };
+    cfg.err_user = &probe;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    Instance* ii = static_cast<Instance*>(inst);
+    const uint32_t data_size = ii->staging->data_size();
+    auto w_now = [&]() { return get_u32(ii->staging->raw_base() + 16); };
+    auto f_now = [&]() { return get_u32(ii->staging->raw_base() + 12); };
+
+    // 1) 探测单条记录的落环长度与固定开销(同 tag/level 下 record = msg + overhead)
+    const uint32_t kMsg = 512;
+    const char* kTag = "R21F1C";
+    std::vector<uint8_t> msg(kMsg, 'M');
+    ASSERT_EQ(w_now(), 0u);
+    ASSERT_EQ(logx_write(inst, 2, kTag, msg.data(), kMsg), LOGX_OK);
+    const uint32_t rec_len = w_now();
+    ASSERT_GT(rec_len, kMsg + kHeaderLen);
+    const uint32_t overhead = rec_len - kMsg;
+
+    // 2) 精确填到 w == data_size - 3(留 3B 环尾 → 下一次写入必触发 pad=3<6 留零回绕)
+    const uint32_t kSeam = 3;
+    const uint32_t budget = data_size - kSeam - rec_len;   // 已写一条 rec_len
+    ASSERT_GT(budget, overhead + 1);
+    const uint32_t n_full = (budget - (overhead + 1)) / rec_len;
+    for (uint32_t i = 0; i < n_full; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, kTag, msg.data(), kMsg), LOGX_OK);
+    }
+    ASSERT_EQ(w_now(), rec_len * (n_full + 1));            // 线性假设校验
+    const uint32_t tail = budget - n_full * rec_len;       // >= overhead+1
+    ASSERT_GE(tail, overhead + 1);
+    std::vector<uint8_t> tail_msg(tail - overhead, 'T');
+    ASSERT_EQ(logx_write(inst, 2, kTag, tail_msg.data(),
+                         static_cast<uint32_t>(tail_msg.size())), LOGX_OK);
+    ASSERT_EQ(w_now(), data_size - kSeam)
+        << "fill must land exactly 3B short of the ring end to force a pad<6 wrap";
+
+    // 3) flush → f 追平 w, 待刷窗口清空且起点停在缝前
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+    ASSERT_EQ(f_now(), data_size - kSeam);
+    ASSERT_EQ(w_now(), data_size - kSeam);
+
+    // 4) 再写一条 → pad=3<6 → 留零缝 + 回绕, 记录落环首
+    const uint64_t skipped_before = ii->seam_blocks_skipped.load();
+    ASSERT_EQ(logx_write(inst, 2, kTag, msg.data(), kMsg), LOGX_OK);
+    ASSERT_EQ(w_now(), rec_len);                           // 已回绕到环首
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 5) 跳过分支确实被执行(场景有效性钉死: 撤销修复后此计数为 0 → 复红)
+    EXPECT_EQ(ii->seam_blocks_skipped.load() - skipped_before, 1u)
+        << "the pad<6 wrap must produce exactly one seam-only block for drain_once to skip";
+    // 全零前提成立(R21 F-7): 不得触发"非缝填充"告警
+    EXPECT_FALSE(probe.saw_msg_substring("not seam padding"));
+
+    // 6) 落盘文件的每个块都必须落在读侧接受域内(独立遍历, 不经 plausible)
+    std::string logfile = day_log_path(dir, today);
+    std::vector<DiskBlock> blks;
+    ASSERT_TRUE(scan_disk_blocks(logfile, &blks))
+        << "block chain must walk cleanly to EOF (no torn/mis-sized block)";
+    ASSERT_GE(blks.size(), 2u);
+    for (const auto& b : blks) {
+        EXPECT_GE(b.raw_len, kHeaderLen)
+            << "micro-block reached disk: read side rejects raw_len<kHeaderLen "
+               "(export breaks there, repair truncates everything after)";
+        EXPECT_LE(b.raw_len, kBlockMaxRaw);
+    }
+    // 缝后那条记录必须真的落盘(旧实现下它排在 3B 块之后, 读侧到 3B 块即 break)
+    EXPECT_EQ(blks.back().raw_len, rec_len);
+    // seqno 连续无洞(跳过缝不消耗序号)
+    for (size_t i = 1; i < blks.size(); ++i) {
+        EXPECT_EQ(blks[i].seqno, blks[i - 1].seqno + 1) << "seqno must stay contiguous";
+    }
+
+    // 7) 导出可取回
+    std::atomic<int> files_with_content{0};
+    ASSERT_EQ(logx_export(inst, "20200101", "20991231",
+        [](void* user, const char*, const char*, uint64_t size) -> int {
+            if (size > 0) static_cast<std::atomic<int>*>(user)->fetch_add(1);
+            return 0;
+        }, &files_with_content), LOGX_OK);
+    EXPECT_GE(files_with_content.load(), 1);
+
+    logx_close(inst);
+    cleanup_dir(dir);
 }
 
 // ============================================================
@@ -299,9 +516,13 @@ TEST(R19Regression, F3_ShortTornLogFile_SelfHealsAndCounts) {
     int64_t sz = pal.file_size_path(torn.c_str());
     EXPECT_GT(sz, 32) << "torn 5B header must be truncated and rewritten; file must grow";
 
-    // 自愈信号必须可见(R19 探针 G 的教训: 修复前计数器全 0 + 无任何事件)
-    EXPECT_TRUE(probe.saw_kind(static_cast<int>(LOGX_EV_RECOVERY)))
-        << "healing a torn <32B header must emit a RECOVERY event (no silent heals)";
+    // 自愈信号必须可见(R19 探针 G 的教训: 修复前计数器全 0 + 无任何事件)。
+    // R21 F-4 更正: 必须按**文案**断言。只比 kind 时, recovery.cpp:308 的
+    // 「appended file tail truncated」同样是 LOGX_EV_RECOVERY, 会把断言顶包——
+    // 实测撤销 scan_one 的新事件后旧断言仍然绿。
+    EXPECT_TRUE(probe.saw_msg_substring("truncated to empty for rewrite"))
+        << "healing a torn <32B header must emit a site-specific RECOVERY event "
+           "(no silent heals); kind-only matching is satisfied by unrelated RECOVERY events";
 
     // 导出可取回数据(修复前 export=-3)
     std::atomic<int> cb_files{0};
@@ -312,9 +533,6 @@ TEST(R19Regression, F3_ShortTornLogFile_SelfHealsAndCounts) {
         }, &cb_files);
     EXPECT_EQ(erc, LOGX_OK);
     EXPECT_GE(cb_files.load(), 1) << "healed file must be exportable";
-    // 自愈事件(R20 复核补的产品侧修复): 修复头撕裂必须发 RECOVERY 事件
-    EXPECT_TRUE(probe.saw_kind(static_cast<int>(LOGX_EV_RECOVERY)))
-        << "healing a torn <32B header must emit a RECOVERY event (no silent heals)";
 
     logx_close(inst);
     cleanup_dir(dir);
@@ -407,6 +625,103 @@ TEST(R19Regression, F6_EncryptWithoutKey_FailFastAndPerBlockExport) {
     }
 }
 
+#if LOGX_WITH_AESGCM
+// ============================================================
+// R21 F-5: 文件级加密能力锁定(堵 R20 只堵了一半的反向竞态)。
+// 有状态 key_provider: 第 1 次调用(open 期探测)给钥 → open 成功;
+// 第 2 次(建文件探测)返回 NULL → 文件头不置加密位 + 本文件能力锁定为明文;
+// 第 3 次起(drain 逐块取 key / export)恢复给钥。
+// 修复前: drain_once 的 flag 只看 inst->encrypt_enable, 于是取到钥就写**密文块**,
+// 形成"文件头声明明文、块实为密文"。撤销能力锁定(把 flag 改回
+// `make_flag(algo, encrypt_enable != 0)`)→ 块头 bit0=1 → 本用例复红。
+// ============================================================
+TEST(R19Regression, F6b_EncCapabilityLockedAtFileCreation_BlocksStayPlaintext) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r21_f6b_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    struct KeyCtx {
+        std::atomic<int> calls{0};
+        uint8_t key[32];
+    } kctx;
+    for (int i = 0; i < 32; ++i) kctx.key[i] = static_cast<uint8_t>(0xA0 + i);
+
+    EventProbe probe;
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.retention_days = 36500;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 0;
+    cfg.compress_algo = 0;
+    cfg.encrypt_enable = 1;
+    cfg.kid = 11;
+    cfg.user = &kctx;
+    cfg.key_provider = [](uint16_t, void* user) -> const uint8_t* {
+        auto* c = static_cast<KeyCtx*>(user);
+        int n = c->calls.fetch_add(1) + 1;
+        return (n == 2) ? nullptr : c->key;   // 仅"建文件那一刻"取不到密钥
+    };
+    cfg.err_fn = [](void* user, logx_event_kind_e k, int code, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, code, m);
+    };
+    cfg.err_user = &probe;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    std::vector<uint8_t> payload(128, 'K');
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, "R21F6B", payload.data(),
+                             static_cast<uint32_t>(payload.size())), LOGX_OK);
+    }
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 探测窗口对齐校验: 建文件时刻确实拿到了 NULL(否则本用例测的不是锁定语义)
+    EXPECT_TRUE(probe.saw_msg_substring("key unavailable at file creation"))
+        << "provider call window drifted; this test no longer exercises capability locking";
+
+    uint32_t today = 0, hhmmss = 0;
+    pal.wallclock_date(&today, &hhmmss);
+    std::string logfile = day_log_path(dir, today);
+
+    // ① 文件头不声明加密(R20 修复)
+    int fd = pal.file_open(logfile.c_str(), false, false);
+    ASSERT_GE(fd, 0);
+    uint8_t fhdr[32];
+    ASSERT_EQ(pal.file_pread(fd, fhdr, 32, 0), 32);
+    pal.file_close(fd);
+    EXPECT_EQ(get_u32(fhdr), kMagicFile);
+    EXPECT_EQ(fhdr[5] & kFlagEncrypted, 0)
+        << "file header must not declare encryption when the key was unavailable at creation";
+
+    // ② 本文件**所有块**也必须是明文(R21 能力锁定; 修复前这里会是密文块)
+    std::vector<DiskBlock> blks;
+    ASSERT_TRUE(scan_disk_blocks(logfile, &blks));
+    ASSERT_FALSE(blks.empty());
+    for (const auto& b : blks) {
+        EXPECT_EQ(b.flag & kFlagEncrypted, 0)
+            << "capability is locked per file: a plaintext-declared file must not "
+               "contain encrypted blocks even after the key becomes available again";
+        EXPECT_GE(b.raw_len, kHeaderLen);
+    }
+
+    // ③ 明文块可正常导出
+    std::atomic<int> files_with_content{0};
+    ASSERT_EQ(logx_export(inst, "20200101", "20991231",
+        [](void* user, const char*, const char*, uint64_t size) -> int {
+            if (size > 0) static_cast<std::atomic<int>*>(user)->fetch_add(1);
+            return 0;
+        }, &files_with_content), LOGX_OK);
+    EXPECT_GE(files_with_content.load(), 1);
+
+    logx_close(inst);
+    cleanup_dir(dir);
+}
+#endif  // LOGX_WITH_AESGCM
+
 // ============================================================
 // F-10: logx_open 失败 → *out_inst = NULL(R19 探针 I 形态)
 // ============================================================
@@ -425,46 +740,61 @@ TEST(R19Regression, F10_FailedOpen_WritesNullOutParam) {
         << "contract logx_c.h: failed open must set *out_inst = NULL";
 }
 
+// 造一个"2 个完整块(seqno 5,6;raw_len 各 64)+ 1 个撕裂块(声明 payload 200B,
+// 实写 10B)"的日志文件 → 扫描得 S_file=6 且 truncated=true。F14/F14b 共用。
+// (日期取真实过去日: 两用例均不经 logx_open、无 Flusher 线程, 按 R18-1 三条件
+//  判据条件 (b)(c) 不成立, 不受 retention 清理影响。)
+static void craft_truncated_log(const std::string& path, uint32_t date,
+                                const uint8_t salt[8]) {
+    Pal& p = default_pal();
+    int fd = p.file_open(path.c_str(), true, false);
+    ASSERT_GE(fd, 0);
+    write_file_header_bytes(fd, date, salt);
+    auto write_block = [&](uint32_t seqno, uint32_t raw_len,
+                           const std::vector<uint8_t>& payload) {
+        uint8_t bhdr[34] = {};
+        make_block_header(bhdr, seqno, raw_len,
+                          static_cast<uint32_t>(payload.size()), 0, salt);
+        put_u32_le(bhdr + 18, crc32_update(0, payload.data(),
+                                           static_cast<uint32_t>(payload.size())));
+        ASSERT_EQ(p.file_write(fd, bhdr, 34), 34);
+        ASSERT_EQ(p.file_write(fd, payload.data(), static_cast<long>(payload.size())),
+                  static_cast<long>(payload.size()));
+    };
+    write_block(5, 64, std::vector<uint8_t>(64, 0xAB));
+    write_block(6, 64, std::vector<uint8_t>(64, 0xAC));
+    write_block(7, 200, std::vector<uint8_t>(10, 0xCD));  // 撕裂: payload_len != raw_len
+    p.file_close(fd);
+}
+
 // ============================================================
-// F-14: rebuilt + 文件尾截断 → 续写 seqno 跳空隙(防 nonce 复用)
+// F-14: rebuilt + 文件尾截断 → 续写 seqno 跳空隙(防 AES-GCM nonce 复用)
+// R21 F-3 更正: 旧版只在**全新** staging 上 new Staging——全零 Header 区使
+// Staging::open 判 fresh=true ⇒ rebuilt=false(staging.cpp:220-231), 于是
+// run_recovery 走常规路径, R19 F-14 所在的 rebuilt 分支(recovery.cpp:216-242)
+// **从未执行**; 实测把 `hdr.seqno = sr.seqno + 1` 改回 `sr.seqno` 旧用例照样绿。
+// 本版真毒化双 Header, 并用 flushed_len 区分两条路径(rebuilt 归零 / 常规按
+// Σraw_len 回推), 避免"同一个数字被两条路径同时满足"而互相掩盖。
 // ============================================================
 TEST(R19Regression, F14_RebuiltTruncatedFile_SeqnoSkipsGap) {
     Pal& pal = default_pal();
     std::string dir = make_tmp_dir("logx_test_r19_f14_");
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
-
-    // 文件: 2 个完整块(seqno=1,2) + 1 个撕裂块(声明 payload 200B, 只写 10B)
-    std::string logfile = dir + "/20260831.log";
-    int fd = pal.file_open(logfile.c_str(), true, false);
-    ASSERT_GE(fd, 0);
     uint8_t salt[8] = {1,2,3,4,5,6,7,8};
-    write_file_header_bytes(fd, 20260831u, salt);
-    auto write_block = [&](uint32_t seqno, uint32_t raw_len,
-                           const std::vector<uint8_t>& payload) {
-        Pal& p = default_pal();
-        uint8_t bhdr[34] = {};
-        put_u32_le(bhdr, kMagicBlock);
-        bhdr[4] = 1; bhdr[5] = 0;  // none, plaintext
-        put_u32_le(bhdr + 6, seqno);
-        put_u32_le(bhdr + 10, raw_len);
-        put_u32_le(bhdr + 14, static_cast<uint32_t>(payload.size()));
-        put_u32_le(bhdr + 18, crc32_update(0, payload.data(), payload.size()));
-        std::memcpy(bhdr + 22, salt, 8);
-        bhdr[30] = static_cast<uint8_t>((seqno >> 24) & 0xff);
-        bhdr[31] = static_cast<uint8_t>((seqno >> 16) & 0xff);
-        bhdr[32] = static_cast<uint8_t>((seqno >> 8) & 0xff);
-        bhdr[33] = static_cast<uint8_t>(seqno & 0xff);
-        ASSERT_EQ(p.file_write(fd, bhdr, 34), 34);
-        ASSERT_EQ(p.file_write(fd, payload.data(), static_cast<long>(payload.size())),
-                  static_cast<long>(payload.size()));
-    };
-    write_block(1, 64, std::vector<uint8_t>(64, 0xAB));
-    write_block(2, 64, std::vector<uint8_t>(64, 0xAC));
-    write_block(3, 200, std::vector<uint8_t>(10, 0xCD));  // 撕裂: raw_len 声明 200
-    pal.file_close(fd);
+    craft_truncated_log(dir + "/20260831.log", 20260831u, salt);
 
-    // 双 Header 破坏 → rebuilt 路径接管(全新 staging), 扫文件得 S_file=2 + truncated
+    // 毒化双 Header 区([0,128) 全 0xFF): pick_header 必失败, 且 Header 区非全零
+    // ⇒ fresh=false ⇒ rebuilt=true。
+    {
+        int sfd = pal.file_open(staging.c_str(), true, false);
+        ASSERT_GE(sfd, 0);
+        std::vector<uint8_t> poison(kHeaderTotal, 0xFF);
+        ASSERT_EQ(pal.file_pwrite(sfd, poison.data(), static_cast<long>(kHeaderTotal), 0),
+                  static_cast<long>(kHeaderTotal));
+        pal.file_close(sfd);
+    }
+
     Instance* inst = new Instance();
     inst->pal = &default_pal();
     inst->log_dir = dir;
@@ -472,12 +802,46 @@ TEST(R19Regression, F14_RebuiltTruncatedFile_SeqnoSkipsGap) {
     inst->staging = new Staging(inst->pal, staging, 8 * 1024);
     ASSERT_TRUE(run_recovery(inst));
 
-    // rebuilt + truncated: hdr.seqno = sr.seqno + 1 = 3(下一块序号),
-    // Flusher 首块 = 4 = S_file + 2(spec: 防被截块 seqno/nonce 复用)。
-    uint32_t resume_seqno = get_u32(inst->staging->raw_base() + 8);
-    EXPECT_EQ(resume_seqno, 3u)
+    // rebuilt + truncated: hdr.seqno = sr.seqno + 1 = 7 ⇒ Flusher 首块 = 8 = S_file+2
+    EXPECT_EQ(get_u32(inst->staging->raw_base() + 8), 7u)
         << "rebuilt+truncated must resume at S_file+1 so the first block = S_file+2 (nonce gap)";
+    // 路径判别: rebuilt 分支 commit(seqno, 0, 0) → 环坐标归零(常规路径会是 128)
+    EXPECT_EQ(get_u32(inst->staging->raw_base() + 12), 0u)
+        << "flushed_len must be 0: proves the rebuilt branch ran, not the normal path";
     EXPECT_GE(inst->truncated_blocks.load(), 1u) << "truncation must be counted";
+
+    delete inst->staging;
+    delete inst;
+    cleanup_dir(dir);
+}
+
+// ============================================================
+// F-14 孪生: 常规路径(S_hdr=0 < S_file=6 且尾块撕裂)→ resume = max+1,
+// 且 flushed_len 按 Σraw_len 回推(recovery.cpp:264-287)。与 F14 成对钉死两条
+// 路径, 任一条被改坏都会各自复红。
+// ============================================================
+TEST(R19Regression, F14b_NormalPathTruncatedFile_ResumeSeqnoMaxPlusOne) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r21_f14b_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+    uint8_t salt[8] = {9,9,9,9,9,9,9,9};
+    craft_truncated_log(dir + "/20260831.log", 20260831u, salt);
+    // 不毒化: staging 全新 → Header 区全零 → fresh=true → rebuilt=false
+
+    Instance* inst = new Instance();
+    inst->pal = &default_pal();
+    inst->log_dir = dir;
+    inst->staging_path = staging;
+    inst->staging = new Staging(inst->pal, staging, 8 * 1024);
+    ASSERT_TRUE(run_recovery(inst));
+
+    EXPECT_EQ(get_u32(inst->staging->raw_base() + 8), 7u)
+        << "normal path: resume = max(S_hdr, S_file) + 1";
+    // 路径判别: S_file > S_hdr 分支按 Σraw_len(seqno ∈ (0,6] = 64+64) 回推 f
+    EXPECT_EQ(get_u32(inst->staging->raw_base() + 12), 128u)
+        << "flushed_len must be backfilled by sum_raw_len_since (proves normal path)";
+    EXPECT_GE(inst->truncated_blocks.load(), 1u);
 
     delete inst->staging;
     delete inst;
@@ -554,4 +918,91 @@ TEST(R19Regression, F4_WrapSeam_PostSeamRecordsSurviveRecovery) {
     delete inst;
     pal.file_unlink(staging.c_str());
     cleanup_dir("logx_test_r19_f4_dir");
+}
+
+// ============================================================
+// R21 N-2: 读侧接受域直测(跨模块契约门禁的**读侧**半边)。
+// "raw_len < kHeaderLen 必拒"是 R20/R21 全部 F-1 处置的立论依据(微块一旦落盘,
+// 导出在块边界不可信处 break、repair 物理截断), 但 block_header_plausible 此前
+// 全仓零直测, 写侧自检成了单边门禁。此处把接受域两侧与其它判据一并钉死。
+// ============================================================
+TEST(R19Regression, ReadSideAcceptanceDomain_RawLenBounds) {
+    const uint8_t salt[8] = {1,2,3,4,5,6,7,8};
+    uint8_t b[34];
+    uint32_t seqno = 0, raw_len = 0, payload_len = 0;
+    uint64_t bsize = 0;
+    const uint64_t kBig = 64ULL * 1024 * 1024;   // 足够大, 避免误触容量判据
+    // 读侧上界是 flusher.cpp 匿名空间内的 kBlockMaxRawPlausible(16MB), 测试侧只能
+    // 以字面量镜像; 该常数若被改动, 下面两条断言会一红一绿地暴露口径漂移。
+    const uint32_t kPlausibleMax = 16u * 1024u * 1024u;
+
+    // 合法基线: 未压缩 + payload_len == raw_len
+    make_block_header(b, 7, 64, 64, 0, salt);
+    ASSERT_TRUE(block_header_plausible(b, kBig, 0, false,
+                                       &seqno, &raw_len, &payload_len, &bsize));
+    EXPECT_EQ(seqno, 7u);
+    EXPECT_EQ(raw_len, 64u);
+    EXPECT_EQ(payload_len, 64u);
+    EXPECT_EQ(bsize, 34u + 64u);
+
+    // 下界: 1~5B 缝独占微块必拒(F-1 处置的立论依据)
+    for (uint32_t rl = 1; rl < kHeaderLen; ++rl) {
+        make_block_header(b, 7, rl, rl, 0, salt);   // payload_len == raw_len, 未压缩
+        EXPECT_FALSE(block_header_plausible(b, kBig, 0, false, nullptr, nullptr, nullptr, nullptr))
+            << "raw_len=" << rl << " must be rejected: seam-only micro-block is unwritable";
+    }
+    // raw_len == 0 亦拒(此例由 payload_len==0 判据命中, 结论一致)
+    make_block_header(b, 7, 0, 0, 0, salt);
+    EXPECT_FALSE(block_header_plausible(b, kBig, 0, false, nullptr, nullptr, nullptr, nullptr));
+
+    // 下界内侧: raw_len == kHeaderLen 必收
+    make_block_header(b, 7, kHeaderLen, kHeaderLen, 0, salt);
+    EXPECT_TRUE(block_header_plausible(b, kBig, 0, false, nullptr, nullptr, nullptr, nullptr))
+        << "raw_len == kHeaderLen is the inclusive lower bound";
+
+    // 写侧上限 kBlockMaxRaw 必收(写读两侧接受域在此重叠)
+    make_block_header(b, 7, kBlockMaxRaw, kBlockMaxRaw, 0, salt);
+    EXPECT_TRUE(block_header_plausible(b, kBig, 0, false, nullptr, nullptr, nullptr, nullptr))
+        << "write side's kBlockMaxRaw must be inside the read side's acceptance domain";
+
+    // 读侧上界: > 16MB 必拒(读侧上界刻意远宽于写侧的 20486, 二者不同源)
+    make_block_header(b, 7, kPlausibleMax + 1, kPlausibleMax + 1, 0, salt);
+    EXPECT_FALSE(block_header_plausible(b, kBig, 0, false, nullptr, nullptr, nullptr, nullptr));
+    make_block_header(b, 7, kPlausibleMax, kPlausibleMax, 0, salt);
+    EXPECT_TRUE(block_header_plausible(b, kBig, 0, false, nullptr, nullptr, nullptr, nullptr));
+}
+
+TEST(R19Regression, ReadSideAcceptanceDomain_SeqnoFlagAndCapacityGuards) {
+    const uint8_t salt[8] = {1,2,3,4,5,6,7,8};
+    uint8_t b[34];
+    auto ok = [&](uint64_t remaining, uint32_t prev, bool has_prev) {
+        return block_header_plausible(b, remaining, prev, has_prev,
+                                      nullptr, nullptr, nullptr, nullptr);
+    };
+
+    // seqno 严格单调: 0 拒、<= prev 拒、> prev 收
+    make_block_header(b, 0, 64, 64, 0, salt);
+    EXPECT_FALSE(ok(1 << 20, 0, false)) << "seqno == 0 is reserved";
+    make_block_header(b, 5, 64, 64, 0, salt);
+    EXPECT_FALSE(ok(1 << 20, 5, true)) << "seqno must strictly increase";
+    EXPECT_FALSE(ok(1 << 20, 6, true));
+    EXPECT_TRUE(ok(1 << 20, 4, true));
+
+    // flag 保留位(bit3+)必拒; 加密块的 block_size 含 16B tag
+    make_block_header(b, 5, 64, 64, 0x08, salt);
+    EXPECT_FALSE(ok(1 << 20, 0, false)) << "reserved flag bits must be rejected";
+    make_block_header(b, 5, 64, 64, kFlagEncrypted, salt);
+    EXPECT_TRUE(ok(34 + 64 + 16, 0, false));
+    EXPECT_FALSE(ok(34 + 64 + 15, 0, false)) << "encrypted block needs room for the 16B tag";
+
+    // 容量判据: block_size 越过文件剩余字节必拒
+    make_block_header(b, 5, 64, 64, 0, salt);
+    EXPECT_TRUE(ok(34 + 64, 0, false));
+    EXPECT_FALSE(ok(34 + 63, 0, false));
+
+    // 协议自洽: 未压缩时 payload_len 必须等于 raw_len; payload_len==0 拒
+    make_block_header(b, 5, 64, 63, 0, salt);
+    EXPECT_FALSE(ok(1 << 20, 0, false)) << "uncompressed payload_len must equal raw_len";
+    make_block_header(b, 5, 64, 0, 0, salt);
+    EXPECT_FALSE(ok(1 << 20, 0, false));
 }

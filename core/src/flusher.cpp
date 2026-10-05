@@ -496,10 +496,18 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
 // seqno 最大"者作为追加目标。
 // 打开/创建追加目标文件;返回 fd;失败 -1。
 // *out_path / *out_salt 由调用方在 retry 时复用。
+// *out_enc_capable (R21 F-5): 本文件的加密能力, 由本函数一次性锁定后交回调用方
+//   持有(FlusherCtx::current_enc_capable)——新建文件取"建文件时刻能否取到密钥"
+//   的探测结果, 已存在文件取其文件头 flag 的加密位。锁定后本文件生命周期内所有
+//   块一律按此能力落盘, 使"文件头声明 == 本文件全部块形态"在 encrypt_enable
+//   开启期间成为不变量(杜绝 R21 F-5 的反向竞态: 建文件时无钥→头声明明文, 随后
+//   密钥恢复→drain_once 写出密文块)。
 int open_or_create_append_target(Instance* inst, const std::string& hint_path,
                                  uint32_t date, uint16_t split_no,
                                  std::string* out_path,
-                                 uint8_t out_salt[8]) {
+                                 uint8_t out_salt[8],
+                                 bool* out_enc_capable) {
+    if (out_enc_capable) *out_enc_capable = true;
     std::string path = hint_path.empty()
         ? make_log_path(inst->log_dir, date, split_no)
         : hint_path;
@@ -511,6 +519,11 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
         // R19 F-3: 1~31B 头部撕裂损坏, 截断为空文件并重写文件头
         inst->pal->file_truncate(fd, 0);
         sz = 0;
+        // R21 F-6: 与 scan_one 的同款自愈保持同一可观测语义。此前只有 scan_one
+        // 发事件、本站点静默, 调用方无法区分"正常空文件"与"撕裂头被修复";
+        // 文案带上站点名, 便于定位是哪条路径完成的自愈。
+        emit_event(inst, LOGX_EV_RECOVERY, -1,
+                   "torn file header at append-target open (0<sz<32); truncated for rewrite");
     }
     if (sz == 0) {
         // 新建:写 32B 头
@@ -521,16 +534,19 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
             inst->pal->file_close(fd);
             return -1;
         }
-        // R20 复核 (F-6 残留): 建文件时刻探测密钥可用性, 文件头加密位与
-        // "本文件预期块形态"一致。encrypt_enable=1 但此刻取不到密钥 → 本
-        // 文件的块将全部明文落盘(drain_once 降级纪律), 头不得声明加密。
+        // R20 复核 (F-6 残留) + R21 F-5 (能力锁定): 建文件时刻探测密钥可用性,
+        // 探测结果即本文件的加密能力, 文件头加密位与之一致; 该能力被调用方锁定
+        // 持有, 本文件后续所有块一律按此落盘(即便密钥稍后恢复可用也不再改口),
+        // 因此"头声明 == 本文件全部块形态"恒成立。
         bool enc_capable = true;
         if (inst->encrypt_enable != 0 &&
             (!inst->key_provider || !inst->key_provider(inst->kid, inst->key_user))) {
             enc_capable = false;
             emit_event(inst, LOGX_EV_DEGRADED, -1,
-                       "key unavailable at file creation; file header written without encrypted bit");
+                       "key unavailable at file creation; this file stays plaintext "
+                       "(header written without encrypted bit) until rollover");
         }
+        if (out_enc_capable) *out_enc_capable = enc_capable;
         if (!write_file_header(inst, fd, date, inst->kid, salt, enc_capable)) {
             inst->pal->file_close(fd); return -1;
         }
@@ -543,10 +559,12 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
             emit_event(inst, LOGX_EV_IO, -1, "new file dir fsync failed");
         }
     } else {
-        // 已存在:读头取 salt
+        // 已存在:读头取 salt 与加密位。加密位即本文件的既有能力(R21 F-5)——
+        // 续写不得改口, 否则同一文件内块形态与文件头声明分裂。
         uint8_t hdr[32];
         if (inst->pal->file_pread(fd, hdr, 32, 0) != 32) { inst->pal->file_close(fd); return -1; }
         std::memcpy(out_salt, hdr + 12, 8);
+        if (out_enc_capable) *out_enc_capable = flag_encrypted(hdr[5]);
     }
     if (out_path) *out_path = path;
     return fd;
@@ -605,6 +623,10 @@ struct FlusherCtx {
     int      current_fd = -1;
     uint64_t current_size = 0;
     bool     date_changed = true;   // 启动时强制为 true,触发首次 target 选择
+    // 本文件的加密能力, 由 open_or_create_append_target 在开/建文件时锁定
+    // (R21 F-5)。仅在 current_fd 重新打开时刷新; drain_once 每块据此组装 flag,
+    // 保证"文件头声明 == 本文件全部块形态"。
+    bool     current_enc_capable = true;
     std::vector<uint8_t> scratch;   // P3-2: 常驻复用缓冲,避免每 75ms 轮询分配 128KB
 };
 
@@ -693,11 +715,14 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
     }
 
     if (c->current_fd < 0) {
+        bool enc_capable = true;
         c->current_fd = open_or_create_append_target(inst, c->current_path,
                                                      c->current_date, c->current_split,
                                                      &c->current_path,
-                                                     c->current_salt);
+                                                     c->current_salt,
+                                                     &enc_capable);
         if (c->current_fd < 0) return -1;
+        c->current_enc_capable = enc_capable;   // R21 F-5: 锁定本文件能力
         inst->active_log_fd.store(c->current_fd);
         int64_t sz = inst->pal->file_size(c->current_fd);
         c->current_size = sz < 0 ? 0 : static_cast<uint64_t>(sz);
@@ -739,8 +764,12 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     std::vector<PendingBlock> blocks;
     split_impl(c->scratch.data(), bytes, &blocks);
 
-    // 4) 决定 flag:bit0 = encrypt,bit1-2 = compress(经 make_flag 组装)
-    uint8_t flag = make_flag(inst->compress_algo, inst->encrypt_enable != 0);
+    // 4) flag 改为逐块组装(见循环内 5.1b): 加密位 = 总开关 && 本文件锁定能力
+    //    (R21 F-5), 而"本文件能力"只有在 ensure_append_target 之后才确定。
+    //    旧实现在循环外算一次、并在缺钥时就地 `flag &= ~kFlagEncrypted`, 使同一轮
+    //    drain 内的后续块(含中途轮换到别的文件之后的块)被**静默**降级为明文且不再
+    //    发 DEGRADED 事件(flag 的加密位已清, 守卫条件不再成立); 逐块重算消除该泄漏。
+    //    注: flag 是 drain_once 的局部量, 泄漏范围止于本轮 drain, 下一轮会重新探测。
 
     // 5) 逐块:压缩/加密 → write() → 清零该区间 → 提交 Header
     // 关键顺序(spec §4.2 第 4→5→6 步):先落数据,再清零,最后提交。
@@ -751,18 +780,37 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     // 当前写指针;清零 [f, f+raw_len) 后需要推进;按块依次 commit。
     uint32_t cur_f = f;
 
+    // key_provider 结果缓存, 以 fd 为键(见 5.1b): 换文件即失效重取。
+    const uint8_t* cached_key = nullptr;
+    int key_fd = -1;
+
     for (const auto& blk : blocks) {
         if (blk.raw_len == 0) continue;
 
-        // R20 复核 (F-1 边界): 缝紧随满长记录时 split_impl 会产出 1~5B 的
-        // "缝独占块"(缝归入当前块会超出 kBlockMaxRaw 硬上限, 只能独立封块)。
-        // 该块不含任何记录数据(缝本就是 write_records 留零回绕的填充), 而
-        // 读侧 block_header_plausible 要求 raw_len >= kHeaderLen, 落盘必被
-        // 拒收(导出在块边界不可信处 break, repair 物理截断)。
+        // R20 复核 (F-1 边界): 缝紧随满长记录、或待刷窗口正好以缝开头时,
+        // split_impl 会产出 1~5B 的"缝独占块"(缝归入当前块会超出 kBlockMaxRaw
+        // 硬上限, 只能独立封块)。该块不含任何记录数据(缝本就是 write_records
+        // 留零回绕的填充), 而读侧 block_header_plausible 要求 raw_len >=
+        // kHeaderLen, 落盘必被拒收(导出在块边界不可信处 break, repair 物理截断)。
         // 处置: 不编码不落盘, 仅计入水位推进(cur_f 跨过该区间, 随后的
         // zero_range_locked/commit 正常执行), 缝字节留零在 staging 内直到该
         // 区域被新写入覆写——与 write_records 留零回绕的既有语义一致。
+        //
+        // R21 F-7: "缝必为纯零"是本处置得以不丢数据的**前提**, 故就地校验而非
+        // 依赖推演。全零 → 正常跳过(常态, 每次 pad<6 回绕一次, 只计数不发事件);
+        // 非全零 → 前提被破(最多 5B 无法成头的残片), 按"宁丢不脏"丢弃并**发
+        // RECOVERY 事件**, 绝不落盘(落盘会让读侧在此截断, 殃及其后全部数据)。
         if (blk.raw_len < kHeaderLen) {
+            const uint8_t* p = c->scratch.data() + blk.raw_offset;
+            bool seam_all_zero = true;
+            for (uint32_t i = 0; i < blk.raw_len; ++i) {
+                if (p[i] != 0) { seam_all_zero = false; break; }
+            }
+            if (!seam_all_zero) {
+                emit_event(inst, LOGX_EV_RECOVERY, -1,
+                           "sub-header block is not seam padding; dropped (never writable: "
+                           "read side rejects raw_len < kHeaderLen)");
+            }
             inst->pal->mutex_lock(inst->mu);
             inst->staging->zero_range_locked(cur_f, blk.raw_len);
             uint32_t new_f = (cur_f + blk.raw_len) % inst->staging->data_size();
@@ -771,20 +819,9 @@ void drain_once(FlusherCtx* c, Instance* inst) {
                 get_u32(inst->staging->raw_base() + 8), new_f, latest_w, &atc);
             inst->pal->mutex_unlock(inst->mu);
             inst->flushed_bytes_total.fetch_add(blk.raw_len, std::memory_order_relaxed);
+            inst->seam_blocks_skipped.fetch_add(1, std::memory_order_relaxed);
             cur_f = new_f;
             continue;
-        }
-
-        // 取 key(可空)
-        const uint8_t* key = nullptr;
-        if ((flag & kFlagEncrypted) && inst->key_provider) {
-            const uint8_t* k = inst->key_provider(inst->kid, inst->key_user);
-            if (!k) {
-                emit_event(inst, LOGX_EV_DEGRADED, -1, "missing key; downgrading block to plaintext");
-                flag &= ~kFlagEncrypted;
-            } else {
-                key = k;
-            }
         }
 
         // 5.1 决定追加目标文件(跨天/切分)
@@ -808,6 +845,27 @@ void drain_once(FlusherCtx* c, Instance* inst) {
             cur_f = new_f;
             continue;
         }
+
+        // 5.1b 逐块组装 flag 并取 key(R21 F-5: 加密位受"本文件锁定能力"约束)。
+        // key 按 (本轮 drain, 当前 fd) 缓存: Android 侧 key_provider 是 JNI
+        // trampoline, Flusher 线程每次调用都要 AttachCurrentThread/DetachCurrentThread
+        // (重量级), 逐块重取会使调用次数从"每轮一次"放大到"每块一次"。缓存以 fd 为
+        // 键 ⇒ 跨天/切分换文件即失效重取。缺钥降级只作用于当块(不再像旧实现那样
+        // 就地清 flag, 把降级静默泄漏给同一轮 drain 的后续块)。
+        uint8_t flag = make_flag(inst->compress_algo,
+                                 inst->encrypt_enable != 0 && c->current_enc_capable);
+        if ((flag & kFlagEncrypted) && inst->key_provider) {
+            if (key_fd != fd) {
+                key_fd = fd;
+                cached_key = inst->key_provider(inst->kid, inst->key_user);
+                if (!cached_key) {
+                    emit_event(inst, LOGX_EV_DEGRADED, -1,
+                               "missing key; downgrading block to plaintext");
+                }
+            }
+        }
+        const uint8_t* key = cached_key;
+        if (!key) flag &= ~kFlagEncrypted;
 
         // 5.2 编码 + 写盘;seqno 取自当前 staging Header
         uint32_t cur_seqno = get_u32(inst->staging->raw_base() + 8);

@@ -84,8 +84,16 @@ typedef struct logx_config {
     /* 当前写入使用的 KID;导出时按文件头 KID 经 key_provider 取对应密钥 */
     uint16_t kid;
 
-    /* (kid)->32B 裸密钥;返回 NULL 表示该 KID 不可解。
-     * 实现必须可应答当前及历史 KID; open(校验当前 KID 可用性)与 export(逐块解密)路径均会调用。 */
+    /* (kid)->32B 裸密钥;返回 NULL 表示该 KID 不可解。实现必须可应答当前及历史 KID。
+     * 三类调用点(R21 N-1 补全,此前仅记了前两类):
+     *   ① open: 校验当前 KID 可用性,返回 NULL 即 fail-fast 拒绝启动;
+     *   ② 建文件/打开追加目标: 探测本文件的加密能力并**锁定**——探测结果为 NULL 时
+     *      文件头不置加密位,且该文件此后所有块一律明文落盘(即便密钥稍后恢复也不再
+     *      改口),直至按天/按大小轮换到新文件;同时发 LOGX_EV_DEGRADED 事件。
+     *      注意此调用点运行在 **Flusher 后台线程**(JNI 实现须自行 attach/detach);
+     *   ③ export: 按文件头 KID 逐块解密。
+     * 返回的指针由实现方持有,调用方不释放、不改动其内容;库侧不做缓存(每次按需索取),
+     * 因此实现应把单次查询控制在廉价范围(②的频率为"每文件一次",③为"每文件一次")。 */
     const uint8_t* (*key_provider)(uint16_t kid, void* user);
 
     void* user;                  /* 透传给 key_provider */
