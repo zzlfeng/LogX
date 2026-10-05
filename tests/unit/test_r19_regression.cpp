@@ -1056,6 +1056,9 @@ TEST(R19Regression, F7_MicroBlockNotSeamPadding_DropsAndEmitsRecoveryEvent) {
     // Check that we have exactly kSeam bytes left
     ASSERT_EQ(w_now(), data_size - kSeam);
     
+    // Flush to advance f to w so staging has room to wrap around
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
     // Now trigger a wrap-around write so the seam is left behind
     std::vector<uint8_t> rmsg(50, 'R');
     ASSERT_EQ(logx_write(inst, 2, kTag, rmsg.data(), static_cast<uint32_t>(rmsg.size())), LOGX_OK);

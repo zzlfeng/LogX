@@ -75,6 +75,20 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
                 pos += seam;
                 continue;
             }
+            // 脏缝探测 (R25 F-2): 若前 1..5 字节虽非纯零但其后紧随合法记录,
+            // 判定为被破坏的缝隙残片; 封为独立微块交付 drain_once 做全零校验与自愈丢弃
+            uint32_t corrupt_seam = 0;
+            for (uint32_t s = 1; s < kHeaderLen && pos + s < total; ++s) {
+                if (peek_record_len(raw, pos + s, total) > 0) {
+                    corrupt_seam = s;
+                    break;
+                }
+            }
+            if (corrupt_seam > 0) {
+                out->push_back({blk_begin, corrupt_seam});
+                pos += corrupt_seam;
+                continue;
+            }
             // 撕裂尾部:封块到 total, 但硬上限不超过 kBlockMaxRaw (R19 F-1 兜底)
             uint32_t take = std::min(total - blk_begin, static_cast<uint32_t>(kBlockMaxRaw));
             out->push_back({blk_begin, take});
