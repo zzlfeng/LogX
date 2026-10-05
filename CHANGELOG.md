@@ -1956,7 +1956,7 @@ __declspec(noinline) void poison_r18_stack() {
 > **⚠️ R21 勘误（2026-10-05，原文保留、就地更正）**：本批次三项产品修复（F-1 微块跳过 / F-3 自愈事件 / F-6 `enc_capable`）经 R21 撤销对照实验证明**当时零回归屏障**——把三项修复全部撤销后，156 单测 + 4 压力 + 2 热路径**全绿**。据此更正本段四处失实表述：
 > 1. 下文 #1 末句「跨模块契约门禁写入测试：每块 `raw_len ∈ [kHeaderLen, kBlockMaxRaw]`」——**实际只有写侧单边自检**：`F1b` 仅调 `split_into_blocks`，从未触及修复点 `drain_once`，且其唯一相关断言 `any_micro || blocks.size() >= 2` 是恒真析取；读侧 `block_header_plausible` 当时全仓零直测。
 > 2. 下文 #6 声称 8 项用例「撤销对应修复即可复红」——**从未做过该实验**。实测 `F1b`（恒真断言 + 测错层次）、`F3` 的 RECOVERY 断言（被 `recovery.cpp:308` 同类事件顶包）、`F6②`（用 `encrypt_enable=0`，`enc_capable` 分支一行未执行）、`F14`（全新 staging ⇒ `rebuilt=false`，R19 F-14 所在分支从未执行）四项撤销后仍绿。
-> 3. 下文「构建：增量 49 步」口径不可复现（R21 全量重建实测 56 步、单文件增量 6~7 步），且「ninja jobserver-pipe 挂死」在 R21 **未复现**：`MSYS_NO_PATHCONV=1 cmd.exe /c build_tmp.bat` 正常跑完全量。挂死记录疑为 Git Bash 把 `/c` 路径转换成 `C:\`、`cmd.exe` 空转 rc=0 所致（详见 `code_review_R21_2026-10-05.md` §五·3）。
+> 3. 下文「构建：增量 49 步」口径不可复现（R21 全量重建实测 56 步、单文件增量 6~7 步），且「ninja jobserver-pipe 挂死」在 R21 **未复现**：`MSYS_NO_PATHCONV=1 cmd.exe /c build_tmp.bat` 正常跑完全量。挂死记录疑为 Git Bash 把 `/c` 路径转换成 `C:\`、`cmd.exe` 空转 rc=0 所致（详见 `code_review_R21_2026-10-05.md` §五·3）。**⚠️ R22 反证（2026-10-05）**：该归因不成立——纯 PowerShell 会话（无 Git Bash、无路径转换环节）实证 ninja 全形态挂死（最小单规则工程真实执行挂死 / 零工作量空跑仍挂 / `-j 2` 挂 / `pool = console` 挂 / VS 官方版 ninja 1.12.1 同挂；`ninja -n` 空跑 0.0s 正常 ⇒ 挂点在执行前的启动机制，jobserver-pipe 变体启动即建命名管道）。挂死属**会话级环境限制**：R19/R20 的挂死记录**恢复采信**，R21 的「未复现」亦真实，分歧在环境而非操作方式。详见 `code_review_R22_2026-10-05.md` §四、计划表 R21-2 勘误段与 R22-1 纪律（`ninja -t commands` 等价构建 fallback）。
 > 4. R20 附带风险（R21 发现）：因该轮以手工 `cl.exe` 绕过 ninja 编译，`build-full` 的 ninja 依赖日志与磁盘 `.obj` 失配，**改头文件不再触发重编**（实测 `logx_internal.h` 结构体布局变更后 `logx_c.cpp.obj` 未重建）。R21 起凡涉及头文件改动一律 `ninja -t clean` 全量重建。
 > 本批次产品修复本身经 R21 逐路径推演**均成立**（F-1 跳过不丢数据、seqno 不消耗、`flushed_bytes_total` 计入是 `flush_blocking` 进度代理的必要项），失实仅限测试与验证记录层面。补强见下文 R21 章节。
 
@@ -2054,7 +2054,7 @@ __declspec(noinline) void poison_r18_stack() {
 **正向对照**（证明 harness 能复红、排除「撤销未生效/二进制陈旧」）：R21 复核阶段已实测撤销 R19 F-10（删 `*out_inst = nullptr`）→ `F10` 红、撤销 R19 F-4（`ring_scan` 传 0）→ `F4` 红。`F2`（回调内 close）未纳入撤销实验：撤销表现为 `0xC0000005` 崩溃而非断言失败，会污染同批结果，其有效性为静态判定。
 
 ### 全量验证（R21 实测）
-- **构建**：MSVC 14.43 /std:c++17 /utf-8 /O2 /MD，`LOGX_WITH_ZSTD=ON` + `LOGX_WITH_AESGCM=ON`。命令 `MSYS_NO_PATHCONV=1 cmd.exe /c build_tmp.bat`（**ninja 未挂死**，R19/R20 的挂死记录已在上文勘误）。因本批改动了头文件（含 `Instance`/`FileScanResult` 结构体布局），按新固化的 R21-2 纪律执行 `ninja -t clean` + **全量重建 56 步**；收尾再 `touch` 全部 logx 源与头重建 **24 步**，两次均 `ninja` 退出码 0，`warning C`/`error C`/`error LNK`/`fatal error` 命中数 **0**。（注：以 `grep -i "error"` 粗筛会误命中 `/showIncludes` 打出的 `zstd_errors.h`、`system_error`、`__msvc_system_error_abi.hpp` 等文件名，须按 MSVC 诊断格式精确匹配。）
+- **构建**：MSVC 14.43 /std:c++17 /utf-8 /O2 /MD，`LOGX_WITH_ZSTD=ON` + `LOGX_WITH_AESGCM=ON`。命令 `MSYS_NO_PATHCONV=1 cmd.exe /c build_tmp.bat`（**ninja 未挂死**，R19/R20 的挂死记录已在上文勘误。⚠️ R22 反证：「未挂死」会话特有，挂死归因勘误见 R20 勘误框第 3 条 R22 反证段与计划表 R21-2 勘误段——挂死属会话级环境限制，本行的「未挂死」不构成对其它会话的预期）。因本批改动了头文件（含 `Instance`/`FileScanResult` 结构体布局），按新固化的 R21-2 纪律执行 `ninja -t clean` + **全量重建 56 步**；收尾再 `touch` 全部 logx 源与头重建 **24 步**，两次均 `ninja` 退出码 0，`warning C`/`error C`/`error LNK`/`fatal error` 命中数 **0**。（注：以 `grep -i "error"` 粗筛会误命中 `/showIncludes` 打出的 `zstd_errors.h`、`system_error`、`__msvc_system_error_abi.hpp` 等文件名，须按 MSVC 诊断格式精确匹配。）
 - **单测**：`logx_unit_tests.exe` **161 / 161 全绿**（156 既有 + R21 新增 5 项：`F1c` / `F6b` / `F14b` / 读侧接受域 2 项）。
 - **热路径**：`logx_hotpath_alloc_tests.exe` **2 / 2**。**压力**：`logx_stress_tests.exe` **4 / 4**。**崩溃 fork**：`logx_crash_fork_tests.exe` **3 / 3**。
 - **撤销对照实验二次复验**：`key_provider` 缓存改动落地后重跑同一组 4 项撤销，结果与首轮一致——恰好 `F1c`/`F3`/`F6b`/`F14` 复红、其余 9 项 R19Regression 用例保持绿。实验改动以 `cp` 备份还原，`grep -rn "R21 EXPERIMENT" core/ tests/` 归零确认无残留，还原后 `git status` 仅含本批 7 个预期文件（`core/src/recovery.cpp` 无 diff）。
@@ -2065,3 +2065,26 @@ __declspec(noinline) void poison_r18_stack() {
 - **B-7**（新）：R20 §四 的「F-5 同日多分卷孤儿块漏检」——`reconcile` 仅按 `date` 比较，同一天内 ATC 落后于最新分卷时孤儿块漏检仍在。
 - **B-8**（新）：R20 §四 的「F-13 新文件 + 崩溃留下部分块且 Header 未提交」组合下 `S_hdr > seqno_file` 仍会虚报 `truncated_blocks`。
 - 文档收口：计划表补 R19/R20/R21 三批收口行（升版 v1.29）；spec §3 文件头 flag 语义写入「文件级能力锁定」。
+
+## R22 批次: R21 补强批次审查与收口 (2026-10-05)
+
+> 复核对象：R21 补强工作树改动（收口 `code_review_R22_2026-10-05.md`，R21 补强提交 `8c71afb`）。R22 裁定：**R21 补强 6 项全部成立**——撤销对照实验第三次独立复做与 CHANGELOG 记录逐字吻合（同时撤销缝跳过分支/能力锁定/scan_one 事件/rebuilt seqno 跳隙 4 处，恰好 `F1c`/`F3`/`F6b`/`F14` 复红、其余 157 项保持绿；失败断言 `seam_blocks_skipped 0 vs 1`、`raw_len actual: 3 vs 6`、`resume_seqno 6≠7` 与记录一字不差）；基线复跑 161+2+4+3 全绿；实验后源码 SHA-256 字节级还原、残留归零。R20「空洞绿」问题经此确认实质修复。**本批零代码改动**，全部为记录级修正。
+
+### 补强条目
+
+#### 1. F-1(P3): ninja 挂死「Git Bash 路径转换」归因勘误（R21-2 附带更正段证伪）
+- R21 勘误曾称「挂死疑为 Git Bash 把 `/c` 转成 `C:\`、cmd rc=0 空转所致，R21 未复现」。R22 在**纯 PowerShell 会话**（无 Git Bash、无路径转换环节）实证反例链：最小单规则工程真实执行挂死 / `-j 2` 挂 / `pool = console`（stdio 不经管道）挂 / **零工作量**空跑仍挂 / pip 装 jobserver-pipe 1.13.0 与 **VS 官方版 1.12.1 都挂**；`ninja -n` 空跑 0.0s 正常 ⇒ 挂点在执行前的启动机制（jobserver-pipe 变体启动即建命名管道，疑与本会话进程/管道类限制冲突）。
+- **裁定**：挂死属**会话级环境限制**——R19/R20 的原始挂死记录**恢复采信**，R21 的「未复现」亦真实，分歧在环境而非操作方式。`MSYS_NO_PATHCONV=1` 防的是 adb push/cmd 路径转换（既有记录不受影响），不是挂死根因。
+- **落盘**：计划表 R21-2「附带更正」段就地勘误；CHANGELOG R20 勘误框第 3 条与本节构建行两处反证补注；新增计划表纪律 **R22-1**——ninja 挂死时以 `ninja -t commands <target>` 抽取与 ninja 完全一致的命令行落 .bat 执行（R22 实测：2 编译 + lib + 4 链接 = 7 条命令，exit 0 / MSVC 诊断 0），并写明边界：头文件改动禁用该 fallback（增量依赖不可信，须回 R21-2 全量重建）；恢复可用环境后补跑全量重建核对。
+
+#### 2. F-2(P3): R22 报告自身「export 频次 2 次/文件」误报收口证伪
+- R22 报告初版推断 `logx_c.h` 契约注释「③ 每文件一次」与实现不符、可达 2 次/文件。收口修复时逐行复查证伪：`decode_one_file:92-93` 在每文件首次调用时**同步置位** `key_lookup_attempted`，循环内 :120-123 补偿分支被 `!key_lookup_attempted` 守卫**恒不可达**（唯一反例 `key_provider==NULL` 时两处均不调用）——实际频度**每文件恰好 1 次**，`logx_c.h` 注释本就准确，核心代码零改动；:120-123 按 R18「恒冗余守卫记录不改」惯例保留（属不可达防御死分支，未来引入密钥热插拔语义时可复活，届时须先做撤销实验）。
+- **落盘**：R22 报告 §一/§二/§五 就地勘误（原文保留于 §五 details 存档块）。「频次/可达性类发现落笔前须附控制流证据链」补入 R21-1 适用范围（报告自身亦受该纪律约束）。
+
+#### 3. 其余发现（3×Nit，记录不改动）
+- **N-1**：`F1c` 依赖 `copy_pending` 把回绕窗口线性化进 scratch（`raw_offset` 直接索引）——经代码核对成立，留痕备查；**N-2**：缝非全零 RECOVERY 分支（flusher.cpp:809-813「宁丢不脏」）零测试覆盖——构造需写侧 bug 或 staging 位翻转，难度高，留待变异测试补；**N-3**：未复跑清单（Android arm64 / 构建矩阵另两组 / Python decoder / ninja 全量重建以定向重建等价替代）如实。
+
+### 全量验证（R22 实测）
+- **基线复跑**（实验前）：单测 **161/161**、热路径 **2/2**、压力 **4/4**、崩溃 fork **3/3**。
+- **撤销对照实验（第三次独立执行）**：一次构建内同时撤销 4 处修复 → 恰好 `F1c`/`F3`/`F6b`/`F14` 复红、其余 9 个 R19Regression 用例保持绿；实验改动以 SHA-256 校验的备份字节级还原，`git grep "R22 EXPERIMENT"` 归零，还原后重建复跑 161+2+4+3 全绿。
+- **本批（R22 收口）**：零代码改动，文档修正不触发构建；未复跑清单沿用（Android arm64、构建矩阵另两组、Python decoder）。
