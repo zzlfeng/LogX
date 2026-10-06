@@ -1009,7 +1009,13 @@ TEST(R19Regression, ReadSideAcceptanceDomain_RawLenBounds) {
     EXPECT_TRUE(block_header_plausible(b, kBig, 0, false, nullptr, nullptr, nullptr, nullptr))
         << "write side's kBlockMaxRaw must be inside the read side's acceptance domain";
 
-    // 读侧上界: > 16MB 必拒(读侧上界刻意远宽于写侧的 20486, 二者不同源)
+    // 写侧缝并入上限 kBlockMaxRawWithSeam(20491, R26 方案A)必收(R27 N-1):
+    // R26 后写侧真实产出上限放宽至此, 读侧显式收容断言使契约边界不依赖 16MB 宽域推演
+    make_block_header(b, 7, kBlockMaxRawWithSeam, kBlockMaxRawWithSeam, 0, salt);
+    EXPECT_TRUE(block_header_plausible(b, kBig, 0, false, nullptr, nullptr, nullptr, nullptr))
+        << "write side's kBlockMaxRawWithSeam must be inside the read side's acceptance domain";
+
+    // 读侧上界: > 16MB 必拒(读侧上界刻意远宽于写侧的 20491, 二者不同源)
     make_block_header(b, 7, kPlausibleMax + 1, kPlausibleMax + 1, 0, salt);
     EXPECT_FALSE(block_header_plausible(b, kBig, 0, false, nullptr, nullptr, nullptr, nullptr));
     make_block_header(b, 7, kPlausibleMax, kPlausibleMax, 0, salt);

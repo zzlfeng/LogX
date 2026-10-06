@@ -74,6 +74,7 @@
 | `48875dd` | fix(core,test,decoder,spec): R26 B-9 流中部脏缝根除——R24 §7.2 方案A+B 组合落地(缝吸收上限 20491 + 窗口头前置消费 + 内层对称脏缝探测, 新增 F9) |
 | `c3d0feb` | docs: R26 批次收口——B-9 拍板记录 + CHANGELOG R26 章节 + 计划表 v1.34 + 提交表行 |
 | `5df4f9b` | docs: R26 真机复跑随行——CHANGELOG R26 章节第 7 项 |
+| `28d1f51` | docs: R27 审查报告入库——R26 批次独立复核 + 计划表 F-1 闭环 + reviews/README 登记 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -409,6 +410,15 @@ __declspec(noinline) void poison_r18_stack() {
    - **压测 4/4 全绿**（50 线程并发 + 崩溃恢复 50 轮）、**crash_fork 3/3 全绿**（真实进程 fork 强杀，含 50 轮循环）、**hotpath 2/2 全绿**（零堆分配门禁）。
    - 至此 **R26 修复在 Windows 桌面（163/163）与 Android 真机（164/164）双端闭环**。方案C（ActiveFileTarget 聚合）仍为遗留待决策。
 8. **已知残留**：R24 §7.2 条 4 **方案 C（ActiveFileTarget 聚合，收编 `key_provider` 五处调用点）**独立未实施，可并行推进；docs 收口提交见下（c3d0feb / 真机段随行提交）。
+
+## R27 批次: R26 复核收口——N-1 读侧接受域契约边界显式化 (2026-10-06)
+
+R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_review_R27_2026-10-06.md)）裁定 R26 批次完全成立，唯一缺陷 F-1（计划表滞后于 CHANGELOG）已随报告入库提交 `28d1f51` 闭环。本批落地报告遗留的最后一项建议：
+
+1. **N-1（Nit→落地）：`ReadSideAcceptanceDomain_RawLenBounds` 追加写侧新上限收容断言**：在 `tests/unit/test_r19_regression.cpp` 该用例中，对 `kBlockMaxRawWithSeam`(20491, R26 方案A 派生单源) 显式断言 `block_header_plausible` 必收——R26 后写侧真实产出上限已放宽至 20491，原用例仅钉死旧上限 20486，新契约边界依赖 16MB 宽域推演而非显式断言。同步将相邻注释过时数值 20486 更正为 20491。产品代码零改动。
+2. **反空洞绿验证（R18-2 门禁）**：变异实验——将读侧 `kBlockMaxRawPlausible` 临时收窄至 20490（恰落在 20486 与 20491 之间，模拟「读端未同步方案A」回归）定向重建后，`ReadSideAcceptanceDomain_RawLenBounds` 恰好复红（同套件其余 2 项保持绿）；实验后 flusher.cpp 以 SHA-256 字节级还原（`0F715FA…`，与 R26 基线一致）。
+3. **全量验证**：`build-full`（MSVC Release, ZSTD+AESGCM 全开）增量重建 + `logx_unit_tests.exe` **163/163 全绿**（17 套件，退出码 0）。未复跑清单沿用 R22（构建矩阵另两组、Android arm64、Python decoder——decoder 常量 20491 已在 R26 冒烟验证且本批零改动）。
+4. **遗留**：R24 §7.2 条 4 方案 C（ActiveFileTarget 聚合）保持待决策 Backlog（R27 N-3）。
 
 ---
 
