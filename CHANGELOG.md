@@ -76,6 +76,7 @@
 | `5df4f9b` | docs: R26 真机复跑随行——CHANGELOG R26 章节第 7 项 |
 | `28d1f51` | docs: R27 审查报告入库——R26 批次独立复核 + 计划表 F-1 闭环 + reviews/README 登记 |
 | `ebcb93c` | test: R27 收口——N-1 读侧接受域追加 `kBlockMaxRawWithSeam`(20491) 收容断言(变异实验实证刚性) |
+| `7cbe773` | refactor(flusher,test): R24 §7.2 方案 C——ActiveFileTarget 聚合与 key_provider 上下文内聚 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -419,7 +420,39 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
 1. **N-1（Nit→落地）：`ReadSideAcceptanceDomain_RawLenBounds` 追加写侧新上限收容断言**：在 `tests/unit/test_r19_regression.cpp` 该用例中，对 `kBlockMaxRawWithSeam`(20491, R26 方案A 派生单源) 显式断言 `block_header_plausible` 必收——R26 后写侧真实产出上限已放宽至 20491，原用例仅钉死旧上限 20486，新契约边界依赖 16MB 宽域推演而非显式断言。同步将相邻注释过时数值 20486 更正为 20491。产品代码零改动。
 2. **反空洞绿验证（R18-2 门禁）**：变异实验——将读侧 `kBlockMaxRawPlausible` 临时收窄至 20490（恰落在 20486 与 20491 之间，模拟「读端未同步方案A」回归）定向重建后，`ReadSideAcceptanceDomain_RawLenBounds` 恰好复红（同套件其余 2 项保持绿）；实验后 flusher.cpp 以 SHA-256 字节级还原（`0F715FA…`，与 R26 基线一致）。
 3. **全量验证**：`build-full`（MSVC Release, ZSTD+AESGCM 全开）增量重建 + `logx_unit_tests.exe` **163/163 全绿**（17 套件，退出码 0）。未复跑清单沿用 R22（构建矩阵另两组、Android arm64、Python decoder——decoder 常量 20491 已在 R26 冒烟验证且本批零改动）。
-4. **遗留**：R24 §7.2 条 4 方案 C（ActiveFileTarget 聚合）保持待决策 Backlog（R27 N-3）。
+4. **遗留**：已全部闭环（R24 §7.2 方案 C 随后落地，详见下文对应章节）。
+
+---
+
+## R24 §7.2 方案 C: ActiveFileTarget 聚合与 key_provider 上下文内聚 (2026-10-06)
+
+> **收口提交 `7cbe773`**（refactor(flusher,test)）。落实 R24 代码审查报告 §7.2 条 4「方案 C：文件追加目标聚合与 key_provider 上下文内聚」，根除 Flusher 线程跨函数重复 JNI 探测与状态双轨管理，实现 `logx_c.h` 声明的「每文件一次」密钥提取契约。
+
+1. **`ActiveFileTarget` 聚合结构体引入 (`core/src/flusher.cpp`)**：
+   - 提取活跃目标文件五元组：`fd`（文件句柄）、`path`（路径）、`salt[8]`（文件盐）、`enc_capable`（文件级加密能力锁定位，R21 F-5）、`key`（有效密钥指针）。
+   - 提供 `reset()` 方法安全清空句柄与元数据，指针置 `nullptr`，`salt` 零化。
+   - `FlusherCtx` 移除平铺字段 `current_fd`、`current_path`、`current_salt`、`current_enc_capable`，收敛为单一 `target: ActiveFileTarget`。
+2. **`open_or_create_append_target` 上下文内聚与单点取钥**：
+   - 入参重构：由散装指针改传 `ActiveFileTarget* out_target`。
+   - 新建文件分支（`sz == 0`）：探测密钥可用性、写入文件头 flag、拷贝 salt、并直接将获取的密钥缓存至 `out_target->key`。
+   - 已存在文件分支（续写）：回读文件头 flag 锁定 `enc_capable`；若声明加密则单点解析 `key_provider` 注入 `out_target->key`。
+   - 生命周期闭环：`close_current` 统一重置 `c->target.fd = -1` 与 `c->target.key = nullptr`，换文件或跨天时密钥缓存自动安全失效。
+3. **`drain_once` 纯无状态消费解耦**：
+   - 彻底移除栈上 `cached_key`、`key_fd` 局部变量及冗余查找逻辑。
+   - `drain_once` 转化为纯无状态消费者，仅依据 `inst->encrypt_enable`、`c->target.enc_capable` 与 `c->target.key != nullptr` 直接决策当块加密，杜绝同一轮建文件与写首块时重复触发重量级 JNI `AttachCurrentThread`/`DetachCurrentThread`。
+4. **专属回归用例 (`tests/unit/test_r19_regression.cpp`)**：
+   - 新增 `R19Regression.SchemeC_ActiveFileTarget_KeyProviderCalledOncePerFile`：
+     - `logx_open` 启动校验：`calls` 恰好为 1；
+     - 写入 20 条记录跨 2 轮 `logx_flush` 落盘同一目标：`calls` 累计恰好为 2（1 open + 1 建文件锁定；`drain_once` 消费 `target.key`，零二次调用）；
+     - 校验落盘文件头声明加密且块均为密文块；
+     - `logx_export` 导出解密：`calls` 累计恰好为 3（每文件 1 次），且 20 条日志完全无损解出。
+5. **全量实测验证**：
+   - `build-full`（MSVC Release，ZSTD+AESGCM 全开）构建 0 错误 0 警告；
+   - 单测 `logx_unit_tests.exe` **164/164 全绿**（17 套件，退出码 0）；
+   - 热路径 `logx_hotpath_alloc_tests.exe` **2/2 全绿**（0 堆分配）；
+   - 压力 `logx_stress_tests.exe` **4/4 全绿**（50 线程并发，Missing=0，50 轮崩溃注入 397/397 挽回）；
+   - 崩溃 fork `logx_crash_fork_tests.exe` **3/3 全绿**。
+6. **已知残留**：无。R24 §7.2 方案 A/B/C 全部闭环，Backlog B-9 彻底清零。
 
 ---
 
