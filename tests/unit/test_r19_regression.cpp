@@ -764,6 +764,131 @@ TEST(R19Regression, F6b_EncCapabilityLockedAtFileCreation_BlocksStayPlaintext) {
     logx_close(inst);
     cleanup_dir(dir);
 }
+
+// ============================================================
+// R24 §7.2 方案 C: ActiveFileTarget 聚合与 key_provider 上下文内聚。
+// 验证 key_provider 调用次数被严格限制在"每文件恰好一次"契约下:
+// - logx_open 期: 启动校验探测 1 次;
+// - 写入 20 条记录并触发多轮 flush (落盘到同一文件): 累计恰好 2 次
+//   (1 open 探活 + 1 建文件锁定; drain_once 消费 target.key, 绝不重复调用);
+// - logx_export 读取该文件: 累计恰好 3 次 (每文件读取 1 次)。
+// 同时断言落盘块均为加密块且导出内容完整可读(全部 20 行解出)。
+// ============================================================
+TEST(R19Regression, SchemeC_ActiveFileTarget_KeyProviderCalledOncePerFile) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r24_schemec_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    struct KeyCtx {
+        std::atomic<int> calls{0};
+        uint8_t key[32];
+    } kctx;
+    for (int i = 0; i < 32; ++i) kctx.key[i] = static_cast<uint8_t>(0xB0 + i);
+
+    EventProbe probe;
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.retention_days = 7;
+    cfg.max_file_size = 10 * 1024 * 1024;
+    cfg.flush_threshold = 0;
+    cfg.compress_algo = 0;
+    cfg.encrypt_enable = 1;
+    cfg.kid = 42;
+    cfg.user = &kctx;
+    cfg.key_provider = [](uint16_t, void* user) -> const uint8_t* {
+        auto* c = static_cast<KeyCtx*>(user);
+        c->calls.fetch_add(1);
+        return c->key;
+    };
+    cfg.err_fn = [](void* user, logx_event_kind_e k, int code, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, code, m);
+    };
+    cfg.err_user = &probe;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    // 1. open 期探测恰好 1 次
+    EXPECT_EQ(kctx.calls.load(), 1)
+        << "logx_open boot probe must query key_provider exactly once";
+
+    std::vector<uint8_t> payload(128, 'C');
+    // 第一批: 写入 10 条并 flush
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, "SCHEMEC", payload.data(),
+                             static_cast<uint32_t>(payload.size())), LOGX_OK);
+    }
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 第二批: 写入 10 条并再次 flush (跨轮 drain)
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, "SCHEMEC", payload.data(),
+                             static_cast<uint32_t>(payload.size())), LOGX_OK);
+    }
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    // 2. 累计调用恰好 2 次 (1 open + 1 建文件锁定; drain_once 消费 target.key, 绝不重复查询)
+    EXPECT_EQ(kctx.calls.load(), 2)
+        << "ActiveFileTarget must lock key once per file; drain_once must not re-query key_provider";
+
+    uint32_t today = 0, hhmmss = 0;
+    pal.wallclock_date(&today, &hhmmss);
+    std::string logfile = day_log_path(dir, today);
+
+    // 验证文件头声明加密且落盘块均为加密块
+    int fd = pal.file_open(logfile.c_str(), false, false);
+    ASSERT_GE(fd, 0);
+    uint8_t fhdr[32];
+    ASSERT_EQ(pal.file_pread(fd, fhdr, 32, 0), 32);
+    pal.file_close(fd);
+    EXPECT_EQ(get_u32(fhdr), kMagicFile);
+    EXPECT_NE(fhdr[5] & kFlagEncrypted, 0)
+        << "file header must declare encryption when key is provided";
+
+    std::vector<DiskBlock> blks;
+    ASSERT_TRUE(scan_disk_blocks(logfile, &blks));
+    ASSERT_FALSE(blks.empty());
+    for (const auto& b : blks) {
+        EXPECT_NE(b.flag & kFlagEncrypted, 0)
+            << "blocks written with cached key must be encrypted";
+    }
+
+    // 3. 导出该文件: key_provider 恰好再被调用 1 次 (累计 3 次)
+    struct ExportCtx {
+        int files = 0;
+        int lines = 0;
+    } exp_ctx;
+
+    logx_status_e erc = logx_export(inst, "20200101", "20991231",
+        [](void* user, const char*, const char* path, uint64_t size) -> int {
+            auto* c = static_cast<ExportCtx*>(user);
+            if (size > 0) {
+                c->files++;
+                Pal& p = default_pal();
+                int exp_fd = p.file_open(path, false, false);
+                if (exp_fd >= 0) {
+                    std::vector<char> buf(size);
+                    p.file_pread(exp_fd, buf.data(), size, 0);
+                    p.file_close(exp_fd);
+                    for (uint64_t i = 0; i < size; ++i) {
+                        if (buf[i] == '\n') c->lines++;
+                    }
+                }
+            }
+            return 0;
+        }, &exp_ctx);
+    EXPECT_EQ(erc, LOGX_OK);
+    EXPECT_EQ(exp_ctx.files, 1);
+    EXPECT_EQ(exp_ctx.lines, 20)
+        << "all 20 written records must be decoded and exported successfully";
+    EXPECT_EQ(kctx.calls.load(), 3)
+        << "export must query key_provider exactly once for this file, totaling 3 calls";
+
+    logx_close(inst);
+    cleanup_dir(dir);
+}
 #endif  // LOGX_WITH_AESGCM
 
 // ============================================================

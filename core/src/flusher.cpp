@@ -524,22 +524,32 @@ FileScanResult scan_one(Instance* inst, const std::string& path, bool repair) {
     return r;
 }
 
+// R24 §7.2 方案 C: 文件追加目标聚合上下文
+struct ActiveFileTarget {
+    int fd = -1;
+    std::string path;
+    uint8_t salt[8] = {0};
+    bool enc_capable = false;
+    const uint8_t* key = nullptr;  // 当前活跃文件的有效密钥缓存 (换文件即失效重取)
+
+    void reset() {
+        fd = -1;
+        path.clear();
+        std::memset(salt, 0, sizeof(salt));
+        enc_capable = false;
+        key = nullptr;
+    }
+};
+
 // 在 hint_path 命中失败时,从 log_dir 扫所有文件;选"文件名日期最大且尾块
 // seqno 最大"者作为追加目标。
 // 打开/创建追加目标文件;返回 fd;失败 -1。
-// *out_path / *out_salt 由调用方在 retry 时复用。
-// *out_enc_capable (R21 F-5): 本文件的加密能力, 由本函数一次性锁定后交回调用方
-//   持有(FlusherCtx::current_enc_capable)——新建文件取"建文件时刻能否取到密钥"
-//   的探测结果, 已存在文件取其文件头 flag 的加密位。锁定后本文件生命周期内所有
-//   块一律按此能力落盘, 使"文件头声明 == 本文件全部块形态"在 encrypt_enable
-//   开启期间成为不变量(杜绝 R21 F-5 的反向竞态: 建文件时无钥→头声明明文, 随后
-//   密钥恢复→drain_once 写出密文块)。
+// R24 §7.2 方案 C: 一次性解析并填充 ActiveFileTarget 全部字段 (fd, path, salt, enc_capable, key)。
 int open_or_create_append_target(Instance* inst, const std::string& hint_path,
                                  uint32_t date, uint16_t split_no,
-                                 std::string* out_path,
-                                 uint8_t out_salt[8],
-                                 bool* out_enc_capable) {
-    if (out_enc_capable) *out_enc_capable = true;
+                                 ActiveFileTarget* out_target) {
+    if (!out_target) return -1;
+    out_target->reset();
     std::string path = hint_path.empty()
         ? make_log_path(inst->log_dir, date, split_no)
         : hint_path;
@@ -567,22 +577,29 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
             return -1;
         }
         // R20 复核 (F-6 残留) + R21 F-5 (能力锁定): 建文件时刻探测密钥可用性,
-        // 探测结果即本文件的加密能力, 文件头加密位与之一致; 该能力被调用方锁定
-        // 持有, 本文件后续所有块一律按此落盘(即便密钥稍后恢复可用也不再改口),
-        // 因此"头声明 == 本文件全部块形态"恒成立。
+        // 探测结果即本文件的加密能力, 文件头加密位与之一致;
+        // R24 §7.2 方案 C: 将探测所得 key 直接缓存进 ActiveFileTarget, 杜绝同一轮
+        // 建文件与写首块时重复触发 JNI key_provider 调用。
         bool enc_capable = true;
-        if (inst->encrypt_enable != 0 &&
-            (!inst->key_provider || !inst->key_provider(inst->kid, inst->key_user))) {
-            enc_capable = false;
-            emit_event(inst, LOGX_EV_DEGRADED, -1,
-                       "key unavailable at file creation; this file stays plaintext "
-                       "(header written without encrypted bit) until rollover");
+        const uint8_t* key = nullptr;
+        if (inst->encrypt_enable != 0) {
+            if (inst->key_provider) {
+                key = inst->key_provider(inst->kid, inst->key_user);
+            }
+            if (!key) {
+                enc_capable = false;
+                emit_event(inst, LOGX_EV_DEGRADED, -1,
+                           "key unavailable at file creation; this file stays plaintext "
+                           "(header written without encrypted bit) until rollover");
+            }
         }
-        if (out_enc_capable) *out_enc_capable = enc_capable;
         if (!write_file_header(inst, fd, date, inst->kid, salt, enc_capable)) {
             inst->pal->file_close(fd); return -1;
         }
-        std::memcpy(out_salt, salt, 8);
+        std::memcpy(out_target->salt, salt, 8);
+        out_target->enc_capable = enc_capable;
+        out_target->key = key;
+
         // 新建文件后对文件和父目录 fsync 一次 (spec §10 / T4.0-12)
         if (inst->pal->file_fsync(fd) != 0) {
             emit_event(inst, LOGX_EV_IO, -1, "new file fsync failed");
@@ -593,12 +610,22 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
     } else {
         // 已存在:读头取 salt 与加密位。加密位即本文件的既有能力(R21 F-5)——
         // 续写不得改口, 否则同一文件内块形态与文件头声明分裂。
+        // R24 §7.2 方案 C: 若文件声明加密, 一次性解析密钥并缓存进 ActiveFileTarget。
         uint8_t hdr[32];
         if (inst->pal->file_pread(fd, hdr, 32, 0) != 32) { inst->pal->file_close(fd); return -1; }
-        std::memcpy(out_salt, hdr + 12, 8);
-        if (out_enc_capable) *out_enc_capable = flag_encrypted(hdr[5]);
+        std::memcpy(out_target->salt, hdr + 12, 8);
+        out_target->enc_capable = flag_encrypted(hdr[5]);
+        out_target->key = nullptr;
+        if (out_target->enc_capable && inst->encrypt_enable != 0 && inst->key_provider) {
+            out_target->key = inst->key_provider(inst->kid, inst->key_user);
+            if (!out_target->key) {
+                emit_event(inst, LOGX_EV_DEGRADED, -1,
+                           "missing key; downgrading block to plaintext");
+            }
+        }
     }
-    if (out_path) *out_path = path;
+    out_target->fd = fd;
+    out_target->path = std::move(path);
     return fd;
 }
 
@@ -648,24 +675,19 @@ void retention_cleanup_impl(Instance* inst) {
 // ---- §D Flusher 主循环 ----
 struct FlusherCtx {
     Instance* inst = nullptr;
-    std::string current_path;     // 当前活跃文件路径
+    ActiveFileTarget target;        // 聚合活跃文件目标 (R24 §7.2 方案 C)
     uint32_t current_date = 0;
     uint16_t current_split = 0;
-    uint8_t  current_salt[8] = {0};
-    int      current_fd = -1;
     uint64_t current_size = 0;
     bool     date_changed = true;   // 启动时强制为 true,触发首次 target 选择
-    // 本文件的加密能力, 由 open_or_create_append_target 在开/建文件时锁定
-    // (R21 F-5)。仅在 current_fd 重新打开时刷新; drain_once 每块据此组装 flag,
-    // 保证"文件头声明 == 本文件全部块形态"。
-    bool     current_enc_capable = true;
     std::vector<uint8_t> scratch;   // P3-2: 常驻复用缓冲,避免每 75ms 轮询分配 128KB
 };
 
 void close_current(FlusherCtx* c, Pal* pal) {
-    if (c->current_fd >= 0) {
-        int fd_to_close = c->current_fd;
-        c->current_fd = -1;
+    if (c->target.fd >= 0) {
+        int fd_to_close = c->target.fd;
+        c->target.fd = -1;
+        c->target.key = nullptr;
         if (c->inst) {
             c->inst->active_log_fd.store(-1, std::memory_order_release);
         }
@@ -677,16 +699,16 @@ void close_current(FlusherCtx* c, Pal* pal) {
 }
 
 // 决定"这一轮的追加目标文件";失败/跨天时切换。
-// 返回 fd;失败 -1。*out_salt 写到调用方缓冲。
+// 返回 fd;失败 -1。
 int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
-    if (!c->date_changed && c->current_fd >= 0) {
+    if (!c->date_changed && c->target.fd >= 0) {
         if (!should_rotate_file_size(c->current_size, inst->max_file_size)) {
-            return c->current_fd;
+            return c->target.fd;
         }
     }
 
     close_current(c, inst->pal);
-    if (c->current_path.empty()) {
+    if (c->target.path.empty()) {
         // 优先用 hint(追加目标缓存)
         std::string hint;
         if (inst->staging) {
@@ -706,7 +728,7 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
             FileScanResult sr = scan_append_target(inst, hint);  // 命中即修复截断
             if (sr.ok && !sr.truncated && sr.last_block_end_offset > 0) {
                 // 命中并校验过
-                c->current_path = hint;
+                c->target.path = hint;
                 if (!parse_log_filename(sr.path, &c->current_date, &c->current_split)) {
                     c->current_date = today;
                     c->current_split = 0;
@@ -718,7 +740,7 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
 
     // 跨天:轮换到新文件并清理超期日志
     if (c->current_date != today) {
-        c->current_path.clear();
+        c->target.path.clear();
         c->current_date = today;
         c->current_split = 0;
         // R16 F-5: 昨日尾文件的 size 不跨天沿用——若保留, 跨天后首个
@@ -741,26 +763,22 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
             c->current_split += 1;
         } while (inst->pal->file_size_path(
             make_log_path(inst->log_dir, c->current_date, c->current_split).c_str()) >= 0);
-        c->current_path.clear();
+        c->target.path.clear();
         c->current_size = 0;
         close_current(c, inst->pal);
     }
 
-    if (c->current_fd < 0) {
-        bool enc_capable = true;
-        c->current_fd = open_or_create_append_target(inst, c->current_path,
-                                                     c->current_date, c->current_split,
-                                                     &c->current_path,
-                                                     c->current_salt,
-                                                     &enc_capable);
-        if (c->current_fd < 0) return -1;
-        c->current_enc_capable = enc_capable;   // R21 F-5: 锁定本文件能力
-        inst->active_log_fd.store(c->current_fd);
-        int64_t sz = inst->pal->file_size(c->current_fd);
+    if (c->target.fd < 0) {
+        int fd = open_or_create_append_target(inst, c->target.path,
+                                              c->current_date, c->current_split,
+                                              &c->target);
+        if (fd < 0) return -1;
+        inst->active_log_fd.store(c->target.fd);
+        int64_t sz = inst->pal->file_size(c->target.fd);
         c->current_size = sz < 0 ? 0 : static_cast<uint64_t>(sz);
     }
     c->date_changed = false;
-    return c->current_fd;
+    return c->target.fd;
 }
 
 void drain_once(FlusherCtx* c, Instance* inst) {
@@ -841,10 +859,6 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     // 当前写指针;清零 [f, f+raw_len) 后需要推进;按块依次 commit。
     uint32_t cur_f = f;
 
-    // key_provider 结果缓存, 以 fd 为键(见 5.1b): 换文件即失效重取。
-    const uint8_t* cached_key = nullptr;
-    int key_fd = -1;
-
     for (const auto& blk : blocks) {
         if (blk.raw_len == 0) continue;
 
@@ -907,35 +921,23 @@ void drain_once(FlusherCtx* c, Instance* inst) {
             continue;
         }
 
-        // 5.1b 逐块组装 flag 并取 key(R21 F-5: 加密位受"本文件锁定能力"约束)。
-        // key 按 (本轮 drain, 当前 fd) 缓存: Android 侧 key_provider 是 JNI
-        // trampoline, Flusher 线程每次调用都要 AttachCurrentThread/DetachCurrentThread
-        // (重量级), 逐块重取会使调用次数从"每轮一次"放大到"每块一次"。缓存以 fd 为
-        // 键 ⇒ 跨天/切分换文件即失效重取。缺钥降级只作用于当块(不再像旧实现那样
-        // 就地清 flag, 把降级静默泄漏给同一轮 drain 的后续块)。
-        uint8_t flag = make_flag(inst->compress_algo,
-                                 inst->encrypt_enable != 0 && c->current_enc_capable);
-        if ((flag & kFlagEncrypted) && inst->key_provider) {
-            if (key_fd != fd) {
-                key_fd = fd;
-                cached_key = inst->key_provider(inst->kid, inst->key_user);
-                if (!cached_key) {
-                    emit_event(inst, LOGX_EV_DEGRADED, -1,
-                               "missing key; downgrading block to plaintext");
-                }
-            }
-        }
-        const uint8_t* key = cached_key;
-        if (!key) flag &= ~kFlagEncrypted;
+        // 5.1b 逐块组装 flag (R24 §7.2 方案 C: ActiveFileTarget 统一持有 salt / enc_capable / key)
+        // 密钥由 open_or_create_append_target 在开/建文件时一次性解析锁定, drain_once 仅作为
+        // 无状态消费者直接读取 c->target.key, 消除局部变量 cached_key/key_fd 及跨函数重复 JNI 探测。
+        bool encrypt_this_block = (inst->encrypt_enable != 0) &&
+                                  c->target.enc_capable &&
+                                  (c->target.key != nullptr);
+        uint8_t flag = make_flag(inst->compress_algo, encrypt_this_block);
+        const uint8_t* key = encrypt_this_block ? c->target.key : nullptr;
 
         // 5.2 编码 + 写盘;seqno 取自当前 staging Header
         uint32_t cur_seqno = get_u32(inst->staging->raw_base() + 8);
-        BlockWriteResult wr = write_and_record(inst, fd,
+        BlockWriteResult wr = write_and_record(inst, c->target.fd,
                                                c->scratch.data() + blk.raw_offset,
                                                blk.raw_len,
                                                cur_seqno + 1,
                                                flag,
-                                               c->current_salt,
+                                               c->target.salt,
                                                key);
         if (!wr.ok) {
             emit_event(inst, LOGX_EV_IO, -1, "write block failed");
