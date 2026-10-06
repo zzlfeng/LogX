@@ -28,6 +28,7 @@
 | [code_review_R22_2026-10-05.md](code_review_R22_2026-10-05.md) | R22 审查(R21 补强复核) | 主文件 R22 批次 |
 | [code_review_R23_2026-10-05.md](code_review_R23_2026-10-05.md) | R23 审查(R22 代码优化补丁裁定) | 主文件 R25 批次 |
 | [code_review_R24_2026-10-05.md](code_review_R24_2026-10-05.md) | R24 独立验证与 §7.1 处方 | 主文件 R25 批次 |
+| [code_review_R27_2026-10-06.md](code_review_R27_2026-10-06.md) | R27 审查(R26 批次独立复核) | 主文件 R26 批次 |
 
 ## 说明
 

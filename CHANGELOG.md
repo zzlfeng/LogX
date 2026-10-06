@@ -72,6 +72,8 @@
 | `b9056e6` | fix(core,test,docs): R25 止血——F7 单测补 flush (F-1) + split_impl 窗口头脏缝识别 (F-2) + CHANGELOG 勘误 |
 | `11fef10` | docs: CHANGELOG 拆分归档(docs/changelog/archive-2026-09.md, 2132→443 行) + 审查报告 21 份迁入 docs/reviews/ 入库 + 交叉引用修正 |
 | `48875dd` | fix(core,test,decoder,spec): R26 B-9 流中部脏缝根除——R24 §7.2 方案A+B 组合落地(缝吸收上限 20491 + 窗口头前置消费 + 内层对称脏缝探测, 新增 F9) |
+| `c3d0feb` | docs: R26 批次收口——B-9 拍板记录 + CHANGELOG R26 章节 + 计划表 v1.34 + 提交表行 |
+| `5df4f9b` | docs: R26 真机复跑随行——CHANGELOG R26 章节第 7 项 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -394,7 +396,7 @@ __declspec(noinline) void poison_r18_stack() {
 
 ## R26 批次: B-9 流中部脏缝根除——R24 §7.2 方案A+B 组合落地 (2026-10-06)
 
-> **收口提交 `48875dd`**（fix(core,test,decoder,spec)）；用户拍板「B-9 采纳方案 A+B 组合，立项 R26」（同日）。R24 报告本体 `code_review_R24_2026-10-05.md`（§7.2 处方）。
+> **收口提交 `48875dd`**（fix(core,test,decoder,spec)）；用户拍板「B-9 采纳方案 A+B 组合，立项 R26」（同日）。R24 报告本体 `code_review_R24_2026-10-05.md`（§7.2 处方）。独立审查报告 [`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_review_R27_2026-10-06.md)（总裁定完全成立，双撤销+单撤销实验逐字闭环，1 项文档不同步缺陷闭环收口）。
 
 1. **方案A（缝并入块尾，F1b 型微块根除）**：缝吸收上限由 `kBlockMaxRaw`(20486) 放宽至 **`kBlockMaxRawWithSeam = kBlockMaxRaw + (kHeaderLen-1) = 20491`**（`logx_staging.h` 派生单源，读端兼容性逐端注释）；`split_impl` 三处吸收点统一放宽——内层纯零缝吸收、16KB 封块边界缝吸收、窗口尾吸收。F1b 场景（满长记录 + 缝）形态从 `[20486][3][2500]` 变为 **`[20489][2500]`**，缝由读侧 `parse_records_stream` 块尾 <6B 原生 break 消费。
 2. **方案B（窗口头缝前置消费，F1c 型微块根除）**：`drain_once` 在 `copy_pending` 前于锁内检测 `pending > 0 && data_size - f < kHeaderLen`——**全零缝**清零区间、`f=0`、提交 Header，并计入 `seam_blocks_skipped` 与 `flushed_bytes_total`；缝字节自此不进入切块层。**非全零缝不吞**（保留 R25 F-2 腐坏可见性），交切块层窗口头脏缝探测处置。实施中发现并修复前置消费漏计 `flushed_bytes_total` 缺陷——`staged_bytes_total` 侧 `consumed = pad + total` 已含 pad（`logx_c.cpp:540`），漏计会使 `flush_blocking` 进度环失配、空转至超时误报。
