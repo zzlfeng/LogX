@@ -402,7 +402,11 @@ __declspec(noinline) void poison_r18_stack() {
 4. **对 R24 §7.2 字面清单的必要修正**：「整体拆除 drain_once 微块拦截/全零校验/计数/RECOVERY 分支」的前提是微块绝迹，但**脏缝残片处置本身仍产出微块**（窗口头非全零缝 + 流中部脏缝），拆除会使脏字节直接落盘（读侧 break/截断，比现状更糟）。故拦截分支**保留**、语义收敛为「脏缝残片处置」（常规全零缝已由 A+B 源头消解、不再可达），并以**双撤销对照实验**实证纵深结构的必要性（见第 6 项）。
 5. **读端四端同步核验**（R24 三重论据遗漏第四端）：① `block_header_plausible` 上界 16MB ✓；② zstd `kDecompressOutputMax = kBlockMaxRaw+64 = 20550 ≥ 20491` ✓；③ **Python 解码器 `MAX_BLOCK_RAW = 20486 → 20491`**（若无同步，合法 20491B 块会被 F-05 严检拒绝）✓；④ `parse_records_stream` 块尾 <6B 原生 break ✓。spec §3.3 块上限与缝处置契约同步修订（20491 + 三路径处置形态）。
 6. **验证与撤销对照（R18-2 门禁）**：全量重建 **56/56**（0 错误 0 警告，ninja 未挂死）；单测 **163/163 全绿**（17 套件，新增 F9）；压测 **4/4**、crash_fork **3/3**、hotpath **2/2**；**双撤销实验**——同时禁用「前置消费 + 拦截分支」→ `F1c` 计数断言与落盘 `raw_len 3 vs 6` 双断言复红、`F7` RECOVERY 断言复红（纵深防御缺一即漏）；**单撤销实验**——禁用内层探测 → `F9` 形态断言复红；恢复后 flusher.cpp **SHA-256 字节级还原**（`0F715FA…`）全量复绿；decoder 冒烟 `MAX_BLOCK_RAW = 20491` ✓。`F1b` 改名反转断言（`SeamAbsorbedIntoBlockTail`）、`F1c` 注释同步（防线前移说明）、`F7` 零改动通过。
-7. **已知残留**：R24 §7.2 条 4 **方案 C（ActiveFileTarget 聚合，收编 `key_provider` 五处调用点）**独立未实施，可并行推进；Android 真机复跑待下批随行。
+7. **Android 真机全量复跑验证（2026-10-06，用户连接设备随行执行）**：设备 Redmi K30 Pro（arm64-v8a，Android 12/API 31，`192.168.1.102:42339`）；`build-android-tests` 增量重编 **26/26 步**（覆盖 R26 的 `flusher.cpp`/`logx_staging.h`/测试改动；1 条无害警告沿 R25 记录），推送 `/data/local/tmp/logx_test/` 实跑四套件：
+   - **单测 164/164 全绿**（17 套件；桌面 163 + 设备专属 `CodecTest.ArmCe_HardwarePathOnDevice`）。**R19 缝四件套真机全通过**：`F1b_SeamAbsorbedIntoBlockTail`（R26 新形态）、`F9_MidStreamCorruptSeam_NeverFusedIntoBlock`（R26 新增）、`F1c`（前置消费路径，55ms）、`F7`（脏缝 RECOVERY 路径，34ms）。
+   - **压测 4/4 全绿**（50 线程并发 + 崩溃恢复 50 轮）、**crash_fork 3/3 全绿**（真实进程 fork 强杀，含 50 轮循环）、**hotpath 2/2 全绿**（零堆分配门禁）。
+   - 至此 **R26 修复在 Windows 桌面（163/163）与 Android 真机（164/164）双端闭环**。方案C（ActiveFileTarget 聚合）仍为遗留待决策。
+8. **已知残留**：R24 §7.2 条 4 **方案 C（ActiveFileTarget 聚合，收编 `key_provider` 五处调用点）**独立未实施，可并行推进；docs 收口提交见下（c3d0feb / 真机段随行提交）。
 
 ---
 
