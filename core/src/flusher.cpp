@@ -549,10 +549,11 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
                                  uint32_t date, uint16_t split_no,
                                  ActiveFileTarget* out_target) {
     if (!out_target) return -1;
-    out_target->reset();
+    // 先拷贝解析 path, 消除 hint_path 与 out_target->path 别名导致的入参被 reset() 提前清空隐患
     std::string path = hint_path.empty()
         ? make_log_path(inst->log_dir, date, split_no)
         : hint_path;
+    out_target->reset();
     int fd = inst->pal->file_open(path.c_str(), true, true);
     if (fd < 0) return -1;
     int64_t sz = inst->pal->file_size(fd);
@@ -699,8 +700,9 @@ void close_current(FlusherCtx* c, Pal* pal) {
 }
 
 // 决定"这一轮的追加目标文件";失败/跨天时切换。
-// 返回 fd;失败 -1。
-int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
+// 返回 fd;失败 -1。*out_is_new_target 指示本次调用是否新打开/创建了文件。
+int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst, bool* out_is_new_target = nullptr) {
+    if (out_is_new_target) *out_is_new_target = false;
     if (!c->date_changed && c->target.fd >= 0) {
         if (!should_rotate_file_size(c->current_size, inst->max_file_size)) {
             return c->target.fd;
@@ -773,6 +775,7 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst) {
                                               c->current_date, c->current_split,
                                               &c->target);
         if (fd < 0) return -1;
+        if (out_is_new_target) *out_is_new_target = true;
         inst->active_log_fd.store(c->target.fd);
         int64_t sz = inst->pal->file_size(c->target.fd);
         c->current_size = sz < 0 ? 0 : static_cast<uint64_t>(sz);
@@ -859,6 +862,9 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     // 当前写指针;清零 [f, f+raw_len) 后需要推进;按块依次 commit。
     uint32_t cur_f = f;
 
+    // R24 §7.2 方案 C (P3-2 方案 b): 标记本轮 drain 是否已尝试重探密钥, 确保每轮至多探一次
+    bool retry_key_probed = false;
+
     for (const auto& blk : blocks) {
         if (blk.raw_len == 0) continue;
 
@@ -900,7 +906,8 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         }
 
         // 5.1 决定追加目标文件(跨天/切分)
-        int fd = ensure_append_target(c, yyyymmdd, inst);
+        bool is_new_target = false;
+        int fd = ensure_append_target(c, yyyymmdd, inst, &is_new_target);
         atc.date = c->current_date;
         atc_set_split(&atc, c->current_split);
         if (fd < 0) {
@@ -922,8 +929,21 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         }
 
         // 5.1b 逐块组装 flag (R24 §7.2 方案 C: ActiveFileTarget 统一持有 salt / enc_capable / key)
-        // 密钥由 open_or_create_append_target 在开/建文件时一次性解析锁定, drain_once 仅作为
-        // 无状态消费者直接读取 c->target.key, 消除局部变量 cached_key/key_fd 及跨函数重复 JNI 探测。
+        // P3-2 方案 b: 若既有加密文件在 open 阶段缺钥 (target.key == nullptr),
+        // 在后续 drain 轮次中每轮尝试重探一次 key_provider (每轮至多一次, 绝不每块重探)。
+        // 一旦获取成功立即锁定至 target.key 并恢复密文写入; 稳态下 (target.key != nullptr) 条件不满足, 零 JNI 开销。
+        if (is_new_target) {
+            retry_key_probed = true;  // 新开/建文件已在 open_or_create_append_target 探测过一次
+        } else if (!retry_key_probed && c->target.enc_capable && (inst->encrypt_enable != 0) &&
+                   !c->target.key && inst->key_provider) {
+            retry_key_probed = true;
+            c->target.key = inst->key_provider(inst->kid, inst->key_user);
+            if (!c->target.key) {
+                emit_event(inst, LOGX_EV_DEGRADED, -1,
+                           "missing key; downgrading block to plaintext");
+            }
+        }
+
         bool encrypt_this_block = (inst->encrypt_enable != 0) &&
                                   c->target.enc_capable &&
                                   (c->target.key != nullptr);

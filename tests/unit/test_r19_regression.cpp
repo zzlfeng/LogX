@@ -889,6 +889,171 @@ TEST(R19Regression, SchemeC_ActiveFileTarget_KeyProviderCalledOncePerFile) {
     logx_close(inst);
     cleanup_dir(dir);
 }
+
+// ============================================================
+// R24 §7.2 方案 C (P3-2 方案 b): 续写加密文件若打开时刻缺钥 (target.key == nullptr),
+// 在后续 drain 轮次中每轮尝试重探 key_provider; 一旦恢复则立即锁定, 随后块恢复密文落盘。
+// 验证:
+// - 既有加密文件在 open 阶段密钥不可用 (调用 2 返回 NULL) -> 当轮 flush 以明文块落盘;
+// - 下一轮 drain 密钥恢复 (调用 3 返回有效 key) -> target.key 锁定, 该轮及后续块恢复为密文块;
+// - 第三轮 drain target.key 已锁定 -> 不再重复调用 key_provider;
+// - 最终导出: 验证所有块 (明文 + 密文) 均可正确完整解码导出。
+// ============================================================
+TEST(R19Regression, SchemeC_EncryptedFile_MissingKeyAtOpen_RecoversOnSubsequentDrain) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r24_schemec_p3_2_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    uint8_t static_key[32];
+    for (int i = 0; i < 32; ++i) static_key[i] = static_cast<uint8_t>(0xD0 + i);
+
+    // 第一阶段: 用常态密钥实例建立一个声明加密的日志文件, 写入 10 条密文日志
+    {
+        logx_config_t cfg{};
+        cfg.log_dir = dir.c_str();
+        cfg.staging_path = staging.c_str();
+        cfg.max_log_length = 64 * 1024;
+        cfg.retention_days = 7;
+        cfg.max_file_size = 10 * 1024 * 1024;
+        cfg.flush_threshold = 0;
+        cfg.compress_algo = 0;
+        cfg.encrypt_enable = 1;
+        cfg.kid = 42;
+        cfg.key_provider = [](uint16_t, void* user) -> const uint8_t* {
+            return static_cast<const uint8_t*>(user);
+        };
+        cfg.user = static_key;
+
+        logx_instance_t* inst1 = nullptr;
+        ASSERT_EQ(logx_open(&cfg, &inst1), LOGX_OK);
+        std::vector<uint8_t> payload(128, 'A');
+        for (int i = 0; i < 10; ++i) {
+            ASSERT_EQ(logx_write(inst1, 2, "STAGE1", payload.data(),
+                                 static_cast<uint32_t>(payload.size())), LOGX_OK);
+        }
+        ASSERT_EQ(logx_flush(inst1), LOGX_OK);
+        logx_close(inst1);
+    }
+
+    // 第二阶段: 重新打开该目录, 模拟有状态 key_provider
+    // 1st 调用: logx_open 探活 -> 返回 key (允许启动)
+    // 2nd 调用: open_or_create_append_target 续写打开 -> 返回 NULL (模拟暂时缺钥)
+    // 3rd 调用: 下一轮 drain 重试 -> 返回 key (模拟密钥恢复就绪)
+    struct StatefulKeyCtx {
+        std::atomic<int> calls{0};
+        const uint8_t* key = nullptr;
+    } kctx;
+    kctx.key = static_key;
+
+    EventProbe probe;
+    logx_config_t cfg2{};
+    cfg2.log_dir = dir.c_str();
+    cfg2.staging_path = staging.c_str();
+    cfg2.max_log_length = 64 * 1024;
+    cfg2.retention_days = 7;
+    cfg2.max_file_size = 10 * 1024 * 1024;
+    cfg2.flush_threshold = 0;
+    cfg2.compress_algo = 0;
+    cfg2.encrypt_enable = 1;
+    cfg2.kid = 42;
+    cfg2.user = &kctx;
+    cfg2.key_provider = [](uint16_t, void* user) -> const uint8_t* {
+        auto* c = static_cast<StatefulKeyCtx*>(user);
+        int n = c->calls.fetch_add(1) + 1;
+        if (n == 2) return nullptr;  // 仅在打开追加目标时缺钥
+        return c->key;
+    };
+    cfg2.err_fn = [](void* user, logx_event_kind_e k, int code, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, code, m);
+    };
+    cfg2.err_user = &probe;
+
+    logx_instance_t* inst2 = nullptr;
+    ASSERT_EQ(logx_open(&cfg2, &inst2), LOGX_OK);
+    EXPECT_EQ(kctx.calls.load(), 1);
+
+    // Batch 1 (缺钥轮次): 写入 5 条并 flush -> 降级为明文块落盘
+    std::vector<uint8_t> payload(128, 'B');
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(logx_write(inst2, 2, "STAGE2_B1", payload.data(),
+                             static_cast<uint32_t>(payload.size())), LOGX_OK);
+    }
+    ASSERT_EQ(logx_flush(inst2), LOGX_OK);
+    EXPECT_EQ(kctx.calls.load(), 2);
+    EXPECT_TRUE(probe.saw_msg_substring("missing key; downgrading block to plaintext"));
+
+    // Batch 2 (恢复轮次): 写入 5 条并 flush -> drain_once 重探成功, 恢复密文块落盘
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(logx_write(inst2, 2, "STAGE2_B2", payload.data(),
+                             static_cast<uint32_t>(payload.size())), LOGX_OK);
+    }
+    ASSERT_EQ(logx_flush(inst2), LOGX_OK);
+    EXPECT_EQ(kctx.calls.load(), 3);  // 第 3 次调用重探成功
+
+    // Batch 3 (锁定稳态轮次): 写入 5 条并 flush -> target.key 已锁定, 不再重探
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(logx_write(inst2, 2, "STAGE2_B3", payload.data(),
+                             static_cast<uint32_t>(payload.size())), LOGX_OK);
+    }
+    ASSERT_EQ(logx_flush(inst2), LOGX_OK);
+    EXPECT_EQ(kctx.calls.load(), 3);  // 保持 3 次, 无冗余调用
+
+    uint32_t today = 0, hhmmss = 0;
+    pal.wallclock_date(&today, &hhmmss);
+    std::string logfile = day_log_path(dir, today);
+
+    // 检查磁盘块:
+    // 应该包含: 阶段 1 密文块 + 阶段 2 Batch 1 明文块 + 阶段 2 Batch 2/3 密文块
+    std::vector<DiskBlock> blks;
+    ASSERT_TRUE(scan_disk_blocks(logfile, &blks));
+    ASSERT_GE(blks.size(), 3u);
+    // 第一块是密文
+    EXPECT_NE(blks.front().flag & kFlagEncrypted, 0);
+    // 至少有 1 块明文 (降级产物)
+    bool has_plaintext = false;
+    for (const auto& b : blks) {
+        if ((b.flag & kFlagEncrypted) == 0) has_plaintext = true;
+    }
+    EXPECT_TRUE(has_plaintext) << "degraded batch must produce plaintext block";
+    // 最后一块是密文 (恢复产物)
+    EXPECT_NE(blks.back().flag & kFlagEncrypted, 0)
+        << "recovered batch must produce encrypted block";
+
+    // 导出检验: 全部 10 + 5 + 5 + 5 = 25 条日志完整解码导出
+    struct ExportCtx {
+        int files = 0;
+        int lines = 0;
+    } exp_ctx;
+
+    logx_status_e erc = logx_export(inst2, "20200101", "20991231",
+        [](void* user, const char*, const char* path, uint64_t size) -> int {
+            auto* c = static_cast<ExportCtx*>(user);
+            if (size > 0) {
+                c->files++;
+                Pal& p = default_pal();
+                int exp_fd = p.file_open(path, false, false);
+                if (exp_fd >= 0) {
+                    std::vector<char> buf(size);
+                    p.file_pread(exp_fd, buf.data(), size, 0);
+                    p.file_close(exp_fd);
+                    for (uint64_t i = 0; i < size; ++i) {
+                        if (buf[i] == '\n') c->lines++;
+                    }
+                }
+            }
+            return 0;
+        }, &exp_ctx);
+    EXPECT_EQ(erc, LOGX_OK);
+    EXPECT_EQ(exp_ctx.files, 1);
+    EXPECT_EQ(exp_ctx.lines, 25)
+        << "all 25 written records (10 initial enc + 5 degraded plain + 10 recovered enc) must be exported";
+    EXPECT_EQ(kctx.calls.load(), 4)  // export 阶段该文件调用 1 次 key_provider
+        << "export must query key_provider once, totaling 4 calls";
+
+    logx_close(inst2);
+    cleanup_dir(dir);
+}
 #endif  // LOGX_WITH_AESGCM
 
 // ============================================================
