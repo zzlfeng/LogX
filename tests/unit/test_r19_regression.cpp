@@ -4,9 +4,12 @@
 //   [R19 F-1]  F1_SeamMidStream_SplitsWithinContract
 //              回绕缝在拷出缓冲中部 + 缝后积压 > kBlockMaxRaw → 块数 ≥ 2,
 //              每块 raw_len ∈ [kHeaderLen, kBlockMaxRaw](写侧产出 == 读侧可收)
-//   [R20 F-1]  F1b_SeamAfterFullLengthRecord_NoMicroBlock(切分层: 钉死场景确实
-//              产出 1~5B 缝独占块)+ F1c_WrapSeamAtPendingHead_MicroBlockNeverReachesDisk
-//              (落盘层: 缝独占块绝不进文件, 靠 drain_once 的跳过分支)
+//   [R20 F-1]  F1b_SeamAfterFullLengthRecord_SeamAbsorbedIntoBlockTail(切分层:
+//              R26 B-9 方案A 后缝并入块尾, 微块在切分层根除; 撤销放宽即复红)
+//              + F1c_WrapSeamAtPendingHead_MicroBlockNeverReachesDisk
+//              (落盘层: R26 方案B 后缝在 copy_pending 前置消费, 绝不进切块层)
+//   [R26 B-9]  F9_MidStreamCorruptSeam_NeverFusedIntoBlock(流中部脏缝: 先封当前
+//              块 + 缝残片独立微块, 绝不融合落盘; R26 新增, 撤销内层探测即复红)
 //   [R19 F-2]  F2_CloseInsideErrorCallback_SurvivesAndDefers
 //              错误回调内 logx_close → 安全返回, 后续 write 不 UAF(旧实现 0xC0000005;
 //              撤销表现为崩溃而非断言失败, 故未纳入撤销实验)
@@ -87,7 +90,9 @@ BlockBounds analyze_blocks(const std::vector<PendingBlock>& blocks) {
         b.max_len = std::max(b.max_len, blk.raw_len);
         b.covered += blk.raw_len;
         if (blk.raw_len > 0 && blk.raw_len < kHeaderLen) b.any_micro = true;
-        if (blk.raw_len > kBlockMaxRaw) b.any_oversize = true;
+        // R26 B-9: 缝并入块尾后写侧契约上限放宽至 kBlockMaxRawWithSeam(20491),
+        // 读侧接受域(block_header_plausible 16MB / zstd 20550 / decoder 20491)均容纳。
+        if (blk.raw_len > kBlockMaxRawWithSeam) b.any_oversize = true;
     }
     return b;
 }
@@ -250,14 +255,12 @@ TEST(R19Regression, F1_SeamMidStream_SplitsWithinContract) {
 }
 
 // ============================================================
-// R20 复核: 缝紧随满长记录 → 切分层必然产出 1~5B "缝独占块"。
-// 本用例钉死**场景有效性**(撤销 R19 缝封块修复 / 改动 kBlockMaxRaw 关系时复红);
-// 真正的处置防线在 drain_once 的 <kHeaderLen 跳过分支, 由 F1c 在落盘层守护。
-// R21 F-2 更正: 旧版名为 NoMicroBlock 却从不断言"无微块", 唯一相关断言
-// `any_micro || blocks.size() >= 2` 是恒真析取(后半支永远成立), 且微块被显式
-// 过滤后才断言区间——撤销 R20 修复本用例照样绿。
-// ============================================================
-TEST(R19Regression, F1b_SeamAfterFullLengthRecord_SplitPinsSeamOnlyBlock) {
+// R20 复核: 缝紧随满长记录 → 旧实现切块层产出 1~5B "缝独占块"(R20 探针 P2)。
+// R26 B-9(方案A) 落地后缝并入块尾(kBlockMaxRawWithSeam 放宽), 微块在切分层
+// 根除——本用例改名并反转断言钉死新契约; 撤销 R26 放宽 → 缝独占微块复现复红。
+// (R21 F-2 历史备注: 旧版 NoMicroBlock 的 any_micro 析取恒真断言问题, 已随
+//  R21 批次修正; 本轮 R26 契约反转后该备注保留在 CHANGELOG 历史原文中。)
+TEST(R19Regression, F1b_SeamAfterFullLengthRecord_SeamAbsorbedIntoBlockTail) {
     std::vector<uint8_t> raw;
     {
         auto r = make_entry(kBlockMaxRaw - kHeaderLen, 0xC3);
@@ -276,28 +279,69 @@ TEST(R19Regression, F1b_SeamAfterFullLengthRecord_SplitPinsSeamOnlyBlock) {
     // ① 覆盖完整缓冲、② 无超上限块
     EXPECT_EQ(bb.covered, raw.size());
     EXPECT_FALSE(bb.any_oversize);
-    // ③ 场景有效性: 必须真的产出 1~5B 缝独占块, 否则本用例什么都没测
-    EXPECT_TRUE(bb.any_micro)
-        << "scenario must produce a 1~5B seam-only block (full-length record + seam); "
-           "without it F1b/F1c exercise nothing";
-    // ④ 块序列形态钉死: [满长记录][3B 缝][50 条小记录]
-    ASSERT_EQ(blocks.size(), 3u);
-    EXPECT_EQ(blocks[0].raw_len, static_cast<uint32_t>(kBlockMaxRaw));
-    EXPECT_EQ(blocks[1].raw_len, 3u);            // 缝独占块
-    EXPECT_EQ(blocks[2].raw_len, 50u * 50u);
-    // ⑤ 除缝独占块外, 其余块全部落在读侧接受域 [kHeaderLen, kBlockMaxRaw]
+    // ③ R26 新契约: 微块在切分层根除——任何块 raw_len 均 ≥ kHeaderLen
+    EXPECT_FALSE(bb.any_micro)
+        << "R26 B-9: seam must be absorbed into block tail, no 1~5B seam-only block";
+    // ④ 块序列形态钉死: [满长记录 20486 + 3B 缝并入][50 条小记录]
+    ASSERT_EQ(blocks.size(), 2u);
+    EXPECT_EQ(blocks[0].raw_len, static_cast<uint32_t>(kBlockMaxRaw) + 3u);
+    EXPECT_EQ(blocks[1].raw_len, 50u * 50u);
+    // ⑤ 全部块落在读侧接受域 [kHeaderLen, kBlockMaxRawWithSeam]
     for (const auto& blk : blocks) {
-        if (blk.raw_len < kHeaderLen) continue;
         EXPECT_GE(blk.raw_len, kHeaderLen);
-        EXPECT_LE(blk.raw_len, kBlockMaxRaw);
+        EXPECT_LE(blk.raw_len, kBlockMaxRawWithSeam);
     }
 }
 
 // ============================================================
-// R20 F-1 的**落盘层**防线(R21 新增): 待刷窗口以 1~5B 留零缝开头时,
-// drain_once 必须跳过缝独占块——不编码、不落盘, 只推进水位。
-// 撤销 drain_once 的 `raw_len < kHeaderLen` 分支 → 3B 块进文件 → 本用例复红
-// (块头 raw_len 下界断言 + seam_blocks_skipped 计数断言双重捕获)。
+// R26 B-9(方案A 内层对称探测): 流中部脏缝——缝前仍有未刷记录、待刷窗口
+// 跨回绕时, 内层累计循环 rec==0 且 probe_wrap_seam==0(缝含脏字节), 旧实现
+// 走撕裂尾兜底把脏字节与后续全部记录融合成单块落盘(R25 独立诊断实证:
+// [100条][3B脏缝][50条] → 单块 8103/10903B, 无 RECOVERY、计数 0)。
+// R26 修复: 内层命中 corrupt_seam 即 break 封当前块, 缝残片由外层窗口头
+// 路径封 s 字节微块交 drain_once 全零校验/RECOVERY 丢弃, 绝不融合。
+// 撤销内层探测(恢复 R25 状态) → 融合单块复现 → ④ 形态断言复红。
+// ============================================================
+TEST(R19Regression, F9_MidStreamCorruptSeam_NeverFusedIntoBlock) {
+    std::vector<uint8_t> raw;
+    for (int i = 0; i < 100; ++i) {
+        auto r = make_entry(78, 0xA1);            // 84B × 100 = 8400B
+        raw.insert(raw.end(), r.begin(), r.end());
+    }
+    append_seam(raw, 3);
+    raw[raw.size() - 1] = 0xAA;                   // 位翻转: 末字节打脏, 缝不再全零
+    for (int i = 0; i < 50; ++i) {
+        auto r = make_entry(44, 0xD4);            // 50B × 50 = 2500B
+        raw.insert(raw.end(), r.begin(), r.end());
+    }
+    ASSERT_EQ(raw.size(), 100u * 84u + 3u + 50u * 50u);
+    std::vector<PendingBlock> blocks;
+    split_into_blocks(raw.data(), static_cast<uint32_t>(raw.size()), &blocks);
+
+    BlockBounds bb = analyze_blocks(blocks);
+    // ① 块链覆盖完整缓冲(融合/丢失都会破坏)
+    EXPECT_EQ(bb.covered, raw.size());
+    // ② 精确形态钉死: [100条 8400B][3B 脏缝微块][50条 2500B]
+    //    旧实现为单块 10903B(融合); 缝并入任一侧亦判伪
+    ASSERT_EQ(blocks.size(), 3u);
+    EXPECT_EQ(blocks[0].raw_len, 8400u);
+    EXPECT_EQ(blocks[1].raw_len, 3u) << "corrupt seam must be pinned as its own micro-block";
+    EXPECT_EQ(blocks[2].raw_len, 2500u);
+    // ③ 除 3B 微块外全部落在读侧接受域
+    for (const auto& blk : blocks) {
+        if (blk.raw_len < kHeaderLen) continue;
+        EXPECT_GE(blk.raw_len, kHeaderLen);
+        EXPECT_LE(blk.raw_len, kBlockMaxRawWithSeam);
+    }
+}
+
+// ============================================================
+// R20 F-1 的**落盘层**防线(R21 新增; R26 B-9 方案B 后防线前移):
+// 待刷窗口以 1~5B 留零缝开头时, 缝在 drain_once 的 copy_pending 前置消费
+// (锁内清零 + f=0 + 计数), F1c 型窗口头微块不再进入切块层, 缝字节绝不落盘。
+// 撤销前置消费分支 → 缝重新进入切块层 → 旧路径产出微块落盘 / R26 放宽后
+// 并入块尾(脏缝形态)——两种回归形态均被落盘断言与计数断言双重捕获。
+// (块链逐块 raw_len 下界断言 + seam_blocks_skipped 计数断言双重捕获)。
 // 场景构造: 填满环到 w == data_size-3 → flush(f 追平 w) → 再写一条 →
 // write_records 触发 pad=3<6 留零回绕 → 下一次 drain 的窗口正好以缝开头。
 // ============================================================

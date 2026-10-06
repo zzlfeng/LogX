@@ -228,6 +228,12 @@ private:
 constexpr uint32_t kBlockHeaderSize = 4 + 1 + 1 + 4 + 4 + 4 + 4 + 12;  // magic+ver+flag+seqno+raw+payload+crc+nonce = 34B (S-03)
 constexpr uint32_t kBlockGcmTagSize = 16;
 constexpr uint32_t kBlockMaxRaw = kMaxSlicePayload + kHeaderLen;  // 单条独占一块上限(20KB + 6B 记录头,R8 派生单源)
+// R26 B-9(方案A,R24 §7.2): 缝并入块尾后的块上限 = kBlockMaxRaw + 最多 5B 留零缝。
+// 读端兼容性(逐端核验): block_header_plausible 上界 16MB(flusher.cpp)✓;
+// zstd kDecompressOutputMax = kBlockMaxRaw+64 = 20550 ≥ 20491(codec.cpp)✓;
+// decoder MAX_BLOCK_RAW 同步至 20491(logx_decode.py, R26)✓;块尾 <6B 由
+// parse_records_stream 原生 break(format.cpp)✓。
+constexpr uint32_t kBlockMaxRawWithSeam = kBlockMaxRaw + (kHeaderLen - 1);
 constexpr uint32_t kBlockMaxNormal = 16 * 1024;             // 常规块 ≤ 16KB raw
 constexpr uint32_t kFileHeaderSize = 32;
 constexpr uint32_t kMagicFile = 0x4658474c;                  // 'LGXF'

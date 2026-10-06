@@ -61,7 +61,9 @@ FLAG_COMPRESS_SHIFT = 1
 # 单块解压输出上限 = kBlockMaxRaw (单条独占一块上限,含 6B 记录头)。
 # (D-05) C++ 写入端单块 raw ≤ 20KB+6,超限块头在 F-05 严检即被拒绝;
 # 解码端按同一契约收紧,防畸形帧触发过度内存分配 (原 64MB 过宽)。
-MAX_BLOCK_RAW = 20 * 1024 + 6
+# (R26 B-9 方案A) 上限放宽至 kBlockMaxRawWithSeam = 20KB+6+5 = 20491:
+# 留零缝(≤5B)并入块尾后的合法块上限,与 logx_staging.h 派生式严格对齐。
+MAX_BLOCK_RAW = 20 * 1024 + 6 + 5
 
 # ---------------- 文件格式 helpers ----------------
 def crc32_update(crc: int, data: bytes) -> int:

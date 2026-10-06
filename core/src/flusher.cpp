@@ -75,7 +75,7 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
                 pos += seam;
                 continue;
             }
-            // 脏缝探测 (R25 F-2): 若前 1..5 字节虽非纯零但其后紧随合法记录,
+            // 脏缝探测 (R25 F-2 / R26 B-9): 若前 1..5 字节虽非纯零但其后紧随合法记录,
             // 判定为被破坏的缝隙残片; 封为独立微块交付 drain_once 做全零校验与自愈丢弃
             uint32_t corrupt_seam = 0;
             for (uint32_t s = 1; s < kHeaderLen && pos + s < total; ++s) {
@@ -105,7 +105,8 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
         uint32_t cur = pos;
         while (cur < total) {
             if (total - cur < kHeaderLen) {
-                if (total - blk_begin <= kBlockMaxRaw) {
+                // R26 B-9(方案A): 窗口尾缝残留并入块尾, 上限放宽至 kBlockMaxRawWithSeam
+                if (total - blk_begin <= kBlockMaxRawWithSeam) {
                     cur = total;
                 }
                 break;
@@ -114,11 +115,28 @@ uint32_t split_impl(const uint8_t* raw, uint32_t total,
             if (rec == 0) {
                 uint32_t seam = probe_wrap_seam(raw, cur, total);
                 if (seam > 0) {
-                    // 回绕缝归入当前块并在此封块 (R19 F-1), 缝后记录另起新块
-                    if (cur + seam - blk_begin <= kBlockMaxRaw) {
+                    // 回绕缝归入当前块并在此封块 (R19 F-1 → R26 B-9 放宽上限):
+                    // 缝吸收判伪不再产出缝独占微块(F1b 型根除), 缝并入块尾由读侧
+                    // parse_records_stream 的块尾 <6B break 语义原生消费。
+                    if (cur + seam - blk_begin <= kBlockMaxRawWithSeam) {
                         cur += seam;
                     }
                     break;
+                }
+                // 脏缝探测 (R26 B-9): 内层累计中 rec==0 且 probe_wrap_seam==0 时,
+                // 与窗口头路径(R25 F-2)对称地探测 [cur, cur+kHeaderLen) 内是否存在
+                // 偏移 s∈[1,5] 使 cur+s 处为合法记录头; 命中则先封当前块 [blk_begin,cur),
+                // 缝残片留在原位由外层下一轮以窗口头路径封 s 字节微块交 drain_once
+                // 做全零校验/RECOVERY 丢弃——堵住 B-9 融合落盘现场(脏字节并入块尾)。
+                uint32_t corrupt_seam = 0;
+                for (uint32_t s = 1; s < kHeaderLen && cur + s < total; ++s) {
+                    if (peek_record_len(raw, cur + s, total) > 0) {
+                        corrupt_seam = s;
+                        break;
+                    }
+                }
+                if (corrupt_seam > 0) {
+                    break;  // 封 [blk_begin, cur); 外层窗口头路径处置缝残片
                 }
                 // 撕裂尾部: 封块, 但不得超过 kBlockMaxRaw 硬上限
                 uint32_t remain = total - cur;
@@ -753,6 +771,35 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     // 1) 锁内取快照判定 pending 字节数; 若无日志待刷, 零分配立即返回 (P3-2)
     uint32_t f = 0, snap = 0, bytes = 0;
     inst->pal->mutex_lock(inst->mu);
+    // R26 B-9(方案B, R24 §7.2): copy_pending 前置消费窗口头缝。缝只产生于
+    // write_records 的 pad<6 留零回绕(几何上仅存在于环尾 [data_size-k, data_size),
+    // k∈[1,5]), 因此 `pending>0 且 data_size-f < kHeaderLen` 当且仅当 f 停在缝前。
+    //   全零缝 → 锁内清零 + f=0, F1c 型窗口头微块自此不再进入切块层;
+    //   非全零 → 不吞(保留 R25 F-2 的腐坏检测语义), 交切块层窗口头脏缝探测封微块
+    //   走下方拦截分支 RECOVERY 丢弃(本轮窗口保持跨回绕, 缝仍在拷出流头部)。
+    // 前置后 scratch 拷出流恒从合法记录头开始, 拆除窗口头微块的成因(F1c 型根除)。
+    bytes = inst->staging->snapshot_pending(&f, &snap);
+    if (bytes > 0 && inst->staging->data_size() - f < kHeaderLen) {
+        const uint8_t* p = inst->staging->data_base() + f;
+        const uint32_t seam_len = inst->staging->data_size() - f;
+        bool seam_all_zero = true;
+        for (uint32_t i = 0; i < seam_len; ++i) {
+            if (p[i] != 0) { seam_all_zero = false; break; }
+        }
+        if (seam_all_zero) {
+            AppendTargetCache atc_seam{};
+            atc_seam.date = c->current_date;
+            atc_set_split(&atc_seam, c->current_split);
+            inst->staging->zero_range_locked(f, seam_len);
+            inst->staging->commit_header_locked(
+                get_u32(inst->staging->raw_base() + 8), 0,
+                get_u32(inst->staging->raw_base() + 16), &atc_seam);
+            inst->seam_blocks_skipped.fetch_add(1, std::memory_order_relaxed);
+            // 与既有跳过分支同口径: 缝字节计入 flushed_bytes_total —— 该计数是
+            // flush_blocking 的进度代理, 不计入会使纯缝刷盘空转到超时误报。
+            inst->flushed_bytes_total.fetch_add(seam_len, std::memory_order_relaxed);
+        }
+    }
     bytes = inst->staging->snapshot_pending(&f, &snap);
     if (bytes == 0) {
         inst->pal->mutex_unlock(inst->mu);
