@@ -70,6 +70,8 @@
 | `6d5da0e` | docs: R22 审查批次收口——ninja 挂死归因勘误 + R22-1 等价构建 fallback 纪律 (计划表 v1.30, 零代码改动) |
 | `66c5345` | fix(core,test): R22 代码优化补丁——清理 logx_c.cpp 死代码并补充 F7 微块测试覆盖率 (⚠️ F7 用例自提交起确定性失败, R23/R24 审查揭露, `b9056e6` 修复; 原提交「实测验证通过」声明不实, 勘误见下文 R22 代码优化补丁章节) |
 | `b9056e6` | fix(core,test,docs): R25 止血——F7 单测补 flush (F-1) + split_impl 窗口头脏缝识别 (F-2) + CHANGELOG 勘误 |
+| `11fef10` | docs: CHANGELOG 拆分归档(docs/changelog/archive-2026-09.md, 2132→443 行) + 审查报告 21 份迁入 docs/reviews/ 入库 + 交叉引用修正 |
+| `48875dd` | fix(core,test,decoder,spec): R26 B-9 流中部脏缝根除——R24 §7.2 方案A+B 组合落地(缝吸收上限 20491 + 窗口头前置消费 + 内层对称脏缝探测, 新增 F9) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -387,6 +389,20 @@ __declspec(noinline) void poison_r18_stack() {
    - **hotpath 2/2 全绿**：常规 400 条 + 截断 100 条写入，调用线程堆分配 **0 次/0B**。
    - 观测门禁：40k 条稳态负载 **ΔRSS=0 / ΔPSS=+8KB**（无泄漏）；OS 级 fd 基线=终值=16，Pal 层 fd/mmap/mutex/ev/thread 六轮 create/destroy **净 0**；写延迟中位 3646ns、**robustCV=0.014**（界 5.0）、P99/P50=27.61x（界 100）。
    - 构建仅 3 条无害编译警告（`test_concurrent.cpp` unused-lambda-capture/unused-variable、`test_r19_regression.cpp` unused-function），不影响结果。至此 **R25 修复在 Windows 桌面（162/162）与 Android 真机（163/163）双端闭环**；B-9 流中部脏缝残留不受平台影响，仍待 R26。
+
+---
+
+## R26 批次: B-9 流中部脏缝根除——R24 §7.2 方案A+B 组合落地 (2026-10-06)
+
+> **收口提交 `48875dd`**（fix(core,test,decoder,spec)）；用户拍板「B-9 采纳方案 A+B 组合，立项 R26」（同日）。R24 报告本体 `code_review_R24_2026-10-05.md`（§7.2 处方）。
+
+1. **方案A（缝并入块尾，F1b 型微块根除）**：缝吸收上限由 `kBlockMaxRaw`(20486) 放宽至 **`kBlockMaxRawWithSeam = kBlockMaxRaw + (kHeaderLen-1) = 20491`**（`logx_staging.h` 派生单源，读端兼容性逐端注释）；`split_impl` 三处吸收点统一放宽——内层纯零缝吸收、16KB 封块边界缝吸收、窗口尾吸收。F1b 场景（满长记录 + 缝）形态从 `[20486][3][2500]` 变为 **`[20489][2500]`**，缝由读侧 `parse_records_stream` 块尾 <6B 原生 break 消费。
+2. **方案B（窗口头缝前置消费，F1c 型微块根除）**：`drain_once` 在 `copy_pending` 前于锁内检测 `pending > 0 && data_size - f < kHeaderLen`——**全零缝**清零区间、`f=0`、提交 Header，并计入 `seam_blocks_skipped` 与 `flushed_bytes_total`；缝字节自此不进入切块层。**非全零缝不吞**（保留 R25 F-2 腐坏可见性），交切块层窗口头脏缝探测处置。实施中发现并修复前置消费漏计 `flushed_bytes_total` 缺陷——`staged_bytes_total` 侧 `consumed = pad + total` 已含 pad（`logx_c.cpp:540`），漏计会使 `flush_blocking` 进度环失配、空转至超时误报。
+3. **B-9 修正（流中部脏缝，本批核心）**：内层累计循环补**对称脏缝探测**——`rec == 0 && probe_wrap_seam == 0` 时扫 `[cur, cur+kHeaderLen)` 内合法记录头，命中即封当前块 `[blk_begin, cur)`，缝残片由外层窗口头路径封 s 字节微块交拦截分支 **RECOVERY 丢弃**。B-9 实证场景（`[100条][3B脏缝][50条]` 融合为 8103/10903B 单块）根除，新用例 `F9_MidStreamCorruptSeam_NeverFusedIntoBlock` 钉死 `[8400][3][2500]` 精确形态。
+4. **对 R24 §7.2 字面清单的必要修正**：「整体拆除 drain_once 微块拦截/全零校验/计数/RECOVERY 分支」的前提是微块绝迹，但**脏缝残片处置本身仍产出微块**（窗口头非全零缝 + 流中部脏缝），拆除会使脏字节直接落盘（读侧 break/截断，比现状更糟）。故拦截分支**保留**、语义收敛为「脏缝残片处置」（常规全零缝已由 A+B 源头消解、不再可达），并以**双撤销对照实验**实证纵深结构的必要性（见第 6 项）。
+5. **读端四端同步核验**（R24 三重论据遗漏第四端）：① `block_header_plausible` 上界 16MB ✓；② zstd `kDecompressOutputMax = kBlockMaxRaw+64 = 20550 ≥ 20491` ✓；③ **Python 解码器 `MAX_BLOCK_RAW = 20486 → 20491`**（若无同步，合法 20491B 块会被 F-05 严检拒绝）✓；④ `parse_records_stream` 块尾 <6B 原生 break ✓。spec §3.3 块上限与缝处置契约同步修订（20491 + 三路径处置形态）。
+6. **验证与撤销对照（R18-2 门禁）**：全量重建 **56/56**（0 错误 0 警告，ninja 未挂死）；单测 **163/163 全绿**（17 套件，新增 F9）；压测 **4/4**、crash_fork **3/3**、hotpath **2/2**；**双撤销实验**——同时禁用「前置消费 + 拦截分支」→ `F1c` 计数断言与落盘 `raw_len 3 vs 6` 双断言复红、`F7` RECOVERY 断言复红（纵深防御缺一即漏）；**单撤销实验**——禁用内层探测 → `F9` 形态断言复红；恢复后 flusher.cpp **SHA-256 字节级还原**（`0F715FA…`）全量复绿；decoder 冒烟 `MAX_BLOCK_RAW = 20491` ✓。`F1b` 改名反转断言（`SeamAbsorbedIntoBlockTail`）、`F1c` 注释同步（防线前移说明）、`F7` 零改动通过。
+7. **已知残留**：R24 §7.2 条 4 **方案 C（ActiveFileTarget 聚合，收编 `key_provider` 五处调用点）**独立未实施，可并行推进；Android 真机复跑待下批随行。
 
 ---
 
