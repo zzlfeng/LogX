@@ -90,6 +90,9 @@
 | `1a82f1d` | feat(recovery,test,docs): 补全 hdr.rebuilt 整区重建防御门与逻辑精简 (F-1/N-1 收口, 计划表 v1.45) |
 | `0cd1e60` | docs: 登记提交记录表行 9ca6d53/ec4c0c5 |
 | `1507765` | docs: 登记提交记录表行 1a82f1d |
+| `b9d63a3` | docs(reviews): R33 复核报告入库——B-10 方案 1 与 rebuilt 收口批次独立复核 |
+| `915e4ad` | docs: Android 真机复跑收口——B-10 方案1/ rebuilt 批次 Redmi K30 Pro 175/175+2/2+4/4+3/3 全绿 (计划表 v1.46) |
+| `c1860a4` | feat(format,recovery,flusher): Backlog B-4 落地——收敛平行记录扫描实现与 cksum1 单源化 (计划表 v1.47) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
