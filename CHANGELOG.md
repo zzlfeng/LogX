@@ -95,6 +95,8 @@
 | `c1860a4` | feat(format,recovery,flusher): Backlog B-4 落地——收敛平行记录扫描实现与 cksum1 单源化 (计划表 v1.47) |
 | `b3a758d` | feat(core,flusher,test): R32 方案 2 落地——NO_SPACE 退避事件驱动化与级联唤醒令牌 (计划表 v1.48) |
 | `6217326` | fix(test,format,core): 收口 N-1~N-3——建立 R18-2 撤销复红屏障、防下溢守卫与 Wire 偏移编译期断言 (计划表 v1.49) |
+| `0dc9c4a` | docs: 登记提交记录表行 6217326 |
+| `3640d8a` | fix(test): 级联唤醒屏障停驻门固化 + 补 #include <thread> 修复 Android 构建断裂 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -558,6 +560,14 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **N-2 (Nit, 记录头下溢防御)**：`core/include/logx_format.h` 中 `parse_staging_record_header` 补充 `off > total` 守卫，杜绝 `total - off` 无符号整数回绕下溢；`tests/unit/test_format.cpp` 补充 `off > total` 边界断言；
    - **N-3 (观察/清理)**：清理 `core/src/logx_c.cpp:90` 遗留的未用变量 `key_lookup_attempted`（消除 clang `-Wunused-but-set-variable` 警告，收口 R33 N-1）；在 `logx_format.h` 提炼 `kWireOffPayloadLen`、`kWireOffMagic`、`kWireOffFlags`、`kWireOffCksum` 4 处 wire-format 偏移常量并辅以 5 条编译期 `static_assert` 约束；
    - **验证**：MSVC Release 全量 clean 重建 56/56 目标 **0 警告 0 错误**；单测套件 **177/177 100% 全绿**，hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过。
+
+13. **R35 批次：R34 批次独立复核——级联屏障停驻门固化、Android 构建断裂修复与真机复跑 (2026-10-08)**：
+   - **F-1 (P3, 已收口)**：R34 批次的级联撤销复红实为**时序依赖型**——Flusher 去抖定时器（75ms）在 limit 布防前自主 drain 填充记录，pre-limit 信号可唤醒全部等待者（独立复做实证 5+ 次假绿，探针取证 3 次 WOKE 均先于首个 DROPPED），级联令牌未被依赖；`3640d8a` 引入 **StrictEventWaitPal 停驻门**（`hold_flusher` 先于 `logx_open` 布防、确认首轮空环 drain 后再填充、放行后恰好一次 drain 在限流下进行），撤销实验转为**确定性复红（1654ms，Flusher 侧信号 #2-#9 全部被限流丢弃）**，绿路径 3 连跑通过——屏障由时序依赖转为刚性；
+   - **F-2 (P3, 已收口)**：`b3a758d` 起测试使用 `std::thread` 未包含 `<thread>`，MSVC 透传包含掩盖，**Android/clang 构建自该提交起断裂**（真机验证链路中断约 1.5 天）；本批补 include 修复，NDK 构建恢复；新增流程教训「Android 侧定期构建冒烟」候选；
+   - **N-1 (Nit, 观察)**：`logx_format.h` 的 5 条 wire-format `static_assert` 为自指式同义反复，无钉住力（有效成分为偏移量具名化与统一引用）；可选换行为级 roundtrip 断言或删除；
+   - **N-2 (Nit, 观察)**：clang 构建余 1 条存量 `-Wunused-function` 警告（`cleanup_file`，test_r19_regression.cpp:123），「0 警告」口径仍仅限 MSVC；
+   - **真机复跑**：Redmi K30 Pro 四套件 **178/178**（含停驻门版级联用例）+ 2/2 + 4/4 + 3/3，退出码全 0；时钟 1:1（`auto_time 0` 维持）；二进制 mtime 晚于全部审查对象提交；
+   - **验证**：MSVC clean 重建 56/56 零警告；桌面 177/177 + 2 + 4 + 3；撤销对照实验 3 组（A/B/B'）独立执行并取证。复核全文见 [`docs/reviews/code_review_R35_2026-10-08.md`](./docs/reviews/code_review_R35_2026-10-08.md)。
 
 
 ---
