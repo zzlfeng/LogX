@@ -88,6 +88,8 @@
 | `9ca6d53` | docs(reviews): R32 审查报告入库——近期提交与 B-10/B-8 落地综合独立审查 (修订勘误版) |
 | `ec4c0c5` | feat(recovery,test,docs): B-10 升级全局目录最大序号防御门(方案 1)——收口 F-1/F-2 盲区与 Nonce 密码学定性勘误 (计划表 v1.44) |
 | `1a82f1d` | feat(recovery,test,docs): 补全 hdr.rebuilt 整区重建防御门与逻辑精简 (F-1/N-1 收口, 计划表 v1.45) |
+| `0cd1e60` | docs: 登记提交记录表行 9ca6d53/ec4c0c5 |
+| `1507765` | docs: 登记提交记录表行 1a82f1d |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -527,6 +529,13 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **N-1 (Nit, 代码规范与分支合并)**：`recovery.cpp` 中合并 `reconcile` 防御门两个完全同构的分支条件，移除函数尾部多余空行；
    - **专属回归用例**：`tests/unit/test_r19_regression.cpp` 新增 `B10_RebuiltStaging_ResidualHigherSplit_ClampedAndWarned`（Staging Header 损毁重建 + 分卷 0 尾块 20 + 残留分卷 1 尾块 5 → 断言告警 + recovered seqno=20 钉死防御屏障）；
    - **验证**：MSVC Release 单测升至 **174/174**、hotpath 2/2、stress 4/4、crash_fork 3/3 100% 全绿（总用时 17.68s）。
+
+9. **R33 复核收口：B-10 方案 1 与 rebuilt 收口批次独立复核 + Android 真机复跑 (2026-10-07)**：
+   - **复核裁定**：`ec4c0c5` / `1a82f1d` 两批次完全成立，B-10 防御在 **reconcile 与 rebuilt 双路径完整闭环**；审查报告全文见 [`docs/reviews/code_review_R33_2026-10-07.md`](./docs/reviews/code_review_R33_2026-10-07.md)；reports 索引同步登记；
+   - **独立撤销对照实验（R18-2，两次复做）**：reconcile 防御门前置 `false &&` → `B10_ResidualHigherSplit...` 复红（recovered 11 vs 20）+ `B10_EmptyResidualSplit...` 复红（10 vs 20）；rebuilt 钳制退回 `hdr.seqno = sr.seqno` → `B10_RebuiltStaging...` 复红（5 vs 20）——均与提交记录逐字吻合，实验后源码还原回绿；
+   - **真机复跑**：Redmi K30 Pro（NDK 26.1 arm64 Release，重建后二进制 mtime 晚于 `1a82f1d`）四套件 **175/175 + 2/2 + 4/4 + 3/3 全绿**，退出码全 0；`auto_time 0` 维持，时钟复测 3s 步进 3.047/3.049s ≈ 1:1（首轮单次 4.85s 归因无线 adb 连接建立抖动，已复核排除 NTP 阶跃复发）；
+   - **发现（存量，非本批引入）**：N-1(P3) `logx_c.cpp:90` `key_lookup_attempted` 触发 clang `-Wunused-but-set-variable`（R22 F-2 死分支残留，MSVC 静默——历史「0 警告」声称口径仅限 MSVC 工具链）；N-2(Nit) rebuilt 两处 `else if (max_dir_seqno > 0)` 兜底实际不可达（`max>0 ⟹ best 非空` 不变量），建议保留并注释钉死；
+   - **验证**：MSVC clean 全量重建（R21-2 头文件门禁）56/56 **0 警告 0 错误**；单测 174/174 + 2/2 + 4/4 + 3/3；Android NDK 重建 + 真机四套件全绿。
 
 
 ---
