@@ -516,7 +516,8 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **B-10 回归用例与反空洞绿**：`B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned`（hint 分卷 seqno 1..20 + S_hdr 撕裂至 10 + 残留分卷 seqno 1..5 → 断言告警事件 + recovered seqno=20）；撤销对照（R18-2）：注释掉钳制 → 用例确定性复红（recovered 11 vs 20），还原后复绿；
    - **B-8 (用户拍板先验证后定 C)**：验证实验证实 B-8 原始虚报链（R20 F-13）的本质是 **ATC 提示与实际尾块持有文件错配**，**已由 B-7 从根消解**——新用例 `B8_SameDaySplit_StaleAtcWithCommittedSeqno_NoTruncatedOvercount`（S_hdr=25 + ATC 撕裂回退分卷 0 + 块 21..25 在分卷 1）当前代码零虚报，撤销 B-7 判据后确定性复红（虚报 +15 重现，正向对照耦合成立）；残余面由 B-10 A1 覆盖。**方案 C 落地**：`logx_c.h` 的 `truncated_blocks` 注释补口径注记（Header 撕裂场景下缺口不必然等于真实丢块数，仅作诊断参考，非精确 SLA 指标——用户确认）；
    - **顺手项**：计划表 M3 阶段标题「核心完成, 工具待修」更正为「全量闭环，含真机联调」（T3.4 早已闭环，标题状态过时）；
-   - **验证**：MSVC 单测 **172/172**、hotpath 2/2、stress 4/4、crash_fork 3/3；**Android 真机 173/173 + 2/2 + 4/4 + 3/3 全绿**（B8/B10 用例 9ms/11ms 通过）。**环境归因记录**：首轮真机 2 用例假红（`TimeoutWhenFlusherStalled` 提前 2.8s 超时、`LatencyJitter` CV 超界）——实测定位为设备 NTP 持续阶跃墙钟（实测 2s 真实时间墙钟快进 7-9s），`flush_blocking` 墙钟超时（flusher.cpp:1256, P3-1 审查已标注的存量同类隐患）被精确触发；`settings put global auto_time 0` 关闭自动校时后四套件全绿，属环境问题非代码回归。
+   - **验证**：MSVC 单测 **172/172**、hotpath 2/2、stress 4/4、crash_fork 3/3；**Android 真机 173/173 + 2/2 + 4/4 + 3/3 全绿**（B8/B10 用例 9ms/11ms 通过）。**环境归因记录**：首轮真机 2 用例假红（`TimeoutWhenFlusherStalled` 提前 2.8s 超时、`LatencyJitter` CV 超界）——实测定位为设备 NTP 持续阶跃墙钟（实测 2s 真实时间墙钟快进 7-9s），`flush_blocking` 墙钟超时（flusher.cpp:1256, P3-1 审查已标注的存量同类隐患）被精确触发；`settings put global auto_time 0` 关闭自动校时后四套件全绿，属环境问题非代码回归；
+   - **审查报告入库**：近期提交综合复审全文见 [`docs/reviews/code_review_R32_2026-10-07.md`](./docs/reviews/code_review_R32_2026-10-07.md)（对象 `a213762` / `4cc998a` / `d636559`，裁定成立 + F-1/F-2/F-3 三项发现与全局目录最大序号优化方案）；reports 索引同步登记。
 
 
 ---
