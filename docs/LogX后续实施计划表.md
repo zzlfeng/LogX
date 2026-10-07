@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.45 (2026-10-07 R32 补强收口: F-1 整区重建防御门补齐 + N-1 逻辑精简)
+> **文档版本**: v1.46 (2026-10-07 R33 复核入库: B-10 方案 1/ rebuilt 批次独立复核 + Android 真机复跑收口)
+>
+> **v1.46 修订说明**: 2026-10-07 **R33 独立复核与真机收口**：① **复核裁定**: `ec4c0c5`（B-10 升级方案 1 + Nonce 定性勘误）与 `1a82f1d`（rebuilt 整区重建防御门补齐 + N-1 精简）两批次完全成立，B-10 防御在 **reconcile 与 rebuilt 双路径完整闭环**；独立撤销对照实验两次复做（防御门变异 → 复红 11/10 vs 20；rebuilt 钳制退回 → 复红 5 vs 20），与提交记录逐字吻合；② **Android 真机复跑**: Redmi K30 Pro 四套件 **175/175 + 2/2 + 4/4 + 3/3 全绿**（NDK 重建后二进制 mtime 晚于 `1a82f1d`；`auto_time 0` 维持，时钟复测 1:1，首轮 4.85s 步进归因无线 adb 连接抖动已排除）；③ **发现（存量）**: N-1(P3) `logx_c.cpp:90` `key_lookup_attempted` 触发 clang `-Wunused-but-set-variable`（「0 警告」历史声称口径仅限 MSVC 工具链）；N-2(Nit) rebuilt 两处兜底分支不可达（`max>0 ⟹ best 非空`），建议保留并注释钉死不变量。复核全文见 [`docs/reviews/code_review_R33_2026-10-07.md`](./reviews/code_review_R33_2026-10-07.md)。
 >
 > **v1.45 修订说明**: 2026-10-07 **R32 审查遗留收口**：① **F-1 (P3, 整区重建防御门补齐)**: `recovery.cpp:240-266` 在 `hdr.rebuilt == true` 整区重建路径中提取 `scan_dir_for_target(inst, &max_dir_seqno)` 目录最大序号，将 `hdr.seqno` 钳制为 `std::max(sr.seqno, max_dir_seqno)`（尾块损坏截断时 `+1`），若发生倒退触发 `LOGX_EV_RECOVERY` 告警，彻底补齐 Staging 损毁场景下的跨卷序号倒退漏洞；② **N-1 (Nit, 代码规范与精简)**: `recovery.cpp:212-220` 合并 `reconcile` 中两处行为完全一致的告警与钳制分支条件，移除多余空行；③ **测试侧补强**: 新增 `B10_RebuiltStaging_ResidualHigherSplit_ClampedAndWarned`，断言重建路径下 seqno 成功钳制至历史分卷最大序号并发出专用告警；单测升至 174/174 全绿，四套件 100% 通过。
 >
