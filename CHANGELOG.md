@@ -521,6 +521,12 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **验证**：MSVC 单测 **173/173**、hotpath 2/2、stress 4/4、crash_fork 3/3；**Android 真机 173/173 + 2/2 + 4/4 + 3/3 全绿**（B8/B10 用例 9ms/11ms 通过）。**环境归因记录**：首轮真机 2 用例假红（`TimeoutWhenFlusherStalled` 提前 2.8s 超时、`LatencyJitter` CV 超界）——实测定位为设备 NTP 持续阶跃墙钟（实测 2s 真实时间墙钟快进 7-9s），`flush_blocking` 墙钟超时（flusher.cpp:1256, P3-1 审查已标注的存量同类隐患）被精确触发；`settings put global auto_time 0` 关闭自动校时后四套件全绿，属环境问题非代码回归；
    - **审查报告入库**：近期提交综合复审全文见 [`docs/reviews/code_review_R32_2026-10-07.md`](./docs/reviews/code_review_R32_2026-10-07.md)（对象 `a213762` / `4cc998a` / `d636559`，裁定成立 + F-1/F-2/F-3 三项发现与全局目录最大序号优化方案落地闭环）；reports 索引同步登记。
 
+8. **R32 复审遗留收口：F-1 (hdr.rebuilt 路径受防御门保护) 与 N-1 (逻辑精简) (2026-10-07)**：
+   - **F-1 (P3, 整区重建防御门保护)**：`core/src/recovery.cpp` 中 `run_recovery` 的 `hdr.rebuilt == true` 分支原先直接调用 `scan_dir_for_target(inst)` 仅取 target 文件尾块序号，若 Staging 损坏重建且目录存在残留高分卷时仍会发生跨卷序号倒退；现修复为传入 `&max_dir_seqno` 并以 `hdr.seqno = std::max(sr.seqno, max_dir_seqno)`（截断时 `+1`）钳制下限，并触发 `LOGX_EV_RECOVERY`（"rebuilt: target seqno regression vs directory max; resume clamped"）专属告警，彻底补齐重建路径盲区；
+   - **N-1 (Nit, 代码规范与分支合并)**：`recovery.cpp` 中合并 `reconcile` 防御门两个完全同构的分支条件，移除函数尾部多余空行；
+   - **专属回归用例**：`tests/unit/test_r19_regression.cpp` 新增 `B10_RebuiltStaging_ResidualHigherSplit_ClampedAndWarned`（Staging Header 损毁重建 + 分卷 0 尾块 20 + 残留分卷 1 尾块 5 → 断言告警 + recovered seqno=20 钉死防御屏障）；
+   - **验证**：MSVC Release 单测升至 **174/174**、hotpath 2/2、stress 4/4、crash_fork 3/3 100% 全绿（总用时 17.68s）。
+
 
 ---
 

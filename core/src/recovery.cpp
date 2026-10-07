@@ -209,17 +209,13 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
     // 只要选中追加目标尾块低于目录历史最大尾块 (或空目标但 Header 撕裂落后于历史最大)，
     // 发 LOGX_EV_RECOVERY 告警并以 seqno_floor 钳制 resume_seqno 下限，维护全局单调递增。
     // 收口 F-1 (空残留分卷且 Header 撕裂) 与 F-2 (多级分卷/无 hint 漏防)。
-    if (sr.seqno > 0 && max_dir_seqno > sr.seqno) {
-        r.seqno_floor = max_dir_seqno;
-        emit_event(inst, LOGX_EV_RECOVERY, -1,
-                   "target seqno regression vs directory max; resume clamped");
-    } else if (sr.seqno == 0 && max_dir_seqno > hdr.seqno) {
+    if ((sr.seqno > 0 && max_dir_seqno > sr.seqno) ||
+        (sr.seqno == 0 && max_dir_seqno > hdr.seqno)) {
         r.seqno_floor = max_dir_seqno;
         emit_event(inst, LOGX_EV_RECOVERY, -1,
                    "target seqno regression vs directory max; resume clamped");
     }
     return r;
-
 }
 
 }  // namespace
@@ -239,18 +235,24 @@ bool run_recovery(Instance* inst) {
         rec = reconcile(inst, hdr);
     } else {
         // 整区重建:seqno 接管为文件 max(seqno), 环坐标归零并提交初始 Header
-        std::string best = scan_dir_for_target(inst);
+        // B-10: 提取目录中历史分卷的最大 seqno，防止残留下级分卷导致序号倒退 (F-1 收口)
+        uint32_t max_dir_seqno = 0;
+        std::string best = scan_dir_for_target(inst, &max_dir_seqno);
         AppendTargetCache atc{};
         if (!best.empty()) {
             FileScanResult sr = scan_append_target(inst, best);
             if (sr.ok) {
-                hdr.seqno = sr.seqno;
+                hdr.seqno = std::max(sr.seqno, max_dir_seqno);
                 if (sr.truncated) {
-                    // R19 F-14: 若发生截断, 为防止被截断块的 seqno 与加密 nonce 被复用,
-                    // 首块 seqno 须跳空隙 (hdr.seqno = sr.seqno + 1, Flusher 首块为 hdr.seqno + 1 即 max+2)
-                    hdr.seqno = sr.seqno + 1;
+                    // R19 F-14: 若发生截断, 为防止同文件被截断块的 seqno 与加密 nonce 被复用,
+                    // 首块 seqno 须跳空隙 (hdr.seqno = max(sr.seqno, max_dir_seqno) + 1, Flusher 首块为 hdr.seqno + 1 即 max+2)
+                    hdr.seqno += 1;
                     inst->truncated_blocks.fetch_add(1);
                     emit_event(inst, LOGX_EV_RECOVERY, -1, "rebuilt: appended file tail truncated");
+                }
+                if (max_dir_seqno > sr.seqno) {
+                    emit_event(inst, LOGX_EV_RECOVERY, -1,
+                               "rebuilt: target seqno regression vs directory max; resume clamped");
                 }
                 uint16_t split = 0;
                 parse_log_filename(sr.path, &atc.date, &split);
@@ -259,7 +261,11 @@ bool run_recovery(Instance* inst) {
                                              &atc.last_block_offset, &atc.last_block_end_offset)) {
                     emit_event(inst, LOGX_EV_IO, -1, "scan offset exceeds atc capacity");
                 }
+            } else if (max_dir_seqno > 0) {
+                hdr.seqno = max_dir_seqno;
             }
+        } else if (max_dir_seqno > 0) {
+            hdr.seqno = max_dir_seqno;
         }
         inst->staging->commit_header_locked(hdr.seqno, 0, 0, &atc);
         return true;

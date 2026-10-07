@@ -1758,6 +1758,90 @@ TEST(R19Regression, B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax) {
     cleanup_dir(dir);
 }
 
+// ============================================================
+// B-10 (F-1 补全): staging 整区重建 (hdr.rebuilt == true) 路径受防御门保护
+// 场景:
+//   staging 双 Header 损坏触发整区重建 (rebuilt == true), 环坐标归零。
+//   分卷 0 历史写至 seqno = 20; 异常残留分卷 1 仅写至 seqno = 5。
+//   scan_dir_for_target 选择分卷 1 为 best append 目标 (sr.seqno = 5)。
+//   防御门生效前: rebuilt 分支直接取 sr.seqno (5), 恢复后新写入发生跨卷倒退 (20 -> 6)。
+//   防御门修复后: scan_dir_for_target 传出 max_dir_seqno (20),
+//     hdr.seqno 钳制至 max(5, 20) = 20, 发出告警事件, 彻底收口 rebuilt 路径。
+// ============================================================
+TEST(R19Regression, B10_RebuiltStaging_ResidualHigherSplit_ClampedAndWarned) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_b10_rebuilt_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+    uint32_t today = 20261007u;
+    uint8_t salt0[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t salt1[8] = {8, 7, 6, 5, 4, 3, 2, 1};
+
+    auto write_custom_log = [&](const std::string& path, uint32_t date, const uint8_t salt[8],
+                                uint32_t seq_start, uint32_t count) {
+        int fd = pal.file_open(path.c_str(), true, false);
+        ASSERT_GE(fd, 0);
+        write_file_header_bytes(fd, date, salt);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint8_t bhdr[34] = {};
+            std::vector<uint8_t> payload(64, static_cast<uint8_t>(0x30 + i));
+            make_block_header(bhdr, seq_start + i, 64,
+                              static_cast<uint32_t>(payload.size()), 0, salt);
+            put_u32_le(bhdr + 18, crc32_update(0, payload.data(),
+                                               static_cast<uint32_t>(payload.size())));
+            ASSERT_EQ(pal.file_write(fd, bhdr, 34), 34);
+            ASSERT_EQ(pal.file_write(fd, payload.data(), static_cast<long>(payload.size())),
+                      static_cast<long>(payload.size()));
+        }
+        pal.file_close(fd);
+    };
+
+    // 分卷 0 写至 seqno = 20; 异常残留分卷 1 写至 seqno = 5
+    write_custom_log(make_log_path(dir, today, 0), today, salt0, 1, 20);
+    write_custom_log(make_log_path(dir, today, 1), today, salt1, 1, 5);
+
+    // 预置损坏的 staging.mmap: 写入非全 0 垃圾数据破坏 Header A/B, 触发 rebuilt == true
+    {
+        int sfd = pal.file_open(staging.c_str(), true, false);
+        ASSERT_GE(sfd, 0);
+        std::vector<uint8_t> garbage(128 * 1024, 0xAA);
+        ASSERT_EQ(pal.file_write(sfd, garbage.data(), static_cast<long>(garbage.size())),
+                  static_cast<long>(garbage.size()));
+        pal.file_close(sfd);
+    }
+
+    Instance* inst = new Instance();
+    inst->pal = &pal;
+    inst->log_dir = dir;
+    inst->staging_path = staging;
+    inst->staging = new Staging(inst->pal, staging, 128 * 1024);
+
+    EventProbe probe;
+    inst->err_fn = [](void* user, logx_event_kind_e k, int c, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, c, m);
+    };
+    inst->err_user = &probe;
+
+    ASSERT_TRUE(run_recovery(inst));
+
+    // 断言:
+    // 1. 发出 rebuilt 专属的钳制告警事件
+    EXPECT_TRUE(probe.saw_kind(LOGX_EV_RECOVERY));
+    EXPECT_TRUE(probe.saw_msg_substring("rebuilt: target seqno regression vs directory max; resume clamped"));
+
+    // 2. staging 提交的恢复 seqno 被钳制至分卷 0 的最大 seqno (20), 杜绝倒退至分卷 1 的 5
+    const uint8_t* raw = inst->staging->raw_base();
+    uint32_t recovered_seqno = get_u32(raw + 8);
+    AppendTargetCache recovered_atc{};
+    std::memcpy(&recovered_atc, raw + 20, sizeof(recovered_atc));
+    EXPECT_EQ(recovered_seqno, 20u);
+    EXPECT_EQ(atc_split(recovered_atc), 1u);
+
+    delete inst->staging;
+    delete inst;
+    cleanup_dir(dir);
+}
+
 
 // ============================================================
 // B-1 方案 A (基准对照): staging_wait_ms == 0 保持默认绝不阻塞

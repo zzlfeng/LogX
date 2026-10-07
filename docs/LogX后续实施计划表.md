@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.44 (2026-10-07 R32 审查收口: B-10 升级全局目录最大序号防御门 + 密码学定性勘误)
+> **文档版本**: v1.45 (2026-10-07 R32 补强收口: F-1 整区重建防御门补齐 + N-1 逻辑精简)
+>
+> **v1.45 修订说明**: 2026-10-07 **R32 审查遗留收口**：① **F-1 (P3, 整区重建防御门补齐)**: `recovery.cpp:240-266` 在 `hdr.rebuilt == true` 整区重建路径中提取 `scan_dir_for_target(inst, &max_dir_seqno)` 目录最大序号，将 `hdr.seqno` 钳制为 `std::max(sr.seqno, max_dir_seqno)`（尾块损坏截断时 `+1`），若发生倒退触发 `LOGX_EV_RECOVERY` 告警，彻底补齐 Staging 损毁场景下的跨卷序号倒退漏洞；② **N-1 (Nit, 代码规范与精简)**: `recovery.cpp:212-220` 合并 `reconcile` 中两处行为完全一致的告警与钳制分支条件，移除多余空行；③ **测试侧补强**: 新增 `B10_RebuiltStaging_ResidualHigherSplit_ClampedAndWarned`，断言重建路径下 seqno 成功钳制至历史分卷最大序号并发出专用告警；单测升至 174/174 全绿，四套件 100% 通过。
 >
 > **v1.44 修订说明**: 2026-10-07 **R32 审查收口与 B-10 升级**：① **密码学定性勘误**: 澄清由于每文件均拥有独立 8B 随机 salt（nonce = salt ‖ seqno），跨分卷 seqno 倒退并不构成 AES-GCM Nonce 复用；防御核心动机在于维持「磁盘 seqno 全局单调递增」系统结构不变量，防止恢复期对账与离线解码器排序紊乱；② **B-10 升级方案 1 (全局目录最大序号防御门)**: `scan_dir_for_target` 顺带记录全目录最大序号 `max_dir_seqno`，`reconcile` 凡最新目标尾块低于目录最大序号（或空目标且 Staging Header 撕裂落后）一律钳制 `seqno_floor`，收口 F-1（空残留分卷）与 F-2（多级分卷/无 hint 漏防），同时消除二次扫描 hint 的磁盘 IO 开销；③ **测试侧补强**: 新增 `B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax`（空残留高分卷 seqno=0 且 S_hdr=10 撕裂落后于历史尾块 20 → 成功阻断倒退，recovered seqno=20 钉死 F-1 屏障）；单测升至 173/173 全绿；`ClosingOnRetryPal` 单测补齐幂等复位注释。
 >
@@ -384,7 +386,7 @@ gantt
 ### B-10 异常残留高分卷且尾块 seqno 倒退时的防御与告警 (B-7 落地后观察)
 
 - **记录日期**: 2026-10-07
-- **状态**: ✅ **已全量落地并升级 (2026-10-07, 用户拍板「方案 A1」，R32 升级「方案 1」)**——`reconcile` 升级为全局目录最大序号防御门（Global Max Seqno Floor）：`scan_dir_for_target` 顺带记录全目录最大序号 `max_dir_seqno`，凡最新追加目标尾块 seqno 低于目录历史最大尾块（或空目标且 Staging Header 撕裂落后时，覆盖 F-1/F-2 盲区），发 `LOGX_EV_RECOVERY` 告警事件并以 `ReconcileResult::seqno_floor` 钳制 `resume_seqno` 下限，杜绝磁盘全局 seqno 跨分卷倒退，维持单调递增结构不变量；**不改变 B-7 的 (date, split) 文件决选语义**。回归用例：`B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned`（hint 尾块 20 + S_hdr=10 + 残留分卷 5 → recovered seqno=20；撤销钳制复红 11 vs 20）+ R32 补强用例 `B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax`（空残留分卷 0 块且 Header 撕裂落后 → recovered seqno=20 钉死 F-1 屏障）。
+- **状态**: ✅ **已全量落地并升级 (2026-10-07, 用户拍板「方案 A1」，R32 升级「方案 1」与 rebuilt 收口)**——`reconcile` 升级为全局目录最大序号防御门（Global Max Seqno Floor）：`scan_dir_for_target` 顺带记录全目录最大序号 `max_dir_seqno`，凡最新追加目标尾块 seqno 低于目录历史最大尾块（或空目标且 Staging Header 撕裂落后时，覆盖 F-1/F-2 盲区），发 `LOGX_EV_RECOVERY` 告警事件并以 `ReconcileResult::seqno_floor` 钳制 `resume_seqno` 下限；`hdr.rebuilt` 整区重建分支亦同步调用并钳制 `hdr.seqno = max(sr.seqno, max_dir_seqno)`，杜绝磁盘全局 seqno 跨分卷倒退，维持单调递增结构不变量；**不改变 B-7 的 (date, split) 文件决选语义**。回归用例：`B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned`（hint 尾块 20 + S_hdr=10 + 残留分卷 5 → recovered seqno=20；撤销钳制复红 11 vs 20）+ R32 补强用例 `B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax`（空残留分卷 0 块且 Header 撕裂落后 → recovered seqno=20 钉死 F-1 屏障）+ `B10_RebuiltStaging_ResidualHigherSplit_ClampedAndWarned`（Staging 损毁整区重建 + 残留高分卷 seqno=5 落后于历史尾块 20 → recovered seqno=20 钉死 rebuilt 屏障）。
 - **定性勘误说明（见 R32 审查报告）**: 原提交与规划表关于“GCM nonce 复用”的密码学危害定性不成立（由于每文件均独立派生 8B 随机 salt，两分卷 salt 独立，跨卷相同 seqno 拼装出不同 Nonce，不构成 Nonce 复用）；防御动机核心在于维护「磁盘 seqno 全局单调递增」结构不变量，防止恢复期对账（`sum_raw_len_since`）与离线解码器（decoder 排序合并）紊乱。
 - **背景**: B-7 落地后，恢复期 `reconcile` 严格信任最新 `(date, split)` 二元组决选出的追加目标。若日志目录由于异常原因（多进程写者并发注入或外部工具生成）存在残留的高 split 文件，且其尾块 `seqno` 低于历史分卷，则按高 split 接管后恢复出的 `resume_seqno` 可能回退导致磁盘分卷间 `seqno` 倒退。
 - **影响面**: 在规范的“单写者”契约下不成立（Flusher 为唯一写者，分卷与 seqno 单调递增）。现已通过方案 1 全局目录最大序号防御门对多写者/异常文件残留提供彻底防御。
