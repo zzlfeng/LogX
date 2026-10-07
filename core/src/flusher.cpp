@@ -32,16 +32,8 @@ constexpr uint32_t kSingleRecordMaxRaw = kBlockMaxRaw;  // 与块上限同源(20
 
 // put_u32_le 见 logx_internal.h(测试可见)
 
-// 在 raw 流里看下一条记录的字节数(头+payload);不足返回 0。
-uint32_t peek_record_len(const uint8_t* p, uint32_t off, uint32_t total) {
-    if (total - off < kHeaderLen) return 0;
-    uint16_t magic = uint16_t(p[off + 2]) | (uint16_t(p[off + 3]) << 8);
-    if (magic != kMagicEntry && magic != kMagicPad) return 0;
-    uint32_t len = uint32_t(p[off]) | (uint32_t(p[off + 1]) << 8);
-    uint32_t sz = kHeaderLen + len;
-    if (off + sz > total) return 0;
-    return sz;
-}
+// peek_record_len 移入 logx_format.h 单源共享 (B-4)
+
 
 // 探测 pos 起始处是否为回绕缝 (1..5 字节 0 且其后有合法记录)
 static uint32_t probe_wrap_seam(const uint8_t* raw, uint32_t pos, uint32_t total) {

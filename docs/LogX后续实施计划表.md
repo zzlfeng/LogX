@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.46 (2026-10-07 R33 复核入库: B-10 方案 1/ rebuilt 批次独立复核 + Android 真机复跑收口)
+> **文档版本**: v1.47 (2026-10-07 Backlog B-4 落地: 收敛 flusher/recovery 平行记录扫描实现)
+>
+> **v1.47 修订说明**: 2026-10-07 **Backlog B-4 落地（收敛 flusher/recovery 平行记录扫描实现）**：① **原语单源化**: 在 `core/include/logx_format.h` 提炼 `StagingRecordHeaderView`、`parse_staging_record_header` 与 `peek_record_len` 内联共享原语，统一提供记录头元数据解析与边界检查；同时将 `cksum1`（1B 载荷 XOR 折叠）由 `format.cpp` 与 `recovery.cpp` 匿名命名空间上提至 `logx_format.h` 单源共享；② **消除重复实现**: `flusher.cpp` 移除局部 `peek_record_len`，`split_impl` / `probe_wrap_seam` / 脏缝探测均调用单源原语；`recovery.cpp` 移除局部 `probe_record` 与 `cksum1`，`ring_scan` 统一调用 `parse_staging_record_header`，彻底消除手写记录头偏移（`[off]`, `[off+2]`, `[off+5]`）与常量单源化漂移结构性根因；③ **测试侧补强**: `tests/unit/test_format.cpp` 新增 `PeekAndParseStagingRecordHeader_EquivalenceAndBounds`（覆盖 Entry/Pad 合法性、<6B 短缓冲、长度溢出、非法 Magic、NULL 守卫及 cksum1 一致性）；单测升至 175/175 全绿，四套件 100% 通过。
 >
 > **v1.46 修订说明**: 2026-10-07 **R33 独立复核与真机收口**：① **复核裁定**: `ec4c0c5`（B-10 升级方案 1 + Nonce 定性勘误）与 `1a82f1d`（rebuilt 整区重建防御门补齐 + N-1 精简）两批次完全成立，B-10 防御在 **reconcile 与 rebuilt 双路径完整闭环**；独立撤销对照实验两次复做（防御门变异 → 复红 11/10 vs 20；rebuilt 钳制退回 → 复红 5 vs 20），与提交记录逐字吻合；② **Android 真机复跑**: Redmi K30 Pro 四套件 **175/175 + 2/2 + 4/4 + 3/3 全绿**（NDK 重建后二进制 mtime 晚于 `1a82f1d`；`auto_time 0` 维持，时钟复测 1:1，首轮 4.85s 步进归因无线 adb 连接抖动已排除）；③ **发现（存量）**: N-1(P3) `logx_c.cpp:90` `key_lookup_attempted` 触发 clang `-Wunused-but-set-variable`（「0 警告」历史声称口径仅限 MSVC 工具链）；N-2(Nit) rebuilt 两处兜底分支不可达（`max>0 ⟹ best 非空`），建议保留并注释钉死不变量。复核全文见 [`docs/reviews/code_review_R33_2026-10-07.md`](./reviews/code_review_R33_2026-10-07.md)。
 >
@@ -305,12 +307,17 @@ gantt
 ### B-4 收敛 flusher/recovery 平行记录扫描实现(R9 复审根因观察)
 
 - **记录日期**: 2026-09-13
-- **状态**: ⏸ 待决策
+- **状态**: ✅ **已落地闭环 (2026-10-07, 采纳方案 A 共享原语)**
 - **背景**: `flusher.cpp` 的 `peek_record_len`/`split_impl` 与 `recovery.cpp` 的 `probe_record`/`ring_scan` 为语义几乎相同的两份平行实现(记录长度探测 + raw 流按记录边界扫描),仅细节不同(peek 多验 magic;ring_scan 带 6B 全零终止符判定与 cksum 校验)。常量单源化因此三度遗漏(R8-3 staging 块内部分替换 → R9-1 补;R9-2 补 flusher 漏 recovery → R10-1 补),该重复是结构性根因。
+- **落地详情 (2026-10-07 方案 A)**:
+  - `core/include/logx_format.h`：引入 `StagingRecordHeaderView` POD 结构体与 `parse_staging_record_header` / `peek_record_len` 内联原语，统一解析并校验 6B 头字段（`payload_len`, `magic`, `flags`, `cksum`, `valid_magic`, `total_size`）；上提 `cksum1`（8 位 XOR 折叠）单源共享；
+  - `core/src/flusher.cpp`：废弃局部 `peek_record_len`，统一步进扫描与缝探测；
+  - `core/src/recovery.cpp`：废弃局部 `probe_record` 与 `cksum1`，`ring_scan` 改调 `parse_staging_record_header`，消除手写偏移与裸常量；
+  - `core/src/format.cpp`：清理局部重复的 `cksum1`；
+  - `tests/unit/test_format.cpp`：新增 `PeekAndParseStagingRecordHeader_EquivalenceAndBounds`，严密断言各分支边界防御。
 - **候选方案**:
-  - **A. 收敛共享原语**: 将"记录长度探测 / 按记录边界步进扫描"收敛为共享实现(候选位置 `logx_format.cpp` 或独立 `record_scan.cpp`),flusher/recovery 以参数差异化(magic 校验开关、终止符/校验回调等);波及写/恢复两条关键路径,需等价性论证 + 全量回归。
-  - **B. 维持平行实现**: 接受重复,以"裸 `6`(记录头语义)模式穷尽扫描"作为批次收口流程门禁(R10 已执行一次)防再漂移;零回归风险。
-- **决策点**: 等价性论证成本 vs 长期漂移风险;两处语义差异(magic 校验时机/终止符语义)能否无损参数化;若选 A,可顺势把记录头布局断言扩展到扫描原语。
+  - **A. 收敛共享原语 (已落地)**: 将"记录长度探测 / 按记录边界步进扫描"收敛为共享实现(`logx_format.h`)，零堆分配、内联无开销。
+  - **B. 维持平行实现**: 接受重复。
 
 ### B-5 Windows PAL 目录/文件删除 errno 间歇性失败(单次观测,审查未复现)
 

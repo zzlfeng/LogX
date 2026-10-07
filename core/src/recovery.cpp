@@ -31,22 +31,7 @@ namespace logx {
 
 namespace {
 
-// 读 raw 区里一条记录,返回该记录的字节数(头+payload);0 表示到达尾部/失败。
-// 跨回绕处理由 caller 保证 raw 是连续 buffer。
-uint32_t probe_record(const uint8_t* raw, uint32_t off, uint32_t total) {
-    if (total - off < kHeaderLen) return 0;
-    uint32_t len = uint32_t(raw[off]) | (uint32_t(raw[off + 1]) << 8);
-    uint32_t sz = kHeaderLen + len;
-    if (off + sz > total) return 0;
-    return sz;
-}
-
-// 计算一条 staging 记录的 payload 校验和(8 位折叠)。
-uint8_t cksum1(const uint8_t* p, uint32_t n) {
-    uint8_t c = 0;
-    for (uint32_t i = 0; i < n; ++i) c ^= p[i];
-    return c;
-}
+// probe_record 与 cksum1 移入 logx_format.h 单源共享 (B-4)
 
 // 环形扫描 [F, total),遇 6B 全零、撕裂、校验失败即停。
 // *out_valid_end 为有效末尾(不含任何不可识别数据);*out_truncated_tail 为
@@ -84,8 +69,8 @@ uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
             *out_truncated_tail = 0;
             return pos;
         }
-        uint32_t rec = probe_record(raw, pos, total);
-        if (rec == 0) {
+        StagingRecordHeaderView rh{};
+        if (!parse_staging_record_header(raw, pos, total, &rh)) {
             // 检查是否恰好为回绕缝 (<6B 且全为 0 且到达 wrap_boundary)
             if (wrap_boundary > 0 && pos < wrap_boundary && (wrap_boundary - pos < kHeaderLen)) {
                 bool seam_zero = true;
@@ -102,34 +87,29 @@ uint32_t ring_scan(const uint8_t* raw, uint32_t f, uint32_t total,
             *out_truncated_tail = total - pos;
             return pos;
         }
-        // 校验 cksum
-        uint16_t magic = uint16_t(raw[pos + 2]) | (uint16_t(raw[pos + 3]) << 8);
-        uint8_t cksum_byte = raw[pos + 5];
-        uint32_t payload_len = uint32_t(raw[pos]) | (uint32_t(raw[pos + 1]) << 8);
-        // magic 必须合法(LGXGXX / GP)
-        bool valid_magic = (magic == kMagicEntry || magic == kMagicPad);
-        if (!valid_magic) {
+        if (!rh.valid_magic) {
             *out_valid_end = valid_end;
             *out_truncated_tail = total - pos;
             return pos;
         }
-        if (magic == kMagicEntry) {
-            uint8_t actual = cksum1(raw + pos + kHeaderLen, payload_len);
-            if (actual != cksum_byte) {
+        // 校验 cksum
+        if (rh.magic == kMagicEntry) {
+            uint8_t actual = cksum1(raw + pos + kHeaderLen, rh.payload_len);
+            if (actual != rh.cksum) {
                 *out_valid_end = valid_end;
                 *out_truncated_tail = total - pos;
                 return pos;
             }
         } else {
-            // PAD:c payload 全部为 0;cksum_byte 必须为 0。
-            if (cksum_byte != 0) {
+            // PAD: payload 全部为 0; cksum_byte 必须为 0。
+            if (rh.cksum != 0) {
                 *out_valid_end = valid_end;
                 *out_truncated_tail = total - pos;
                 return pos;
             }
         }
-        valid_end = pos + rec;
-        pos += rec;
+        valid_end = pos + rh.total_size;
+        pos += rh.total_size;
     }
     *out_valid_end = valid_end;
     *out_truncated_tail = 0;

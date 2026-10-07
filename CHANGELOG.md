@@ -537,6 +537,12 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **发现（存量，非本批引入）**：N-1(P3) `logx_c.cpp:90` `key_lookup_attempted` 触发 clang `-Wunused-but-set-variable`（R22 F-2 死分支残留，MSVC 静默——历史「0 警告」声称口径仅限 MSVC 工具链）；N-2(Nit) rebuilt 两处 `else if (max_dir_seqno > 0)` 兜底实际不可达（`max>0 ⟹ best 非空` 不变量），建议保留并注释钉死；
    - **验证**：MSVC clean 全量重建（R21-2 头文件门禁）56/56 **0 警告 0 错误**；单测 174/174 + 2/2 + 4/4 + 3/3；Android NDK 重建 + 真机四套件全绿。
 
+10. **Backlog B-4 落地：收敛 flusher 与 recovery 平行记录扫描实现 (2026-10-07)**：
+   - **原语单源化与去重**：在 `core/include/logx_format.h` 提炼 `StagingRecordHeaderView` POD 结构体与 `parse_staging_record_header` / `peek_record_len` 内联公共原语；同时将 `cksum1`（1B 载荷 XOR 折叠）由 `format.cpp` 与 `recovery.cpp` 匿名命名空间上提至 `logx_format.h` 单源共享；
+   - **消除代码重复**：`core/src/flusher.cpp` 移除局部私有的 `peek_record_len`，块切分与回绕/脏缝探测调用公共原语；`core/src/recovery.cpp` 移除局部私有的 `probe_record` 与 `cksum1`，`ring_scan` 改调 `parse_staging_record_header`，彻底消除手写记录头偏移（`[off]`, `[off+2]`, `[off+5]`）与“裸 6 漂移”结构性根因；
+   - **专属回归用例**：`tests/unit/test_format.cpp` 新增 `PeekAndParseStagingRecordHeader_EquivalenceAndBounds`（覆盖 Entry/Pad 合法性、<6B 短缓冲、长度溢出、非法 Magic、NULL 守卫及 cksum1 一致性）；
+   - **验证**：MSVC Release 单测升至 **175/175**、hotpath 2/2、stress 4/4、crash_fork 3/3 100% 全绿（总用时 19.92s）。
+
 
 ---
 

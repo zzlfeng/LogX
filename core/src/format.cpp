@@ -19,12 +19,7 @@ namespace logx {
 
 namespace {
 
-// 1B 校验和:payload XOR 折叠(8 位);PAD 头 cksum 恒为 0。
-inline uint8_t cksum1(const uint8_t* p, uint32_t n) {
-    uint8_t c = 0;
-    for (uint32_t i = 0; i < n; ++i) c ^= p[i];
-    return c;
-}
+// cksum1 移入 logx_format.h 单源共享 (B-4)
 
 // 内部用户数据头尺寸: [ts_ms:8][pid:4][tid:8][level:1][taglen:2][msglen:4] = 27B
 // (R7 上提至命名空间级,供 format_record / 截断求解器 / kTruncBufSize 断言共用;

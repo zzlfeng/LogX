@@ -29,6 +29,46 @@ constexpr uint32_t kHeaderLen = 6;
 constexpr uint16_t kMagicEntry = 0x474c;   // 高字节 0x47='G', 低字节 0x4c='L'
 constexpr uint16_t kMagicPad   = 0x5047;   // 高字节 0x50='P', 低字节 0x47='G'
 
+// 1B 校验和: payload XOR 折叠(8 位); PAD 头 cksum 恒为 0。
+inline uint8_t cksum1(const uint8_t* p, uint32_t n) {
+    uint8_t c = 0;
+    for (uint32_t i = 0; i < n; ++i) c ^= p[i];
+    return c;
+}
+
+// B-4: staging 记录头解析视图 (零堆分配 POD)
+struct StagingRecordHeaderView {
+    uint32_t total_size = 0;   // kHeaderLen + payload_len
+    uint16_t payload_len = 0;  // 载荷声明长度
+    uint16_t magic = 0;        // kMagicEntry 或 kMagicPad
+    uint8_t  flags = 0;
+    uint8_t  cksum = 0;
+    bool     valid_magic = false;
+};
+
+// 完整解包记录头元数据并校验边界 (供 recovery / flusher / format / 测试共用)
+inline bool parse_staging_record_header(const uint8_t* raw, uint32_t off, uint32_t total,
+                                       StagingRecordHeaderView* out) {
+    if (!out || total - off < kHeaderLen) return false;
+    out->payload_len = uint16_t(raw[off]) | (uint16_t(raw[off + 1]) << 8);
+    out->magic = uint16_t(raw[off + 2]) | (uint16_t(raw[off + 3]) << 8);
+    out->flags = raw[off + 4];
+    out->cksum = raw[off + 5];
+    out->valid_magic = (out->magic == kMagicEntry || out->magic == kMagicPad);
+    out->total_size = kHeaderLen + out->payload_len;
+    if (off + out->total_size > total) return false;
+    return true;
+}
+
+// 快速探测下一条记录总尺寸 (头 6B + 载荷); 不足 6B、magic 非法或长度越界返回 0
+inline uint32_t peek_record_len(const uint8_t* raw, uint32_t off, uint32_t total) {
+    StagingRecordHeaderView h;
+    if (!parse_staging_record_header(raw, off, total, &h) || !h.valid_magic) {
+        return 0;
+    }
+    return h.total_size;
+}
+
 // 写入环形缓冲区的多片 LGXE 记录(同条日志的所有分片,连续)。
 // 失败原因:level 非法 / tag 过长 / payload 总长 > 60KB / 输出缓冲不足(仅内部防御)。
 bool format_record(uint8_t level, const char* tag,

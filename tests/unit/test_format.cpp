@@ -405,3 +405,54 @@ TEST(FormatBounded, NullOutParamsTolerated) {
               FormatBoundedStatus::kOk);
     EXPECT_GT(dropped_only, 0u);
 }
+
+// B-4: peek_record_len 与 parse_staging_record_header 单源原语与等价性验证
+TEST(Format, PeekAndParseStagingRecordHeader_EquivalenceAndBounds) {
+    uint8_t buf[64] = {};
+
+    // 1. 合法 Entry (len = 10, total = 16)
+    buf[0] = 10; buf[1] = 0;
+    buf[2] = 0x4c; buf[3] = 0x47;  // 'L', 'G' (kMagicEntry)
+    buf[4] = 0x01; buf[5] = 0xAA;
+    for (int i = 0; i < 10; ++i) buf[6 + i] = static_cast<uint8_t>(i);
+
+    EXPECT_EQ(peek_record_len(buf, 0, 16), 16u);
+    StagingRecordHeaderView rh{};
+    EXPECT_TRUE(parse_staging_record_header(buf, 0, 16, &rh));
+    EXPECT_EQ(rh.total_size, 16u);
+    EXPECT_EQ(rh.payload_len, 10u);
+    EXPECT_EQ(rh.magic, kMagicEntry);
+    EXPECT_TRUE(rh.valid_magic);
+    EXPECT_EQ(rh.flags, 0x01);
+    EXPECT_EQ(rh.cksum, 0xAA);
+    EXPECT_EQ(cksum1(buf + 6, 10), 0 ^ 1 ^ 2 ^ 3 ^ 4 ^ 5 ^ 6 ^ 7 ^ 8 ^ 9);
+
+    // 2. 合法 Pad (len = 4, total = 10)
+    buf[0] = 4; buf[1] = 0;
+    buf[2] = 0x47; buf[3] = 0x50;  // 'G', 'P' (kMagicPad)
+    buf[4] = 0x00; buf[5] = 0x00;
+    EXPECT_EQ(peek_record_len(buf, 0, 10), 10u);
+    EXPECT_TRUE(parse_staging_record_header(buf, 0, 10, &rh));
+    EXPECT_EQ(rh.total_size, 10u);
+    EXPECT_EQ(rh.payload_len, 4u);
+    EXPECT_EQ(rh.magic, kMagicPad);
+    EXPECT_TRUE(rh.valid_magic);
+
+    // 3. 边界防御: 缓冲区短于 6B 头
+    EXPECT_EQ(peek_record_len(buf, 0, 5), 0u);
+    EXPECT_FALSE(parse_staging_record_header(buf, 0, 5, &rh));
+
+    // 4. 边界防御: 声明长度超出 total 范围
+    EXPECT_EQ(peek_record_len(buf, 0, 9), 0u);
+    EXPECT_FALSE(parse_staging_record_header(buf, 0, 9, &rh));
+
+    // 5. 非法 Magic
+    buf[2] = 0xFF; buf[3] = 0xFF;
+    EXPECT_EQ(peek_record_len(buf, 0, 10), 0u);
+    EXPECT_TRUE(parse_staging_record_header(buf, 0, 10, &rh));
+    EXPECT_FALSE(rh.valid_magic);
+
+    // 6. 空指针防御
+    EXPECT_FALSE(parse_staging_record_header(buf, 0, 10, nullptr));
+}
+
