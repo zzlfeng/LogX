@@ -34,6 +34,7 @@ struct Instance {
     uint32_t    retention_days = 7;
     uint64_t    max_file_size  = 10 * 1024 * 1024;
     uint32_t    flush_threshold = 8 * 1024;
+    uint32_t    staging_wait_ms = 0;  // B-1 方案 A: 环满阻塞等待上限 (毫秒), 0=默认不阻塞
     uint8_t     compress_algo = kAlgoNone;
     bool        encrypt_enable = false;
     uint16_t    kid = 0;

@@ -120,6 +120,9 @@ object LogX {
         // logcat 单行 ~4KB 截断为系统行为)。仅限 debug 期使用: 明文进 logcat 有泄露面
         // (adb 任意可读), 生产保持默认关闭。丢弃记录不镜像(走 ErrorHandler.DROP)。
         val consoleEcho: Boolean = false,
+        // B-1 方案 A: 环满阻塞等待上限 (毫秒)。0 = 默认绝不阻塞 (立即丢弃并报 NO_SPACE);
+        // > 0 = 业务线程锁外退避重试，直至 Flusher 腾出空间或超时。
+        val stagingWaitMs: Int = 0,
     )
 
     @Volatile private var nativeHandle: Long = 0L
@@ -311,7 +314,8 @@ object LogX {
                     config.maxFileSize,
                     config.maxLogLength,
                     config.flushThreshold,
-                    config.consoleEcho
+                    config.consoleEcho,
+                    config.stagingWaitMs
                 )
                 if (handle == 0L) {
                     throw IllegalStateException("LogX native init failed")
@@ -493,7 +497,7 @@ object LogX {
         logDir: String, stagingPath: String,
         compressAlgo: Int, encryptEnable: Int, kid: Int, keyProvider: Any?,
         retentionDays: Int, maxFileSize: Long, maxLogLength: Int, flushThreshold: Int,
-        consoleEcho: Boolean
+        consoleEcho: Boolean, stagingWaitMs: Int
     ): Long
     @JvmStatic private external fun nativeClose(handle: Long)
     @JvmStatic private external fun nativeWrite(handle: Long, level: Int,

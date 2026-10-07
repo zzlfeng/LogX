@@ -76,6 +76,10 @@ typedef struct logx_config {
     /* E-06: staging 待刷阈值。0 = 禁用按阈值自动唤醒(纯手动 logx_flush 控制);
      * UINT32_MAX = 取默认 8KB;其它值 = 配置字节阈值。 */
     uint32_t flush_threshold;
+    /* B-1 方案 A: 环形暂存区满 (NO_SPACE) 时的有界阻塞等待上限 (毫秒)。
+     * 0 = 保持默认绝不阻塞 (立即丢弃并返回 LOGX_ERR_NO_SPACE);
+     * > 0 = 业务线程在锁外有界退避重试，直至 Flusher 腾出空间或超时。 */
+    uint32_t staging_wait_ms;
 
     /* 编解码:0=none / 1=zstd / 2=zlib */
     uint8_t compress_algo;

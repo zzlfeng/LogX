@@ -1,8 +1,11 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.38 (2026-10-07 方案 C 复核遗留 F-1/N-1 收口: key_provider 契约②拆分新建/续写子情形 + spec 同步缺钥重试语义, 提交 `c4b9570`)
+> **文档版本**: v1.39 (2026-10-07 B-7 同日多分卷恢复防御 + B-1 方案 A NO_SPACE 暂存区满有界退避重试落地)
 >
-> **v1.38 修订说明**: 2026-10-07 **方案 C 复核遗留收口**（提交 `c4b9570`，对象为 `3553544` 收口批次的独立复审再发现）——纯注释/文档级修改，零产品代码改动：① **F-1 (`core/include/logx_c.h`)**: 调用点②原文「该文件此后所有块一律明文落盘(即便密钥稍后恢复也不再改口)」仅对**新建文件**子情形成立，与 P3-1 新写的末段频率句「仅在缺钥降级态下每轮重试」同块自相矛盾——拆分为「新建文件（锁定不改口，直至轮换）」与「续写已存在加密文件（打开瞬间缺钥仅当期降级，此后每轮 drain 至多重试一次，密钥恢复后立即锁定并恢复密文落盘）」两子情形，两种情形均发 `LOGX_EV_DEGRADED` 事件（与 `flusher.cpp` 591/622/942 三处事件站点逐一核对）；② **N-1 (`docs/LogX日志库最终实施方案.md` 三处)**: §3.2 不变量句「缺钥降级只影响当块」（R21 轮级缓存时代措辞）改为按能力位分述并补 flag 组装式「`&& 有效密钥`」因子（与 `drain_once` 947-949 精确对齐）；§3.2 调用点频率句补「续写缺钥降级态下每轮至多重试一次直至恢复」；§6 降级矩阵 keyProvider 行补续写重试语义；③ **验证**: 定向重建 + 全量单测 165/165 全绿（退出码 0）；Android 侧核对无镜像契约文案需同步（tester README 的「落盘降级明文」描述当轮现象，方案 b 后仍属实）。
+> **v1.39 修订说明**: 2026-10-07 **Backlog 关键优化落地（B-7 与 B-1 方案 A）**：
+> ① **B-7 落地（同日多分卷 ATC 提示落后跨分卷防御）**：`recovery.cpp` 中 `reconcile()` 将目标新旧判定由单比日期扩为 `(best_date, best_split) > (target.date, atc_split(target))` 二元组比较；`flusher.cpp` 中 `scan_dir_for_target()` 纠偏为严格按 `(date, split)` 二元组全序决选最新追加目标，根除新分卷 seqno=0 时漏选新分卷缺陷；同步对齐 `tests/unit/test_flusher.cpp` 的 `FileSizeThreshold_DefensiveProbeSkipsExistingSplit` 用例注入时序，消除与 B-7 智能接管语义的冲突；
+> ② **B-1 (方案 A) 落地（NO_SPACE 暂存区满时有界阻塞退避重试）**：`logx_c.h` / `logx_internal.h` 的 `logx_config_t` 与 `Instance` 追加 `staging_wait_ms` 配置（默认值 0 严格保持绝不阻塞既有契约，>0 时在暂存区打满时解锁并主动唤醒 Flusher，锁外 `pal->sleep_ms(2)` 有界退避重试至指定超时；Flusher 停机时快速失败防死锁）；JNI 与 Kotlin `Config.stagingWaitMs` 全链路接线；
+> ③ **反空洞绿专属回归与全量验证**：`tests/unit/test_r19_regression.cpp` 新增 4 项用例（B-7 变异测试恢复仅比日期逻辑实证确定性复红见红，B-1 覆盖 0ms 即刻丢弃、1000ms 240KB 突发打满 128KB 暂存区 0 丢弃落盘、Flusher 停机快速失败防死锁）；MSVC Release 56/56 全量 clean 重建 0 警告 0 错误；单测 169/169、hotpath 2/2、stress 4/4、crash_fork 3/3 100% 全绿。
 >
 > **v1.37 修订说明**: 2026-10-06 **R24 §7.2 方案 C 复核收口**（提交 `3553544`，对象为方案 C 独立审查报告）——对方案 C 进行独立复核后，改动确认成立；本批次针对复核报告发现的 2 项 P3 及 1 项 Nit 彻底收口闭环：① **P3-1 (`core/include/logx_c.h`)**: 修正指针生命周期契约注释，如实声明库侧在单文件生命周期内按文件缓存 key 指针（②③频次均为每文件一次），并明确要求实现方保证指针持续有效稳定直至下一次调用，消除第三方集成者悬垂指针风险；② **P3-2 (方案 b，`core/src/flusher.cpp`)**: 续写已存在加密文件打开瞬间若缺钥，在后续未重开 target 的 drain 轮次中每轮尝试重探一次 `key_provider`（`retry_key_probed` 守卫保证每轮至多一次，稳态零冗余 JNI 开销），成功后锁定 `target.key` 并恢复后续密文写入；③ **Nit (`core/src/flusher.cpp`)**: `open_or_create_append_target` 入口先备份解析 `path` 再调用 `out_target->reset()`，消除 `hint_path` 与 `out_target->path` 别名导致入参被提前清空的脆弱性；④ **专属回归用例与反空洞绿验证 (`tests/unit/test_r19_regression.cpp`)**: 新增 `SchemeC_EncryptedFile_MissingKeyAtOpen_RecoversOnSubsequentDrain`，严密断言缺钥打开明文落盘 -> 密钥恢复后自动重探并转为密文落盘 -> 稳态锁定零冗余探测 -> 25 条日志完整无损解出；通过变异测试（临时禁用重探恢复逻辑）实证确定性复红（Actual 2 calls vs Expected 3，且块落为明文），证实测试屏障刚性；⑤ **全量验证**: MSVC Release 构建 0 错误 0 警告；单测 165/165 全绿，hotpath 2/2，stress 4/4，crash_fork 3/3 全部通过。
 >
@@ -237,27 +240,25 @@ gantt
 ### B-1 两条丢弃路径改造评估:NO_SPACE / TOO_LARGE 能否不丢日志
 
 - **记录日期**: 2026-09-08
-- **状态**: 🔶 拆分推进——**方案B 已拍板落地为 T5.5(2026-09-13,✅)**;方案 A(NO_SPACE 有界阻塞重试)仍 ⏸ 待决策(决策点 1/3 见文末,决策点 2 已随 T5.5 闭环)
+- **状态**: ✅ **全量落地**——**方案B（TOO_LARGE 截断保前缀）**已拍板落地为 T5.5 (2026-09-13, ✅)；**方案 A（NO_SPACE 有界阻塞退避重试）**已落地闭环 (2026-10-07, ✅)。
 - **背景**: 现行设计遵循 spec §5/§8 "宁丢不脏、绝不阻塞"原则:
   - **NO_SPACE** — staging 空闲不足时整条丢弃:`drop_no_space` 计数 + `LOGX_EV_DROP` 事件 + 返回 `LOGX_ERR_NO_SPACE`(`core/src/logx_c.cpp:435-457`,`Staging::write_records` 返回 `kFull`);
   - **TOO_LARGE** — 单条格式化后超 `maxLogLength` 时整条丢弃:`drop_too_large` 计数 + `LOGX_EV_DROP` 事件 + 返回 `LOGX_ERR_TOO_LARGE`(`core/src/logx_c.cpp:428-432`;init 强制 `max_log_length < 数据区−1`,超长记录物理上放不进环,无"等待腾空间"选项)。
 
 #### 方案评估结论
 
-| 方案 | 适用路径 | 改动量 | 思路 | 波及面 |
-|---|---|---|---|---|
-| **A. 有界阻塞重试** | NO_SPACE | **小**(~0.5d,`logx_write` 单函数 ~40-60 行) | `logx_write` 进锁前已完成 `build_records` 格式化(栈上 `buf`),重试零重新格式化成本:锁内 `write_records` 失败即解锁,轮询短暂等待(复用 `flush_blocking` 的 `sleep_ms(5)` 风格,或在 `drain_once` 每块提交后补一行 `ev_signal`)后重试;超过总上限(如 5s)或 Flusher 已死才走现行丢弃路径保底 | `logx_c.cpp`、`logx_internal.h` 加等待上限常量/配置;`flusher.cpp` 可选加 1-2 行 signal;补单测(满时阻塞至 flush 腾出、Flusher 死亡仍返回 NO_SPACE);现有 stress 测试自带 NO_SPACE 重试,兼容 |
-| **B. 截断保留前缀** | TOO_LARGE | **小**(~20-40 行) | 超长时用缩小后的 payload 经 `format_record` 重新格式化一次,保证 ≤ `max_log_length` 落环;新增截断计数(占用 `logx_stats_t.reserved` 预留位,ABI 兼容),事件改为 "log truncated" | `format.cpp`/`logx_c.cpp`;Kotlin 层 API 与磁盘格式均不动 |
-| **C. 溢出文件保全文** | 两者 | **大**(不推荐) | 超限记录落独立溢出文件 | 打破"文件单写者"不变量(spec 不变量 4,仅 Flusher 写日志文件),需新增文件类型并贯通恢复/导出/保留期/切分全链路,引入新对账复杂度 |
+| 方案 | 适用路径 | 改动量 | 思路 | 波及面 | 落地状态 |
+|---|---|---|---|---|---|
+| **A. 有界阻塞重试** | NO_SPACE | **小**(~0.5d,`logx_write` 单函数 ~40-60 行) | `logx_write` 进锁前已完成 `build_records` 格式化(栈上 `buf`),重试零重新格式化成本:锁内 `write_records` 失败即解锁,轮询短暂等待(`pal->sleep_ms(2)`)后重试;超过总上限(`staging_wait_ms`)或 Flusher 已死才走现行丢弃路径保底 | `logx_c.cpp`、`logx_internal.h`、`logx_c.h`、JNI 与 Kotlin `Config.stagingWaitMs` 接线;默认 0ms 保持不阻塞契约 | ✅ 已落地 (2026-10-07) |
+| **B. 截断保留前缀** | TOO_LARGE | **小**(~20-40 行) | 超长时用缩小后的 payload 经 `format_record` 重新格式化一次,保证 ≤ `max_log_length` 落环;新增截断计数(占用 `logx_stats_t.reserved` 预留位,ABI 兼容),事件改为 "log truncated" | `format.cpp`/`logx_c.cpp`;Kotlin 层 API 与磁盘格式均不动 | ✅ 已落地 (2026-09-13 T5.5) |
+| **C. 溢出文件保全文** | 两者 | **大**(不推荐) | 超限记录落独立溢出文件 | 打破"文件单写者"不变量(spec 不变量 4,仅 Flusher 写日志文件),需新增文件类型并贯通恢复/导出/保留期/切分全链路,引入新对账复杂度 | ❌ 否决 |
 
-- **可行性依据(方案 A 活性保证)**: `drain_once` 的块写失败分支(`flusher.cpp:696-705`、`717-727`)同样清零区间并推进 `f`,即使磁盘持续 IO 失败空间也必然释放,不会死等;Flusher debounce 仅 75ms,需 5s 内灌满 128KB 且磁盘彻底卡死才真正丢,反压传导到业务线程是最坏 5s 的延迟代价。
-- **效果预估**: A+B 落地后,真正丢日志仅剩"磁盘彻底坏死且持续 5s+"与"超长且截断不可接受"两类边缘场景。
+- **方案 A 落地详情 (2026-10-07)**:
+  - 引入可配置 `staging_wait_ms`（默认值 0 保持零等待即时丢弃契约，>0 开启退避重试）；
+  - `logx_write` 锁内遇 `kFull` 且 `staging_wait_ms > 0` 时解锁，主动唤醒 `flush_event` 并在锁外 `pal->sleep_ms(2)` 有界退避重试，超时或 Flusher 死亡快速失败后走原有即时丢弃与打点；
+  - 专属单测覆盖 0ms 即刻丢弃、1000ms 240KB 突发打满 128KB 暂存区 0 丢弃落盘、Flusher 停机快速失败防死锁。
+- **效果预估**: A+B 落地后,真正丢日志仅剩"磁盘彻底坏死且持续超过 staging_wait_ms"与"超长且截断不可接受"两类边缘场景。
 
-#### 决策点(拍板前需确认)
-
-1. **延迟契约变更**: 方案 A 与 spec "空闲不足 → 丢弃 + 打点,绝不阻塞"原则冲突——磁盘卡住时反压会阻塞业务调用线程(最坏等满等待上限)。建议加配置开关(如 `staging_wait_ms`:0 = 保持现行丢弃语义,>0 = 有界等待),默认值待定。
-2. **TOO_LARGE 语义选择**: 截断保前缀(方案 B)是否可接受;若业务要求超长记录一字节不能少,才考虑方案 C(代价大)。
-3. spec 文档(`LogX日志库最终实施方案.md` §3.1/§5/§8)需随决策同步修订对应条款与计数/事件说明。
 
 ### B-2 LogX.kt 状态机冻结声明与 JVM 侧并发回归测试门禁
 
@@ -319,15 +320,15 @@ gantt
 ### B-7 同日内 ATC 提示落后于最新分卷时的跨分卷 seqno 回退 (R20 F-5 小缺口 / R21 补记)
 
 - **记录日期**: 2026-10-05 (R20 报告 §二·5 提出"纳入 backlog"，当时未落；R21 补记为 B-7)
-- **状态**: ⏸ 待决策
-- **背景**: `reconcile`(`recovery.cpp:152-198`) 的回退判据只比 **date**——R19 F-5 修的是"昨日 ATC 接管今日文件"，条件为 `best_date > hdr.target.date`。**同一天内** ATC 提示落后于最新分卷时（如 staging Header 的提交丢失/陈旧，使 `hdr.target` 仍指 `<today>.log.2`，而 `<today>.log.5` 已持有更高 seqno 的块）不会触发回退，于是按 hint 扫 `.log.2` 得 `S_file`，`resume_seqno = max(S_hdr, S_file)` 可能低于 `.log.5` 已有的 seqno ⇒ **跨分卷 seqno 回退/重号**。
+- **状态**: ✅ **已拍板并落地 (2026-10-07, 采纳方案 A 判据扩为二元组)**
+- **背景**: `reconcile`(`recovery.cpp:152-198`) 的回退判据此前只比 **date**——R19 F-5 修的是"昨日 ATC 接管今日文件"，条件为 `best_date > hdr.target.date`。**同一天内** ATC 提示落后于最新分卷时（如 staging Header 的提交丢失/陈旧，使 `hdr.target` 仍指 `<today>.log.2`，而 `<today>.log.5` 已持有更高 seqno 的块）不会触发回退，于是按 hint 扫 `.log.2` 得 `S_file`，`resume_seqno = max(S_hdr, S_file)` 可能低于 `.log.5` 已有的 seqno ⇒ **跨分卷 seqno 回退/重号**。
 - **影响面（已核实，勿夸大）**: ① 同一文件内 seqno 仍严格单调（`block_header_plausible` 只在本文件内比较），单文件读取不受影响；② **加密 nonce 不复用**——nonce = 文件盐(8B，每文件随机) + seqno(4B)，跨文件同 seqno 因盐不同仍唯一；③ 真正的后果是"全局 seqno 单调"这一**对外消费者的隐含假设**被打破（按 (date,split) 顺序导出时序号会回跳），以及 `S_file > S_hdr` 分支的 `Σraw_len` 回推少算 ⇒ `flushed_len` 偏小 ⇒ 已落盘数据被重刷（日志重复，不丢）。
-- **触发条件**: 同日多次切分 + staging Header 提交丢失/陈旧（崩溃窗口叠加），低概率。
-- **候选方案**:
-  - **A. 判据扩为二元组**: `is_target_newer` 由 `best_date > target.date` 扩为 `(best_date, best_split) > (target.date, atc_split(target))`。改动最小（一处比较），保留 ATC 快路径。
-  - **B. 放弃 hint 快路径**: 启动一律用 `scan_dir_for_target` 的结果。语义最干净，代价是每次启动多一次全目录扫描 + 逐文件 `scan_one`。
-  - **C. 暂缓**: 仅在 spec 中写明"seqno 单调性保证以单文件为界"，把跨文件单调降级为非目标。
-- **决策点**: 是否对外承诺跨文件 seqno 单调（若 Kotlin/decoder 侧或用户脚本依赖它做去重/排序，则必须选 A 或 B）；启动耗时预算能否容纳 B 的全目录扫描。
+- **落地详情 (2026-10-07 方案 A)**:
+  - `recovery.cpp`：`is_target_newer` 判据由仅比日期扩展为二元组比较 `(best_date > hdr.target.date) || (best_date == hdr.target.date && best_split > hint_split)`；
+  - `flusher.cpp`：`scan_dir_for_target()` 候选排序决选逻辑纠偏为严格按 `(date, split)` 二元组全序决选最新追加目标，根除新分卷 seqno 为 0 时漏选新分卷缺陷；
+  - `tests/unit/test_flusher.cpp`：修正 `Flush.FileSizeThreshold_DefensiveProbeSkipsExistingSplit` 用例时序，使候选冲突分卷在打开后注入，兼顾切分滚动防覆写断言与 B-7 智能接管语义；
+  - 专属单测 `B7_SameDaySplit_StaleAtcHintRecoversToLatestSplit`：通过变异测试（临时恢复仅比日期逻辑）实证确定性复红见红，还原后复绿，反空洞绿屏障刚性确立。
+
 
 ### B-8 新文件 + 孤儿块组合下 truncated_blocks 虚报 (R20 F-13 边界缺口 / R21 补记)
 

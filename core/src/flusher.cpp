@@ -1021,14 +1021,14 @@ void flusher_loop(Instance* inst) {
     inst->flusher_running.store(false, std::memory_order_release);
 }
 
-// 在 log_dir 下扫描所有日志文件,选"日期最大且尾块 seqno 最大"者作为追加目标。
+// 在 log_dir 下扫描所有日志文件,选"(日期, 分卷序号) 最新"者作为追加目标。
 // 定义在 anonymous 外(header 声明 + MSVC merge 限制);recovery 对账也用。
 std::string scan_dir_for_target(Instance* inst) {
     auto files = inst->pal->file_list(inst->log_dir.c_str());
     std::sort(files.begin(), files.end());
     std::string best;
     uint32_t best_date = 0;
-    uint32_t best_seqno = 0;
+    uint16_t best_split = 0;
     for (const auto& f : files) {
         // R-03: 统一走 parse_log_filename(含日历合法性校验)
         uint32_t date = 0;
@@ -1036,8 +1036,9 @@ std::string scan_dir_for_target(Instance* inst) {
         if (!parse_log_filename(f, &date, &split)) continue;
         FileScanResult r = scan_one(inst, f, /*repair=*/false);  // 只评估,不修复
         if (!r.ok) continue;
-        if (date > best_date || (date == best_date && r.seqno > best_seqno)) {
-            best = f; best_date = date; best_seqno = r.seqno;
+        // B-7: 严格按 (date, split) 二元组全序决出最新目标文件, 消除同日空新分卷(r.seqno==0)被漏选缺陷
+        if (date > best_date || (date == best_date && split > best_split)) {
+            best = f; best_date = date; best_split = split;
         }
     }
     return best;

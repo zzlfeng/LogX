@@ -157,8 +157,8 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
         hint = make_log_path(inst->log_dir, hdr.target.date, atc_split(hdr.target));
     }
     FileScanResult sr;
-    // R19 F-5: 检查目录最新目标。若目录存在日期大于 ATC 提示日期的文件，
-    // 说明跨天已创建新文件，ATC 提示属于昨日旧文件，必须回退最新文件扫描。
+    // R19 F-5 / B-7: 检查目录最新目标。若目录存在 (date, split) 大于 ATC 提示的目标，
+    // 说明跨天或同日切分已创建新文件，ATC 提示属于旧文件，必须回退最新文件扫描。
     std::string best = scan_dir_for_target(inst);
     uint32_t best_date = 0;
     uint16_t best_split = 0;
@@ -167,12 +167,16 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
     }
 
     bool is_target_newer = false;
-    if (!best.empty() && hdr.target.date != 0 && best_date > hdr.target.date) {
-        is_target_newer = true;
+    if (!best.empty() && hdr.target.date != 0) {
+        uint16_t hint_split = atc_split(hdr.target);
+        if (best_date > hdr.target.date ||
+            (best_date == hdr.target.date && best_split > hint_split)) {
+            is_target_newer = true;
+        }
     }
 
     if (is_target_newer) {
-        // 跨天后 ATC 提示文件已过时，直接使用最新的当日文件 (R19 F-5)
+        // 跨天或同日切分后 ATC 提示文件已过时，直接使用最新的目标文件 (R19 F-5 / B-7)
         sr = scan_append_target(inst, best);
     } else if (!hint.empty()) {
         sr = scan_append_target(inst, hint);

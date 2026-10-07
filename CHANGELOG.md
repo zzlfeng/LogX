@@ -460,6 +460,37 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
 
 ---
 
+## Backlog 优化落地: B-7 同日多分卷恢复防御 + B-1(方案 A) 暂存区满有界退避重试 (2026-10-07)
+
+落实 Backlog 中评估优先级最高的两项关键优化任务 B-7 与 B-1（方案 A）：
+
+1. **B-7 落地（同日多分卷 ATC 提示落后时的跨分卷 seqno 回退防御）**：
+   - `core/src/recovery.cpp`：`reconcile()` 中的目标新旧判定由仅比日期扩为二元组：`is_target_newer = (best_date > hdr.target.date) || (best_date == hdr.target.date && best_split > hint_split);`。当 Staging 头部陈旧指向旧分卷而磁盘已存在更新分卷时，不再盲目采信陈旧 ATC，而是准确接管最新分卷。
+   - `core/src/flusher.cpp`：`scan_dir_for_target()` 决选逻辑由 `r.seqno > best_seqno` 纠偏为严格按 `(date, split)` 二元组全序决选最新追加目标，根除新分卷首块尚未持久化或 seqno 为 0 时漏选新分卷的缺陷。
+   - 用例语义对齐（`tests/unit/test_flusher.cpp`）：修正 `Flush.FileSizeThreshold_DefensiveProbeSkipsExistingSplit`，将冲突候选分卷注入时机与 B-7 智能接管语义对齐，断言切分滚动防覆写逻辑依然 100% 成立。
+
+2. **B-1 (方案 A) 落地（NO_SPACE 暂存区满时有界阻塞退避重试）**：
+   - `core/include/logx_c.h` & `core/include/logx_internal.h`：`logx_config_t` 追加 `uint32_t staging_wait_ms;`（配置字段）；`Instance` 追加 `uint32_t staging_wait_ms = 0;`。
+   - `core/src/logx_c.cpp`：
+     - `logx_open` 初始化 `inst->staging_wait_ms`；
+     - `logx_write` 实现锁外退避循环：`write_records` 返回 `kFull` 且 `staging_wait_ms > 0` 时，解锁互斥锁，检查 Flusher 运行状态（若 Flusher 死亡则快速失败），主动唤醒 `flush_event` 并在锁外 `pal->sleep_ms(2)` 退避重试；超时或未配置时（默认 0ms）严格回退到原有即时丢弃、打点与返回 `LOGX_ERR_NO_SPACE`。
+   - `android/cpp/logx_jni.cpp` & `android/kotlin/LogX.kt`：`nativeInit` 新增 `stagingWaitMs` 参数，`Config` 数据类新增 `val stagingWaitMs: Long = 0L`，对齐跨语言契约，默认值保持 0 杜绝阻断既有业务。
+
+3. **专属回归用例与反空洞绿验证（`tests/unit/test_r19_regression.cpp`）**：
+   - `B7_SameDaySplit_StaleAtcHintRecoversToLatestSplit`：模拟分卷 0 与分卷 1 共存但 ATC 指针停留在分卷 0，验证正确接管分卷 1 且 seqno 连续单调；经变异测试验证（临时恢复仅比日期逻辑）实证确定性复红（`atc_split: 0 vs 1`，`recovered_seqno: 10 vs 20`），撤销实验还原后复绿，反空洞绿屏障刚性确立；
+   - `B1_NoSpace_DefaultZeroWait_DropsImmediately`：验证 `stagingWaitMs = 0` 时保持即刻丢弃契约；
+   - `B1_NoSpace_BoundedRetry_SucceedsWithoutDrop`：验证配置 `stagingWaitMs = 1000` 时，240KB 突发流量在 128KB 暂存区下平稳落盘，0 丢弃（drop_no_space == 0）；
+   - `B1_NoSpace_BoundedRetry_FailFastWhenFlusherDead`：验证 Flusher 异常停机时有界重试快速失败，绝不发生锁内或锁外死锁。
+
+4. **全量实测验证**：
+   - `build-full` 全量 clean 重建 56/56 目标 0 错误 0 警告；
+   - 单测 `logx_unit_tests.exe` **169/169 全绿**（17 套件，退出码 0）；
+   - 热路径 `logx_hotpath_alloc_tests.exe` **2/2 全绿**；
+   - 压力 `logx_stress_tests.exe` **4/4 全绿**；
+   - 崩溃 fork `logx_crash_fork_tests.exe` **3/3 全绿**。
+
+---
+
 ## 附:构建命令速查
 
 ### Windows(桌面,MSVC)

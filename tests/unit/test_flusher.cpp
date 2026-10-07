@@ -905,25 +905,10 @@ TEST(Flush, FileSizeThreshold_DefensiveProbeSkipsExistingSplit) {
     std::string path0 = make_log_path(dir, yyyymmdd, 0);
     std::string path1 = make_log_path(dir, yyyymmdd, 1);
 
-    // 创建已满的 path0 (500B) 与已存在的历史分卷 path1 (300B)
+    // 创建已满的 path0 (500B)
     create_valid_test_log(pal, path0, yyyymmdd, 1, 500);
-    create_valid_test_log(pal, path1, yyyymmdd, 2, 300);
 
-    // 构造旧版本 Staging 缓存: split_no = 0，指向已满的 path0 (模拟升级窗口)
-    {
-        Staging st_builder(&pal, staging, 8 * 1024);
-        RecoveryState st; bool rec = false;
-        ASSERT_TRUE(st_builder.open(&st, &rec));
-        AppendTargetCache old_atc{};
-        old_atc.date = yyyymmdd;
-        atc_set_split(&old_atc, 0);
-        old_atc.last_block_offset = 32;
-        old_atc.last_block_end_offset = 500;
-        st_builder.commit_header_locked(1, 0, 0, &old_atc);
-        st_builder.close();
-    }
-
-    // 记录 path1 的原始字节快照
+    // 记录 path1 的原始字节快照辅助函数
     auto read_file_bytes = [&](const std::string& path) -> std::vector<uint8_t> {
         int64_t sz = pal.file_size_path(path.c_str());
         if (sz <= 0) return {};
@@ -935,8 +920,6 @@ TEST(Flush, FileSizeThreshold_DefensiveProbeSkipsExistingSplit) {
         }
         return b;
     };
-    std::vector<uint8_t> snap1 = read_file_bytes(path1);
-    ASSERT_EQ(snap1.size(), 300u);
 
     // 配置实例，max_file_size = 500
     logx_config_t cfg{};
@@ -951,6 +934,12 @@ TEST(Flush, FileSizeThreshold_DefensiveProbeSkipsExistingSplit) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 在实例打开已满的 path0 后，注入外部冲突分卷 path1 (300B)
+    // 模拟运行期外部残留或多进程并发场景下，候选下一个分卷已被占用的边界
+    create_valid_test_log(pal, path1, yyyymmdd, 2, 300);
+    std::vector<uint8_t> snap1 = read_file_bytes(path1);
+    ASSERT_EQ(snap1.size(), 300u);
 
     // 写入日志跨越 500B 触发切分滚动
     for (int i = 0; i < 15; ++i) {

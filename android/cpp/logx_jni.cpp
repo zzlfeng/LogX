@@ -228,7 +228,8 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
                                       jint kid, jobject jKeyProvider,
                                       jint retentionDays, jlong maxFileSize,
                                       jint maxLogLength, jint flushThreshold,
-                                      jboolean jConsoleEcho) {
+                                      jboolean jConsoleEcho,
+                                      jint stagingWaitMs) {
     if (!jLogDir || !jStagingPath) return 0;
 
     // T5.4: consoleEcho 开关在 init 时点定型(Kotlin facade 单实例契约下
@@ -286,6 +287,7 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     cfg.flush_threshold = (flushThreshold == -1)
         ? UINT32_MAX
         : static_cast<uint32_t>(flushThreshold);
+    cfg.staging_wait_ms = stagingWaitMs > 0 ? static_cast<uint32_t>(stagingWaitMs) : 0;
     // compressAlgo 直传:Kotlin Compress 枚举(NONE=0/ZSTD=1/ZLIB=2)与 core 的
     // logx::kAlgoNone/kAlgoZstd/kAlgoZlib 严格一一对应,logx_open 内 fail-fast 校验;
     // 落盘时由 make_flag() 写入块头 flag 字节 bit1..2。

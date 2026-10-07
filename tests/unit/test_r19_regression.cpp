@@ -1416,3 +1416,238 @@ TEST(R19Regression, F7_MicroBlockNotSeamPadding_DropsAndEmitsRecoveryEvent) {
     logx_close(inst);
     cleanup_dir(dir);
 }
+
+// ============================================================
+// B-7: 同日内多次切分且 ATC 提示陈旧时的跨分卷 seqno 回退与新分卷漏选防御
+// 场景:
+//   同日内存在分卷 0 (<date>.log, seqno 1..10) 与分卷 1 (<date>.log.1, seqno 11..20)。
+//   Staging Header 的 ATC 提示因崩溃未持久化而滞留在分卷 0 (split=0, seqno=10)。
+//   在 B-7 修复前:
+//     reconcile() 的 is_target_newer 仅比较 best_date > hdr.target.date (同日两值相等为 false),
+//     且 scan_dir_for_target 原按 seqno 比较对空分卷失效。恢复错误采信 hint 走向分卷 0,
+//     resume_seqno 回退到 10, ATC 滞留在 split 0。
+//   在 B-7 修复后:
+//     严格按 (date, split) 二元组全序判定, 识别分卷 1 更优, 恢复目标正确切换至分卷 1,
+//     resume_seqno 推进至 >= 20, ATC 切换为 split 1。
+// ============================================================
+TEST(R19Regression, B7_SameDaySplit_StaleAtcHintRecoversToLatestSplit) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_b7_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+    uint32_t today = 20261007u;
+    uint8_t salt0[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t salt1[8] = {8, 7, 6, 5, 4, 3, 2, 1};
+
+    auto write_custom_log = [&](const std::string& path, uint32_t date, const uint8_t salt[8],
+                                uint32_t seq_start, uint32_t count) {
+        int fd = pal.file_open(path.c_str(), true, false);
+        ASSERT_GE(fd, 0);
+        write_file_header_bytes(fd, date, salt);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint8_t bhdr[34] = {};
+            std::vector<uint8_t> payload(64, static_cast<uint8_t>(0x30 + i));
+            make_block_header(bhdr, seq_start + i, 64,
+                              static_cast<uint32_t>(payload.size()), 0, salt);
+            put_u32_le(bhdr + 18, crc32_update(0, payload.data(),
+                                               static_cast<uint32_t>(payload.size())));
+            ASSERT_EQ(pal.file_write(fd, bhdr, 34), 34);
+            ASSERT_EQ(pal.file_write(fd, payload.data(), static_cast<long>(payload.size())),
+                      static_cast<long>(payload.size()));
+        }
+        pal.file_close(fd);
+    };
+
+    // 分卷 0: seqno 1..10
+    write_custom_log(make_log_path(dir, today, 0), today, salt0, 1, 10);
+    // 分卷 1: seqno 11..20
+    write_custom_log(make_log_path(dir, today, 1), today, salt1, 11, 10);
+
+    // 构造 Staging: 预置 Header 指向陈旧的分卷 0 (seqno=10, flushed_len=0, atc split=0)
+    Instance* inst = new Instance();
+    inst->pal = &pal;
+    inst->log_dir = dir;
+    inst->staging_path = staging;
+    inst->staging = new Staging(inst->pal, staging, 128 * 1024);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    AppendTargetCache stale_atc{};
+    stale_atc.date = today;
+    atc_set_split(&stale_atc, 0);
+    stale_atc.last_block_offset = 32;
+    stale_atc.last_block_end_offset = 32 + 10 * (34 + 64);
+    inst->staging->commit_header_locked(10, 0, 0, &stale_atc);
+
+    // 执行恢复
+    ASSERT_TRUE(run_recovery(inst));
+
+    // 校验恢复后的 Staging Header:
+    const uint8_t* raw = inst->staging->raw_base();
+    uint32_t recovered_seqno = get_u32(raw + 8);
+    AppendTargetCache recovered_atc{};
+    std::memcpy(&recovered_atc, raw + 20, sizeof(recovered_atc));
+
+    // B-7 核心断言:
+    // 1. ATC 必须指向最新的分卷 1 (杜绝留在滞后的分卷 0)
+    EXPECT_EQ(recovered_atc.date, today);
+    EXPECT_EQ(atc_split(recovered_atc), 1u);
+
+    // 2. 恢复后的 seqno 必须 >= 20 (分卷 1 的尾块序号)，严禁回退至分卷 0 的 10
+    EXPECT_GE(recovered_seqno, 20u);
+
+    delete inst->staging;
+    delete inst;
+    cleanup_dir(dir);
+}
+
+// ============================================================
+// B-1 方案 A (基准对照): staging_wait_ms == 0 保持默认绝不阻塞
+// 场景:
+//   关闭自动刷盘 (flush_threshold = 0)，单条 32KB 记录连续写入。
+//   第 5 条必定超出 128KB 数据区触顶 kFull。
+//   在 staging_wait_ms == 0 时: 立即返回 LOGX_ERR_NO_SPACE，绝不阻塞，
+//   且 drop_no_space 增加，发 LOGX_EV_DROP 事件。
+// ============================================================
+TEST(R19Regression, B1_NoSpace_DefaultZeroWait_DropsImmediately) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_b1_def_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    EventProbe probe;
+    auto on_err = [](void* user, logx_event_kind_e k, int c, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, c, m);
+    };
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 48 * 1024;
+    cfg.flush_threshold = 0;  // 禁用按阈值自动刷盘
+    cfg.staging_wait_ms = 0;  // 默认: 绝不阻塞
+    cfg.retention_days = 36500;
+    cfg.err_fn = on_err;
+    cfg.err_user = &probe;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    Instance* ii = static_cast<Instance*>(inst);
+
+    std::vector<uint8_t> rec(32 * 1024, 'A');
+    bool saw_nospace = false;
+    uint64_t start = pal.wallclock_ms();
+    for (int i = 0; i < 8; ++i) {
+        int rc = logx_write(inst, 2, "B1Test", rec.data(), static_cast<uint32_t>(rec.size()));
+        if (rc == LOGX_ERR_NO_SPACE) {
+            saw_nospace = true;
+            break;
+        }
+    }
+    uint64_t cost = pal.wallclock_ms() - start;
+
+    EXPECT_TRUE(saw_nospace);
+    EXPECT_LT(cost, 100u) << "0ms 等待配置下应即刻返回，不产生退避耗时";
+    EXPECT_GE(ii->drop_no_space.load(), 1u);
+    EXPECT_TRUE(probe.saw_kind(LOGX_EV_DROP));
+    EXPECT_TRUE(probe.saw_msg_substring("staging full"));
+
+    logx_close(inst);
+    cleanup_dir(dir);
+}
+
+// ============================================================
+// B-1 方案 A (核心功能): staging_wait_ms > 0 开启有界重试，突发脉冲零丢日志
+// 场景:
+//   关闭自动刷盘 (flush_threshold = 0)，配置 staging_wait_ms = 1000。
+//   突发写入 8 条 30KB 记录 (累计 240KB >> 128KB 暂存区总容积)。
+//   在第 5 条触顶 kFull 时，logx_write 在锁外触发 flush_event 唤醒 Flusher 并退避，
+//   Flusher 刷盘腾出空间后 logx_write 重试成功。
+//   断言: 全部 8 条全部成功返回 LOGX_OK，drop_no_space 严格为 0，零丢弃事件。
+// ============================================================
+TEST(R19Regression, B1_NoSpace_BoundedRetry_SucceedsWithoutDrop) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_b1_retry_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    EventProbe probe;
+    auto on_err = [](void* user, logx_event_kind_e k, int c, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, c, m);
+    };
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 48 * 1024;
+    cfg.flush_threshold = 0;    // 禁用自动阈值，完全依赖 B-1 环满时触发的 flush_event
+    cfg.staging_wait_ms = 1000; // 允许至多 1000ms 的有界退避重试
+    cfg.retention_days = 36500;
+    cfg.err_fn = on_err;
+    cfg.err_user = &probe;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    Instance* ii = static_cast<Instance*>(inst);
+
+    std::vector<uint8_t> rec(30 * 1024, 'R');
+    const int kTotalWrites = 8; // 8 * 30KB = 240KB >> 128KB staging
+    for (int i = 0; i < kTotalWrites; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, "B1Retry", rec.data(), static_cast<uint32_t>(rec.size())), LOGX_OK)
+            << "第 " << i << " 条写入应有界重试成功，不应丢弃";
+    }
+
+    // 核心断言: 零丢弃、零丢弃事件、统计计数严格为 0
+    EXPECT_EQ(ii->drop_no_space.load(), 0u);
+    EXPECT_FALSE(probe.saw_kind(LOGX_EV_DROP));
+    EXPECT_FALSE(probe.saw_msg_substring("staging full"));
+
+    // 刷盘确认所有日志完好落盘
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+    logx_close(inst);
+    cleanup_dir(dir);
+}
+
+// ============================================================
+// B-1 方案 A (活性防护): Flusher 停止运行时即便配置重试也快速失败
+// ============================================================
+TEST(R19Regression, B1_NoSpace_BoundedRetry_FailFastWhenFlusherDead) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_b1_dead_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 48 * 1024;
+    cfg.flush_threshold = 0;
+    cfg.staging_wait_ms = 2000; // 配置了等待 2 秒
+    cfg.retention_days = 36500;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    Instance* ii = static_cast<Instance*>(inst);
+
+    // 填满 staging
+    std::vector<uint8_t> rec(32 * 1024, 'D');
+    while (true) {
+        if (logx_write(inst, 2, "Dead", rec.data(), static_cast<uint32_t>(rec.size())) == LOGX_ERR_NO_SPACE) {
+            break;
+        }
+        // 模拟 Flusher 死亡/未运行
+        ii->flusher_running.store(false, std::memory_order_release);
+    }
+
+    // 在 flusher_running == false 时写满后再次写入
+    uint64_t t0 = pal.wallclock_ms();
+    int rc = logx_write(inst, 2, "Dead", rec.data(), static_cast<uint32_t>(rec.size()));
+    uint64_t elapsed = pal.wallclock_ms() - t0;
+
+    EXPECT_EQ(rc, LOGX_ERR_NO_SPACE);
+    EXPECT_LT(elapsed, 100u) << "Flusher 死亡时应快速失败，不应等待 2000ms 超时";
+
+    logx_close(inst);
+    cleanup_dir(dir);
+}
+

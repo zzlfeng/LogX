@@ -386,6 +386,7 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->flush_threshold = (cfg->flush_threshold == UINT32_MAX)
         ? (8 * 1024)
         : cfg->flush_threshold;
+    inst->staging_wait_ms = cfg->staging_wait_ms;
     inst->compress_algo = cfg->compress_algo;
     inst->encrypt_enable = (cfg->encrypt_enable != 0);
     inst->kid = cfg->kid;
@@ -526,30 +527,58 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         return LOGX_OK;
     }
 
-    // 2) 锁内写入 staging
-    inst->pal->mutex_lock(inst->mu);
+    // 2) 锁内写入 staging (B-1 方案 A: 环满支持锁外有界重试)
     uint32_t consumed = 0;
     uint32_t pads = 0;
-    auto st = inst->staging->write_records(buf, total, &consumed, &pads);
+    Staging::WriteStatus st = Staging::WriteStatus::kFull;
     bool need_wake = false;
-    bool need_drop_event = false;
-    if (st == Staging::WriteStatus::kOk) {
-        if (pads > 0) {
-            inst->pad_records.fetch_add(pads, std::memory_order_relaxed);
+    uint64_t start_retry_ms = 0;
+
+    while (true) {
+        inst->pal->mutex_lock(inst->mu);
+        st = inst->staging->write_records(buf, total, &consumed, &pads);
+        if (st == Staging::WriteStatus::kOk) {
+            if (pads > 0) {
+                inst->pad_records.fetch_add(pads, std::memory_order_relaxed);
+            }
+            inst->staged_bytes_total.fetch_add(consumed, std::memory_order_relaxed);
+            uint32_t f, snap;
+            uint32_t pending = inst->staging->snapshot_pending(&f, &snap);
+            need_wake = inst->flush_threshold > 0 && pending >= inst->flush_threshold;
+            inst->pal->mutex_unlock(inst->mu);
+            break;
         }
-        inst->staged_bytes_total.fetch_add(consumed, std::memory_order_relaxed);
-        uint32_t f, snap;
-        uint32_t pending = inst->staging->snapshot_pending(&f, &snap);
-        need_wake = inst->flush_threshold > 0 && pending >= inst->flush_threshold;
-    } else if (st == Staging::WriteStatus::kFull) {
-        inst->drop_no_space.fetch_add(1);
-        need_drop_event = true;
+        inst->pal->mutex_unlock(inst->mu);
+
+        // 空间不足: 检查重试条件 (staging_wait_ms == 0 时默认绝不阻塞)
+        if (inst->staging_wait_ms == 0 || !inst->flusher_running.load(std::memory_order_acquire)) {
+            break;
+        }
+
+        uint64_t now = inst->pal->wallclock_ms();
+        if (start_retry_ms == 0) {
+            start_retry_ms = now;
+        } else if (now >= start_retry_ms + inst->staging_wait_ms) {
+            break;  // 超时
+        }
+
+        // 唤醒 Flusher 加速刷盘
+        if (inst->flush_event) {
+            inst->pal->ev_signal(inst->flush_event);
+        }
+
+        // 锁外短暂退避休眠 2ms (防自旋占满 CPU，给后台 Flusher 刷盘窗口)
+        inst->pal->sleep_ms(2);
+
+        if (inst->closing.load(std::memory_order_acquire)) {
+            return LOGX_OK;
+        }
     }
-    inst->pal->mutex_unlock(inst->mu);
 
     // P1-1: emit_event 必须在解锁后触发, 杜绝回调内调用 close/flush 造成自死锁,
     // 同时避免回调内耗时阻断其他并发写线程。
-    if (need_drop_event) {
+    if (st == Staging::WriteStatus::kFull) {
+        inst->drop_no_space.fetch_add(1);
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full");
     }
 
