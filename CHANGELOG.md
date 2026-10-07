@@ -512,12 +512,12 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - NDK clang 存量警告 4 处（`logx_c.cpp:90 key_lookup_attempted`〔方案 C 遗留〕、zstd 第三方、2 个测试文件），非本批引入，MSVC 0 警告声称不受影响。
 
 7. **Backlog B-10 方案 A1 落地 + B-8 闭环 (方案 C) (2026-10-07)**：
-   - **B-10 (用户拍板 A1)**：`reconcile` 在 is_target_newer 分支增加异常残留高分卷防御门——选中目标**非空**且尾块 seqno 低于 ATC hint 文件尾块（多写者/外部残留特征）时，发 `LOGX_EV_RECOVERY` 告警（"target seqno regression vs hint; resume clamped"）并以 `ReconcileResult::seqno_floor` 钳制 `resume_seqno` 下限；杜绝磁盘 seqno 重复（seqno 兼 AES-GCM nonce 材料，重复即 nonce 复用）；**不改变 B-7 的 (date, split) 文件决选语义**（空新目标 seqno==0 仍归 R19 F-13 管辖）；
-   - **B-10 回归用例与反空洞绿**：`B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned`（hint 分卷 seqno 1..20 + S_hdr 撕裂至 10 + 残留分卷 seqno 1..5 → 断言告警事件 + recovered seqno=20）；撤销对照（R18-2）：注释掉钳制 → 用例确定性复红（recovered 11 vs 20），还原后复绿；
+   - **B-10 (用户拍板 A1，R32 升级方案 1)**：`reconcile` 升级全局目录最大序号防御门（Global Max Seqno Floor）——无论追加目标是否为空分卷或 hint 是否有效，当选中目标尾块 seqno 低于目录历史分卷最大序号（或空目标且 Staging Header 撕裂落后）时，发 `LOGX_EV_RECOVERY` 告警（"target seqno regression vs directory max; resume clamped"）并以 `ReconcileResult::seqno_floor` 钳制 `resume_seqno` 下限；杜绝磁盘全局 seqno 跨分卷倒退，维持单调递增结构不变量（防恢复对账失真与解码排序紊乱）；不改变 B-7 的 (date, split) 文件决选语义；
+   - **B-10 回归用例与反空洞绿**：`B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned`（hint 尾块 20 + S_hdr 撕裂至 10 + 残留分卷 5 → 断言告警 + recovered seqno=20；撤销钳制确定性复红 11 vs 20）+ R32 补强用例 `B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax`（空残留高分卷 seqno=0 且 S_hdr=10 撕裂落后于历史尾块 20 → 成功阻断倒退，断言告警 + recovered seqno=20 钉死 F-1 防御屏障）；
    - **B-8 (用户拍板先验证后定 C)**：验证实验证实 B-8 原始虚报链（R20 F-13）的本质是 **ATC 提示与实际尾块持有文件错配**，**已由 B-7 从根消解**——新用例 `B8_SameDaySplit_StaleAtcWithCommittedSeqno_NoTruncatedOvercount`（S_hdr=25 + ATC 撕裂回退分卷 0 + 块 21..25 在分卷 1）当前代码零虚报，撤销 B-7 判据后确定性复红（虚报 +15 重现，正向对照耦合成立）；残余面由 B-10 A1 覆盖。**方案 C 落地**：`logx_c.h` 的 `truncated_blocks` 注释补口径注记（Header 撕裂场景下缺口不必然等于真实丢块数，仅作诊断参考，非精确 SLA 指标——用户确认）；
    - **顺手项**：计划表 M3 阶段标题「核心完成, 工具待修」更正为「全量闭环，含真机联调」（T3.4 早已闭环，标题状态过时）；
-   - **验证**：MSVC 单测 **172/172**、hotpath 2/2、stress 4/4、crash_fork 3/3；**Android 真机 173/173 + 2/2 + 4/4 + 3/3 全绿**（B8/B10 用例 9ms/11ms 通过）。**环境归因记录**：首轮真机 2 用例假红（`TimeoutWhenFlusherStalled` 提前 2.8s 超时、`LatencyJitter` CV 超界）——实测定位为设备 NTP 持续阶跃墙钟（实测 2s 真实时间墙钟快进 7-9s），`flush_blocking` 墙钟超时（flusher.cpp:1256, P3-1 审查已标注的存量同类隐患）被精确触发；`settings put global auto_time 0` 关闭自动校时后四套件全绿，属环境问题非代码回归；
-   - **审查报告入库**：近期提交综合复审全文见 [`docs/reviews/code_review_R32_2026-10-07.md`](./docs/reviews/code_review_R32_2026-10-07.md)（对象 `a213762` / `4cc998a` / `d636559`，裁定成立 + F-1/F-2/F-3 三项发现与全局目录最大序号优化方案）；reports 索引同步登记。
+   - **验证**：MSVC 单测 **173/173**、hotpath 2/2、stress 4/4、crash_fork 3/3；**Android 真机 173/173 + 2/2 + 4/4 + 3/3 全绿**（B8/B10 用例 9ms/11ms 通过）。**环境归因记录**：首轮真机 2 用例假红（`TimeoutWhenFlusherStalled` 提前 2.8s 超时、`LatencyJitter` CV 超界）——实测定位为设备 NTP 持续阶跃墙钟（实测 2s 真实时间墙钟快进 7-9s），`flush_blocking` 墙钟超时（flusher.cpp:1256, P3-1 审查已标注的存量同类隐患）被精确触发；`settings put global auto_time 0` 关闭自动校时后四套件全绿，属环境问题非代码回归；
+   - **审查报告入库**：近期提交综合复审全文见 [`docs/reviews/code_review_R32_2026-10-07.md`](./docs/reviews/code_review_R32_2026-10-07.md)（对象 `a213762` / `4cc998a` / `d636559`，裁定成立 + F-1/F-2/F-3 三项发现与全局目录最大序号优化方案落地闭环）；reports 索引同步登记。
 
 
 ---

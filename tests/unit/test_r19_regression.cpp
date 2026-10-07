@@ -1592,9 +1592,8 @@ TEST(R19Regression, B8_SameDaySplit_StaleAtcWithCommittedSeqno_NoTruncatedOverco
 //   seqno 1..5, 低于 hint 尾块)。staging Header seqno 撕裂回退至 10
 //   (块 11..20 已落分卷 0 但提交未持久化)。
 //   B-7 按 (date, split) 选中分卷 1 (seqno_file=5); 若无防御, resume =
-//   max(10,5)+1 = 11, 新块 11.. 将与分卷 0 已有块 11..20 磁盘 seqno 重复
-//   (= AES-GCM nonce 复用)。
-//   B-10 A1 落地后: 检测 S_target(5) < S_hint(20) → 发 RECOVERY 告警 +
+//   max(10,5)+1 = 11, 新块 11.. 将与分卷 0 已有块 11..20 磁盘 seqno 倒退与重复。
+//   B-10 升级落地后: 检测 S_target(5) < max_dir_seqno(20) → 发 RECOVERY 告警 +
 //   resume 钳制至 20, 新块自 21 起, 磁盘 seqno 全局单调。
 //   撤销钳制 (R18-2 门禁): recovered seqno 11 → 本用例确定性复红。
 // ============================================================
@@ -1672,6 +1671,93 @@ TEST(R19Regression, B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned) {
     delete inst;
     cleanup_dir(dir);
 }
+
+// ============================================================
+// B-10 / F-1 验证用例: 空残留高分卷 (sr.seqno == 0) 且 Staging Header 撕裂落后
+// 场景:
+//   分卷 0 (seqno 1..20, 历史分卷, 尾块 20)。
+//   分卷 1 (异常残留空文件, 仅 32B 文件头, seqno == 0)。
+//   staging Header 撕裂回退至 seqno = 10, ATC 指向分卷 0。
+//   若无 F-1 防御: sr.seqno == 0 走 R19 F-13 is_new_target 分支,
+//     resume_seqno 取 S_hdr (10), 新块自 11 起写, 与分卷 0 的 11..20 发生跨卷倒退。
+//   方案 1 (全局目录最大序号防御门) 落地后:
+//     检测 max_dir_seqno (20) > hdr.seqno (10) → 发 RECOVERY 告警 +
+//     resume 钳制至 20, 新块自 21 起写, 全局单调不变量保持。
+// ============================================================
+TEST(R19Regression, B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_b10_f1_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+    uint32_t today = 20261007u;
+    uint8_t salt0[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t salt1[8] = {8, 7, 6, 5, 4, 3, 2, 1};
+
+    auto write_custom_log = [&](const std::string& path, uint32_t date, const uint8_t salt[8],
+                                uint32_t seq_start, uint32_t count) {
+        int fd = pal.file_open(path.c_str(), true, false);
+        ASSERT_GE(fd, 0);
+        write_file_header_bytes(fd, date, salt);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint8_t bhdr[34] = {};
+            std::vector<uint8_t> payload(64, static_cast<uint8_t>(0x30 + i));
+            make_block_header(bhdr, seq_start + i, 64,
+                              static_cast<uint32_t>(payload.size()), 0, salt);
+            put_u32_le(bhdr + 18, crc32_update(0, payload.data(),
+                                               static_cast<uint32_t>(payload.size())));
+            ASSERT_EQ(pal.file_write(fd, bhdr, 34), 34);
+            ASSERT_EQ(pal.file_write(fd, payload.data(), static_cast<long>(payload.size())),
+                      static_cast<long>(payload.size()));
+        }
+        pal.file_close(fd);
+    };
+
+    // 分卷 0: seqno 1..20; 分卷 1: 异常空残留 (count = 0, 仅 32B 头, seqno == 0)
+    write_custom_log(make_log_path(dir, today, 0), today, salt0, 1, 20);
+    write_custom_log(make_log_path(dir, today, 1), today, salt1, 1, 0);
+
+    // 构造 Staging: seqno 撕裂回退至 10, ATC 指分卷 0
+    Instance* inst = new Instance();
+    inst->pal = &pal;
+    inst->log_dir = dir;
+    inst->staging_path = staging;
+    inst->staging = new Staging(inst->pal, staging, 128 * 1024);
+    RecoveryState st; bool rec = false;
+    ASSERT_TRUE(inst->staging->open(&st, &rec));
+
+    AppendTargetCache stale_atc{};
+    stale_atc.date = today;
+    atc_set_split(&stale_atc, 0);
+    stale_atc.last_block_offset = 32;
+    stale_atc.last_block_end_offset = 32 + 10 * (34 + 64);
+    inst->staging->commit_header_locked(10, 0, 0, &stale_atc);
+
+    EventProbe probe;
+    inst->err_fn = [](void* user, logx_event_kind_e k, int c, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, c, m);
+    };
+    inst->err_user = &probe;
+
+    ASSERT_TRUE(run_recovery(inst));
+
+    // F-1 断言:
+    // 1. 告警事件必须发出
+    EXPECT_TRUE(probe.saw_kind(LOGX_EV_RECOVERY));
+    EXPECT_TRUE(probe.saw_msg_substring("resume clamped"));
+
+    // 2. resume 被钳制至历史分卷尾块 (20)，杜绝回退至 S_hdr (10)
+    const uint8_t* raw = inst->staging->raw_base();
+    uint32_t recovered_seqno = get_u32(raw + 8);
+    AppendTargetCache recovered_atc{};
+    std::memcpy(&recovered_atc, raw + 20, sizeof(recovered_atc));
+    EXPECT_EQ(recovered_seqno, 20u);
+    EXPECT_EQ(atc_split(recovered_atc), 1u);
+
+    delete inst->staging;
+    delete inst;
+    cleanup_dir(dir);
+}
+
 
 // ============================================================
 // B-1 方案 A (基准对照): staging_wait_ms == 0 保持默认绝不阻塞
@@ -1960,6 +2046,7 @@ TEST(R19Regression, B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk) {
         mock_pal.stall_write.store(false, std::memory_order_release);
         mock_pal.stall_cv.notify_all();
     }
+    // logx_close 内部通过 closing.exchange(true) 保证幂等；此处需显式复位 false，以便正常触发 Flusher 退出与资源 join 清理
     ii->closing.store(false, std::memory_order_release);
 
     logx_close(inst);

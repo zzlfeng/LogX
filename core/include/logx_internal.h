@@ -254,9 +254,9 @@ FileScanResult scan_append_target(Instance* inst, const std::string& hint_path);
 // out_sync_time_ms: 可选输出完成同步时的系统时间戳 (毫秒, wallclock ms)。
 int durability_sync(Instance* inst, uint64_t* out_sync_time_ms = nullptr);
 
-// 在 log_dir 下扫描所有日志文件,选"日期最大且尾块 seqno 最大"者作为追加目标;
-// 返回文件路径(空 = 无)。recovery 对账用。
-std::string scan_dir_for_target(Instance* inst);
+// 在 log_dir 下扫描所有日志文件,选"(日期, 分卷序号) 最新"者作为追加目标;
+// 返回文件路径(空 = 无)。可选输出目录下所有分卷尾块的最大有效序号 out_max_seqno。recovery 对账用。
+std::string scan_dir_for_target(Instance* inst, uint32_t* out_max_seqno = nullptr);
 
 // k 块回溯:从 target_path 中 seqno = upto_seqno(不含)之后的第一块开始,
 // 逐块累加 raw_len 直到文件尾(最后一个有效块),返回 Σraw_len。

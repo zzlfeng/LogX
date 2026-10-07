@@ -1,8 +1,10 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.43 (2026-10-07 B-10 方案 A1 落地 + B-8 闭环(方案 C) + M3 状态修正)
+> **文档版本**: v1.44 (2026-10-07 R32 审查收口: B-10 升级全局目录最大序号防御门 + 密码学定性勘误)
 >
-> **v1.43 修订说明**: 2026-10-07 **Backlog B-8/B-10 双闭环**：① **B-10 (用户拍板方案 A1)**: `reconcile` 增加异常残留高分卷防御门——选中目标非空且尾块 seqno 低于 hint 文件尾块时发 `LOGX_EV_RECOVERY` 告警并以 `seqno_floor` 钳制 `resume_seqno`，杜绝磁盘 seqno 重复（= AES-GCM nonce 复用危害）；不改 B-7 文件决选语义；用例 `B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned` + 撤销对照复红；② **B-8 (用户拍板先验证后定 C)**: 验证实验证实 B-8 原始虚报链 = ATC 与尾块持有文件错配，**已由 B-7 从根消解**（新用例零虚报 + 撤销 B-7 确定性复红）；方案 C 注释口径注记入 `logx_c.h`（用户确认非 SLA 指标）；③ M3 阶段标题「工具待修」过时状态更正（T3.4 已含真机联调闭环）。**验证**: MSVC 单测 172/172、hotpath 2/2、stress 4/4、crash_fork 3/3；**Android 真机 Redmi K30 Pro 173/173 + 2/2 + 4/4 + 3/3 全绿**（B8/B10 用例真机 9ms/11ms 通过；期间发现设备 NTP 持续阶跃墙钟致 2 个时序敏感存量用例假红，`auto_time 0` 关闭自动校时后全绿——环境问题非代码回归，已归因记录）。
+> **v1.44 修订说明**: 2026-10-07 **R32 审查收口与 B-10 升级**：① **密码学定性勘误**: 澄清由于每文件均拥有独立 8B 随机 salt（nonce = salt ‖ seqno），跨分卷 seqno 倒退并不构成 AES-GCM Nonce 复用；防御核心动机在于维持「磁盘 seqno 全局单调递增」系统结构不变量，防止恢复期对账与离线解码器排序紊乱；② **B-10 升级方案 1 (全局目录最大序号防御门)**: `scan_dir_for_target` 顺带记录全目录最大序号 `max_dir_seqno`，`reconcile` 凡最新目标尾块低于目录最大序号（或空目标且 Staging Header 撕裂落后）一律钳制 `seqno_floor`，收口 F-1（空残留分卷）与 F-2（多级分卷/无 hint 漏防），同时消除二次扫描 hint 的磁盘 IO 开销；③ **测试侧补强**: 新增 `B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax`（空残留高分卷 seqno=0 且 S_hdr=10 撕裂落后于历史尾块 20 → 成功阻断倒退，recovered seqno=20 钉死 F-1 屏障）；单测升至 173/173 全绿；`ClosingOnRetryPal` 单测补齐幂等复位注释。
+>
+> **v1.43 修订说明**: 2026-10-07 **Backlog B-8/B-10 双闭环**：① **B-10 (用户拍板方案 A1)**: `reconcile` 增加异常残留高分卷防御门——选中目标非空且尾块 seqno 低于 hint 文件尾块时发 `LOGX_EV_RECOVERY` 告警并以 `seqno_floor` 钳制 `resume_seqno`，杜绝磁盘 seqno 倒退；不改 B-7 文件决选语义；用例 `B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned` + 撤销对照复红；② **B-8 (用户拍板先验证后定 C)**: 验证实验证实 B-8 原始虚报链 = ATC 与尾块持有文件错配，**已由 B-7 从根消解**（新用例零虚报 + 撤销 B-7 确定性复红）；方案 C 注释口径注记入 `logx_c.h`（用户确认非 SLA 指标）；③ M3 阶段标题「工具待修」过时状态更正（T3.4 已含真机联调闭环）。**验证**: MSVC 单测 172/172、hotpath 2/2、stress 4/4、crash_fork 3/3；**Android 真机 Redmi K30 Pro 173/173 + 2/2 + 4/4 + 3/3 全绿**（B8/B10 用例真机 9ms/11ms 通过；期间发现设备 NTP 持续阶跃墙钟致 2 个时序敏感存量用例假红，`auto_time 0` 关闭自动校时后全绿——环境问题非代码回归，已归因记录）。
 >
 > **v1.42 修订说明**: 2026-10-07 **真机复跑收口**：Redmi K30 Pro (Android 12, 无线 adb) 对 `291197f`/`a213762`/`4cc998a` 三批次 NDK clean 重建后全量实测——单测 **171/171**（较主机多 1 个平台特有用例，预期差异）、hotpath 2/2、stress 4/4、crash_fork 3/3 全绿；本批新增 5 用例（B-7 跨分卷恢复 + B-1 四项含 ClosingDuringRetry）逐项确认执行且 OK。二进制新鲜度经 mtime 比对排除旧产物假绿。
 >
@@ -382,11 +384,13 @@ gantt
 ### B-10 异常残留高分卷且尾块 seqno 倒退时的防御与告警 (B-7 落地后观察)
 
 - **记录日期**: 2026-10-07
-- **状态**: ✅ **已拍板并落地 (2026-10-07, 用户拍板「方案 A1」)**——`reconcile` 在 is_target_newer 分支增加防御门：选中目标**非空**且尾块 seqno 低于 ATC hint 文件尾块（多写者/外部残留特征）时，发 `LOGX_EV_RECOVERY` 告警事件并以 `ReconcileResult::seqno_floor` 钳制 `resume_seqno` 下限，杜绝磁盘 seqno 重复（seqno 兼 AES-GCM nonce 材料，重复即 nonce 复用）；**不改变 B-7 的 (date, split) 文件决选语义**（空新目标 seqno==0 仍归 R19 F-13 管辖）。回归用例 `B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned`（S_hdr=10 撕裂 + hint 尾块 20 + 残留分卷尾块 5 → 断言告警事件 + recovered seqno=20）；撤销对照（R18-2）：注释掉钳制 → 用例确定性复红 (recovered 11 vs 20)。危害定级说明：防御动机除读侧可读性外，核心是 **seqno 复用 = GCM nonce 复用** 的密码学危害。
-- **背景**: B-7 落地后，恢复期 `reconcile` 严格信任最新 `(date, split)` 二元组决选出的追加目标。若日志目录由于异常原因（多进程写者并发注入或外部工具生成）存在残留的高 split 文件，且其尾块 `seqno` 低于 ATC hint 中的 `S_hdr` 或历史分卷，则按高 split 接管后恢复出的 `resume_seqno` 可能回退导致磁盘分卷间或分卷内 `seqno` 重复。
-- **影响面**: 在规范的“单写者”契约下不成立（Flusher 为唯一写者，分卷与 seqno 单调递增）。R19 F-13 目前仅通过 `is_new_target` 兜底“空的新分卷（`seqno == 0`）”保持 `S_hdr`。
+- **状态**: ✅ **已全量落地并升级 (2026-10-07, 用户拍板「方案 A1」，R32 升级「方案 1」)**——`reconcile` 升级为全局目录最大序号防御门（Global Max Seqno Floor）：`scan_dir_for_target` 顺带记录全目录最大序号 `max_dir_seqno`，凡最新追加目标尾块 seqno 低于目录历史最大尾块（或空目标且 Staging Header 撕裂落后时，覆盖 F-1/F-2 盲区），发 `LOGX_EV_RECOVERY` 告警事件并以 `ReconcileResult::seqno_floor` 钳制 `resume_seqno` 下限，杜绝磁盘全局 seqno 跨分卷倒退，维持单调递增结构不变量；**不改变 B-7 的 (date, split) 文件决选语义**。回归用例：`B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned`（hint 尾块 20 + S_hdr=10 + 残留分卷 5 → recovered seqno=20；撤销钳制复红 11 vs 20）+ R32 补强用例 `B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax`（空残留分卷 0 块且 Header 撕裂落后 → recovered seqno=20 钉死 F-1 屏障）。
+- **定性勘误说明（见 R32 审查报告）**: 原提交与规划表关于“GCM nonce 复用”的密码学危害定性不成立（由于每文件均独立派生 8B 随机 salt，两分卷 salt 独立，跨卷相同 seqno 拼装出不同 Nonce，不构成 Nonce 复用）；防御动机核心在于维护「磁盘 seqno 全局单调递增」结构不变量，防止恢复期对账（`sum_raw_len_since`）与离线解码器（decoder 排序合并）紊乱。
+- **背景**: B-7 落地后，恢复期 `reconcile` 严格信任最新 `(date, split)` 二元组决选出的追加目标。若日志目录由于异常原因（多进程写者并发注入或外部工具生成）存在残留的高 split 文件，且其尾块 `seqno` 低于历史分卷，则按高 split 接管后恢复出的 `resume_seqno` 可能回退导致磁盘分卷间 `seqno` 倒退。
+- **影响面**: 在规范的“单写者”契约下不成立（Flusher 为唯一写者，分卷与 seqno 单调递增）。现已通过方案 1 全局目录最大序号防御门对多写者/异常文件残留提供彻底防御。
 - **候选方案**:
-  - **A. reconcile 增加异常倒退防御校验**: 若 `best.split > hint.split` 且 `best.seqno < hint.seqno` 且非空时，发 `LOGX_EV_RECOVERY` 告警事件（或降级回退 hint；注：`S_file > S_hdr` 仅在 target==hint 时有意义，跨文件比无意义；`upto_seqno` 属导出消费侧，无关）。
-  - **B. 维持现状**: 遵循单写者契约，记录在案即可。
-- **决策点**: 是否需要在单写者核心契约之外增加对多写者/外部脏文件的防御与容错。
+  - **方案 1 (已落地)**: `scan_dir_for_target` 顺带统计并输出全目录最大 seqno，`reconcile` 凡低于目录最大序号一律以 `seqno_floor` 钳制，消除 hint 二次扫描磁盘 IO，覆盖空分卷残留与多级分卷全部边界。
+  - **方案 A1 (前期落地版本)**: `is_target_newer` 仅扫描比对 hint，要求 `sr.seqno > 0`。
+  - **维持现状**: 遵循单写者契约。
+
 

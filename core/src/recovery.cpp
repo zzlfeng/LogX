@@ -147,9 +147,9 @@ struct ReconcileResult {
     bool     file_truncated = false;
     std::string target_path;
     bool     is_new_target = false;
-    // B-10 方案 A1: 异常残留分卷防御——选中目标尾块 seqno 低于 ATC hint 文件尾块
-    // (多写者/外部残留) 时, resume_seqno 的钳制下限, 防磁盘 seqno 重复
-    // (seqno 兼加密 nonce 材料, 重复即 GCM nonce 复用)。0 = 未触发。
+    // B-10 升级 (方案 1): 异常残留分卷防御——选中目标尾块 seqno 低于目录历史分卷
+    // 最大尾块时, resume_seqno 的钳制下限, 维持磁盘全局 seqno 单调递增结构不变量
+    // (防恢复对账失真与离线解码器排序紊乱)。0 = 未触发。
     uint32_t seqno_floor = 0;
 };
 
@@ -163,7 +163,8 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
     FileScanResult sr;
     // R19 F-5 / B-7: 检查目录最新目标。若目录存在 (date, split) 大于 ATC 提示的目标，
     // 说明跨天或同日切分已创建新文件，ATC 提示属于旧文件，必须回退最新文件扫描。
-    std::string best = scan_dir_for_target(inst);
+    uint32_t max_dir_seqno = 0;
+    std::string best = scan_dir_for_target(inst, &max_dir_seqno);
     uint32_t best_date = 0;
     uint16_t best_split = 0;
     if (!best.empty()) {
@@ -182,19 +183,6 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
     if (is_target_newer) {
         // 跨天或同日切分后 ATC 提示文件已过时，直接使用最新的目标文件 (R19 F-5 / B-7)
         sr = scan_append_target(inst, best);
-        // B-10 方案 A1: 异常残留高分卷防御。单写者契约下新目标尾块 seqno 必 >=
-        // hint 文件尾块; 违反即多写者/外部残留, 此时 resume_seqno 若低于 hint
-        // 尾块将造成磁盘 seqno 重复(= 加密 nonce 复用)。钳制 resume 并发告警;
-        // 不改变 B-7 的 (date, split) 文件决选语义。空新目标(seqno==0)属
-        // R19 F-13 is_new_target 管辖, 不在此门内。
-        if (!hint.empty() && sr.ok && sr.seqno > 0) {
-            FileScanResult hs = scan_append_target(inst, hint);
-            if (hs.ok && hs.seqno > sr.seqno) {
-                r.seqno_floor = hs.seqno;
-                emit_event(inst, LOGX_EV_RECOVERY, -1,
-                           "target seqno regression vs hint; resume clamped");
-            }
-        }
     } else if (!hint.empty()) {
         sr = scan_append_target(inst, hint);
         if (!sr.ok) {
@@ -216,7 +204,22 @@ ReconcileResult reconcile(Instance* inst, const RecoveryState& hdr) {
     if (is_target_newer && sr.seqno == 0 && !sr.truncated) {
         r.is_new_target = true;
     }
+
+    // B-10 升级 (方案 1): 目录全局最大序号防御门 (Global Max Seqno Floor)。
+    // 只要选中追加目标尾块低于目录历史最大尾块 (或空目标但 Header 撕裂落后于历史最大)，
+    // 发 LOGX_EV_RECOVERY 告警并以 seqno_floor 钳制 resume_seqno 下限，维护全局单调递增。
+    // 收口 F-1 (空残留分卷且 Header 撕裂) 与 F-2 (多级分卷/无 hint 漏防)。
+    if (sr.seqno > 0 && max_dir_seqno > sr.seqno) {
+        r.seqno_floor = max_dir_seqno;
+        emit_event(inst, LOGX_EV_RECOVERY, -1,
+                   "target seqno regression vs directory max; resume clamped");
+    } else if (sr.seqno == 0 && max_dir_seqno > hdr.seqno) {
+        r.seqno_floor = max_dir_seqno;
+        emit_event(inst, LOGX_EV_RECOVERY, -1,
+                   "target seqno regression vs directory max; resume clamped");
+    }
     return r;
+
 }
 
 }  // namespace
@@ -342,7 +345,7 @@ bool run_recovery(Instance* inst) {
     } else {
         resume_seqno = std::max(S_hdr, seqno_file);      // 首块 = max + 1
     }
-    // B-10 方案 A1: 异常残留分卷检测到的 seqno 回退下限钳制
+    // B-10 方案 1 升级: 目录全局最大序号回退下限钳制 (防跨卷倒退)
     resume_seqno = std::max(resume_seqno, rec.seqno_floor);
 
     // 5) 环形扫描 staging:上界 = 裸 write_pos(崩溃前沿;Header 只在逐块提交时
