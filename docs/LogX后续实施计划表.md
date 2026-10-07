@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.42 (2026-10-07 Android 真机复跑收口: B-7/B-1 全链批次 Redmi K30 Pro 全绿)
+> **文档版本**: v1.43 (2026-10-07 B-10 方案 A1 落地 + B-8 闭环(方案 C) + M3 状态修正)
+>
+> **v1.43 修订说明**: 2026-10-07 **Backlog B-8/B-10 双闭环**：① **B-10 (用户拍板方案 A1)**: `reconcile` 增加异常残留高分卷防御门——选中目标非空且尾块 seqno 低于 hint 文件尾块时发 `LOGX_EV_RECOVERY` 告警并以 `seqno_floor` 钳制 `resume_seqno`，杜绝磁盘 seqno 重复（= AES-GCM nonce 复用危害）；不改 B-7 文件决选语义；用例 `B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned` + 撤销对照复红；② **B-8 (用户拍板先验证后定 C)**: 验证实验证实 B-8 原始虚报链 = ATC 与尾块持有文件错配，**已由 B-7 从根消解**（新用例零虚报 + 撤销 B-7 确定性复红）；方案 C 注释口径注记入 `logx_c.h`（用户确认非 SLA 指标）；③ M3 阶段标题「工具待修」过时状态更正（T3.4 已含真机联调闭环）。**验证**: MSVC 单测 172/172、hotpath 2/2、stress 4/4、crash_fork 3/3；**Android 真机 Redmi K30 Pro 173/173 + 2/2 + 4/4 + 3/3 全绿**（B8/B10 用例真机 9ms/11ms 通过；期间发现设备 NTP 持续阶跃墙钟致 2 个时序敏感存量用例假红，`auto_time 0` 关闭自动校时后全绿——环境问题非代码回归，已归因记录）。
 >
 > **v1.42 修订说明**: 2026-10-07 **真机复跑收口**：Redmi K30 Pro (Android 12, 无线 adb) 对 `291197f`/`a213762`/`4cc998a` 三批次 NDK clean 重建后全量实测——单测 **171/171**（较主机多 1 个平台特有用例，预期差异）、hotpath 2/2、stress 4/4、crash_fork 3/3 全绿；本批新增 5 用例（B-7 跨分卷恢复 + B-1 四项含 ClosingDuringRetry）逐项确认执行且 OK。二进制新鲜度经 mtime 比对排除旧产物假绿。
 >
@@ -121,7 +123,7 @@ gantt
 
 ## 2. 详细任务分解表 (WBS)
 
-### 阶段一：M3 加密链路闭环 (核心完成, 工具待修)
+### 阶段一：M3 加密链路闭环 (全量闭环，含真机联调)
 
 | 任务编号 | 任务名称 | 责任模块 / 文件 | 优先级 | 状态 | 实施要点与验收结果 |
 |---|---|---|---|---|---|
@@ -347,7 +349,7 @@ gantt
 ### B-8 新文件 + 孤儿块组合下 truncated_blocks 虚报 (R20 F-13 边界缺口 / R21 补记)
 
 - **记录日期**: 2026-10-05 (R20 报告 §二·9 提出"纳入 backlog"，当时未落；R21 补记为 B-8)
-- **状态**: ⏸ 待决策
+- **状态**: ✅ **已闭环 (2026-10-07, 用户拍板「先验证后定 C」)**——**关键前置发现（验证实验证实）**: B-8 原始虚报链的本质是 **ATC 提示与实际尾块持有文件错配**（R20 时代同日采信 hint 扫旧分卷，S_hdr 与错配文件尾块之差被误计），**B-7 的 (date, split) 决选已从根上消解该错配**——回归用例 `B8_SameDaySplit_StaleAtcWithCommittedSeqno_NoTruncatedOvercount`（S_hdr=25 已提交 + ATC 撕裂回退分卷 0 + 块 21..25 实际在分卷 1）在当前代码下 `truncated_blocks` 零虚报，且撤销 B-7 判据后该用例确定性复红（+15，正向对照耦合成立）；残余面（选中文件自身真丢尾块 = 应计；多写者残留 = B-10 方案 A1 已防御）均已覆盖。**方案 C 落地**: `logx_c.h` 的 `truncated_blocks` 注释补口径注记（"计数语义为 Header 已提交序号与文件尾块序号的缺口，Header 撕裂场景下不必然等于真实丢块数，仅作诊断参考，非精确 SLA 指标"——用户确认该统计不被外部当 SLA/告警指标）。
 - **背景**: R19 F-13 以 `ReconcileResult::is_new_target` 豁免"空的新分卷/新日期文件"被误判为损坏尾部（判定条件 `is_target_newer && sr.seqno == 0 && !sr.truncated`，见 `recovery.cpp:195-197`）。R20 复核指出该条件把"**新文件已有孤儿块**（`sr.seqno > 0`）"排除在豁免之外：此时若 staging Header 未提交（`S_hdr > seqno_file`），`recovery.cpp:301` 仍会把历史 `S_hdr` 整体计入 `truncated_blocks`，虚报"丢失了 N 块"，而实际一块都没丢。
 - **影响面**: 仅统计失真（`truncated_blocks` / `logx_stats_t`），不影响数据正确性与 seqno/nonce 纪律。触发需"跨天或切分产生新文件 + 崩溃留下部分块 + Header 提交未持久化"三者叠加，窗口极窄。
 - **候选方案**:
@@ -380,7 +382,7 @@ gantt
 ### B-10 异常残留高分卷且尾块 seqno 倒退时的防御与告警 (B-7 落地后观察)
 
 - **记录日期**: 2026-10-07
-- **状态**: ⏸ 待决策 (Backlog 观察项)
+- **状态**: ✅ **已拍板并落地 (2026-10-07, 用户拍板「方案 A1」)**——`reconcile` 在 is_target_newer 分支增加防御门：选中目标**非空**且尾块 seqno 低于 ATC hint 文件尾块（多写者/外部残留特征）时，发 `LOGX_EV_RECOVERY` 告警事件并以 `ReconcileResult::seqno_floor` 钳制 `resume_seqno` 下限，杜绝磁盘 seqno 重复（seqno 兼 AES-GCM nonce 材料，重复即 nonce 复用）；**不改变 B-7 的 (date, split) 文件决选语义**（空新目标 seqno==0 仍归 R19 F-13 管辖）。回归用例 `B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned`（S_hdr=10 撕裂 + hint 尾块 20 + 残留分卷尾块 5 → 断言告警事件 + recovered seqno=20）；撤销对照（R18-2）：注释掉钳制 → 用例确定性复红 (recovered 11 vs 20)。危害定级说明：防御动机除读侧可读性外，核心是 **seqno 复用 = GCM nonce 复用** 的密码学危害。
 - **背景**: B-7 落地后，恢复期 `reconcile` 严格信任最新 `(date, split)` 二元组决选出的追加目标。若日志目录由于异常原因（多进程写者并发注入或外部工具生成）存在残留的高 split 文件，且其尾块 `seqno` 低于 ATC hint 中的 `S_hdr` 或历史分卷，则按高 split 接管后恢复出的 `resume_seqno` 可能回退导致磁盘分卷间或分卷内 `seqno` 重复。
 - **影响面**: 在规范的“单写者”契约下不成立（Flusher 为唯一写者，分卷与 seqno 单调递增）。R19 F-13 目前仅通过 `is_new_target` 兜底“空的新分卷（`seqno == 0`）”保持 `S_hdr`。
 - **候选方案**:
