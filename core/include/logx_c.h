@@ -177,7 +177,10 @@ typedef struct logx_stats {
      * 缓冲被新实现越界写)。新增字段一律占用 reserved 并同步递减其数量。 */
     uint64_t drop_no_space;      /* staging 空闲不足丢弃 */
     uint64_t drop_too_large;     /* 单条超 maxLogLength 丢弃(B-1B 后仅病态小上限路径) */
-    uint64_t truncated_blocks;    /* 启动恢复截尾块计数 */
+    uint64_t truncated_blocks;    /* 启动恢复截尾块计数。口径注记(B-8 方案C): 计数
+                                     语义为 "staging Header 已提交序号与目标文件尾块
+                                     序号的缺口", 在 Header 撕裂等场景下该缺口不必然
+                                     等于真实丢块数, 仅作诊断参考, 非精确 SLA 指标 */
     uint64_t pad_records;        /* 回绕垫 PAD 数 */
     uint64_t block_write_errors; /* write 短写/IO 错误计数 */
     uint64_t truncated_logs;     /* B-1B: 超长截断保前缀写入计数(占原 reserved[0]) */
