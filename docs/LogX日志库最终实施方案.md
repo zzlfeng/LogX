@@ -140,9 +140,9 @@ staging 内记录统一格式(条目与 PAD),头部 6B(所有多字节读写均�
 
 **文件头 flag 的加密位语义 = 本文件的加密能力，创建时一次性锁定（R21 F-5）**:
 - 新建文件时探测一次 `keyProvider(kid)`:取到密钥 → 置位;取不到 → **不置位**并发 `LOGX_EV_DEGRADED`("key unavailable at file creation; this file stays plaintext until rollover")。续写已存在文件时**回读该文件头的加密位**作为能力，不得改口。
-- 锁定后，本文件生命周期内（直至按天/按大小轮换）**所有块的实际形态必须与该位一致**:头未置位 ⇒ 即便密钥稍后恢复可用，本文件后续块也一律明文落盘（`drain_once` 逐块以 `encrypt_enable && 本文件能力` 组装 flag）；缺钥降级只影响当块，不得把降级状态泄漏到后续块或后续文件。
+- 锁定后，本文件生命周期内（直至按天/按大小轮换）**所有块的实际形态必须与该位一致**:头未置位 ⇒ 即便密钥稍后恢复可用，本文件后续块也一律明文落盘（`drain_once` 逐块以 `encrypt_enable && 本文件能力 && 有效密钥` 组装 flag）。续写已存在加密文件的临时缺钥降级不改变能力位：缺钥当块明文落盘，此后每轮 drain 至多重试取钥一次（不逐块重试），恢复后立即锁定并恢复密文落盘——降级状态不跨块静默泄漏，也不泄漏到后续文件。
 - 由此建立不变量:**`encrypt_enable` 开启期间，"文件头声明 == 本文件全部块形态"**。读端（C++ 导出 / `scan_one` / Python decoder）仍一律按**块头** flag 逐块判定，文件头该位属元数据（供外部工具快速分类），不参与解密决策——这是历史文件（头声明加密但含明文降级块）仍可逐块导出的原因（R19 F-6 修复②）。
-- 加密能力探测是 `keyProvider` 的第三类调用点（另两类为 open 期 fail-fast 与 export 逐块解密），运行在 **Flusher 后台线程**，频率为"每文件一次"；JNI 实现须自行 attach/detach。契约详见 `logx_c.h`。
+- 加密能力探测是 `keyProvider` 的第三类调用点（另两类为 open 期 fail-fast 与 export 逐块解密），运行在 **Flusher 后台线程**，频率为"每文件一次"（续写缺钥降级态下每轮至多重试一次直至恢复）；JNI 实现须自行 attach/detach。契约详见 `logx_c.h`。
 
 Block(自包含,流式排列):
 
@@ -294,7 +294,7 @@ void write_records(const char* recs, uint32_t total) {  // 一条日志的全部
 |---|---|
 | mmap 失败 | 堆内存 staging + 每 5s/64KB 定时 write(),打点(实测概率约万分之一量级);**经 errorHandler(type=DEGRADED)显式暴露——此期间"崩溃零丢失"承诺失效** |
 | zstd/mbedtls 初始化失败 | flag 降级为 none/明文继续写,同样经 errorHandler 暴露 |
-| keyProvider 取不到当前 KID 密钥 | 新块降级明文(flag bit0=0)继续写,经 errorHandler(DEGRADED) 暴露;历史文件不受影响 |
+| keyProvider 取不到当前 KID 密钥 | 新块降级明文(flag bit0=0)继续写,经 errorHandler(DEGRADED) 暴露;续写已存在加密文件时此后每轮至多重试取钥一次,恢复即恢复密文落盘;历史文件不受影响 |
 | 磁盘满 | 先清过期日志;仍不足停写+打点,不向业务抛异常 |
 | 块 CRC/GCM 失败 | 从损坏点截断续写(截到最后有效块);截断后续写 seqno 跳 1 空隙(§3.2) |
 | 断电丢尾部(S_file < S_hdr) | 截到最后有效块续写;丢失的已提交块数量打点,窗口 ≤30s(§11) |
