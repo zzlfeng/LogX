@@ -44,6 +44,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace logx;
@@ -2151,6 +2152,12 @@ TEST(R19Regression, B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk) {
 // 强制忽略 5ms 切片超时自旋，转为无界等待真实信号；
 // 若删去 Flusher 或级联写线程的 ev_signal，写线程绝无法借 5ms 切片轮询自愈，
 // 从而确立确定性的撤销复红屏障。
+//
+// Flusher 停驻门 (R33 F-1 收口): Flusher 的去抖定时器会自主 drain 填充记录，
+// 其信号在 limit 布防前发出即不可控（探针实证会唤醒全部等待者使级联屏障失效）。
+// hold_flusher 置位后，Flusher 线程对 flush_event 的等待被拦截到内部门闩，
+// 保证填充阶段零自主 drain；release_flusher() 放行后，恰好一次 drain 在
+// 限流布防下进行——级联令牌成为后继写线程的唯一唤醒源，屏障转为刚性。
 // ============================================================
 class StrictEventWaitPal : public Pal {
 public:
@@ -2162,6 +2169,28 @@ public:
     std::atomic<int> flusher_space_signals_sent{0};
     std::atomic<int> space_signal_count{0};
     std::atomic<int> space_wait_entered{0};
+    std::atomic<int> flusher_parked_count{0};
+
+    void hold_flusher_now() {
+        hold_flusher.store(true, std::memory_order_release);
+    }
+    void release_flusher() {
+        {
+            std::lock_guard<std::mutex> lk(gate_mu);
+            gate_open_ = true;
+        }
+        gate_cv.notify_all();
+        hold_flusher.store(false, std::memory_order_release);
+    }
+
+    void* ev_create() override {
+        void* h = real_->ev_create();
+        // logx_open 首个创建的事件即 flush_event (space_event 第二)——
+        // 捕获句柄使停驻门可在 inst 存在前布防 (hold 必须先于 logx_open,
+        // 否则 flusher 线程抢先进入真实等待, 去抖定时器照常自主 drain, 探针实证)
+        if (!flush_event_handle_) flush_event_handle_ = h;
+        return h;
+    }
 
     int file_open(const char* p, bool c, bool a) override { return real_->file_open(p, c, a); }
     int file_close(int fd) override { return real_->file_close(fd); }
@@ -2187,7 +2216,6 @@ public:
     int   threading_init() override { return real_->threading_init(); }
     int   thread_start(void* (*fn)(void*), void* a, void** out_h) override { return real_->thread_start(fn, a, out_h); }
     int   thread_join(void* h) override { return real_->thread_join(h); }
-    void* ev_create() override { return real_->ev_create(); }
     void  ev_destroy(void* h) override { real_->ev_destroy(h); }
     void  ev_signal(void* h) override {
         if (inst && h == inst->space_event) {
@@ -2202,8 +2230,12 @@ public:
         }
         real_->ev_signal(h);
     }
-    void  ev_wait(void* h) override { real_->ev_wait(h); }
+    void  ev_wait(void* h) override {
+        park_flusher_if_hold(h);
+        real_->ev_wait(h);
+    }
     bool  ev_wait_timeout(void* h, uint32_t ms) override {
+        park_flusher_if_hold(h);
         if (strict_space_wait.load(std::memory_order_acquire) && inst && h == inst->space_event) {
             space_wait_entered.fetch_add(1, std::memory_order_release);
             // 忽略传入的 wait_slice_ms (5ms) 超时参数，强制无界等待真实信号；
@@ -2225,6 +2257,21 @@ public:
     void     debug_log(const char* s) override { real_->debug_log(s); }
 private:
     Pal* real_ = nullptr;
+
+    // 停驻门: hold_flusher 期间 flusher 线程在 flush_event 等待点阻塞于门闩
+    void park_flusher_if_hold(void* h) {
+        if (!hold_flusher.load(std::memory_order_acquire)) return;
+        if (!h || h != flush_event_handle_) return;
+        flusher_parked_count.fetch_add(1, std::memory_order_release);
+        std::unique_lock<std::mutex> lk(gate_mu);
+        gate_cv.wait(lk, [this] { return gate_open_; });
+    }
+
+    std::atomic<bool> hold_flusher{false};
+    void* flush_event_handle_ = nullptr;
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool gate_open_ = false;
 };
 
 // ============================================================
@@ -2321,6 +2368,8 @@ TEST(R19Regression, B1_EventDrivenBackoff_FastWakeupOnSpaceFreed) {
 // 前一写线程写入成功向 space_event 传递令牌，后继写线程依次即刻唤醒并落环；
 // 若删去级联令牌传递逻辑，后继写线程在 StrictEventWaitPal 保护下永不被唤醒，
 // 确立刚性的撤销复红屏障 (R18-2)。
+// 刚性前提 (R33 F-1): hold_flusher 停驻门保证填充阶段零自主 drain——否则
+// Flusher 去抖定时器的 pre-limit 信号会唤醒全部等待者、架空级联依赖（实证）。
 // ============================================================
 TEST(R19Regression, B1_EventDrivenBackoff_CascadingWakeupMultiThread) {
     Pal& real_pal = default_pal();
@@ -2338,10 +2387,22 @@ TEST(R19Regression, B1_EventDrivenBackoff_CascadingWakeupMultiThread) {
     cfg.retention_days = 36500;
     cfg.pal_override = &mock_pal;
 
+    // 停驻 Flusher (R33 F-1): 必须先于 logx_open 布防——flusher 线程在 open 内
+    // 即启动，若其抢先进入真实等待，去抖定时器的自主 drain 信号在 limit 布防前
+    // 发出即不受限流约束（探针实证会唤醒全部等待者、架空级联屏障）。
+    // 停驻后填充阶段零自主 drain，放行后的恰好一次 drain 才是唯一受控信号源。
+    mock_pal.hold_flusher_now();
+
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     Instance* ii = static_cast<Instance*>(inst);
     mock_pal.inst = ii;
+
+    // 等待 Flusher 完成首轮 drain_once 并确认停驻——首轮 drain 必须面对空环
+    // (填充尚未开始)，否则线程调度晚于填充时首轮即刷掉填充记录并 pre-limit 发信号
+    while (mock_pal.flusher_parked_count.load(std::memory_order_acquire) < 1) {
+        real_pal.sleep_ms(1);
+    }
 
     // 填满暂存区至剩余容量不足 4KB (7 条 16KB + 1 条 15KB 占用约 129.7KB，余约 1.2KB)
     std::vector<uint8_t> rec16k(16 * 1024, 'C');
@@ -2380,8 +2441,14 @@ TEST(R19Regression, B1_EventDrivenBackoff_CascadingWakeupMultiThread) {
            mock_pal.space_wait_entered.load(std::memory_order_acquire) < kWaiters) {
         real_pal.sleep_ms(1);
     }
+    // 稳态确认: space_wait_entered 含 sticky 消耗型重入（如初始空 drain 的遗留信号），
+    // 短暂静置确保 3 线程均已真正阻塞在门闩化的 space_event 等待内
+    real_pal.sleep_ms(20);
     // 激活限制 Flusher 仅注入首个唤醒信号，强制后继线程只能依赖级联令牌唤醒 (R18-2 刚性屏障)
     mock_pal.limit_flusher_space_signals.store(true, std::memory_order_release);
+
+    // 放行 Flusher: 恰好一次 drain 在限流布防下进行 (仅首个 space 信号可通过)
+    mock_pal.release_flusher();
 
     // 主线程 flush 腾出空间
     ASSERT_EQ(logx_flush(inst), LOGX_OK);
