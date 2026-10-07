@@ -1787,8 +1787,12 @@ TEST(R19Regression, B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk) {
     EXPECT_TRUE(probe.saw_msg_substring("staging full"));
 
     // 解除 Flusher 阻塞与 closing，以便安全退出
-    mock_pal.stall_write.store(false, std::memory_order_release);
-    mock_pal.stall_cv.notify_all();
+    // 持锁 store+notify: 消除 notify 落在 waiter "pred 判 false 后、阻塞前" 间隙的丢唤醒窗口
+    {
+        std::lock_guard<std::mutex> lk(mock_pal.stall_mu);
+        mock_pal.stall_write.store(false, std::memory_order_release);
+        mock_pal.stall_cv.notify_all();
+    }
     ii->closing.store(false, std::memory_order_release);
 
     logx_close(inst);
