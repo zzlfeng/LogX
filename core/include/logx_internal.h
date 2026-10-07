@@ -45,6 +45,7 @@ struct Instance {
     Pal*     pal = nullptr;
     void*     mu = nullptr;            // 全局 mutex
     void*     flush_event = nullptr;   // Flusher 唤醒
+    void*     space_event = nullptr;   // 暂存区有可用空间唤醒 (R32 方案 2 / 事件驱动退避)
     void*     flusher_thread = nullptr;
     std::atomic<bool> flusher_exit{false};
     std::atomic<bool> flusher_running{false};

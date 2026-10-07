@@ -816,6 +816,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
     bytes = inst->staging->snapshot_pending(&f, &snap);
     if (bytes == 0) {
         inst->pal->mutex_unlock(inst->mu);
+        if (inst->space_event) inst->pal->ev_signal(inst->space_event);
         return;
     }
 
@@ -891,6 +892,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
             inst->staging->commit_header_locked(
                 get_u32(inst->staging->raw_base() + 8), new_f, latest_w, &atc);
             inst->pal->mutex_unlock(inst->mu);
+            if (inst->space_event) inst->pal->ev_signal(inst->space_event);
             inst->flushed_bytes_total.fetch_add(blk.raw_len, std::memory_order_relaxed);
             inst->seam_blocks_skipped.fetch_add(1, std::memory_order_relaxed);
             cur_f = new_f;
@@ -915,6 +917,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
             inst->staging->commit_header_locked(get_u32(inst->staging->raw_base() + 8),
                                                 new_f, latest_w, &atc);
             inst->pal->mutex_unlock(inst->mu);
+            if (inst->space_event) inst->pal->ev_signal(inst->space_event);
             inst->flushed_bytes_total.fetch_add(blk.raw_len, std::memory_order_relaxed);
             cur_f = new_f;
             continue;
@@ -959,6 +962,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
             uint32_t latest_w = get_u32(inst->staging->raw_base() + 16);
             inst->staging->commit_header_locked(cur_seqno, new_f, latest_w, &atc);
             inst->pal->mutex_unlock(inst->mu);
+            if (inst->space_event) inst->pal->ev_signal(inst->space_event);
             inst->flushed_bytes_total.fetch_add(blk.raw_len, std::memory_order_relaxed);
             cur_f = new_f;
             continue;
@@ -977,6 +981,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         uint32_t latest_w = get_u32(inst->staging->raw_base() + 16);
         inst->staging->commit_header_locked(new_seqno, new_f, latest_w, &atc);
         inst->pal->mutex_unlock(inst->mu);
+        if (inst->space_event) inst->pal->ev_signal(inst->space_event);
 
         c->current_size = wr.end_offset;
         inst->flushed_bytes_total.fetch_add(blk.raw_len, std::memory_order_relaxed);

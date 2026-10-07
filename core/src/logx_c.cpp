@@ -304,12 +304,17 @@ void destroy_instance(Instance* inst, bool is_flusher_thread) {
     // 再让 Flusher 退出
     inst->flusher_exit.store(true, std::memory_order_release);
     if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
+    if (inst->space_event) inst->pal->ev_signal(inst->space_event);
     if (inst->flusher_thread && !is_flusher_thread) {
         inst->pal->thread_join(inst->flusher_thread);
         inst->flusher_thread = nullptr;
     }
     delete inst->staging;
     inst->staging = nullptr;
+    if (inst->space_event) {
+        inst->pal->ev_destroy(inst->space_event);
+        inst->space_event = nullptr;
+    }
     if (inst->flush_event) {
         inst->pal->ev_destroy(inst->flush_event);
         inst->flush_event = nullptr;
@@ -401,7 +406,9 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
         : &default_pal();
     inst->mu = inst->pal->mutex_create();
     inst->flush_event = inst->pal->ev_create();
+    inst->space_event = inst->pal->ev_create();
     if (inst->pal->threading_init() != 0) {
+        if (inst->space_event) inst->pal->ev_destroy(inst->space_event);
         inst->pal->ev_destroy(inst->flush_event);
         inst->pal->mutex_destroy(inst->mu);
         delete inst;
@@ -424,6 +431,7 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     if (!run_recovery(inst)) {
         delete inst->staging;
         inst->staging = nullptr;
+        if (inst->space_event) inst->pal->ev_destroy(inst->space_event);
         inst->pal->ev_destroy(inst->flush_event);
         inst->pal->mutex_destroy(inst->mu);
         delete inst;
@@ -438,6 +446,7 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     if (inst->pal->thread_start(&flusher_main, inst, &inst->flusher_thread) != 0) {
         delete inst->staging;
         inst->staging = nullptr;  // S-05: 防御性置空,杜绝潜在 double-free
+        if (inst->space_event) inst->pal->ev_destroy(inst->space_event);
         inst->pal->ev_destroy(inst->flush_event);
         inst->pal->mutex_destroy(inst->mu);
         delete inst;
@@ -455,6 +464,9 @@ logx_status_e logx_close(logx_instance_t* h) {
     if (inst->closing.exchange(true, std::memory_order_acq_rel)) {
         return LOGX_OK;
     }
+    // R32 方案 2: 唤醒可能阻塞在退避重试中的写线程，促使其快速退出
+    if (inst->space_event) inst->pal->ev_signal(inst->space_event);
+
     uint64_t current_tid = inst->pal->tid();
     bool on_flusher = (inst->flusher_tid.load(std::memory_order_acquire) == current_tid);
     if (on_flusher) {
@@ -527,7 +539,7 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         return LOGX_OK;
     }
 
-    // 2) 锁内写入 staging (B-1 方案 A: 环满支持锁外有界重试)
+    // 2) 锁内写入 staging (B-1 方案 A: 环满支持锁外有界重试 / R32 方案 2: 事件驱动化)
     uint32_t consumed = 0;
     uint32_t pads = 0;
     Staging::WriteStatus st = Staging::WriteStatus::kFull;
@@ -547,6 +559,13 @@ logx_status_e logx_write(logx_instance_t* h, int level,
             uint32_t pending = inst->staging->snapshot_pending(&f, &snap);
             need_wake = inst->flush_threshold > 0 && pending >= inst->flush_threshold;
             inst->pal->mutex_unlock(inst->mu);
+
+            // R32 方案 2 级联唤醒令牌 (Cascading Wake-up Token):
+            // 若本写线程曾因满等待，写入成功后向 space_event 传递令牌，
+            // 唤醒下一排队写线程探测剩余空间，消除单唤醒竞争饥饿
+            if (retry_started && inst->space_event) {
+                inst->pal->ev_signal(inst->space_event);
+            }
             break;
         }
         inst->pal->mutex_unlock(inst->mu);
@@ -570,11 +589,36 @@ logx_status_e logx_write(logx_instance_t* h, int level,
             inst->pal->ev_signal(inst->flush_event);
         }
 
-        // 锁外短暂退避休眠 2ms (防自旋占满 CPU，给后台 Flusher 刷盘窗口)
-        inst->pal->sleep_ms(2);
-
         // P3-2: 正在关闭时跳出循环交由统一 kFull 记账，避免静默丢弃无痕迹
+        // (同时向下一个排队写线程级联传递 space_event 唤醒，确保所有写线程快速退出)
         if (inst->closing.load(std::memory_order_acquire)) {
+            if (inst->space_event) {
+                inst->pal->ev_signal(inst->space_event);
+            }
+            break;
+        }
+
+        // R32 方案 2: 事件驱动等待 + 有界切片退避 (替代旧版固定 sleep_ms(2))
+        // 计算剩余重试预算，切片等待 (至多 5ms) 保证即使 Flusher 偶发漏通知也能及时重试/检查 closing
+        uint64_t elapsed_ms = now_ms - start_retry_ms;
+        uint32_t remaining_ms = (elapsed_ms < inst->staging_wait_ms)
+            ? static_cast<uint32_t>(inst->staging_wait_ms - elapsed_ms)
+            : 0;
+        if (remaining_ms == 0) {
+            break;
+        }
+        uint32_t wait_slice_ms = std::min<uint32_t>(remaining_ms, 5u);
+        if (inst->space_event) {
+            inst->pal->ev_wait_timeout(inst->space_event, wait_slice_ms);
+        } else {
+            inst->pal->sleep_ms(1);
+        }
+
+        // 唤醒后再次检查 closing
+        if (inst->closing.load(std::memory_order_acquire)) {
+            if (inst->space_event) {
+                inst->pal->ev_signal(inst->space_event);
+            }
             break;
         }
     }

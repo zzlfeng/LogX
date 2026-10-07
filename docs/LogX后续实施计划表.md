@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.47 (2026-10-07 Backlog B-4 落地: 收敛 flusher/recovery 平行记录扫描实现)
+> **文档版本**: v1.48 (2026-10-07 R32 方案 2 落地: NO_SPACE 退避事件驱动化与级联唤醒令牌)
+>
+> **v1.48 修订说明**: 2026-10-07 **R32 方案 2 落地（NO_SPACE 退避事件驱动化与级联唤醒令牌）**：① **机制升级**: 在 `Instance` 引入 `space_event` 事件原语（`logx_internal.h`），`logx_write` 退避重试彻底移除固定 2ms 睡眠轮询（`pal->sleep_ms(2)`），改用单次至多 5ms 切片的事件驱动等待（`ev_wait_timeout(space_event, wait_slice_ms)`）；Flusher 在落块提交释放缓冲区（`commit_header_locked` + `mutex_unlock`）后主动触发 `space_event` 唤醒写线程，将唤醒延迟从固定毫秒级骤降至即刻响应；② **级联唤醒令牌 (Cascading Wake-up Token)**: 阻塞写线程成功落环后主动向 `space_event` 传递唤醒令牌，逐级唤醒排队中的后继写线程探测剩余空间，消除单唤醒竞争饥饿；③ **关闭加速与防挂死**: `logx_close` 与写线程退出循环时级联广播 `space_event`，促使所有退避写线程即刻退出并统一记账（保持 P3-2 契约）；`ClosingOnRetryPal` 同步接管 `ev_wait_timeout`；④ **测试侧补强**: `tests/unit/test_r19_regression.cpp` 新增 `B1_EventDrivenBackoff_FastWakeupOnSpaceFreed`（空间释放毫秒级即刻唤醒）与 `B1_EventDrivenBackoff_CascadingWakeupMultiThread`（多写线程排队级联唤醒零饥饿全量落盘）；单测升至 177/177 全绿，四套件（177 + 2 + 4 + 3）100% 通过。
 >
 > **v1.47 修订说明**: 2026-10-07 **Backlog B-4 落地（收敛 flusher/recovery 平行记录扫描实现）**：① **原语单源化**: 在 `core/include/logx_format.h` 提炼 `StagingRecordHeaderView`、`parse_staging_record_header` 与 `peek_record_len` 内联共享原语，统一提供记录头元数据解析与边界检查；同时将 `cksum1`（1B 载荷 XOR 折叠）由 `format.cpp` 与 `recovery.cpp` 匿名命名空间上提至 `logx_format.h` 单源共享；② **消除重复实现**: `flusher.cpp` 移除局部 `peek_record_len`，`split_impl` / `probe_wrap_seam` / 脏缝探测均调用单源原语；`recovery.cpp` 移除局部 `probe_record` 与 `cksum1`，`ring_scan` 统一调用 `parse_staging_record_header`，彻底消除手写记录头偏移（`[off]`, `[off+2]`, `[off+5]`）与常量单源化漂移结构性根因；③ **测试侧补强**: `tests/unit/test_format.cpp` 新增 `PeekAndParseStagingRecordHeader_EquivalenceAndBounds`（覆盖 Entry/Pad 合法性、<6B 短缓冲、长度溢出、非法 Magic、NULL 守卫及 cksum1 一致性）；单测升至 175/175 全绿，四套件 100% 通过。
 >
@@ -194,6 +196,7 @@ gantt
 | **B-7 & B-1A** | Backlog 优化落地: B-7 同日多分卷恢复防御 + B-1(方案 A) 暂存区满有界退避重试 | `core/src/recovery.cpp`, `core/src/flusher.cpp`, `core/include/logx_c.h`, `core/include/logx_internal.h`, `core/src/logx_c.cpp`, `android/cpp/logx_jni.cpp`, `android/kotlin/LogX.kt`, `tests/unit/test_r19_regression.cpp`, `tests/unit/test_flusher.cpp` | **P2** | **✅ 100% 已完成 (2026-10-07)**<br>提交 `291197f` | **B-7 跨分卷防御**: `recovery.cpp` 扩 `is_target_newer` 为 `(best_date, best_split) > (target.date, atc_split)` 二元组全序比较，`flusher.cpp` 的 `scan_dir_for_target()` 改按 `(date, split)` 全序决选目标，根除新分卷 seqno=0 漏选缺陷；对齐 `test_flusher.cpp` 防御性切分探测注入时序；**B-1 方案 A (NO_SPACE 退避重试)**: `logx_config_t` 与 `Instance` 追加 `staging_wait_ms`（默认 0ms 绝不阻塞），`logx_write` 实现锁外 `pal->sleep_ms(2)` 有界退避重试与 Flusher 死亡快速失败，JNI 与 Kotlin `Config.stagingWaitMs` 全链路接线；**专属回归用例与反空洞绿**: 新增 4 项用例（B-7 变异测试恢复单比日期逻辑实证确定性复红见红，B-1 覆盖 0ms 立即丢弃 / 1000ms 240KB 突发打满 0 丢弃 / Flusher 停机快速失败防死锁）；**验证**: MSVC 56/56 全量 clean 重建 0 警告 0 错误；单测 169/169、hotpath 2/2、stress 4/4、crash_fork 3/3 100% 全绿；**Android 真机复跑 (2026-10-07, Redmi K30 Pro)**: 单测 171/171、hotpath 2/2、stress 4/4、crash_fork 3/3 全绿。 |
 | **B-1 复审收口** | B-1 复审发现收口: P3-1 单调钟 + P3-2 closing 丢弃记账统一 + Nit-1 哨兵布尔化 | `core/src/logx_c.cpp`, `tests/unit/test_r19_regression.cpp`, `docs/LogX后续实施计划表.md` | **P3** | **✅ 100% 已完成 (2026-10-07)**<br>提交 `a213762` | **P3-1 & Nit-1**: B-1 重试循环时钟源采用 `monotonic_ns() / 1000000ULL` 杜绝 NTP/时间跳变导致有界重试退化为无界自旋，以 `bool retry_started` 消除 0 哨兵歧义；<br>**P3-2**: 循环内 `closing` 早退改为 `break`，统一由 `kFull` 路径执行 `drop_no_space` 计数与 `LOGX_EV_DROP` 事件通知（杜绝关闭时静默丢弃），随后在函数尾返回 `LOGX_OK`；<br>**反空洞绿回归测试**: 新增 `B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk`，通过专用 `ClosingOnRetryPal`（阻塞 Flusher 刷盘 + 退避时自动置位 `closing`）钉死契约；变异测试（撤销改回 `return LOGX_OK`）确定性复红见红，还原后复绿；<br>**验证**: MSVC 56/56 全量重建 0 警告 0 错误；单测 170/170 全绿，hotpath 2/2，stress 4/4，crash_fork 3/3；**Android 真机复跑 (2026-10-07, Redmi K30 Pro)**: 171/171 + 2/2 + 4/4 + 3/3 全绿，`B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk` 真机 1027ms 无挂起。 |
 | **B-1 收口用例加固** | R31 复审 Nit-1: ClosingOnRetryPal 丢唤醒窗口消除 | `tests/unit/test_r19_regression.cpp` | **Nit** | **✅ 100% 已完成 (2026-10-07)**<br>提交 `4cc998a` | `B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk` 退出段解除 Flusher 阻塞由 `stall_mu` 锁外 `store(false)+notify_all` 改为锁内 `store+notify`，消除 notify 落在 waiter "pred 判 false 后、wait 阻塞前" 间隙被丢失、极端时序下 `logx_close` join 挂死的窗口；纯测试侧零产品代码改动。**验证**: 增量重建过；单测 170/170 全绿（目标用例 1067ms 无挂起）；**Android 真机 (2026-10-07, Redmi K30 Pro)**: 该用例随 171/171 全绿复跑通过 (1027ms)。 |
+| **R32 方案 2** | Backlog 优化落地: NO_SPACE 退避事件驱动化与级联唤醒令牌 | `core/include/logx_internal.h`, `core/src/flusher.cpp`, `core/src/logx_c.cpp`, `tests/unit/test_r19_regression.cpp`, `docs/LogX后续实施计划表.md` | **P3** | **✅ 100% 已完成 (2026-10-07)** | **机制升级**: `Instance` 引入 `space_event` 事件原语，彻底移除 `pal->sleep_ms(2)` 轮询阻塞，改用至多 5ms 切片的 `ev_wait_timeout(space_event, wait_slice_ms)` 事件等待；Flusher 在各落块提交释放缓冲区后主动触发 `space_event` 唤醒写线程，将唤醒延迟从固定毫秒级骤降至即刻响应；**级联唤醒令牌 (Cascading Wake-up Token)**: 阻塞写线程成功落环后主动向 `space_event` 传递唤醒令牌，逐级唤醒排队中的后继写线程探测剩余空间，消除单唤醒竞争饥饿；**关闭加速**: `logx_close` 与退出循环时级联广播 `space_event`，促使写线程即刻退出并统一记账；**专属回归用例**: 新增 `B1_EventDrivenBackoff_FastWakeupOnSpaceFreed` 与 `B1_EventDrivenBackoff_CascadingWakeupMultiThread`；**验证**: 全量 clean 重建 56/56 目标 0 警告 0 错误；单测 177/177、hotpath 2/2、stress 4/4、crash_fork 3/3 100% 全绿。 |
 
 
 ---
@@ -277,10 +280,10 @@ gantt
 | **B. 截断保留前缀** | TOO_LARGE | **小**(~20-40 行) | 超长时用缩小后的 payload 经 `format_record` 重新格式化一次,保证 ≤ `max_log_length` 落环;新增截断计数(占用 `logx_stats_t.reserved` 预留位,ABI 兼容),事件改为 "log truncated" | `format.cpp`/`logx_c.cpp`;Kotlin 层 API 与磁盘格式均不动 | ✅ 已落地 (2026-09-13 T5.5) |
 | **C. 溢出文件保全文** | 两者 | **大**(不推荐) | 超限记录落独立溢出文件 | 打破"文件单写者"不变量(spec 不变量 4,仅 Flusher 写日志文件),需新增文件类型并贯通恢复/导出/保留期/切分全链路,引入新对账复杂度 | ❌ 否决 |
 
-- **方案 A 落地详情 (2026-10-07)**:
+- **方案 A 落地与事件驱动化升级详情 (2026-10-07)**:
   - 引入可配置 `staging_wait_ms`（默认值 0 保持零等待即时丢弃契约，>0 开启退避重试）；
-  - `logx_write` 锁内遇 `kFull` 且 `staging_wait_ms > 0` 时解锁，主动唤醒 `flush_event` 并在锁外 `pal->sleep_ms(2)` 有界退避重试，超时或 Flusher 死亡快速失败后走原有即时丢弃与打点；
-  - 专属单测覆盖 0ms 即刻丢弃、1000ms 240KB 突发打满 128KB 暂存区 0 丢弃落盘、Flusher 停机快速失败防死锁。
+  - **R32 方案 2 升级 (事件驱动化与级联令牌)**：彻底废弃原始固定 `pal->sleep_ms(2)` 轮询阻塞，改为基于 `space_event` 与至多 5ms 切片的 `ev_wait_timeout` 事件驱动等待；Flusher 释放空间即刻唤醒写线程；写线程落环后级联传递令牌唤醒后继线程消除饥饿；`logx_close` 级联唤醒加速退出；
+  - 专属单测覆盖 0ms 即刻丢弃、1000ms 240KB 突发打满 128KB 暂存区 0 丢弃落盘、Flusher 停机快速失败防死锁、空间释放毫秒级即刻唤醒、多写线程排队级联唤醒全量成功。
 - **效果预估**: A+B 落地后,真正丢日志仅剩"磁盘彻底坏死且持续超过 staging_wait_ms"与"超长且截断不可接受"两类边缘场景。
 
 

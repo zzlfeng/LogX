@@ -546,6 +546,13 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **专属回归用例**：`tests/unit/test_format.cpp` 新增 `PeekAndParseStagingRecordHeader_EquivalenceAndBounds`（覆盖 Entry/Pad 合法性、<6B 短缓冲、长度溢出、非法 Magic、NULL 守卫及 cksum1 一致性）；
    - **验证**：MSVC Release 单测升至 **175/175**、hotpath 2/2、stress 4/4、crash_fork 3/3 100% 全绿（总用时 19.92s）。
 
+11. **R32 方案 2 落地：NO_SPACE 退避事件驱动化与级联唤醒令牌 (2026-10-07)**：
+   - **机制升级与事件驱动退避**：在 `Instance` 引入 `space_event` 事件原语（`logx_internal.h`），`logx_write` 退避重试彻底移除固定 2ms 睡眠轮询（`pal->sleep_ms(2)`），改用单次至多 5ms 切片的事件驱动等待（`ev_wait_timeout(space_event, wait_slice_ms)`）；Flusher 在落块提交释放缓冲区（`commit_header_locked` + `mutex_unlock`）后主动触发 `space_event` 唤醒写线程，将唤醒延迟从固定毫秒级骤降至即刻响应；
+   - **级联唤醒令牌 (Cascading Wake-up Token)**：阻塞写线程成功落环后主动向 `space_event` 传递唤醒令牌，逐级唤醒排队中的后继写线程探测剩余空间，消除单唤醒竞争饥饿；
+   - **关闭加速与防挂死**：`logx_close` 与写线程退出循环时级联广播 `space_event`，促使所有退避写线程即刻退出并统一记账（保持 P3-2 契约）；`ClosingOnRetryPal` 同步接管 `ev_wait_timeout`；
+   - **专属回归用例**：`tests/unit/test_r19_regression.cpp` 新增 `B1_EventDrivenBackoff_FastWakeupOnSpaceFreed`（空间释放毫秒级即刻唤醒）与 `B1_EventDrivenBackoff_CascadingWakeupMultiThread`（多写线程排队级联唤醒零饥饿全量落盘）；
+   - **验证**：MSVC Release 全量 clean 重建（R21-2 头文件门禁）56/56 目标 **0 警告 0 错误**；单测套件升至 **177/177 100% 全绿**，hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过。
+
 
 ---
 

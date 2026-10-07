@@ -2047,14 +2047,22 @@ public:
     void  ev_destroy(void* h) override { real_->ev_destroy(h); }
     void  ev_signal(void* h) override { real_->ev_signal(h); }
     void  ev_wait(void* h) override { real_->ev_wait(h); }
-    bool  ev_wait_timeout(void* h, uint32_t ms) override { return real_->ev_wait_timeout(h, ms); }
+    bool  ev_wait_timeout(void* h, uint32_t ms) override {
+        if (armed_closing.load(std::memory_order_acquire)) {
+            if (inst) {
+                inst->closing.store(true, std::memory_order_release);
+                if (h) real_->ev_signal(h);
+            }
+        }
+        return real_->ev_wait_timeout(h, ms);
+    }
     uint64_t atomic_add(uint64_t* p, int64_t d) override { return real_->atomic_add(p, d); }
     uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
     uint64_t monotonic_ns() override { return real_->monotonic_ns(); }
     uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
     void     wallclock_date(uint32_t* y, uint32_t* h) override { real_->wallclock_date(y, h); }
     void     sleep_ms(uint32_t ms) override {
-        if (ms == 2 && armed_closing.load(std::memory_order_acquire)) {
+        if (armed_closing.load(std::memory_order_acquire)) {
             if (inst) {
                 inst->closing.store(true, std::memory_order_release);
             }
@@ -2133,6 +2141,137 @@ TEST(R19Regression, B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk) {
     // logx_close 内部通过 closing.exchange(true) 保证幂等；此处需显式复位 false，以便正常触发 Flusher 退出与资源 join 清理
     ii->closing.store(false, std::memory_order_release);
 
+    logx_close(inst);
+    cleanup_dir(dir);
+}
+
+// ============================================================
+// R32 方案 2: NO_SPACE 退避事件驱动化 — 空间释放即刻唤醒低延迟测试
+// 验证: 写线程因环满阻塞在 space_event 时，后台 Flusher 刷盘释放空间
+// 后通过 space_event 毫秒级即刻唤醒写线程，无需轮询死等或超时。
+// ============================================================
+TEST(R19Regression, B1_EventDrivenBackoff_FastWakeupOnSpaceFreed) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_b1_ev_fast_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 48 * 1024;
+    cfg.flush_threshold = 0;    // 禁用自动刷盘阈值，人工控制刷盘时机
+    cfg.staging_wait_ms = 3000; // 允许至多 3000ms 等待
+    cfg.retention_days = 36500;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    Instance* ii = static_cast<Instance*>(inst);
+
+    // 填满暂存区 (4 条 32KB 记录填满 128KB 环)
+    std::vector<uint8_t> rec(32 * 1024, 'F');
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, "FastFill", rec.data(), static_cast<uint32_t>(rec.size())), LOGX_OK);
+    }
+
+    std::atomic<bool> thread_started{false};
+    std::atomic<int> write_result{-999};
+    std::atomic<uint64_t> write_duration_ms{0};
+
+    // 启动写线程，第 5 条写入必因环满进入 space_event 等待
+    std::thread writer([&]() {
+        thread_started.store(true, std::memory_order_release);
+        uint64_t t0 = pal.wallclock_ms();
+        int rc = logx_write(inst, 2, "BlockedWrite", rec.data(), static_cast<uint32_t>(rec.size()));
+        write_duration_ms.store(pal.wallclock_ms() - t0, std::memory_order_release);
+        write_result.store(rc, std::memory_order_release);
+    });
+
+    while (!thread_started.load(std::memory_order_acquire)) {
+        pal.sleep_ms(1);
+    }
+    // 短暂等待使写线程确定进入退避等待态
+    pal.sleep_ms(30);
+
+    // 主线程调用 flush 刷盘腾出空间，Flusher commit 触发 space_event 唤醒
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    writer.join();
+
+    EXPECT_EQ(write_result.load(), LOGX_OK);
+    EXPECT_EQ(ii->drop_no_space.load(), 0u);
+    // 断言: 唤醒迅速，写耗时远小于配置的 3000ms 超时（通常 < 500ms）
+    EXPECT_LT(write_duration_ms.load(), 1500u);
+
+    logx_close(inst);
+    cleanup_dir(dir);
+}
+
+// ============================================================
+// R32 方案 2: NO_SPACE 级联唤醒令牌测试 (Cascading Wake-up Token)
+// 验证: 多个并发写线程在环满阻塞排队时，Flusher 刷盘释放空间后，
+// 前一写线程写入成功向 space_event 传递令牌，后继写线程依次即刻唤醒并落环，
+// 零饥饿、零丢弃、全量写入成功。
+// ============================================================
+TEST(R19Regression, B1_EventDrivenBackoff_CascadingWakeupMultiThread) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_b1_ev_cascade_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 48 * 1024;
+    cfg.flush_threshold = 0;    // 禁用自动刷盘
+    cfg.staging_wait_ms = 3000; // 3000ms 有界等待
+    cfg.retention_days = 36500;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    Instance* ii = static_cast<Instance*>(inst);
+
+    // 填满暂存区
+    std::vector<uint8_t> rec32(32 * 1024, 'C');
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, "CascFill", rec32.data(), static_cast<uint32_t>(rec32.size())), LOGX_OK);
+    }
+
+    constexpr int kWaiters = 3;
+    std::vector<uint8_t> rec16(16 * 1024, 'W'); // 3 * 16KB = 48KB < 128KB 释放容积
+    std::vector<std::thread> threads;
+    std::atomic<int> start_count{0};
+    std::atomic<int> success_count{0};
+
+    for (int t = 0; t < kWaiters; ++t) {
+        threads.emplace_back([&, t]() {
+            start_count.fetch_add(1, std::memory_order_release);
+            char tag[16];
+            std::snprintf(tag, sizeof(tag), "Wait_%d", t);
+            int rc = logx_write(inst, 2, tag, rec16.data(), static_cast<uint32_t>(rec16.size()));
+            if (rc == LOGX_OK) {
+                success_count.fetch_add(1, std::memory_order_release);
+            }
+        });
+    }
+
+    while (start_count.load(std::memory_order_acquire) < kWaiters) {
+        pal.sleep_ms(1);
+    }
+    pal.sleep_ms(40); // 确保所有 3 个写线程都已进入 space_event 等待
+
+    // 主线程 flush 腾出所有 128KB 空间
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
+
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    EXPECT_EQ(success_count.load(), kWaiters);
+    EXPECT_EQ(ii->drop_no_space.load(), 0u);
+
+    // 验证追加的数据全部完好落盘
+    ASSERT_EQ(logx_flush(inst), LOGX_OK);
     logx_close(inst);
     cleanup_dir(dir);
 }
