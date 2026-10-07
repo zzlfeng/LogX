@@ -552,7 +552,11 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **级联唤醒令牌 (Cascading Wake-up Token)**：阻塞写线程成功落环后主动向 `space_event` 传递唤醒令牌，逐级唤醒排队中的后继写线程探测剩余空间，消除单唤醒竞争饥饿；
    - **关闭加速与防挂死**：`logx_close` 与写线程退出循环时级联广播 `space_event`，促使所有退避写线程即刻退出并统一记账（保持 P3-2 契约）；`ClosingOnRetryPal` 同步接管 `ev_wait_timeout`；
    - **专属回归用例**：`tests/unit/test_r19_regression.cpp` 新增 `B1_EventDrivenBackoff_FastWakeupOnSpaceFreed`（空间释放毫秒级即刻唤醒）与 `B1_EventDrivenBackoff_CascadingWakeupMultiThread`（多写线程排队级联唤醒零饥饿全量落盘）；
-   - **验证**：MSVC Release 全量 clean 重建（R21-2 头文件门禁）56/56 目标 **0 警告 0 错误**；单测套件升至 **177/177 100% 全绿**，hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过。
+12. **R34 批次：R32 方案 2 复核与 R33 遗留收口 (2026-10-07)**：
+   - **N-1 (P3, R18-2 刚性屏障建立)**：针对原测试中 5ms 切片轮询允许删去 `ev_signal` 仍假绿问题，引入 `StrictEventWaitPal` 并启用 `limit_flusher_space_signals` 与 `strict_space_wait`；重构 `B1_EventDrivenBackoff_FastWakeupOnSpaceFreed` 与 `B1_EventDrivenBackoff_CascadingWakeupMultiThread` 测试配置（129.7KB 填环余 1.2KB，3×4KB 线程在首个 16KB 释放块下竞争），撤销变异实测：注释级联令牌传递 `inst->pal->ev_signal(inst->space_event)` 时确定性复红（Actual 1 vs Expected 3，退出码 1），恢复后确定性复绿（65ms）；注释 Flusher 首脉冲唤醒同样确定性复红；成功建立 R18-2 刚性屏障；
+   - **N-2 (Nit, 记录头下溢防御)**：`core/include/logx_format.h` 中 `parse_staging_record_header` 补充 `off > total` 守卫，杜绝 `total - off` 无符号整数回绕下溢；`tests/unit/test_format.cpp` 补充 `off > total` 边界断言；
+   - **N-3 (观察/清理)**：清理 `core/src/logx_c.cpp:90` 遗留的未用变量 `key_lookup_attempted`（消除 clang `-Wunused-but-set-variable` 警告，收口 R33 N-1）；在 `logx_format.h` 提炼 `kWireOffPayloadLen`、`kWireOffMagic`、`kWireOffFlags`、`kWireOffCksum` 4 处 wire-format 偏移常量并辅以 5 条编译期 `static_assert` 约束；
+   - **验证**：MSVC Release 全量 clean 重建 56/56 目标 **0 警告 0 错误**；单测套件 **177/177 100% 全绿**，hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过。
 
 
 ---

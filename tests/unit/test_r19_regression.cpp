@@ -2146,14 +2146,98 @@ TEST(R19Regression, B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk) {
 }
 
 // ============================================================
+// N-1 (R18-2 刚性撤销屏障桩): StrictEventWaitPal
+// 装饰 PAL：在开启 strict_space_wait 时，space_event 的 ev_wait_timeout
+// 强制忽略 5ms 切片超时自旋，转为无界等待真实信号；
+// 若删去 Flusher 或级联写线程的 ev_signal，写线程绝无法借 5ms 切片轮询自愈，
+// 从而确立确定性的撤销复红屏障。
+// ============================================================
+class StrictEventWaitPal : public Pal {
+public:
+    explicit StrictEventWaitPal(Pal* real_pal) : real_(real_pal) {}
+
+    Instance* inst = nullptr;
+    std::atomic<bool> strict_space_wait{false};
+    std::atomic<bool> limit_flusher_space_signals{false};
+    std::atomic<int> flusher_space_signals_sent{0};
+    std::atomic<int> space_signal_count{0};
+    std::atomic<int> space_wait_entered{0};
+
+    int file_open(const char* p, bool c, bool a) override { return real_->file_open(p, c, a); }
+    int file_close(int fd) override { return real_->file_close(fd); }
+    int file_truncate(int fd, uint64_t len) override { return real_->file_truncate(fd, len); }
+    int64_t file_size(int fd) override { return real_->file_size(fd); }
+    int64_t file_size_path(const char* p) override { return real_->file_size_path(p); }
+    long file_pread(int fd, void* b, size_t n, uint64_t o) override { return real_->file_pread(fd, b, n, o); }
+    long file_write(int fd, const void* b, size_t n) override { return real_->file_write(fd, b, n); }
+    long file_pwrite(int fd, const void* b, size_t n, uint64_t o) override { return real_->file_pwrite(fd, b, n, o); }
+    int file_fsync(int fd) override { return real_->file_fsync(fd); }
+    int file_dir_fsync(const char* p) override { return real_->file_dir_fsync(p); }
+    int file_unlink(const char* p) override { return real_->file_unlink(p); }
+    int file_mkdirs(const char* p) override { return real_->file_mkdirs(p); }
+    int file_rmdir(const char* p) override { return real_->file_rmdir(p); }
+    std::vector<std::string> file_list(const char* d) override { return real_->file_list(d); }
+    PalMmap mmap_open(int fd, size_t len, bool w) override { return real_->mmap_open(fd, len, w); }
+    int mmap_sync(const PalMmap& m, bool s) override { return real_->mmap_sync(m, s); }
+    int mmap_close(const PalMmap& m) override { return real_->mmap_close(m); }
+    void* mutex_create() override { return real_->mutex_create(); }
+    void  mutex_destroy(void* h) override { real_->mutex_destroy(h); }
+    void  mutex_lock(void* h) override { real_->mutex_lock(h); }
+    void  mutex_unlock(void* h) override { real_->mutex_unlock(h); }
+    int   threading_init() override { return real_->threading_init(); }
+    int   thread_start(void* (*fn)(void*), void* a, void** out_h) override { return real_->thread_start(fn, a, out_h); }
+    int   thread_join(void* h) override { return real_->thread_join(h); }
+    void* ev_create() override { return real_->ev_create(); }
+    void  ev_destroy(void* h) override { real_->ev_destroy(h); }
+    void  ev_signal(void* h) override {
+        if (inst && h == inst->space_event) {
+            space_signal_count.fetch_add(1, std::memory_order_relaxed);
+            uint64_t tid = real_->tid();
+            if (limit_flusher_space_signals.load(std::memory_order_acquire) &&
+                tid == inst->flusher_tid.load(std::memory_order_acquire)) {
+                if (flusher_space_signals_sent.fetch_add(1, std::memory_order_acq_rel) >= 1) {
+                    return; // 仅向 space_event 注入 Flusher 的首个唤醒脉冲，后继唤醒必须依赖级联令牌传递
+                }
+            }
+        }
+        real_->ev_signal(h);
+    }
+    void  ev_wait(void* h) override { real_->ev_wait(h); }
+    bool  ev_wait_timeout(void* h, uint32_t ms) override {
+        if (strict_space_wait.load(std::memory_order_acquire) && inst && h == inst->space_event) {
+            space_wait_entered.fetch_add(1, std::memory_order_release);
+            // 忽略传入的 wait_slice_ms (5ms) 超时参数，强制无界等待真实信号；
+            // 仅真实收到 ev_signal 时才被唤醒返回 true。
+            real_->ev_wait(h);
+            return true;
+        }
+        return real_->ev_wait_timeout(h, ms);
+    }
+    uint64_t atomic_add(uint64_t* p, int64_t d) override { return real_->atomic_add(p, d); }
+    uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
+    uint64_t monotonic_ns() override { return real_->monotonic_ns(); }
+    uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
+    void     wallclock_date(uint32_t* y, uint32_t* h) override { real_->wallclock_date(y, h); }
+    void     sleep_ms(uint32_t ms) override { real_->sleep_ms(ms); }
+    uint32_t pid() override { return real_->pid(); }
+    uint64_t tid() override { return real_->tid(); }
+    bool     random_bytes(void* b, size_t l) override { return real_->random_bytes(b, l); }
+    void     debug_log(const char* s) override { real_->debug_log(s); }
+private:
+    Pal* real_ = nullptr;
+};
+
+// ============================================================
 // R32 方案 2: NO_SPACE 退避事件驱动化 — 空间释放即刻唤醒低延迟测试
 // 验证: 写线程因环满阻塞在 space_event 时，后台 Flusher 刷盘释放空间
-// 后通过 space_event 毫秒级即刻唤醒写线程，无需轮询死等或超时。
+// 后通过 space_event 即刻唤醒写线程；在 StrictEventWaitPal 下，
+// 若删去 Flusher 的 ev_signal 唤醒，写线程绝无法超时自愈，确定性复红 (R18-2)。
 // ============================================================
 TEST(R19Regression, B1_EventDrivenBackoff_FastWakeupOnSpaceFreed) {
-    Pal& pal = default_pal();
+    Pal& real_pal = default_pal();
+    StrictEventWaitPal mock_pal(&real_pal);
     std::string dir = make_tmp_dir("logx_test_b1_ev_fast_");
-    pal.file_mkdirs(dir.c_str());
+    real_pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
     logx_config_t cfg{};
@@ -2163,44 +2247,68 @@ TEST(R19Regression, B1_EventDrivenBackoff_FastWakeupOnSpaceFreed) {
     cfg.flush_threshold = 0;    // 禁用自动刷盘阈值，人工控制刷盘时机
     cfg.staging_wait_ms = 3000; // 允许至多 3000ms 等待
     cfg.retention_days = 36500;
+    cfg.pal_override = &mock_pal;
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     Instance* ii = static_cast<Instance*>(inst);
+    mock_pal.inst = ii;
 
-    // 填满暂存区 (4 条 32KB 记录填满 128KB 环)
+    // 填满暂存区 (3 条 32KB 记录占用约 98.3KB，环剩余空间约 32.6KB < 32.8KB，第 4 条必满)
     std::vector<uint8_t> rec(32 * 1024, 'F');
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 3; ++i) {
         ASSERT_EQ(logx_write(inst, 2, "FastFill", rec.data(), static_cast<uint32_t>(rec.size())), LOGX_OK);
     }
 
     std::atomic<bool> thread_started{false};
+    std::atomic<bool> write_finished{false};
     std::atomic<int> write_result{-999};
     std::atomic<uint64_t> write_duration_ms{0};
 
-    // 启动写线程，第 5 条写入必因环满进入 space_event 等待
+    // 激活 strict_space_wait: space_event 等待强制无界阻塞（切断 5ms 轮询自愈后门）
+    mock_pal.strict_space_wait.store(true, std::memory_order_release);
+
+    // 启动写线程，第 4 条写入必因环满进入 space_event 等待
     std::thread writer([&]() {
         thread_started.store(true, std::memory_order_release);
-        uint64_t t0 = pal.wallclock_ms();
+        uint64_t t0 = real_pal.wallclock_ms();
         int rc = logx_write(inst, 2, "BlockedWrite", rec.data(), static_cast<uint32_t>(rec.size()));
-        write_duration_ms.store(pal.wallclock_ms() - t0, std::memory_order_release);
+        write_duration_ms.store(real_pal.wallclock_ms() - t0, std::memory_order_release);
         write_result.store(rc, std::memory_order_release);
+        write_finished.store(true, std::memory_order_release);
     });
 
-    while (!thread_started.load(std::memory_order_acquire)) {
-        pal.sleep_ms(1);
+    while (!thread_started.load(std::memory_order_acquire) ||
+           mock_pal.space_wait_entered.load(std::memory_order_acquire) < 1) {
+        real_pal.sleep_ms(1);
     }
-    // 短暂等待使写线程确定进入退避等待态
-    pal.sleep_ms(30);
+    // 确保写线程确已稳态处于 space_event 阻塞中
+    real_pal.sleep_ms(20);
 
     // 主线程调用 flush 刷盘腾出空间，Flusher commit 触发 space_event 唤醒
     ASSERT_EQ(logx_flush(inst), LOGX_OK);
 
+    // 等待写线程被 signal 唤醒并执行完毕 (至多 1500ms)
+    uint64_t wait_start = real_pal.wallclock_ms();
+    while (!write_finished.load(std::memory_order_acquire)) {
+        if (real_pal.wallclock_ms() - wait_start > 1500) {
+            break;
+        }
+        real_pal.sleep_ms(5);
+    }
+
+    // 撤销复红核心断言：若删去 Flusher 的 ev_signal，写线程永不被唤醒，此处必然判定失败 (RED)
+    EXPECT_TRUE(write_finished.load()) << "写线程必须由 space_event 真实信号唤醒，若删去 signal 必然超时复红";
+    if (!write_finished.load()) {
+        // 安全退出兜底：置位 closing 并人工打信号以解除 writer 悬挂
+        ii->closing.store(true, std::memory_order_release);
+        real_pal.ev_signal(ii->space_event);
+    }
     writer.join();
 
     EXPECT_EQ(write_result.load(), LOGX_OK);
     EXPECT_EQ(ii->drop_no_space.load(), 0u);
-    // 断言: 唤醒迅速，写耗时远小于配置的 3000ms 超时（通常 < 500ms）
+    EXPECT_GE(mock_pal.space_signal_count.load(), 1);
     EXPECT_LT(write_duration_ms.load(), 1500u);
 
     logx_close(inst);
@@ -2210,13 +2318,15 @@ TEST(R19Regression, B1_EventDrivenBackoff_FastWakeupOnSpaceFreed) {
 // ============================================================
 // R32 方案 2: NO_SPACE 级联唤醒令牌测试 (Cascading Wake-up Token)
 // 验证: 多个并发写线程在环满阻塞排队时，Flusher 刷盘释放空间后，
-// 前一写线程写入成功向 space_event 传递令牌，后继写线程依次即刻唤醒并落环，
-// 零饥饿、零丢弃、全量写入成功。
+// 前一写线程写入成功向 space_event 传递令牌，后继写线程依次即刻唤醒并落环；
+// 若删去级联令牌传递逻辑，后继写线程在 StrictEventWaitPal 保护下永不被唤醒，
+// 确立刚性的撤销复红屏障 (R18-2)。
 // ============================================================
 TEST(R19Regression, B1_EventDrivenBackoff_CascadingWakeupMultiThread) {
-    Pal& pal = default_pal();
+    Pal& real_pal = default_pal();
+    StrictEventWaitPal mock_pal(&real_pal);
     std::string dir = make_tmp_dir("logx_test_b1_ev_cascade_");
-    pal.file_mkdirs(dir.c_str());
+    real_pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
 
     logx_config_t cfg{};
@@ -2226,51 +2336,89 @@ TEST(R19Regression, B1_EventDrivenBackoff_CascadingWakeupMultiThread) {
     cfg.flush_threshold = 0;    // 禁用自动刷盘
     cfg.staging_wait_ms = 3000; // 3000ms 有界等待
     cfg.retention_days = 36500;
+    cfg.pal_override = &mock_pal;
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     Instance* ii = static_cast<Instance*>(inst);
+    mock_pal.inst = ii;
 
-    // 填满暂存区
-    std::vector<uint8_t> rec32(32 * 1024, 'C');
-    for (int i = 0; i < 4; ++i) {
-        ASSERT_EQ(logx_write(inst, 2, "CascFill", rec32.data(), static_cast<uint32_t>(rec32.size())), LOGX_OK);
+    // 填满暂存区至剩余容量不足 4KB (7 条 16KB + 1 条 15KB 占用约 129.7KB，余约 1.2KB)
+    std::vector<uint8_t> rec16k(16 * 1024, 'C');
+    std::vector<uint8_t> rec15k(15000, 'C');
+    for (int i = 0; i < 7; ++i) {
+        ASSERT_EQ(logx_write(inst, 2, "CascFill16", rec16k.data(), static_cast<uint32_t>(rec16k.size())), LOGX_OK);
     }
+    ASSERT_EQ(logx_write(inst, 2, "CascFill15", rec15k.data(), static_cast<uint32_t>(rec15k.size())), LOGX_OK);
 
     constexpr int kWaiters = 3;
-    std::vector<uint8_t> rec16(16 * 1024, 'W'); // 3 * 16KB = 48KB < 128KB 释放容积
+    std::vector<uint8_t> rec4k(4 * 1024, 'W'); // 3 * 4KB = 12KB，首个 16KB 刷盘释放块即可完全容纳
     std::vector<std::thread> threads;
     std::atomic<int> start_count{0};
     std::atomic<int> success_count{0};
+    std::vector<std::atomic<bool>> finished(kWaiters);
+    for (int i = 0; i < kWaiters; ++i) finished[i].store(false);
 
+    // 激活 strict_space_wait: 忽略 5ms 切片超时，必须依赖真实信号/级联令牌唤醒
+    mock_pal.strict_space_wait.store(true, std::memory_order_release);
+
+    // 3 个排队写线程各自尝试写入 4KB，因环剩余约 1.2KB 均进入 space_event 等待
     for (int t = 0; t < kWaiters; ++t) {
         threads.emplace_back([&, t]() {
             start_count.fetch_add(1, std::memory_order_release);
             char tag[16];
             std::snprintf(tag, sizeof(tag), "Wait_%d", t);
-            int rc = logx_write(inst, 2, tag, rec16.data(), static_cast<uint32_t>(rec16.size()));
+            int rc = logx_write(inst, 2, tag, rec4k.data(), static_cast<uint32_t>(rec4k.size()));
             if (rc == LOGX_OK) {
                 success_count.fetch_add(1, std::memory_order_release);
             }
+            finished[t].store(true, std::memory_order_release);
         });
     }
 
-    while (start_count.load(std::memory_order_acquire) < kWaiters) {
-        pal.sleep_ms(1);
+    while (start_count.load(std::memory_order_acquire) < kWaiters ||
+           mock_pal.space_wait_entered.load(std::memory_order_acquire) < kWaiters) {
+        real_pal.sleep_ms(1);
     }
-    pal.sleep_ms(40); // 确保所有 3 个写线程都已进入 space_event 等待
+    // 激活限制 Flusher 仅注入首个唤醒信号，强制后继线程只能依赖级联令牌唤醒 (R18-2 刚性屏障)
+    mock_pal.limit_flusher_space_signals.store(true, std::memory_order_release);
 
-    // 主线程 flush 腾出所有 128KB 空间
+    // 主线程 flush 腾出空间
     ASSERT_EQ(logx_flush(inst), LOGX_OK);
 
+    // 等待所有线程通过级联令牌依次唤醒完毕
+    uint64_t wait_start = real_pal.wallclock_ms();
+    while (true) {
+        int done = 0;
+        for (int i = 0; i < kWaiters; ++i) {
+            if (finished[i].load(std::memory_order_acquire)) ++done;
+        }
+        if (done == kWaiters || real_pal.wallclock_ms() - wait_start > 1500) {
+            break;
+        }
+        real_pal.sleep_ms(5);
+    }
+
+    // 撤销复红核心断言：若删去 logx_write 的级联令牌 (retry_started && ev_signal)，
+    // Flusher 仅唤醒 1 个线程，剩余 2 个线程将永久卡在 ev_wait 中无法唤醒！
+    EXPECT_EQ(success_count.load(), kWaiters)
+        << "若级联唤醒令牌失效，后继线程将卡死，必然复红";
+
+    // 安全回收兜底
+    ii->closing.store(true, std::memory_order_release);
+    for (int i = 0; i < kWaiters; ++i) {
+        real_pal.ev_signal(ii->space_event);
+    }
     for (auto& th : threads) {
         th.join();
     }
 
-    EXPECT_EQ(success_count.load(), kWaiters);
     EXPECT_EQ(ii->drop_no_space.load(), 0u);
+    // 信号次数至少为 Flusher 的 1 次 + 写线程级联传递的 2 次
+    EXPECT_GE(mock_pal.space_signal_count.load(), kWaiters);
 
     // 验证追加的数据全部完好落盘
+    ii->closing.store(false, std::memory_order_release);
     ASSERT_EQ(logx_flush(inst), LOGX_OK);
     logx_close(inst);
     cleanup_dir(dir);

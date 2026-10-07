@@ -454,5 +454,11 @@ TEST(Format, PeekAndParseStagingRecordHeader_EquivalenceAndBounds) {
 
     // 6. 空指针防御
     EXPECT_FALSE(parse_staging_record_header(buf, 0, 10, nullptr));
+
+    // 7. N-2 边界防御: off > total 防无符号整数下溢
+    EXPECT_EQ(peek_record_len(buf, 20, 10), 0u);
+    EXPECT_FALSE(parse_staging_record_header(buf, 20, 10, &rh));
+    EXPECT_EQ(peek_record_len(buf, 1, 0), 0u);
+    EXPECT_FALSE(parse_staging_record_header(buf, 1, 0, &rh));
 }
 

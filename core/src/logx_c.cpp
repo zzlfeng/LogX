@@ -87,10 +87,8 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
     uint8_t salt[8];
     std::memcpy(salt, hdr + 12, 8);
     const uint8_t* key32 = nullptr;
-    bool key_lookup_attempted = false;
     if (inst->key_provider) {
         key32 = inst->key_provider(kid_in_file, inst->key_user);
-        key_lookup_attempted = true;
     }
     uint64_t off = 32;
     std::vector<uint8_t> carry_slice_buf;

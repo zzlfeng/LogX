@@ -29,6 +29,18 @@ constexpr uint32_t kHeaderLen = 6;
 constexpr uint16_t kMagicEntry = 0x474c;   // 高字节 0x47='G', 低字节 0x4c='L'
 constexpr uint16_t kMagicPad   = 0x5047;   // 高字节 0x50='P', 低字节 0x47='G'
 
+// Wire-format 字节偏移定义与编译期约束 (N-3)
+constexpr uint32_t kWireOffPayloadLen = 0;
+constexpr uint32_t kWireOffMagic      = 2;
+constexpr uint32_t kWireOffFlags      = 4;
+constexpr uint32_t kWireOffCksum      = 5;
+
+static_assert(kWireOffPayloadLen == 0, "payload_len must be at wire offset 0");
+static_assert(kWireOffMagic == 2,      "magic must be at wire offset 2");
+static_assert(kWireOffFlags == 4,      "flags must be at wire offset 4");
+static_assert(kWireOffCksum == 5,      "cksum must be at wire offset 5");
+static_assert(kWireOffCksum + 1 == kHeaderLen, "record header length must be exactly 6 bytes");
+
 // 1B 校验和: payload XOR 折叠(8 位); PAD 头 cksum 恒为 0。
 inline uint8_t cksum1(const uint8_t* p, uint32_t n) {
     uint8_t c = 0;
@@ -47,13 +59,16 @@ struct StagingRecordHeaderView {
 };
 
 // 完整解包记录头元数据并校验边界 (供 recovery / flusher / format / 测试共用)
+// N-2: 严密防御 off > total 下溢防线 (防 total - off 无符号回绕)
 inline bool parse_staging_record_header(const uint8_t* raw, uint32_t off, uint32_t total,
                                        StagingRecordHeaderView* out) {
-    if (!out || total - off < kHeaderLen) return false;
-    out->payload_len = uint16_t(raw[off]) | (uint16_t(raw[off + 1]) << 8);
-    out->magic = uint16_t(raw[off + 2]) | (uint16_t(raw[off + 3]) << 8);
-    out->flags = raw[off + 4];
-    out->cksum = raw[off + 5];
+    if (!out || off > total || total - off < kHeaderLen) return false;
+    out->payload_len = uint16_t(raw[off + kWireOffPayloadLen]) |
+                       (uint16_t(raw[off + kWireOffPayloadLen + 1]) << 8);
+    out->magic = uint16_t(raw[off + kWireOffMagic]) |
+                 (uint16_t(raw[off + kWireOffMagic + 1]) << 8);
+    out->flags = raw[off + kWireOffFlags];
+    out->cksum = raw[off + kWireOffCksum];
     out->valid_magic = (out->magic == kMagicEntry || out->magic == kMagicPad);
     out->total_size = kHeaderLen + out->payload_len;
     if (off + out->total_size > total) return false;
