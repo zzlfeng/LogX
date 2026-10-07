@@ -501,6 +501,13 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
      - **变异实验（R18-2 刚性门禁）**：临时将 `core/src/logx_c.cpp` 撤销改回 `return LOGX_OK`，用例确定性复红见红（`drop_no_space` 1 vs 2, `LOGX_EV_DROP` false vs true）；还原后复绿！
    - **全量回归验证**：MSVC Release 全量重建 56/56 0 警告 0 错误；单元测试套件增至 **170/170 100% 全绿**，hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过。
 
+6. **Android 真机复跑收口 (2026-10-07, Redmi K30 Pro / Android 12, 无线 adb)**：
+   - 覆盖批次：`291197f` (B-7 & B-1A)、`a213762` (B-1 复审收口)、`4cc998a` (收口用例加固)；
+   - NDK clean 重建 (arm64-v8a / android-21 / Release / Ninja) 后全量部署 `/data/local/tmp/logx_test/`，二进制新鲜度经 mtime 比对（16:02, 晚于全部批次提交）；
+   - **结果**：单测 `logx_unit_tests` **171/171 全绿**（含主机多 1 个平台特有用例，属预期差异；11.3s）、hotpath **2/2**、stress **4/4**、crash_fork **3/3**，退出码全 0；
+   - 本批新增 5 用例逐项确认真机执行且 OK：`B7_SameDaySplit_StaleAtcHintRecoversToLatestSplit` (11ms)、`B1_NoSpace_DefaultZeroWait_DropsImmediately` (19ms)、`B1_NoSpace_BoundedRetry_SucceedsWithoutDrop` (30ms)、`B1_NoSpace_BoundedRetry_FailFastWhenFlusherDead` (18ms)、`B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk` (1027ms, 无挂起)；
+   - NDK clang 存量警告 4 处（`logx_c.cpp:90 key_lookup_attempted`〔方案 C 遗留〕、zstd 第三方、2 个测试文件），非本批引入，MSVC 0 警告声称不受影响。
+
 
 ---
 
