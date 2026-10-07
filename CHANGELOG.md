@@ -490,6 +490,16 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - 压力 `logx_stress_tests.exe` **4/4 全绿**；
    - 崩溃 fork `logx_crash_fork_tests.exe` **3/3 全绿**。
 
+5. **B-1 复审发现收口 (P3-1, P3-2, Nit-1)**：
+   - **P3-1 & Nit-1 (`core/src/logx_c.cpp`)**：重试循环时钟源从墙钟 `wallclock_ms()` 切换为单调钟 `inst->pal->monotonic_ns() / 1000000ULL`，彻底消除 NTP 校时或系统时间回跳导致有界重试退化为无界自旋的风险；引入 `bool retry_started` 消除单调钟起始时间为 0 的哨兵歧义；
+   - **P3-2 (`core/src/logx_c.cpp`)**：重试循环内检测到 `closing` 时由直接 `return LOGX_OK` 改为 `break` 跳出，让统一的 `kFull` 记账路径如实完成 `drop_no_space` 计数与 `LOGX_EV_DROP` 事件通知（随后在函数尾因 `closing` 返回 `LOGX_OK`），杜绝正在关闭时满环日志静默丢失；
+   - **专属回归用例与反空洞绿实证 (`tests/unit/test_r19_regression.cpp`)**：
+     - 新增 `B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk`；
+     - 引入专用 `ClosingOnRetryPal` 桩（通过 `stall_write` 阻塞 Flusher 刷盘稳定维持 staging 打满，并在锁外 `sleep_ms(2)` 退避钩子中原子置位 `closing`）；
+     - **变异实验（R18-2 刚性门禁）**：临时将 `core/src/logx_c.cpp` 撤销改回 `return LOGX_OK`，用例确定性复红见红（`drop_no_space` 1 vs 2, `LOGX_EV_DROP` false vs true）；还原后复绿！
+   - **全量回归验证**：MSVC Release 全量重建 56/56 0 警告 0 错误；单元测试套件增至 **170/170 100% 全绿**，hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过。
+
+
 ---
 
 ## 附:构建命令速查

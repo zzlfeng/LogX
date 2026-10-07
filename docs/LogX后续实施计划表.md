@@ -1,6 +1,12 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.39 (2026-10-07 B-7 同日多分卷恢复防御 + B-1 方案 A NO_SPACE 暂存区满有界退避重试落地)
+> **文档版本**: v1.40 (2026-10-07 B-1 复审收口: P3-1 单调钟 + P3-2 closing 丢弃记账统一 + Nit-1 哨兵布尔化 + Backlog 增录 B-10)
+>
+> **v1.40 修订说明**: 2026-10-07 **B-1 复审发现收口与 Backlog 扩充**：
+> ① **P3-1 & Nit-1 (`core/src/logx_c.cpp`)**: B-1 重试循环时钟源由墙钟 `wallclock_ms()` 改为单调钟 `monotonic_ns() / 1000000ULL`，彻底消除 NTP 校时或系统时间回跳导致有界重试退化为无界自旋的风险；以 `bool retry_started` 消除 0 哨兵值歧义；
+> ② **P3-2 (`core/src/logx_c.cpp`)**: 重试循环内检测到 `closing` 时由直接 `return LOGX_OK` 改为 `break` 跳出，让统一的 `kFull` 记账路径如实完成 `drop_no_space` 计数与 `LOGX_EV_DROP` 事件通知（随后在函数尾因 `closing` 返回 `LOGX_OK`），杜绝正在关闭时满环日志静默丢失；
+> ③ **反空洞绿回归测试 (`tests/unit/test_r19_regression.cpp`)**: 新增 `B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk`，通过专用 `ClosingOnRetryPal`（阻塞 Flusher 刷盘 + 退避时自动置位 `closing`）钉死 closing 期间既如实记账又返回 `LOGX_OK` 的双重契约；变异实验（临时撤销 P3-2 改回 `return LOGX_OK`）实证确定性复红见红，还原后复绿；单测升至 170/170 全绿；
+> ④ **Backlog 增设 B-10**: 记录 B-7 落地后在异常残留高分卷（多进程/外部工具生成且 seqno 低于 hint）场景下的倒退风险评估。
 >
 > **v1.39 修订说明**: 2026-10-07 **Backlog 关键优化落地（B-7 与 B-1 方案 A）**：
 > ① **B-7 落地（同日多分卷 ATC 提示落后跨分卷防御）**：`recovery.cpp` 中 `reconcile()` 将目标新旧判定由单比日期扩为 `(best_date, best_split) > (target.date, atc_split(target))` 二元组比较；`flusher.cpp` 中 `scan_dir_for_target()` 纠偏为严格按 `(date, split)` 二元组全序决选最新追加目标，根除新分卷 seqno=0 时漏选新分卷缺陷；同步对齐 `tests/unit/test_flusher.cpp` 的 `FileSizeThreshold_DefensiveProbeSkipsExistingSplit` 用例注入时序，消除与 B-7 智能接管语义的冲突；
@@ -363,3 +369,15 @@ gantt
   - **残留**: 彻底清零（R24 §7.2 方案 A/B/C 全部实施闭环，Backlog B-9 清空）。
   - **R27 复核与 N-1 闭环 (2026-10-06)**: R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](./reviews/code_review_R27_2026-10-06.md)）裁定 B-9 根除完全成立，F-1（计划表滞后）已随报告入库提交 `28d1f51` 闭环；R27 N-1（Nit→落地）在 `ReadSideAcceptanceDomain_RawLenBounds` 追加 `kBlockMaxRawWithSeam`(20491) 读侧收容断言（变异实验：plausible 临时收窄 20490 → 恰好复红，flusher.cpp SHA-256 字节级还原），全量 163/163 全绿。
   - **方案 C 落地闭环 (2026-10-06, 提交 `7cbe773` + `3553544` + `c4b9570`)**: 落实 R24 §7.2 条 4 方案 C，引入 `ActiveFileTarget` 聚合活跃文件上下文，`open_or_create_append_target` 单点锁定 `key`，`drain_once` 移除栈上局部量并直接消费 `target.key`，消除跨函数重复 JNI 探测；经独立复核后在收口提交 `3553544` 完成 P3-1（契约明确按文件缓存指针）、P3-2（方案 b 缺钥逐轮重探恢复）、Nit（别名消除）；新增 2 个回归用例钉死常态调用频次与缺钥恢复流程，并经变异测试证实屏障刚性；复核遗留收口提交 `c4b9570` (2026-10-07) 完成 F-1（`logx_c.h` 契约②拆分新建/续写子情形）与 N-1（spec §3.2×2 + §6 降级矩阵同步方案 b 语义），纯注释/文档级零代码改动；全量 165/165 + 4/4 + 3/3 + 2/2 全绿。至此方案 C 彻底闭环。
+
+### B-10 异常残留高分卷且尾块 seqno 倒退时的防御与告警 (B-7 落地后观察)
+
+- **记录日期**: 2026-10-07
+- **状态**: ⏸ 待决策 (Backlog 观察项)
+- **背景**: B-7 落地后，恢复期 `reconcile` 严格信任最新 `(date, split)` 二元组决选出的追加目标。若日志目录由于异常原因（多进程写者并发注入或外部工具生成）存在残留的高 split 文件，且其尾块 `seqno` 低于 ATC hint 中的 `S_hdr` 或历史分卷，则按高 split 接管后恢复出的 `resume_seqno` 可能回退导致磁盘分卷间或分卷内 `seqno` 重复。
+- **影响面**: 在规范的“单写者”契约下不成立（Flusher 为唯一写者，分卷与 seqno 单调递增）。R19 F-13 目前仅通过 `is_new_target` 兜底“空的新分卷（`seqno == 0`）”保持 `S_hdr`。
+- **候选方案**:
+  - **A. reconcile 增加异常倒退防御校验**: 若 `best.split > hint.split` 且 `best.seqno < hint.seqno` 且非空时，发 `LOGX_EV_RECOVERY` 告警事件（或降级回退 hint；注：`S_file > S_hdr` 仅在 target==hint 时有意义，跨文件比无意义；`upto_seqno` 属导出消费侧，无关）。
+  - **B. 维持现状**: 遵循单写者契约，记录在案即可。
+- **决策点**: 是否需要在单写者核心契约之外增加对多写者/外部脏文件的防御与容错。
+

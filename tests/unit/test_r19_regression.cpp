@@ -147,6 +147,11 @@ struct EventProbe {
         std::lock_guard<std::mutex> lk(mu);
         return static_cast<size_t>(std::count(kinds.begin(), kinds.end(), k));
     }
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu);
+        kinds.clear();
+        msgs.clear();
+    }
 };
 
 // 写 32B 合法文件头。
@@ -1650,4 +1655,144 @@ TEST(R19Regression, B1_NoSpace_BoundedRetry_FailFastWhenFlusherDead) {
     logx_close(inst);
     cleanup_dir(dir);
 }
+
+// ============================================================
+// B-1 P3-2: 正在 closing 时重试循环跳出并统一记账 (drop_no_space + DROP 事件)
+// ============================================================
+class ClosingOnRetryPal : public Pal {
+public:
+    explicit ClosingOnRetryPal(Pal* real_pal) : real_(real_pal) {}
+
+    std::atomic<bool> stall_write{false};
+    std::atomic<bool> armed_closing{false};
+    std::condition_variable stall_cv;
+    std::mutex stall_mu;
+    Instance* inst = nullptr;
+
+    int file_open(const char* p, bool c, bool a) override { return real_->file_open(p, c, a); }
+    int file_close(int fd) override { return real_->file_close(fd); }
+    int file_truncate(int fd, uint64_t len) override { return real_->file_truncate(fd, len); }
+    int64_t file_size(int fd) override { return real_->file_size(fd); }
+    int64_t file_size_path(const char* p) override { return real_->file_size_path(p); }
+    long file_pread(int fd, void* b, size_t n, uint64_t o) override { return real_->file_pread(fd, b, n, o); }
+
+    long file_write(int fd, const void* b, size_t n) override {
+        if (stall_write.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lock(stall_mu);
+            stall_cv.wait(lock, [&]() { return !stall_write.load(std::memory_order_acquire); });
+        }
+        return real_->file_write(fd, b, n);
+    }
+    long file_pwrite(int fd, const void* b, size_t n, uint64_t o) override {
+        if (stall_write.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lock(stall_mu);
+            stall_cv.wait(lock, [&]() { return !stall_write.load(std::memory_order_acquire); });
+        }
+        return real_->file_pwrite(fd, b, n, o);
+    }
+    int file_fsync(int fd) override { return real_->file_fsync(fd); }
+    int file_dir_fsync(const char* p) override { return real_->file_dir_fsync(p); }
+    int file_unlink(const char* p) override { return real_->file_unlink(p); }
+    int file_mkdirs(const char* p) override { return real_->file_mkdirs(p); }
+    int file_rmdir(const char* p) override { return real_->file_rmdir(p); }
+    std::vector<std::string> file_list(const char* d) override { return real_->file_list(d); }
+    PalMmap mmap_open(int fd, size_t len, bool w) override { return real_->mmap_open(fd, len, w); }
+    int mmap_sync(const PalMmap& m, bool s) override { return real_->mmap_sync(m, s); }
+    int mmap_close(const PalMmap& m) override { return real_->mmap_close(m); }
+    void* mutex_create() override { return real_->mutex_create(); }
+    void  mutex_destroy(void* h) override { real_->mutex_destroy(h); }
+    void  mutex_lock(void* h) override { real_->mutex_lock(h); }
+    void  mutex_unlock(void* h) override { real_->mutex_unlock(h); }
+    int   threading_init() override { return real_->threading_init(); }
+    int   thread_start(void* (*fn)(void*), void* a, void** out_h) override { return real_->thread_start(fn, a, out_h); }
+    int   thread_join(void* h) override { return real_->thread_join(h); }
+    void* ev_create() override { return real_->ev_create(); }
+    void  ev_destroy(void* h) override { real_->ev_destroy(h); }
+    void  ev_signal(void* h) override { real_->ev_signal(h); }
+    void  ev_wait(void* h) override { real_->ev_wait(h); }
+    bool  ev_wait_timeout(void* h, uint32_t ms) override { return real_->ev_wait_timeout(h, ms); }
+    uint64_t atomic_add(uint64_t* p, int64_t d) override { return real_->atomic_add(p, d); }
+    uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
+    uint64_t monotonic_ns() override { return real_->monotonic_ns(); }
+    uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
+    void     wallclock_date(uint32_t* y, uint32_t* h) override { real_->wallclock_date(y, h); }
+    void     sleep_ms(uint32_t ms) override {
+        if (ms == 2 && armed_closing.load(std::memory_order_acquire)) {
+            if (inst) {
+                inst->closing.store(true, std::memory_order_release);
+            }
+        }
+        real_->sleep_ms(ms);
+    }
+    uint32_t pid() override { return real_->pid(); }
+    uint64_t tid() override { return real_->tid(); }
+    bool     random_bytes(void* b, size_t l) override { return real_->random_bytes(b, l); }
+    void     debug_log(const char* s) override { real_->debug_log(s); }
+private:
+    Pal* real_ = nullptr;
+};
+
+TEST(R19Regression, B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk) {
+    Pal& real_pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_b1_closing_");
+    real_pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    EventProbe probe;
+    auto on_err = [](void* user, logx_event_kind_e k, int c, const char* m) {
+        static_cast<EventProbe*>(user)->on_event(k, c, m);
+    };
+
+    ClosingOnRetryPal mock_pal(&real_pal);
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 48 * 1024;
+    cfg.flush_threshold = 0;
+    cfg.staging_wait_ms = 1000;
+    cfg.retention_days = 36500;
+    cfg.err_fn = on_err;
+    cfg.err_user = &probe;
+    cfg.pal_override = &mock_pal;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    Instance* ii = static_cast<Instance*>(inst);
+    mock_pal.inst = ii;
+
+    // 阻塞 Flusher 刷盘，使暂存区得以稳定塞满
+    mock_pal.stall_write.store(true, std::memory_order_release);
+
+    std::vector<uint8_t> rec(32 * 1024, 'C');
+    // 写满 staging (约 4 条 32KB 记录即可填满 128KB)
+    for (int i = 0; i < 4; ++i) {
+        logx_write(inst, 2, "Fill", rec.data(), static_cast<uint32_t>(rec.size()));
+    }
+
+    probe.clear();
+    uint64_t drops_before = ii->drop_no_space.load();
+
+    // 激活 armed_closing: 下一次 logx_write 因暂存区满进入退避 sleep_ms(2) 时，自动将 closing 置为 true
+    mock_pal.armed_closing.store(true, std::memory_order_release);
+
+    int rc = logx_write(inst, 2, "CloseRetry", rec.data(), static_cast<uint32_t>(rec.size()));
+
+    // 核心断言 (P3-2):
+    // 1. 对外语义返回 LOGX_OK (因为 closing 期间不向外部调用方报错)
+    EXPECT_EQ(rc, LOGX_OK);
+    // 2. 内部记账绝不静默丢失: drop 计数与事件必须如实产生
+    EXPECT_EQ(ii->drop_no_space.load(), drops_before + 1);
+    EXPECT_TRUE(probe.saw_kind(LOGX_EV_DROP));
+    EXPECT_TRUE(probe.saw_msg_substring("staging full"));
+
+    // 解除 Flusher 阻塞与 closing，以便安全退出
+    mock_pal.stall_write.store(false, std::memory_order_release);
+    mock_pal.stall_cv.notify_all();
+    ii->closing.store(false, std::memory_order_release);
+
+    logx_close(inst);
+    cleanup_dir(dir);
+}
+
 

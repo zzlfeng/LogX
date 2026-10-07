@@ -532,6 +532,7 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     uint32_t pads = 0;
     Staging::WriteStatus st = Staging::WriteStatus::kFull;
     bool need_wake = false;
+    bool retry_started = false;
     uint64_t start_retry_ms = 0;
 
     while (true) {
@@ -555,10 +556,12 @@ logx_status_e logx_write(logx_instance_t* h, int level,
             break;
         }
 
-        uint64_t now = inst->pal->wallclock_ms();
-        if (start_retry_ms == 0) {
-            start_retry_ms = now;
-        } else if (now >= start_retry_ms + inst->staging_wait_ms) {
+        // P3-1 / Nit-1: 采用单调时钟防 NTP 跳变，辅以布尔标志规避 0 哨兵歧义
+        uint64_t now_ms = inst->pal->monotonic_ns() / 1000000ULL;
+        if (!retry_started) {
+            retry_started = true;
+            start_retry_ms = now_ms;
+        } else if (now_ms >= start_retry_ms + inst->staging_wait_ms) {
             break;  // 超时
         }
 
@@ -570,8 +573,9 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         // 锁外短暂退避休眠 2ms (防自旋占满 CPU，给后台 Flusher 刷盘窗口)
         inst->pal->sleep_ms(2);
 
+        // P3-2: 正在关闭时跳出循环交由统一 kFull 记账，避免静默丢弃无痕迹
         if (inst->closing.load(std::memory_order_acquire)) {
-            return LOGX_OK;
+            break;
         }
     }
 
