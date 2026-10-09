@@ -2,7 +2,7 @@
 
 > **文档版本**: v1.51 (2026-10-09 R35 遗留建议收口: N-1 Wire 编译期 Roundtrip 断言 + N-2 Clang 警告清理 + Stage D NO_SPACE 性能基准对比)
 >
-> **v1.51 修订说明**: 2026-10-09 **R35 遗留建议 1、2、4 收口批次**：① **N-1 (Nit/P3, Wire 断言刚性化与写入原语统一)**: `core/include/logx_format.h` 提炼 `make_staging_record_header` 统一编码原语，`parse_staging_record_header` 升级为 `constexpr`，替换原 5 条自指式断言为行为级 `StagingHeaderWireRoundtrip` 静态编译期 roundtrip 兼物理线格式字节对齐断言；`core/src/format.cpp` 中的 `format_record` 与 `format_pad` 统一改调 `make_staging_record_header`，消除分散手写偏移；`tests/unit/test_format.cpp` 新增 `StagingRecordHeader_WireFormatMakeParseRoundtrip` 运行时与物理字节断言；单测升至 178/178 全绿；② **N-2 (Nit, Clang 存量警告消除)**: 移除 `tests/unit/test_r19_regression.cpp` 中未引用的 `cleanup_file` 函数，NDK Clang 编译 `-Wunused-function` 警告彻底消除；③ **建议 4 (Stage D, NO_SPACE 退避性能基准量化)**: `tests/bench/logx_bench.cpp` 引入阶段 D（NO_SPACE 退避等待机制对比），量化实测 4 线程持续并发打满 128KB 环场景：内部事件驱动退避（`space_event` 级联唤醒令牌，R32 方案 2）相比外部 2ms sleep 轮询退避，纯写聚合吞吐提升 16.5x（288,859 vs 17,516 logs/s），平均写入延迟下降 18.4x（11.0µs vs 203.1µs），P99 尾部延迟下降 270x（56.1µs vs 15.12ms），两模式均保持 0 数据丢失；④ **全量验证**: MSVC clean 重建 58/58 目标 0 警告 0 错误；单测 178/178、hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过；Android NDK Clang clean 重建 62/62 成功。
+> **v1.51 修订说明**: 2026-10-09 **R35 遗留建议 1、2、4 收口批次**：① **N-1 (Nit/P3, Wire 断言刚性化与写入原语统一)**: `core/include/logx_format.h` 提炼 `make_staging_record_header` 统一编码原语，`parse_staging_record_header` 升级为 `constexpr`，替换原 5 条自指式断言为行为级 `StagingHeaderWireRoundtrip` 静态编译期 roundtrip 兼物理线格式字节对齐断言；`core/src/format.cpp` 中的 `format_record` 与 `format_pad` 统一改调 `make_staging_record_header`，消除分散手写偏移；`tests/unit/test_format.cpp` 新增 `StagingRecordHeader_WireFormatMakeParseRoundtrip` 运行时与物理字节断言；单测升至 178/178 全绿；② **N-2 (Nit, Clang 存量警告消除)**: 移除 `tests/unit/test_r19_regression.cpp` 中未引用的 `cleanup_file` 函数，NDK Clang 编译 `-Wunused-function` 警告彻底消除；③ **建议 4 (Stage D, NO_SPACE 退避性能基准量化)**: `tests/bench/logx_bench.cpp` 引入阶段 D（NO_SPACE 退避等待机制对比），量化实测 4 线程持续并发打满 128KB 环场景：内部事件驱动退避（`space_event` 级联唤醒令牌，R32 方案 2）相比外部 2ms sleep 轮询退避，纯写聚合吞吐提升 16.5x（288,859 vs 17,516 logs/s），平均写入延迟下降 18.4x（11.0µs vs 203.1µs），P99 尾部延迟下降 270x（56.1µs vs 15.12ms），两模式均保持 0 数据丢失；④ **全量验证**: MSVC clean 重建 58/58 目标 0 警告 0 错误；单测 178/178、hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过；Android NDK Clang clean 重建 62/62 成功。⑤ **建议编号口径注记 (审查补记, 2026-10-09)**: 提交信息「建议 1/2/4」按 N-1/N-2/Stage D 顺序编号，与 R35 报告 §七原始编号 ①(N-1+N-2)/②(Android 冒烟纪律)/③(Stage D bench) 不一一对应；其中 R35 建议 ②「Android 侧定期构建冒烟记入流程纪律」本批未收口，留置为 Backlog **B-11** 待拍板。
 >
 > **v1.50 修订说明**: 2026-10-08 **R35 独立复核（对象 R34 批次 `6217326` 及关联 `c1860a4`/`b3a758d`）**：① **F-1 (P3, 已收口)**: R34 批次的级联撤销复红为**时序依赖型**——Flusher 去抖定时器（75ms）在 limit 布防前自主 drain，pre-limit 信号可唤醒全部等待者（独立复做实证 5+ 次假绿，探针取证），级联令牌未被依赖；`3640d8a` 引入 **StrictEventWaitPal 停驻门**（hold 先于 `logx_open` 布防 + 确认首轮空环 drain 后再填充 + 放行后恰好一次 drain 在限流下进行），撤销实验转为确定性复红（1654ms）——屏障刚性化；② **F-2 (P3, 已收口)**: `b3a758d` 起测试缺 `#include <thread>`，MSVC 透传包含掩盖，**Android/clang 构建断裂约 1.5 天**（真机链路中断），本批修复并恢复 NDK 构建；建议新增「Android 定期构建冒烟」纪律候选；③ **N-1/N-2 (Nit, 观察)**: wire-format `static_assert` 为自指式无钉住力（可选换 roundtrip 断言）；clang 余 1 条存量 `cleanup_file` unused 警告；④ **真机复跑**: Redmi K30 Pro 四套件 **178/178 + 2/2 + 4/4 + 3/3 全绿**（二进制 mtime 晚于全部对象提交；时钟 1:1）；⑤ **B-4（`c1860a4`）与方案 2（`b3a758d`）经深查无新缺陷**：单源化语义逐行等价、auto-reset + sticky 事件语义下无丢唤醒/无忙旋、5ms 切片提供与 signal 正确性解耦的活性保险。复核全文见 [`docs/reviews/code_review_R35_2026-10-08.md`](./reviews/code_review_R35_2026-10-08.md)。
 >
@@ -415,5 +415,16 @@ gantt
   - **方案 1 (已落地)**: `scan_dir_for_target` 顺带统计并输出全目录最大 seqno，`reconcile` 凡低于目录最大序号一律以 `seqno_floor` 钳制，消除 hint 二次扫描磁盘 IO，覆盖空分卷残留与多级分卷全部边界。
   - **方案 A1 (前期落地版本)**: `is_target_newer` 仅扫描比对 hint，要求 `sr.seqno > 0`。
   - **维持现状**: 遵循单写者契约。
+
+### B-11 「Android 侧定期构建冒烟」是否固化为流程纪律 (R35 报告 §七·建议②，v1.51 批次留置)
+
+- **记录日期**: 2026-10-09 (R35 报告 §七·建议② 提出"记入流程纪律"，v1.51 收口批次未落地；审查补记为 B-11)
+- **状态**: ⬜ **待拍板**
+- **背景**: R35 (2026-10-08) 实证 `b3a758d` 起测试缺 `#include <thread>`，MSVC 透传包含掩盖跨工具链断裂、Android/clang 构建中断约 1.5 天且真机链路失联——Windows 主机 MSVC 全绿不能证明 NDK 侧可编译。v1.51 收口批次（`9c7b1b5`）提交信息「建议 1/2/4」按 N-1/N-2/Stage D 编号，R35 报告 §七原始编号 ①(N-1+N-2)/②(Android 冒烟纪律)/③(Stage D bench) 中的建议 ② 未收口且修订说明当时未声明留置。
+- **候选方案**:
+  - **方案 A (入纪律表)**: §4 新增纪律行——凡改动测试/核心头文件或跨平台公共代码，收口前必须通过 NDK Clang clean 构建冒烟；「0 警告」声称必须区分工具链口径（R33 N-1 先例：NDK 有 1 条警告时不得笼统声称 0 警告）。
+  - **方案 B (维持隐性覆盖)**: 不增设纪律，依赖真机复跑收口时顺带验证 NDK 构建，接受"MSVC 绿 → NDK 断裂"窗口最长一个复跑周期的残余风险。
+- **决策点**: NDK 冒烟的稳定执行环境（本机 NDK 命令行 / CI）；触发时机（每批次收口 vs 仅头文件/跨平台改动触发）。
+
 
 

@@ -577,6 +577,7 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **N-2 (Nit, Clang 存量警告消除)**：移除 `tests/unit/test_r19_regression.cpp` 中未引用的 `cleanup_file` 函数，NDK Clang 编译 `-Wunused-function` 警告彻底消除；
    - **建议 4 (Stage D, NO_SPACE 退避性能基准量化)**：`tests/bench/logx_bench.cpp` 引入阶段 D（NO_SPACE 退避等待机制对比），实测 4 线程持续并发打满 128KB 环场景：内部事件驱动退避（`space_event` 级联唤醒令牌，R32 方案 2）相比外部 2ms sleep 轮询退避，纯写聚合吞吐提升 16.5x（288,859 vs 17,516 logs/s），平均写入延迟下降 18.4x（11.0µs vs 203.1µs），P99 尾部延迟下降 270x（56.1µs vs 15.12ms），两模式均保持 0 数据丢失；
    - **全量验证**：MSVC clean 重建 58/58 目标 **0 警告 0 错误**；单测 178/178、hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过；Android NDK Clang clean 重建 62/62 成功。
+   - **建议编号口径注记 (审查补记, 2026-10-09)**：本条标题「R35 遗留建议收口」的"建议 1/2/4"按 N-1/N-2/Stage D 顺序编号，与 R35 报告 §七原始编号 ①(N-1+N-2)/②(Android 冒烟纪律)/③(Stage D bench) 不一一对应；其中 R35 建议 ②「Android 侧定期构建冒烟记入流程纪律」本批未收口，留置为计划表 Backlog **B-11** 待拍板。
 
 
 ---

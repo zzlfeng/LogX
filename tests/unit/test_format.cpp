@@ -501,5 +501,3 @@ TEST(Format, StagingRecordHeader_WireFormatMakeParseRoundtrip) {
     EXPECT_EQ(rh.magic, kMagicPad);
     EXPECT_TRUE(rh.valid_magic);
 }
-
-
