@@ -569,6 +569,12 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **真机复跑**：Redmi K30 Pro 四套件 **178/178**（含停驻门版级联用例）+ 2/2 + 4/4 + 3/3，退出码全 0；时钟 1:1（`auto_time 0` 维持）；二进制 mtime 晚于全部审查对象提交；
    - **验证**：MSVC clean 重建 56/56 零警告；桌面 177/177 + 2 + 4 + 3；撤销对照实验 3 组（A/B/B'）独立执行并取证。复核全文见 [`docs/reviews/code_review_R35_2026-10-08.md`](./docs/reviews/code_review_R35_2026-10-08.md)。
 
+14. **R35 遗留建议收口与 NO_SPACE 性能基准对比 (2026-10-09)**：
+   - **N-1 (Nit/P3, Wire 断言刚性化与写入原语统一)**：在 `core/include/logx_format.h` 提炼 `make_staging_record_header` 统一编码原语，将 `parse_staging_record_header` 升级为 `constexpr`，替换原 5 条自指式断言为行为级 `StagingHeaderWireRoundtrip` 编译期 roundtrip 兼物理线格式字节对齐断言；`core/src/format.cpp` 中的 `format_record` 与 `format_pad` 统一改调 `make_staging_record_header`，消除分散手写偏移；`tests/unit/test_format.cpp` 新增 `StagingRecordHeader_WireFormatMakeParseRoundtrip` 运行时与物理字节断言，单测套件升至 **178/178 100% 全绿**；
+   - **N-2 (Nit, Clang 存量警告消除)**：移除 `tests/unit/test_r19_regression.cpp` 中未引用的 `cleanup_file` 函数，NDK Clang 编译 `-Wunused-function` 警告彻底消除；
+   - **建议 4 (Stage D, NO_SPACE 退避性能基准量化)**：`tests/bench/logx_bench.cpp` 引入阶段 D（NO_SPACE 退避等待机制对比），实测 4 线程持续并发打满 128KB 环场景：内部事件驱动退避（`space_event` 级联唤醒令牌，R32 方案 2）相比外部 2ms sleep 轮询退避，纯写聚合吞吐提升 16.5x（288,859 vs 17,516 logs/s），平均写入延迟下降 18.4x（11.0µs vs 203.1µs），P99 尾部延迟下降 270x（56.1µs vs 15.12ms），两模式均保持 0 数据丢失；
+   - **全量验证**：MSVC clean 重建 58/58 目标 **0 警告 0 错误**；单测 178/178、hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过；Android NDK Clang clean 重建 62/62 成功。
+
 
 ---
 

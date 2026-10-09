@@ -462,3 +462,44 @@ TEST(Format, PeekAndParseStagingRecordHeader_EquivalenceAndBounds) {
     EXPECT_FALSE(parse_staging_record_header(buf, 1, 0, &rh));
 }
 
+// R35 N-1: make_staging_record_header 与 parse_staging_record_header 运行时双向 Roundtrip 与 Wire 字节核验
+TEST(Format, StagingRecordHeader_WireFormatMakeParseRoundtrip) {
+    uint8_t buf[kHeaderLen] = {};
+
+    // 1. 验证 Entry: payload_len = 500, flags = 0x02, cksum = 0x7E
+    make_staging_record_header(buf, 500, kMagicEntry, 0x02, 0x7E);
+
+    // 逐字节物理线格式断言 (小端 500 = 0x01F4; 'L'=0x4C, 'G'=0x47)
+    EXPECT_EQ(buf[0], 0xF4);
+    EXPECT_EQ(buf[1], 0x01);
+    EXPECT_EQ(buf[2], 0x4C);
+    EXPECT_EQ(buf[3], 0x47);
+    EXPECT_EQ(buf[4], 0x02);
+    EXPECT_EQ(buf[5], 0x7E);
+
+    StagingRecordHeaderView rh{};
+    EXPECT_TRUE(parse_staging_record_header(buf, 0, kHeaderLen + 500, &rh));
+    EXPECT_EQ(rh.total_size, kHeaderLen + 500);
+    EXPECT_EQ(rh.payload_len, 500u);
+    EXPECT_EQ(rh.magic, kMagicEntry);
+    EXPECT_TRUE(rh.valid_magic);
+    EXPECT_EQ(rh.flags, 0x02);
+    EXPECT_EQ(rh.cksum, 0x7E);
+
+    // 2. 验证 Pad: payload_len = 120, flags = 0x00, cksum = 0x00
+    make_staging_record_header(buf, 120, kMagicPad, 0x00, 0x00);
+    EXPECT_EQ(buf[0], 120);
+    EXPECT_EQ(buf[1], 0x00);
+    EXPECT_EQ(buf[2], 0x47);  // 'G'
+    EXPECT_EQ(buf[3], 0x50);  // 'P'
+    EXPECT_EQ(buf[4], 0x00);
+    EXPECT_EQ(buf[5], 0x00);
+
+    EXPECT_TRUE(parse_staging_record_header(buf, 0, kHeaderLen + 120, &rh));
+    EXPECT_EQ(rh.total_size, kHeaderLen + 120);
+    EXPECT_EQ(rh.payload_len, 120u);
+    EXPECT_EQ(rh.magic, kMagicPad);
+    EXPECT_TRUE(rh.valid_magic);
+}
+
+

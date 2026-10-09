@@ -120,8 +120,6 @@ void cleanup_dir(const std::string& dir) {
     pal.file_rmdir(dir.c_str());
 }
 
-void cleanup_file(const std::string& p) { default_pal().file_unlink(p.c_str()); }
-
 // 简单线程安全事件探针(参考 test_j04 ErrorProbe 模式)。
 struct EventProbe {
     mutable std::mutex mu;

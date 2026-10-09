@@ -29,17 +29,11 @@ constexpr uint32_t kHeaderLen = 6;
 constexpr uint16_t kMagicEntry = 0x474c;   // 高字节 0x47='G', 低字节 0x4c='L'
 constexpr uint16_t kMagicPad   = 0x5047;   // 高字节 0x50='P', 低字节 0x47='G'
 
-// Wire-format 字节偏移定义与编译期约束 (N-3)
+// Wire-format 字节偏移定义 (N-3)
 constexpr uint32_t kWireOffPayloadLen = 0;
 constexpr uint32_t kWireOffMagic      = 2;
 constexpr uint32_t kWireOffFlags      = 4;
 constexpr uint32_t kWireOffCksum      = 5;
-
-static_assert(kWireOffPayloadLen == 0, "payload_len must be at wire offset 0");
-static_assert(kWireOffMagic == 2,      "magic must be at wire offset 2");
-static_assert(kWireOffFlags == 4,      "flags must be at wire offset 4");
-static_assert(kWireOffCksum == 5,      "cksum must be at wire offset 5");
-static_assert(kWireOffCksum + 1 == kHeaderLen, "record header length must be exactly 6 bytes");
 
 // 1B 校验和: payload XOR 折叠(8 位); PAD 头 cksum 恒为 0。
 inline uint8_t cksum1(const uint8_t* p, uint32_t n) {
@@ -58,10 +52,21 @@ struct StagingRecordHeaderView {
     bool     valid_magic = false;
 };
 
+// 编码 staging 记录头 6B (供 format_record / format_pad / 测试单源共用)
+constexpr inline void make_staging_record_header(uint8_t* out, uint16_t payload_len,
+                                                 uint16_t magic, uint8_t flags, uint8_t cksum) {
+    out[kWireOffPayloadLen]     = static_cast<uint8_t>(payload_len & 0xFF);
+    out[kWireOffPayloadLen + 1] = static_cast<uint8_t>((payload_len >> 8) & 0xFF);
+    out[kWireOffMagic]          = static_cast<uint8_t>(magic & 0xFF);
+    out[kWireOffMagic + 1]      = static_cast<uint8_t>((magic >> 8) & 0xFF);
+    out[kWireOffFlags]          = flags;
+    out[kWireOffCksum]          = cksum;
+}
+
 // 完整解包记录头元数据并校验边界 (供 recovery / flusher / format / 测试共用)
 // N-2: 严密防御 off > total 下溢防线 (防 total - off 无符号回绕)
-inline bool parse_staging_record_header(const uint8_t* raw, uint32_t off, uint32_t total,
-                                       StagingRecordHeaderView* out) {
+constexpr inline bool parse_staging_record_header(const uint8_t* raw, uint32_t off, uint32_t total,
+                                                 StagingRecordHeaderView* out) {
     if (!out || off > total || total - off < kHeaderLen) return false;
     out->payload_len = uint16_t(raw[off + kWireOffPayloadLen]) |
                        (uint16_t(raw[off + kWireOffPayloadLen + 1]) << 8);
@@ -74,6 +79,43 @@ inline bool parse_staging_record_header(const uint8_t* raw, uint32_t off, uint32
     if (off + out->total_size > total) return false;
     return true;
 }
+
+// Wire-format 编译期行为级 Roundtrip 与物理布局校验 (替代原自指断言, 收口 R35 N-1)
+struct StagingHeaderWireRoundtrip {
+    static constexpr bool verify() {
+        // 1. 测试 make -> parse 闭环与物理字节布局 (小端 2B payload_len + 2B magic + 1B flags + 1B cksum)
+        uint8_t buf[kHeaderLen] = {};
+        make_staging_record_header(buf, 0x1234, kMagicEntry, 0x03, 0x5A);
+
+        // 验证物理内存字节严格对齐 spec wire format:
+        // [0..1] payload_len (小端 0x1234 -> 0x34, 0x12)
+        // [2..3] magic (小端 0x474c -> 'L', 'G' -> 0x4c, 0x47)
+        // [4]    flags (0x03)
+        // [5]    cksum (0x5A)
+        if (buf[0] != 0x34 || buf[1] != 0x12) return false;
+        if (buf[2] != 0x4c || buf[3] != 0x47) return false;
+        if (buf[4] != 0x03) return false;
+        if (buf[5] != 0x5A) return false;
+
+        // 验证 parse_staging_record_header 精确读出对应字段
+        StagingRecordHeaderView h{};
+        if (!parse_staging_record_header(buf, 0, kHeaderLen + 0x1234, &h)) return false;
+        if (h.payload_len != 0x1234 || h.magic != kMagicEntry || !h.valid_magic) return false;
+        if (h.flags != 0x03 || h.cksum != 0x5A || h.total_size != kHeaderLen + 0x1234) return false;
+
+        // 2. 测试 PAD magic 闭环 ('G','P' -> 0x47, 0x50)
+        make_staging_record_header(buf, 0x0020, kMagicPad, 0x00, 0x00);
+        if (buf[2] != 0x47 || buf[3] != 0x50) return false;
+        StagingRecordHeaderView pad_h{};
+        if (!parse_staging_record_header(buf, 0, kHeaderLen + 0x0020, &pad_h)) return false;
+        if (pad_h.payload_len != 0x0020 || pad_h.magic != kMagicPad || !pad_h.valid_magic) return false;
+
+        return true;
+    }
+};
+
+static_assert(StagingHeaderWireRoundtrip::verify(),
+              "Staging record header wire-format roundtrip and literal layout check failed");
 
 // 快速探测下一条记录总尺寸 (头 6B + 载荷); 不足 6B、magic 非法或长度越界返回 0
 inline uint32_t peek_record_len(const uint8_t* raw, uint32_t off, uint32_t total) {

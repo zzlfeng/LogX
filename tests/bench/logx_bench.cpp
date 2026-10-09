@@ -1,6 +1,6 @@
 // logx_bench.cpp - T5.2 性能基线基准 harness。
 //
-// 三阶段基准(验收项见 docs/LogX后续实施计划表.md T5.2 与 docs/benchmark_report.md):
+// 四阶段基准(验收项见 docs/LogX后续实施计划表.md T5.2 与 docs/benchmark_report.md):
 //   A. 单条写入延迟分布:单线程 Native 热路径 logx_write,P50/P90/P99/P99.9/max
 //      + 抖动维度(stddev/CV/MAD/robustCV 与长尾比);
 //      分别以 compress_algo = none / zstd 各跑一轮(压缩在 Flusher 线程执行,
@@ -8,12 +8,14 @@
 //   B. 开/关 zstd 压缩的纯写吞吐与落盘体积对比(混合变长 payload,80% 文本 +
 //      20% 伪随机,代表可压与不可压负载)。
 //   C. logx_flush 阻塞耗时分布(每轮写 100 条后 flush,模拟退后台 flush 场景)。
+//   D. NO_SPACE 退避等待机制对比 (R32 方案 2 量化评估: 外部 Sleep 轮询 vs 内部事件驱动 space_event 级联唤醒)。
 //
 // 独立 main(),非 gtest,不注册 ctest;LOGX_BUILD_BENCH=ON 时才参与构建。
-// 用法: logx_bench [root_dir] [stage_a_n] [stage_b_m]
+// 用法: logx_bench [root_dir] [stage_a_n] [stage_b_m] [stage_d_k]
 //   root_dir  输出根目录,默认 ./logx_bench_out(Android 建议 /data/local/tmp/logx_bench)
 //   stage_a_n 阶段 A 每轮计样条数,默认 100000
 //   stage_b_m 阶段 B 每轮写入条数,默认 100000
+//   stage_d_k 阶段 D 并发压满每轮总条数,默认 10000 (4 线程)
 //
 // 方法论护栏:
 //   - 全程核对 drop_no_space / drop_too_large / block_write_errors,非零即宣告该轮
@@ -28,6 +30,7 @@
 #include <logx_c.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -210,7 +213,8 @@ void print_ns_dist(const char* label, std::vector<uint64_t>& v) {
 
 // flush_threshold: UINT32_MAX = 生产默认 8KB 自动唤醒; 0 = 禁用(纯路径, 仅手动 flush)
 logx_instance_t* open_instance(const std::string& root, const char* name, uint8_t algo,
-                               uint32_t flush_threshold = UINT32_MAX) {
+                               uint32_t flush_threshold = UINT32_MAX,
+                               uint32_t staging_wait_ms = 0) {
     std::string log_dir = root + "/" + name + "_logs";
     std::string staging_dir = root + "/" + name + "_staging";
     ensure_dir(log_dir);
@@ -222,6 +226,7 @@ logx_instance_t* open_instance(const std::string& root, const char* name, uint8_
     cfg.staging_path = staging.c_str();
     cfg.max_log_length = kMaxLogLength;
     cfg.flush_threshold = flush_threshold;
+    cfg.staging_wait_ms = staging_wait_ms;
     cfg.compress_algo = algo;
     cfg.encrypt_enable = 0;  // 压缩对比轮关闭加密,避免密文干扰体积对比
     logx_instance_t* inst = nullptr;
@@ -479,6 +484,166 @@ void bench_stage_c(const std::string& run_dir) {
     clear_dir_files(run_dir + "/flush_logs");
 }
 
+// ---- 阶段 D: NO_SPACE 退避等待机制对比 (R32 方案 2 量化评估) ----
+// 方法论: 多线程持续高频写打满 128KB 环 (频发触发 NO_SPACE), 对比两种退避策略:
+//   1. 外部轮询退避 (staging_wait_ms = 0): 库内返回 NO_SPACE, 线程锁外 sleep(2ms) 轮询重试 (模拟方案 A 原始退避)
+//   2. 库内事件驱动退避 (staging_wait_ms = 1000ms): 依赖 space_event + 级联唤醒令牌即刻响应 (R32 方案 2)
+// 评估指标: 单条写入等待延迟 (P50/P90/P99/max 与抖动指标)、聚合吞吐量 (logs/s, MB/s) 以及真实丢失数。
+void bench_stage_d(const std::string& run_dir, uint32_t total_logs = 10000) {
+    constexpr uint32_t kThreads = 4;
+    const uint32_t logs_per_thread = total_logs / kThreads;
+    const uint32_t actual_total = logs_per_thread * kThreads;
+    const char* kTag = "bench_d";
+
+    // 构造中等长度 payload (~500B), 使得 4 线程并发迅速打满 128KB 环 (单线程写 ~60 条即打满)
+    std::string payload;
+    payload.reserve(500);
+    payload = "Stage-D-NO_SPACE-Backoff-Benchmark: 模拟业务高频突发日志, 验证事件驱动唤醒延迟与吞吐对比; payload_content=";
+    while (payload.size() < 500) payload += "0123456789abcdef";
+
+    const uint32_t payload_len = static_cast<uint32_t>(payload.size());
+    const uint64_t total_bytes = static_cast<uint64_t>(actual_total) * payload_len;
+
+    printf("\n==== Stage D: NO_SPACE 退避机制对比 (4 线程并发持续压满 128KB 环, payload=%uB, 总计%u条) ====\n",
+           payload_len, actual_total);
+
+    // ----------------------------------------------------
+    // 模式 1: 外部轮询退避 (sleep 2ms 轮询)
+    // ----------------------------------------------------
+    {
+        const char* mode_name = "模式 1: 外部轮询退避 (staging_wait_ms=0, 满环 sleep 2ms 轮询)";
+        const char* dir_name = "backoff_poll";
+        printf("\n-- %s --\n", mode_name);
+
+        logx_instance_t* inst = open_instance(run_dir, dir_name, kAlgoNone, UINT32_MAX, /*staging_wait_ms=*/0);
+        if (!inst) return;
+
+        std::vector<uint64_t> thread_ns[kThreads];
+        for (uint32_t t = 0; t < kThreads; ++t) thread_ns[t].reserve(logs_per_thread);
+
+        std::vector<std::thread> workers;
+        workers.reserve(kThreads);
+
+        std::atomic<bool> start_gate{false};
+        std::atomic<uint64_t> lost_count{0};
+
+        for (uint32_t t = 0; t < kThreads; ++t) {
+            workers.emplace_back([&, t]() {
+                while (!start_gate.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (uint32_t i = 0; i < logs_per_thread; ++i) {
+                    uint64_t t0 = now_ns();
+                    bool ok = false;
+                    for (uint32_t retry = 0; retry < 500; ++retry) { // 至多 500 * 2ms = 1000ms
+                        logx_status_e rc = logx_write(inst, 3, kTag,
+                                                      reinterpret_cast<const uint8_t*>(payload.data()),
+                                                      payload_len);
+                        if (rc == LOGX_OK) {
+                            ok = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                    uint64_t dt = now_ns() - t0;
+                    thread_ns[t].push_back(dt);
+                    if (!ok) lost_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
+
+        uint64_t t_begin = now_ns();
+        start_gate.store(true, std::memory_order_release);
+        for (auto& w : workers) w.join();
+        uint64_t t_end = now_ns();
+
+        logx_flush(inst);
+        RoundStats rs = collect_stats(inst);
+        logx_close(inst);
+
+        double sec = static_cast<double>(t_end - t_begin) / 1e9;
+        printf("  纯写吞吐: %.0f logs/s, %.2f MB/s (总耗时 %.3f s, 真实丢失: %llu 条)\n",
+               static_cast<double>(actual_total) / sec,
+               static_cast<double>(total_bytes) / 1048576.0 / sec,
+               sec, (unsigned long long)lost_count.load());
+
+        std::vector<uint64_t> all_ns;
+        all_ns.reserve(actual_total);
+        for (uint32_t t = 0; t < kThreads; ++t) {
+            all_ns.insert(all_ns.end(), thread_ns[t].begin(), thread_ns[t].end());
+        }
+
+        if (lost_count == 0 && round_valid(mode_name, rs, /*skip_drop_no_space=*/true)) {
+            print_ns_dist("logx_write 延迟 (含轮询等待)", all_ns);
+        }
+        clear_dir_files(run_dir + "/" + dir_name + "_logs");
+    }
+
+    // ----------------------------------------------------
+    // 模式 2: 库内事件驱动退避 (space_event 级联令牌)
+    // ----------------------------------------------------
+    {
+        const char* mode_name = "模式 2: 库内事件驱动退避 (staging_wait_ms=1000, space_event 级联令牌即刻唤醒)";
+        const char* dir_name = "backoff_event";
+        printf("\n-- %s --\n", mode_name);
+
+        logx_instance_t* inst = open_instance(run_dir, dir_name, kAlgoNone, UINT32_MAX, /*staging_wait_ms=*/1000);
+        if (!inst) return;
+
+        std::vector<uint64_t> thread_ns[kThreads];
+        for (uint32_t t = 0; t < kThreads; ++t) thread_ns[t].reserve(logs_per_thread);
+
+        std::vector<std::thread> workers;
+        workers.reserve(kThreads);
+
+        std::atomic<bool> start_gate{false};
+        std::atomic<uint64_t> lost_count{0};
+
+        for (uint32_t t = 0; t < kThreads; ++t) {
+            workers.emplace_back([&, t]() {
+                while (!start_gate.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (uint32_t i = 0; i < logs_per_thread; ++i) {
+                    uint64_t t0 = now_ns();
+                    logx_status_e rc = logx_write(inst, 3, kTag,
+                                                  reinterpret_cast<const uint8_t*>(payload.data()),
+                                                  payload_len);
+                    uint64_t dt = now_ns() - t0;
+                    thread_ns[t].push_back(dt);
+                    if (rc != LOGX_OK) lost_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
+
+        uint64_t t_begin = now_ns();
+        start_gate.store(true, std::memory_order_release);
+        for (auto& w : workers) w.join();
+        uint64_t t_end = now_ns();
+
+        logx_flush(inst);
+        RoundStats rs = collect_stats(inst);
+        logx_close(inst);
+
+        double sec = static_cast<double>(t_end - t_begin) / 1e9;
+        printf("  纯写吞吐: %.0f logs/s, %.2f MB/s (总耗时 %.3f s, 真实丢失: %llu 条)\n",
+               static_cast<double>(actual_total) / sec,
+               static_cast<double>(total_bytes) / 1048576.0 / sec,
+               sec, (unsigned long long)lost_count.load());
+
+        std::vector<uint64_t> all_ns;
+        all_ns.reserve(actual_total);
+        for (uint32_t t = 0; t < kThreads; ++t) {
+            all_ns.insert(all_ns.end(), thread_ns[t].begin(), thread_ns[t].end());
+        }
+
+        if (lost_count == 0 && round_valid(mode_name, rs, /*skip_drop_no_space=*/false)) {
+            print_ns_dist("logx_write 延迟 (含事件等待)", all_ns);
+        }
+        clear_dir_files(run_dir + "/" + dir_name + "_logs");
+    }
+}
+
 void print_clock_overhead() {
     const int kN = 200000;
     uint64_t sink = 0;
@@ -496,8 +661,10 @@ int main(int argc, char** argv) {
     std::string root = argc > 1 ? argv[1] : "logx_bench_out";
     uint32_t n_a = argc > 2 ? static_cast<uint32_t>(strtoul(argv[2], nullptr, 10)) : 100000;
     uint32_t m_b = argc > 3 ? static_cast<uint32_t>(strtoul(argv[3], nullptr, 10)) : 100000;
+    uint32_t k_d = argc > 4 ? static_cast<uint32_t>(strtoul(argv[4], nullptr, 10)) : 10000;
 
-    printf("LogX 性能基线基准 (T5.2)  stage_a_n=%u stage_b_m=%u\n", (unsigned)n_a, (unsigned)m_b);
+    printf("LogX 性能基线基准 (T5.2)  stage_a_n=%u stage_b_m=%u stage_d_k=%u\n",
+           (unsigned)n_a, (unsigned)m_b, (unsigned)k_d);
     print_clock_overhead();
 
     if (!ensure_dir(root)) {
@@ -519,6 +686,7 @@ int main(int argc, char** argv) {
     bench_stage_a(run_dir, n_a);
     bench_stage_b(run_dir, m_b);
     bench_stage_c(run_dir);
+    bench_stage_d(run_dir, k_d);
 
     printf("\n==== 基准完成 ====\n");
     return 0;

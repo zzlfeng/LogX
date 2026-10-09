@@ -142,10 +142,9 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
 
     if (user_total <= kMaxSlicePayload) {
         // 整条
-        put_u16(out, static_cast<uint16_t>(user_total)); out += 2;
-        put_u16(out, kMagicEntry); out += 2;
-        *out++ = 0x00;  // flags = 00 (整条)
-        *out++ = cksum1(scratch, static_cast<uint32_t>(user_total));
+        make_staging_record_header(out, static_cast<uint16_t>(user_total), kMagicEntry, 0x00,
+                                   cksum1(scratch, static_cast<uint32_t>(user_total)));
+        out += kHeaderLen;
         std::memcpy(out, scratch, user_total); out += user_total;
     } else {
         // 多片;首/中/末
@@ -159,10 +158,9 @@ bool format_record(uint8_t level, const char* tag, const uint8_t* payload, uint3
             if (first)        flags = 0x01;        // 01: 首片
             else if (!is_last) flags = 0x02;       // 10: 中片(bit0=0, bit1=1)
             else               flags = 0x03;       // 11: 末片(bit0=1, bit1=1)
-            put_u16(out, static_cast<uint16_t>(slice)); out += 2;
-            put_u16(out, kMagicEntry); out += 2;
-            *out++ = flags;
-            *out++ = cksum1(scratch + offset, slice);
+            make_staging_record_header(out, static_cast<uint16_t>(slice), kMagicEntry, flags,
+                                       cksum1(scratch + offset, slice));
+            out += kHeaderLen;
             std::memcpy(out, scratch + offset, slice); out += slice;
             offset += slice;
             first = false;
@@ -320,10 +318,7 @@ FormatBoundedStatus format_record_bounded(
 // 单一 PAD 长度上限 20KB;若 total_pad > 20KB,需要循环调用。
 uint32_t format_pad(uint8_t* out_buf, uint32_t pad_len) {
     if (pad_len > kMaxSlicePayload) pad_len = kMaxSlicePayload;  // 防御性
-    put_u16(out_buf, static_cast<uint16_t>(pad_len));
-    put_u16(out_buf + 2, kMagicPad);
-    out_buf[4] = 0;
-    out_buf[5] = 0;  // PAD cksum 恒为 0
+    make_staging_record_header(out_buf, static_cast<uint16_t>(pad_len), kMagicPad, 0, 0);
     if (pad_len > 0) {
         std::memset(out_buf + kHeaderLen, 0, pad_len);
     }
