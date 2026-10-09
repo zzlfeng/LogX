@@ -21,10 +21,7 @@ namespace {
 
 // cksum1 移入 logx_format.h 单源共享 (B-4)
 
-// 内部用户数据头尺寸: [ts_ms:8][pid:4][tid:8][level:1][taglen:2][msglen:4] = 27B
-// (R7 上提至命名空间级,供 format_record / 截断求解器 / kTruncBufSize 断言共用;
-// 布局表达式由 format_record 内的 static_assert 钉住,常量与权威定义处绑定)。
-constexpr uint32_t kUserHdrSize = 27;
+// kUserHdrSize (27B) 与 kMaxTag (64B) 上提至 logx_format.h 单源共享 (B-6 方案 A)
 
 // 把整数按小端写入(便于 raw 字节比较与 gtest 复读)。
 inline void put_u16(uint8_t* p, uint16_t v) { p[0] = v & 0xff; p[1] = (v >> 8) & 0xff; }
@@ -44,7 +41,7 @@ inline void put_u64(uint8_t* p, uint64_t v) {
 // 仅作文档用途,序列化直接操作 scratch 缓冲;布局以 format_record 内
 // static_assert 钉住的 kUserHdrSize 表达式为准,60KB 上限单源 kMaxUserPayload。
 struct UserRecordHeader {
-    static constexpr uint32_t kMaxTag = 64;
+    static constexpr uint32_t kMaxTag = logx::kMaxTag;
 
     uint64_t ts_ms;
     uint32_t pid;
@@ -67,8 +64,8 @@ struct UserRecordHeader {
 // 返回 false = tag 非法(NULL 或 >64B)。
 inline bool tag_len_bounded(const char* tag, uint32_t* out_len) {
     if (!tag) return false;
-    const size_t n = strnlen(tag, 65);
-    if (n == 65) return false;  // >64B 视为非法
+    const size_t n = strnlen(tag, kMaxTag + 1);
+    if (n == kMaxTag + 1) return false;  // >64B 视为非法
     *out_len = static_cast<uint32_t>(n);
     return true;
 }

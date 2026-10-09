@@ -501,3 +501,46 @@ TEST(Format, StagingRecordHeader_WireFormatMakeParseRoundtrip) {
     EXPECT_EQ(rh.magic, kMagicPad);
     EXPECT_TRUE(rh.valid_magic);
 }
+
+// B-6 方案 A: max_log_length 下界 fail-fast 校验与截断预算笛卡尔积测试
+TEST(Format, MaxLogLength_BoundsFailFastAndBudgetMatrix) {
+    // 1. 静态常量对齐断言
+    static_assert(kMinLogLengthValid == 97, "kMinLogLengthValid must be 97");
+    static_assert(kMinLogLengthValid == kUserHdrSize + kMaxTag + kHeaderLen,
+                  "97 must equal 27 + 64 + 6");
+
+    // 2. 格式化层笛卡尔积扫描: max_total >= 97 时, 任何合法 tag (0..64B) 均绝不落入 kCannotFit
+    const uint32_t kValidTotals[] = { 97, 100, 128, 500, 4096, 64 * 1024 };
+    const uint32_t kTagLens[] = { 0, 1, 7, 32, 40, 64 };
+    for (uint32_t max_total : kValidTotals) {
+        for (uint32_t tag_len : kTagLens) {
+            std::string tag(tag_len, 'T');
+            std::string msg(200, 'M');
+            uint8_t buf[kMaxRecordTotal];
+            uint32_t total = 0;
+            bool truncated = false;
+            uint64_t dropped = 0;
+            FormatBoundedStatus st = format_record_bounded(
+                2, tag.c_str(), reinterpret_cast<const uint8_t*>(msg.data()),
+                static_cast<uint32_t>(msg.size()), 0, 0, 0,
+                buf, sizeof(buf), &total, max_total, &truncated, &dropped);
+            EXPECT_EQ(st, FormatBoundedStatus::kOk)
+                << "Failed at max_total=" << max_total << " tag_len=" << tag_len;
+            EXPECT_LE(total, max_total);
+        }
+    }
+
+    // 3. 病态下界 (max_total < 97) 在短 tag 与长 tag 之间的行为验证
+    // tag_len=64 时最小需要 97B, max_total=96 时连空记录都放不下 -> 必为 kCannotFit
+    {
+        std::string max_tag(64, 'T');
+        uint8_t buf[kMaxRecordTotal];
+        uint32_t total = 0;
+        bool truncated = false;
+        uint64_t dropped = 0;
+        FormatBoundedStatus st = format_record_bounded(
+            2, max_tag.c_str(), reinterpret_cast<const uint8_t*>(""), 0, 0, 0, 0,
+            buf, sizeof(buf), &total, 96, &truncated, &dropped);
+        EXPECT_EQ(st, FormatBoundedStatus::kCannotFit);
+    }
+}

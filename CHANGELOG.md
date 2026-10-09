@@ -100,6 +100,7 @@
 | `2a9565f` | docs(reviews): R35 复核报告入库——R34 批次独立复核、级联屏障停驻门收口与 Android 链路修复 |
 | `f197ed4` | docs: Android 真机复跑收口——B-4/方案2/R34 批次 Redmi K30 Pro 178/178+2/2+4/4+3/3 全绿 (计划表 v1.50) |
 | `9c7b1b5` | fix(format,test,bench,docs): R35 遗留建议 1/2/4 收口——Wire 编译期 Roundtrip 断言、Clang 警告清理与 NO_SPACE 性能基准对比 (计划表 v1.51) |
+| `2947a31` | docs(reviews): R36 审查报告入库——R35 建议收口批次独立复核 (计划表补记 B-11) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -578,6 +579,24 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **建议 4 (Stage D, NO_SPACE 退避性能基准量化)**：`tests/bench/logx_bench.cpp` 引入阶段 D（NO_SPACE 退避等待机制对比），实测 4 线程持续并发打满 128KB 环场景：内部事件驱动退避（`space_event` 级联唤醒令牌，R32 方案 2）相比外部 2ms sleep 轮询退避，纯写聚合吞吐提升 16.5x（288,859 vs 17,516 logs/s），平均写入延迟下降 18.4x（11.0µs vs 203.1µs），P99 尾部延迟下降 270x（56.1µs vs 15.12ms），两模式均保持 0 数据丢失；
    - **全量验证**：MSVC clean 重建 58/58 目标 **0 警告 0 错误**；单测 178/178、hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过；Android NDK Clang clean 重建 62/62 成功。
    - **建议编号口径注记 (审查补记, 2026-10-09)**：本条标题「R35 遗留建议收口」的"建议 1/2/4"按 N-1/N-2/Stage D 顺序编号，与 R35 报告 §七原始编号 ①(N-1+N-2)/②(Android 冒烟纪律)/③(Stage D bench) 不一一对应；其中 R35 建议 ②「Android 侧定期构建冒烟记入流程纪律」本批未收口，留置为计划表 Backlog **B-11** 待拍板。
+
+15. **Backlog B-6 方案 A 落地：max_log_length 下界 fail-fast 校验与常量单源化 (2026-10-09)**：
+   - **理论下界与 fail-fast 校验**：单条合法日志物理最小开销为 $kUserHdrSize(27) + tag\_len + kHeaderLen(6) = 33 + tag\_len$；结合合法 tag 上限 $kMaxTag(64)$，推导得出任意 tag 均可安全容纳的理论严格最小配置下界为 $27 + 64 + 6 = 97$ 字节（`kMinLogLengthValid`）。在 `core/src/logx_c.cpp` 的 `logx_open()` 入口增加防御门：若 `cfg->max_log_length < kMinLogLengthValid`，立即 fail-fast 拦截并返回 `LOGX_ERR_INVALID_ARG`，根除配置偏小（如 33~96）导致长 tag 运行时静默丢弃的不可用性陷阱；保留运行时 `kBuildRecordsCannotFit` 降级兜底防御深度；
+   - **常量单源化与编译期硬化**：在 `core/include/logx_format.h` 集中定义单源权威常量：`constexpr uint32_t kUserHdrSize = 27;`、`constexpr uint32_t kMaxTag = 64;`、`constexpr uint32_t kMinLogLengthValid = kUserHdrSize + kMaxTag + kHeaderLen;`（97），并辅以 `static_assert(kMinLogLengthValid == 97, "...")`；`core/src/format.cpp` 移除匿名命名空间重复的局部 `kUserHdrSize`，并将 `UserRecordHeader::kMaxTag` 与 tag 截断缓冲区绑定至单源常量；
+   - **分层与多平台契约对齐**：
+     - `core/include/logx_c.h` 注释更新：明确 `max_log_length` 必须 `>= 97`，小于此值返回 `LOGX_ERR_INVALID_ARG`；
+     - `android/kotlin/LogX.kt`：`Config.maxLogLength` KDoc 明确下界 `>= 97`，且 `init()` 校验条件更新为 `require(config.maxLogLength >= 97) { "maxLogLength must be at least 97 bytes (header 27 + max tag 64 + wire header 6)" }`；
+   - **测试重构与覆盖率扩展**：
+     - `tests/unit/test_flusher.cpp` (`CannotFitDropPath_PreservedForPathologicalLimit`) 与 `tests/unit/test_j04_regression.cpp` (`TooLargeCannotFit_ErrHandlerSynchronousOnCallerThread`)：断言 `logx_open` 传入 33 严格被拒（返回 `LOGX_ERR_INVALID_ARG`），随后合法打开并内存注入 `inst->max_log_length = 33`，严密保全内部运行时 `kBuildRecordsCannotFit` 降级兜底路径与回调契约测试；
+     - `tests/unit/test_codec.cpp` (`LogxOpen_CompressAlgo_FailFast`)：补齐 `max_log_length` 下界穷举断言（覆盖 0, 1, 32, 33, 40, 96 均返回 `LOGX_ERR_INVALID_ARG`）；
+     - `tests/unit/test_format.cpp` 新增 `Format.MaxLogLength_BoundsFailFastAndBudgetMatrix`：覆盖笛卡尔积测试矩阵（`max_total` $\in \{97, 100, 128, 500, 4096, 65536\} \times tag\_len \in \{0, 1, 7, 32, 40, 64\}$），验证 `solve_truncated_msg_budget` 在 $\ge 97$ 时永不返回 `kCannotFit`，且在 96 + 64B tag 时返回 `kCannotFit`；单元测试套件增至 **179/179 100% 全绿**；
+   - **R18-2 / R21-1 撤销对照实验（变异测试）**：
+     - 将 `core/src/logx_c.cpp` 临时回退为 `== 0` 校验：`test_codec`（`max_log_length` 失败用例）与 `test_flusher`（`logx_open(33)` 断言）确定性复红（预期 `LOGX_ERR_INVALID_ARG(-1)`，实测返回 0）；
+     - 恢复代码后，确定性复绿，实证屏障刚性；
+   - **全量跨平台验证**：
+     - MSVC Release：clean 全量重建 58/58 目标 **0 警告 0 错误**；全套件测试通过：单测 179/179、hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过；Stage A~D benchmark 0 丢失；
+     - Android NDK (arm64-v8a / Clang)：`build-android-tests` (27/27) 与 `build-android` (10/10) clean 编译链接 100% 成功；
+     - Kotlin / Gradle：`testDebugUnitTest` 23 任务 BUILD SUCCESSFUL，纯逻辑单测 100% 全绿。
 
 
 ---

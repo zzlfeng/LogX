@@ -336,7 +336,10 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     if (!cfg || !cfg->log_dir || !cfg->staging_path) {
         return LOGX_ERR_INVALID_ARG;
     }
-    if (cfg->max_log_length == 0) {
+    // B-6 方案 A: 严格下界 fail-fast 校验: 单条日志长度上限至少要能容纳
+    // 最坏情况下的空记录 (kUserHdrSize 27B + kMaxTag 64B + kHeaderLen 6B = 97B)。
+    // 低于此值属于病态小配置，连空日志都放不下，在 open 期直接拒绝。
+    if (cfg->max_log_length < kMinLogLengthValid) {
         return LOGX_ERR_INVALID_ARG;
     }
     if (cfg->max_log_length > kMaxRecordTotal) {

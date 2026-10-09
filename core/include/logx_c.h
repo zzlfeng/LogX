@@ -68,9 +68,9 @@ typedef struct logx_config {
     const char* log_dir;          /* 正式日志目录,应用私有;NULL = 必填 */
     const char* staging_path;     /* mmap staging 文件绝对路径;NULL = 必填 */
 
-    uint32_t max_log_length;     /* 单条日志上限(格式化后);init 校验 < 数据区 - 1。
-                                  * 建议 >= 97(用户头 27B + 最大 Tag 64B + 片头 6B);
-                                  * 若配置病态小值(< 97),单条写入连空记录都放不下时将触发 DROP / LOGX_ERR_TOO_LARGE */
+    uint32_t max_log_length;     /* 单条日志上限(格式化后);init 校验 >= 97 且 < 数据区 - 1。
+                                  * 必须 >= 97(用户头 27B + 最大 Tag 64B + 片头 6B);
+                                  * 低于 97 属于病态小配置(连空记录都无法容纳),init 期直接返回 LOGX_ERR_INVALID_ARG。 */
     uint32_t retention_days;     /* 保留期,过期文件在启动/退后台时清理 */
     uint64_t max_file_size;      /* 单文件上限,默认 10MB,切分决策在 flush 轮次边界 */
     /* E-06: staging 待刷阈值。0 = 禁用按阈值自动唤醒(纯手动 logx_flush 控制);

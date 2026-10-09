@@ -1260,7 +1260,7 @@ TEST(ErrorMonitoring, CannotFitDropPath_PreservedForPathologicalLimit) {
     cfg.log_dir = dir.c_str();
     cfg.staging_path = staging.c_str();
     // tag "E" (1B) 的最小空记录 = 27(用户头) + 1(tag) + 6(片头) = 34B;
-    // max_log_length=33 连空记录都放不下 → kCannotFit → TOO_LARGE 丢弃兜底。
+    // 1. B-6 方案 A 门禁: logx_open 对病态小 max_log_length (33 < 97) 执行 fail-fast 拒绝
     cfg.max_log_length = 33;
     cfg.retention_days = 7;
     cfg.max_file_size = 10 * 1024 * 1024;
@@ -1269,7 +1269,14 @@ TEST(ErrorMonitoring, CannotFitDropPath_PreservedForPathologicalLimit) {
     cfg.encrypt_enable = 0;
 
     logx_instance_t* inst = nullptr;
+    EXPECT_EQ(logx_open(&cfg, &inst), LOGX_ERR_INVALID_ARG);
+    EXPECT_EQ(inst, nullptr);
+
+    // 2. 正常配置 open 成功后，通过内部注入病态下界 33B 验证运行时 kCannotFit 丢弃兜底路径与统计
+    cfg.max_log_length = kMinLogLengthValid;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    ASSERT_NE(inst, nullptr);
+    inst->max_log_length = 33;
 
     struct DropTracker {
         int drop_count = 0;

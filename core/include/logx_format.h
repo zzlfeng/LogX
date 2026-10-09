@@ -21,6 +21,14 @@ constexpr uint32_t kMaxUserPayload = 60 * 1024;
 // 单片 LGXE payload 上限(20KB);超过即分片。
 constexpr uint32_t kMaxSlicePayload = 20 * 1024;
 
+// 内部用户数据头尺寸: [ts_ms:8][pid:4][tid:8][level:1][taglen:2][msglen:4] = 27B
+// (供 format_record / 截断求解器 / kTruncBufSize 断言 / 最小合法下界共用;
+// 布局表达式由 format_record 内的 static_assert 钉住,常量与权威定义处绑定)。
+constexpr uint32_t kUserHdrSize = 27;
+
+// tag 长度上限 (64B)
+constexpr uint32_t kMaxTag = 64;
+
 // staging 记录头 6B;len = payload 字节数。
 // magic 存为小端 2B;磁盘字节顺序为字面 'L','G'(条目) / 'G','P'(PAD)。
 //   kMagicEntry 低字节 'L'=0x4c, 高字节 'G'=0x47 -> 写入 [0x4c,0x47] -> 'L','G'。
@@ -28,6 +36,13 @@ constexpr uint32_t kMaxSlicePayload = 20 * 1024;
 constexpr uint32_t kHeaderLen = 6;
 constexpr uint16_t kMagicEntry = 0x474c;   // 高字节 0x47='G', 低字节 0x4c='L'
 constexpr uint16_t kMagicPad   = 0x5047;   // 高字节 0x50='P', 低字节 0x47='G'
+
+// B-6 方案 A: 单条日志最小合法长度下界 (Fail-Fast 校验):
+// 保证在最坏情况下(用户头 27B + 最大 Tag 64B + 片头 6B = 97B)仍能容纳一条空日志记录。
+// logx_open 中 cfg->max_log_length < kMinLogLengthValid 将被直接拒绝。
+constexpr uint32_t kMinLogLengthValid = kUserHdrSize + kMaxTag + kHeaderLen;  // 97
+static_assert(kMinLogLengthValid == 27 + 64 + 6,
+              "kMinLogLengthValid must equal kUserHdrSize + kMaxTag + kHeaderLen");
 
 // Wire-format 字节偏移定义 (N-3)
 constexpr uint32_t kWireOffPayloadLen = 0;

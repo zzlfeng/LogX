@@ -172,14 +172,16 @@ TEST(J04Regression, TooLargeCannotFit_ErrHandlerSynchronousOnCallerThread) {
         static_cast<ErrorProbe*>(user)->on_event(k, code, msg);
     };
 
-    // tag "J04"(3B) 的最小空记录 = 27+3+6 = 36B;max_log_length=33 连空记录
-    // 都放不下 → kCannotFit → TOO_LARGE 丢弃兜底。
+    // tag "J04"(3B) 的最小空记录 = 27+3+6 = 36B;
+    // B-6 方案 A: logx_open 需满足 >= 97, 通过合法配置 open 后注入 33B 验证运行时兜底路径及同步回调契约。
     logx_config_t cfg = make_cfg(dir.c_str(), staging.c_str(),
-                                 /*max_log_len=*/33, /*flush_threshold=*/0,
+                                 /*max_log_len=*/kMinLogLengthValid, /*flush_threshold=*/0,
                                  &probe, fn);
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    ASSERT_NE(inst, nullptr);
+    inst->max_log_length = 33;
 
     uint64_t caller_tid = pal.tid();
     std::vector<uint8_t> big(4096, 'A');

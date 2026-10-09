@@ -913,6 +913,18 @@ TEST(CodecTest, LogxOpen_CompressAlgo_FailFast) {
     EXPECT_EQ(inst, nullptr);
 #endif
 
+    // 7. B-6 方案 A: max_log_length < 97 必须拒绝启动 (fail-fast 防病态小配置)
+    cfg.encrypt_enable = 0;
+    cfg.key_provider = nullptr;
+    const uint32_t kInvalidLengths[] = { 0, 1, 32, 33, 40, 96 };
+    for (uint32_t len : kInvalidLengths) {
+        cfg.max_log_length = len;
+        EXPECT_EQ(logx_open(&cfg, &inst), LOGX_ERR_INVALID_ARG)
+            << "Expected fail-fast for max_log_length=" << len;
+        EXPECT_EQ(inst, nullptr);
+    }
+    cfg.max_log_length = 4096;
+
     pal.file_unlink(staging.c_str());
     pal.file_rmdir(dir.c_str());
 }
