@@ -1,10 +1,12 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.60 (2026-10-11 B-11 闭环——纪律 B-11-1「NDK 冒烟门禁」入 §4 纪律表, 纯 docs)
+> **文档版本**: v1.61 (2026-10-11 纯 docs 收口批次——真机 180 基线重对全绿 + B-5 状态行勘误)
+>
+> **v1.61 修订说明**: 2026-10-11 **纯 docs 收口批次（用户指示: B-5 状态行勘误与真机复跑补记合成一批）**: ① **真机 180 基线重对（B-13 lib 后首次复跑）**: Redmi K30 Pro (Android 12) 无线 adb（端口轮换第三次记录 40663→39389→**37289**）；产物核验 5 件（01:05:18–22）全部晚于 B-13 源码改动（01:03:40/58），ninja 全图 no work to do——B-13 批次 clean 产物直接部署零重编；设备时钟 1:1（3s→3.051/3.041s）且 auto_time=0 阶跃防护在位；四套件 **180/180 + 2/2 + 4/4 + 3/3 退出码全 0**（R37 2026-10-10 后第二次全绿基线），CHANGELOG 条目 17 补记。② **B-5 状态行勘误**: §6 B-5 状态行 ⏸「待决策」与 2026-10-10 判定门方案 C 收口执行记录不一致（3800 轮 0 命中，方案 A/B 不立项），更新为 ✅ 定性收口。③ B-13 闭环记录尾注「真机复跑待核对」同步闭合。纯 docs 改动零代码，B-11-1 豁免。
 >
 > **v1.60 修订说明**: 2026-10-11 **B-11 方案 A 落地（用户拍板）**: 纪律 **B-11-1（NDK 冒烟门禁）** 入 §4 纪律表（R21-2 的 NDK 侧对偶）——凡批次涉 `core/include`/`core/src`/`tests/**`/`android/**` 任一，收口验证必须含 NDK 冒烟（增量 ninja 即可捕获可编译性断裂；clean-first 仅在声称「0 警告」时强制，衔接四象限口径）；收口提交信息验证段标注「NDK 冒烟 N/N（clean/增量）」；纯 docs 豁免。决策点两子问题落定：执行环境 = 本机 NDK 命令行；触发时机 = 分层触发如上。**Backlog 待拍板自此清零**（B-11/B-13 均闭环）。纯 docs 改动，零代码。
 >
-> **v1.59 修订说明**: 2026-10-11 **B-13 方案 1 落地（用户拍板）**: ① `Instance::retention_days` 升级 `std::atomic<uint32_t>`（`logx_internal.h` 声明一行；读写点 `logx_c.cpp:385` 初始化与 `flusher.cpp:635` 读取走隐式 atomic 语义**零 diff**）+ `is_always_lock_free` `static_assert` 守卫（Instance 经不透明指针跨 C ABI，lock-free 退化即布局破坏——编译期钉住）；`test_robustness.cpp:2059` 注释尾同步（Backlog → 已收口）。② **附带审计（B-13 决策点，穷尽扫描）**: retention_days 为全仓**唯一**跨线程裸写/读 Instance 字段——`max_log_length` 两处测试运行期直写（`test_flusher.cpp:1279`/`test_j04_regression.cpp:184`）的唯读点 `build_records`（`flusher.cpp:1056`）仅由 `logx_write` 在调用方线程同步执行，与写同线程无并发，**非同类**；r19 回归 8 处 `static_cast<Instance*>` 站点全为读或 mock 指针交接；产品侧 config 字段仅 open 期初始化（先于 Flusher 线程启动）。**无 B-14 需要**。③ **验证（R21-2 门禁）**: MSVC clean 58/58 精确 0 警告 + 四套件 179/179+4/4+2/2+3/3 全绿；NDK clean 62/62 精确 0 警告；atomic<uint32_t> lock-free 与原语义等宽对齐，行为零变化，真机复跑待下次批次顺带核对 180 基线。
+> **v1.59 修订说明**: 2026-10-11 **B-13 方案 1 落地（用户拍板）**: ① `Instance::retention_days` 升级 `std::atomic<uint32_t>`（`logx_internal.h` 声明一行；读写点 `logx_c.cpp:385` 初始化与 `flusher.cpp:635` 读取走隐式 atomic 语义**零 diff**）+ `is_always_lock_free` `static_assert` 守卫（Instance 经不透明指针跨 C ABI，lock-free 退化即布局破坏——编译期钉住）；`test_robustness.cpp:2059` 注释尾同步（Backlog → 已收口）。② **附带审计（B-13 决策点，穷尽扫描）**: retention_days 为全仓**唯一**跨线程裸写/读 Instance 字段——`max_log_length` 两处测试运行期直写（`test_flusher.cpp:1279`/`test_j04_regression.cpp:184`）的唯读点 `build_records`（`flusher.cpp:1056`）仅由 `logx_write` 在调用方线程同步执行，与写同线程无并发，**非同类**；r19 回归 8 处 `static_cast<Instance*>` 站点全为读或 mock 指针交接；产品侧 config 字段仅 open 期初始化（先于 Flusher 线程启动）。**无 B-14 需要**。③ **验证（R21-2 门禁）**: MSVC clean 58/58 精确 0 警告 + 四套件 179/179+4/4+2/2+3/3 全绿；NDK clean 62/62 精确 0 警告；atomic<uint32_t> lock-free 与原语义等宽对齐，行为零变化，真机复跑待下次批次顺带核对 180 基线（2026-10-11 v1.61 已重对: 四套件 180/180+2/2+4/4+3/3 退出码全 0, 详见 CHANGELOG 条目 17）。
 >
 > **v1.58 修订说明**: 2026-10-11 **用户拍板「scratch 证据转正」**: B-5 前置协议全套（探针源码/自检日志/rig 脚本/R1+R2 十二负载轮档案，含 B-12 原始命中证据 `r2_run5/full_suite_1.log`）与 B-12 闭环 R2c 复跑全套（rig + 18 负载轮档案）落库至 **`docs/evidence/b5|b12`**（161 个纯文本文件 1.5M，剔除 5 个二进制 .exe/.obj 可经 `build_probe*.bat` 重建；清单与复现注意见 `docs/evidence/README.md`）；原 scratch 目录保留于仓库上级未删除。B-5/B-12 条目内 scratch 引用同步加转正注记，R38 报告 §九.3 补记拍板结果。
 >
@@ -356,7 +358,7 @@ gantt
 ### B-5 Windows PAL 目录/文件删除 errno 间歇性失败(单次观测,审查未复现)
 
 - **记录日期**: 2026-09-13(T5.2 补测批次记录;R12 审查改定性)
-- **状态**: ⏸ 待决策——**间歇性失败**(单次观测,复现条件未知;非 T5.2 补测批次引入,其代码无关性论证成立)
+- **状态**: ✅ **已按判定门方案 C 定性收口 (2026-10-10, 协议合计 3800 轮 0 命中, 方案 A/B 不立项)**——维持「已知间歇性红(单次观测)」定性, 详见下方前置协议执行记录。(2026-10-11 v1.61 勘误: 原状态行 ⏸「待决策」滞后于同条目执行记录的方案 C 收口, 属文档不一致非状态悬置)
 - **单次观测记录**(2026-09-13,补测批次跑全量矩阵时;用例 `Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing`,`tests/unit/test_robustness.cpp:1785`): 该次运行中失败,四处断言与实测:
   1. 对**非空目录** `file_rmdir(dir2)` 返回 **0**(期望 -1);
   2. 随之 `errno` 为 **0**(期望 `ENOTEMPTY` = 41);
@@ -485,7 +487,7 @@ gantt
   - **方案 1 (atomic 化)**: `retention_days` 升级 `std::atomic<uint32_t>`（3 处：`logx_internal.h:34` 声明、`logx_c.cpp:385` 初始化、`flusher.cpp:635` 读取）；字段尺寸/对齐不变，C ABI 无虞；属头文件改动，**须走 R21-2 clean 全量重建门禁**（R37 ① 实证增量构建对头文件变更不感知）。
   - **方案 2 (维持文档化现状)**: 良性竞争已注释文档化，接受形式 UB（实践无害、写者面单一且平台明确）；若未来出现第二写者须先回看本条。
 - **决策点**: 方案 1/2 拍板；若选方案 1，可顺手穷尽审计 `Instance` 其余运行期字段有无同类潜在并发写者（扫描模式 `static_cast<Instance*>(x)->field =`，R38 实测全仓测试侧仅 1 处即本例）。
-- **闭环落地记录 (2026-10-11, 方案 1)**: ①**atomic 化**: `logx_internal.h` 声明升级 `std::atomic<uint32_t>`（结构体既有 atomic 惯例内，E-01/R19 F-2 同风格）+ 结构体外 `static_assert(std::atomic<uint32_t>::is_always_lock_free)`（跨 C ABI 布局稳定性编译期守卫）；读写点 `logx_c.cpp:385`/`flusher.cpp:635` 隐式 atomic 语义**零 diff**；`test_robustness.cpp:2059` 注释尾同步。②**附带审计结论（穷尽扫描）**: retention_days 为全仓唯一跨线程裸写/读 Instance 字段——`max_log_length` 两处测试直写（`test_flusher.cpp:1279`/`test_j04_regression.cpp:184`）唯读点 `build_records`（`flusher.cpp:1056`）仅由 `logx_write` 调用方线程同步执行，与写同线程无并发非同类；r19 回归 8 处 `static_cast<Instance*>` 全为读/mock 指针交接；产品侧 config 字段仅 open 期初始化先于 Flusher 线程启动。**无 B-14**。③**验证（R21-2 门禁）**: MSVC clean 58/58 精确 0 警告 + 四套件 179/179+4/4+2/2+3/3 全绿；NDK clean 62/62 精确 0 警告；真机复跑待下次批次顺带核对 180 基线。
+- **闭环落地记录 (2026-10-11, 方案 1)**: ①**atomic 化**: `logx_internal.h` 声明升级 `std::atomic<uint32_t>`（结构体既有 atomic 惯例内，E-01/R19 F-2 同风格）+ 结构体外 `static_assert(std::atomic<uint32_t>::is_always_lock_free)`（跨 C ABI 布局稳定性编译期守卫）；读写点 `logx_c.cpp:385`/`flusher.cpp:635` 隐式 atomic 语义**零 diff**；`test_robustness.cpp:2059` 注释尾同步。②**附带审计结论（穷尽扫描）**: retention_days 为全仓唯一跨线程裸写/读 Instance 字段——`max_log_length` 两处测试直写（`test_flusher.cpp:1279`/`test_j04_regression.cpp:184`）唯读点 `build_records`（`flusher.cpp:1056`）仅由 `logx_write` 调用方线程同步执行，与写同线程无并发非同类；r19 回归 8 处 `static_cast<Instance*>` 全为读/mock 指针交接；产品侧 config 字段仅 open 期初始化先于 Flusher 线程启动。**无 B-14**。③**验证（R21-2 门禁）**: MSVC clean 58/58 精确 0 警告 + 四套件 179/179+4/4+2/2+3/3 全绿；NDK clean 62/62 精确 0 警告；真机复跑待下次批次顺带核对 180 基线（2026-10-11 v1.61 已重对: 四套件 180/180+2/2+4/4+3/3 退出码全 0, 详见 CHANGELOG 条目 17）。
 
 
 

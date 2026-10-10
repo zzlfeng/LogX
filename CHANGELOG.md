@@ -622,6 +622,11 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **N-5 (Nit, 自指断言删除)**：删除 `test_format.cpp` 与头文件定义同构的恒真 `static_assert`，保留 `== 97` 字面钉住（R37 变异实验实测两处均 C2338 复红，删除无防护损失）；
    - **全量验证**：MSVC 增量重建（纯 .cpp 改动）后四套件 **179/179 + 2/2 + 4/4 + 3/3 全绿**（含 stress 新增 raw_len 交叉断言）；NDK clean-first 62/62 **0 警告**；Gradle 8.9 + JDK17 `testDebugUnitTest` 23 任务 BUILD SUCCESSFUL（13 用例 0 失败，含新增 3 例）；`logx-tester :app:compileDebugKotlin` BUILD SUCCESSFUL；**真机复跑（2026-10-10，Redmi K30 Pro / Android 12，无线 adb 39389）四套件 180/180 + 2/2 + 4/4 + 3/3 全绿**（含设备专属 1 例，与主机 179 口径一致；产物 mtime 经核验，设备时钟 1:1 且 auto_time=0 阶跃防护在位）。
 
+17. **真机 180 基线重对：B-13 atomic 化 lib 后首次复跑 (2026-10-11)**：
+   - **背景**：B-13 批次（`ba4a980`）将 `Instance::retention_days` 升级 `std::atomic<uint32_t>`，core 头与 `liblogx.so` 二进制随之变更，R37 时代（2026-10-10）的真机 180 基线陈旧；本批为纯验证复跑，零代码改动；
+   - **产物核验**：部署 5 件（`liblogx.so` + 4 测试二进制，mtime 01:05:18–22）全部晚于 B-13 改动源码（`logx_internal.h` 01:03:40 / `test_robustness.cpp` 01:03:58），`ninja` 全图 no work to do——直接采用 B-13 批次 clean 链产物，无重编；
+   - **设备与时钟**：Redmi K30 Pro (Android 12)，无线 adb 端口 37289（端口轮换第三次记录：40663→39389→37289）；时钟步进实测 1:1（3s→3.051/3.041s，残差为 shell 开销）且 `auto_time=0` 阶跃防护在位；
+   - **结果**：四套件 **180/180 + 2/2 + 4/4 + 3/3 全绿，退出码全 0**（设备端重定向落盘执行）——B-13 后新基线成立，为 R37 之后第二次全绿基线。
 
 ---
 
