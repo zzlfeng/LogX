@@ -458,6 +458,7 @@ gantt
   - **B. 用例侧区分性断言**: 将 `file_size_path(...) > 0` 失败分支补 GetLastError 归因输出(改测试不改产品),使未来任何复现自带定性证据;可与 A 并行。
   - **C. 暂缓**: 维持双次观测记录,不加测不改码。
 - **决策点**: 方案 A/B/C 拍板;若选 A,复跑预算确认;证据日志 scratch `test_review_tmp_b5/r2/`、`r2_run5/`(full_suite_1.log),是否转正式资产随收口批次拍板。
+- **定性结论 (2026-10-10, 方案 A+B 并行批次 `2d7a15f` 后取证)**: **根因锁定——用例创建循环与后台 Flusher retention 巡扫的时序竞态,产品行为符合设计,零产品缺陷**。证据三线合拢: ①方案 B 断言实测命中轮 `[B12] raw_lasterror=2`(ERROR_FILE_NOT_FOUND)——文件被**真删除**,排除 AV/索引器共享冲突;②方案 A probe2(不含 logx 实例的纯创建循环)**60000 轮 0 命中**(warns=0)——同负载下无实例不复现,Flusher 在场是必要条件;③泄漏实例残留目录仅剩 `staging.mmap`、四个 case 文件全缺席——ASSERT fatal 时唯一能动该目录的 actor 是背景巡扫,物证吻合。**机制**: 用例 `set_clock(2046-09-03)` 后,Flusher 下一次 drain 命中跨天分支(`flusher.cpp:743` `current_date != today` → `retention_cleanup_impl`)按 `retention_days=7` 合法回收「远古」文件 A(20200101.log);该 drain 落在创建循环 ~100µs 窗口内即断言失败(负载下 2/12,独跑时巡扫落在断言后恒绿)。用例虽符合 R18-1「测 retention 本身」豁免,但豁免未考虑跨天背景扫;segfault 级联为 ASSERT fatal 泄漏实例(带真实 Flusher)的下游后果,随根因消除而消失。**修复方向(待拍板)**: ①用例时序改造——open 时 `retention_days=36500`(R18-1 判据)创建+断言全部文件,断言后经 `Instance*` 直改 `retention_days=7`(retention_cleanup_impl 在调用点现读,`flusher.cpp:635`)再调显式 `retention_cleanup()`,测试意图完整保留且零竞态;②可选加固——用例 fatal ASSERT 改 EXPECT+带清理早退,消除实例泄漏级联;③产品侧不动。
 
 
 
