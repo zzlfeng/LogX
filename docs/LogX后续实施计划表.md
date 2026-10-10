@@ -358,6 +358,7 @@ gantt
   - **B. 修用例**: 若确属 Windows 语义差异(非实现缺陷),把用例的 Windows 期望改为平台分支,并在注释中显式记录差异与依据。
   - **C. 暂缓**: 接受该项为已知间歇性红,仅在报告/CHANGELOG 中标注。
 - **决策点**: 前置协议的命中频率与命中条件;若复现,先判定"实现缺陷 vs 用例表述缺陷"(方案 A 的实测定位);若涉及 `translate_win32` 的 errno 契约,需同步 `logx_pal.h` 的接口文档。
+- **前置协议执行记录 (2026-10-10, 方案已拍板并执行)**: 预算 R1 200 轮 + R2 300 轮/60min + R3 条件立项,探针预写,命中后文档先行不改码。**执行结果**: ①目标用例 filtered 循环 R1 200 轮 + R2 十二负载轮 × 300 轮 = **3800 轮 0 命中**(另增强探针 3 轮自检全过);②R2 负载实验 12 轮中出现 2 例**同签名新异常**(判定门 ≥2 达成,另立 Backlog **B-12**);③**按判定门走向方案 C**——B-5 维持「已知间歇性红(单次观测)」定性,协议轮次与预算如实记录,方案 A/B 不立项;④探针/循环脚本留存 scratch `test_review_tmp_b5/`(零仓库改动,R12 探针先例),证据日志 r1/、r2/、r2_run2..12/ 归档在案,`logx_test_r18_retention_3404_17` 等残留目录为 B-12 现场、定性前不清理。
 
 ### B-6 C 侧 max_log_length 下界 fail-fast 校验 (R13 N-1 / R14 D-2)
 
@@ -441,6 +442,22 @@ gantt
   - **方案 A (入纪律表)**: §4 新增纪律行——凡改动测试/核心头文件或跨平台公共代码，收口前必须通过 NDK Clang clean 构建冒烟；「0 警告」声称必须区分工具链口径（R33 N-1 先例：NDK 有 1 条警告时不得笼统声称 0 警告）。
   - **方案 B (维持隐性覆盖)**: 不增设纪律，依赖真机复跑收口时顺带验证 NDK 构建，接受"MSVC 绿 → NDK 断裂"窗口最长一个复跑周期的残余风险。
 - **决策点**: NDK 冒烟的稳定执行环境（本机 NDK 命令行 / CI）；触发时机（每批次收口 vs 仅头文件/跨平台改动触发）。
+
+### B-12 负载下文件可见性异常——close 后紧邻的 file_size_path 返回 -1 并级联实例泄漏与 segfault (B-5 前置协议 R2 实验产出)
+
+- **记录日期**: 2026-10-10 (B-5 前置协议 R2 负载实验首次捕获,复跑判定门达成)
+- **状态**: ⬜ **待拍板**——立项门槛已满足(2/12 负载轮、同签名、条件可归纳),下一步动作待定
+- **签名(两轮逐字一致)**: `Robustness.RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtectsTodayAndFuture` 创建循环内 `test_robustness.cpp:2032` `ASSERT_GT(mock_pal.file_size_path(p), 0)` 实测 **-1 vs 0**——文件 A `20200101.log` 在 `file_open(create)`→`file_write(7B)`→`file_close` 全部成功后的**紧邻下一条语句**查询即不可得。两轮负载实例均在同一用例失败后于**后续不同用例**处 segfault(run 1: `PalRobustness.RandomBytesSuccess`;run 5: `ReviewFixesTest.P1_1_NoDeadlockWhenCallbackClosesInstance`),全部独跑实例(12 轮孤儿 full_suite)均 179/179 绿。
+- **触发条件(归纳)**: R2 负载形态 = 全量单测后台陪跑死循环 + 前台 filtered 用例 ~50ms/轮高频进程创建 churn;命中 2/12 轮(run 1、run 5),未命中 10/12;目标用例(PalRmdirErrno)同环境 3600+ 轮 0 命中——异常仅落在 RetentionCleanup 创建循环的 file_size_path 查询窗口。
+- **级联机制(推定,待定性)**: `ASSERT_GT` 为 fatal——失败即跳过 `logx_close` 与目录清理,**携带真实 Flusher 线程与 staging mmap 的实例泄漏**(残留目录 `logx_test_r18_retention_<pid>_17` 实证),后续用例与活跃泄漏实例共存直至 segfault——segfault 疑为泄漏实例的下游后果而非独立异常,故两签名实为**单一根因的两段表现**。
+- **关键歧义(定性关键)**: `file_size_path` 走 `GetFileAttributesExA`(P-02 契约),返回 -1 有两解:**真消失(ERROR_FILE_NOT_FOUND)** vs **共享冲突(ERROR_SHARING_VIOLATION,AV/索引器瞬时独占)**——测试代码未捕 GetLastError,无法区分;B-5 探针 diag 层(属性+枚举+lasterror)可直接定性,扩展为 probe2(复刻创建循环)即可命中即取证。
+- **混杂因子排除**: 同 CWD 双实例设计中全部测试目录带 pid 唯一后缀、失败文件位于被测实例独占目录内,跨实例互撞不成立;两轮命中签名逐字一致(同断言行号、同文件名、同 -1 vs 0)。
+- **历史**: 无先例——该用例 2026-10-04 R18 批次新增并经变异双向验证,docs/CHANGELOG 无失败记录;全仓 segfault 无记录。
+- **候选方案**:
+  - **A. probe2 定性探针先行**: 扩展 b5_probe 为 RetentionCleanup 创建循环版(每步捕 GetLastError 区分 GONE/共享冲突 + 命中保留现场 + Defender 事件日志关联),复跑负载实验至命中(~1/6 负载轮预期),以取证结果决定修 PAL / 修用例 / 修断言。
+  - **B. 用例侧区分性断言**: 将 `file_size_path(...) > 0` 失败分支补 GetLastError 归因输出(改测试不改产品),使未来任何复现自带定性证据;可与 A 并行。
+  - **C. 暂缓**: 维持双次观测记录,不加测不改码。
+- **决策点**: 方案 A/B/C 拍板;若选 A,复跑预算确认;证据日志 scratch `test_review_tmp_b5/r2/`、`r2_run5/`(full_suite_1.log),是否转正式资产随收口批次拍板。
 
 
 
