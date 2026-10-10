@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.56 (2026-10-11 R38 审查收口: F-1 良性竞争文档化 + N-1 涉及文件口径更正 + R2 负载复跑 18 轮 0 命中, B-12 闭环经验确认)
+> **文档版本**: v1.57 (2026-10-11 Backlog 补登 B-13——retention_days atomic 化彻底化选项登记, 消除 v1.56「列 Backlog」悬空引用)
+>
+> **v1.57 修订说明**: 2026-10-11 **纯 Backlog 补登（零代码改动）**: R38 收口批次（`f5db3d7`）修订说明声称 F-1 彻底化（`std::atomic`）「列 Backlog」但未实际登记条目，属悬空引用——本版补登 **B-13**（`Instance::retention_days` 形式数据竞争的 atomic 化选项，⬜ 待拍板），v1.56 声称自此有实指。先例：R36 报告入库 `2947a31` 补记 B-11 同样伴随版本行更新。
 >
 > **v1.56 修订说明**: 2026-10-10/11 **R38 审查（报告 code_review_R38_2026-10-10.md）收口批次**（用户拍板：先修 F-1/N-1，再 R2 负载复跑）：① **F-1 最小收口**: `test_robustness.cpp` 直改 `retention_days` 处补良性竞争文档化注释（运行期唯一写者、对齐 32 位存储平台原子、交错两支结局均与断言期望兼容）；彻底化（`std::atomic`）列 Backlog（头文件改动须走 R21-2 clean 门禁）；② **措辞收敛（in-place 勘误）**: v1.55 三处「(全流程)零竞态」→「无文件删除时序竞态（R38 F-1 勘误）」——竞态类声称不应超出实际消除面；③ **N-1 更正**: B-12 收口行涉及文件删 CHANGELOG.md（该文件经 `71380b2` 登记行另改）；④ **R2 负载复跑（独立 scratch `test_review_tmp_b12/r2c_run1..18`，rig 1:1 复刻 B-5 R2 形态，原 `test_review_tmp_b5/r2_run1..12` 命中证据未触碰）**: 18 负载轮 ×（前台 300 轮 PalRmdirErrno filtered + 背景 full-suite/hotpath/stress 死循环陪跑），三判读面全零——RetentionCleanup 负载下 **18/18 完整执行 0 命中**（原 rig 归档同面 18 次完整执行 1 归档命中/2 轮命中）、前台 5400 轮 0 命中（B-5 连续确认）、无 segfault、无残留进程；产品零改动、测试仅注释、docs 勘误。验证: MSVC 重建 0 警告、179/179 + 4/4 + 2/2 + 3/3 全绿；真机无需复跑（注释+文档批次，行为不变）。
 >
@@ -465,6 +467,16 @@ gantt
 - **决策点**: 方案 A/B/C 拍板;若选 A,复跑预算确认;证据日志 scratch `test_review_tmp_b5/r2/`、`r2_run5/`(full_suite_1.log),是否转正式资产随收口批次拍板。
 - **定性结论 (2026-10-10, 方案 A+B 并行批次 `2d7a15f` 后取证)**: **根因锁定——用例创建循环与后台 Flusher retention 巡扫的时序竞态,产品行为符合设计,零产品缺陷**。证据三线合拢: ①方案 B 断言实测命中轮 `[B12] raw_lasterror=2`(ERROR_FILE_NOT_FOUND)——文件被**真删除**,排除 AV/索引器共享冲突;②方案 A probe2(不含 logx 实例的纯创建循环)**60000 轮 0 命中**(warns=0)——同负载下无实例不复现,Flusher 在场是必要条件;③泄漏实例残留目录仅剩 `staging.mmap`、四个 case 文件全缺席——ASSERT fatal 时唯一能动该目录的 actor 是背景巡扫,物证吻合。**机制**: 用例 `set_clock(2046-09-03)` 后,Flusher 下一次 drain 命中跨天分支(`flusher.cpp:743` `current_date != today` → `retention_cleanup_impl`)按 `retention_days=7` 合法回收「远古」文件 A(20200101.log);该 drain 落在创建循环 ~100µs 窗口内即断言失败(负载下 2/12,独跑时巡扫落在断言后恒绿)。用例虽符合 R18-1「测 retention 本身」豁免,但豁免未考虑跨天背景扫;segfault 级联为 ASSERT fatal 泄漏实例(带真实 Flusher)的下游后果,随根因消除而消失。
 - **闭环落地记录 (2026-10-10, 方案一 + 方案三并联落地)**: ①**方案一(用例时序解耦)**: `test_robustness.cpp` 内 `logx_open` 初始化传入 `cfg.retention_days = 36500`(100 年, R18-1 判据), 彻底杜绝创建循环期间后台 Flusher 跨天 drain 提前回收远古文件 A; 四类文件创建并断言存在后, 将 `static_cast<Instance*>(inst)->retention_days` 恢复为 7 天并显式调用 `retention_cleanup(...)`, 测试意图 100% 完整保留且无文件删除时序竞态（R38 F-1 勘误）; ②**方案三(生命周期 RAII 保护)**: 引入 `InstGuard` 局部守卫, 析构时若实例非空必调 `logx_close(target)`, 彻底切断任何异常跳出导致的实例泄漏与下游级联崩溃; ③**产品零改动**: 产品行为符合设计, 核心代码 0 侵入; ④**验证**: MSVC 全套件测试 179/179 + 2/2 + 4/4 + 3/3 全绿。
+
+### B-13 `Instance::retention_days` 形式数据竞争的 atomic 化彻底化选项 (R38 F-1 留置)
+
+- **记录日期**: 2026-10-11 (R38 审查发现 F-1 (P3); 最小收口批次 `f5db3d7` 注释文档化留置, 本条为 v1.56「列 Backlog」悬空引用的补登)
+- **状态**: ⬜ **待拍板**
+- **背景**: `Instance::retention_days` 为普通非原子 `uint32_t`（`logx_internal.h:34`），产品侧读方唯一为 Flusher 线程 `retention_cleanup_impl`（`flusher.cpp:635`；到达路径 `:743` 跨天分支 / `:996` 启动清理），运行期无产品写者。B-12 闭环批次 `b1559e7` 引入仓库**首个运行期并发写者**（`test_robustness.cpp:2059`，用例主线程直改 36500→7），与读方构成 C++ 形式数据竞争（UB）。R38 实测无害：对齐 32 位存储在目标平台（x64/ARM64）硬件原子不撕裂；交错两支结局均与断言期望兼容（读旧值 36500 不删任何 fixture / 读新值 7 仅提前删期望被删的 A，B/C/D 受 `flusher.cpp:662` 双守卫保护）。最小收口已将该良性竞争注释文档化（`f5db3d7`），形式 UB 仍在。
+- **候选方案**:
+  - **方案 1 (atomic 化)**: `retention_days` 升级 `std::atomic<uint32_t>`（3 处：`logx_internal.h:34` 声明、`logx_c.cpp:385` 初始化、`flusher.cpp:635` 读取）；字段尺寸/对齐不变，C ABI 无虞；属头文件改动，**须走 R21-2 clean 全量重建门禁**（R37 ① 实证增量构建对头文件变更不感知）。
+  - **方案 2 (维持文档化现状)**: 良性竞争已注释文档化，接受形式 UB（实践无害、写者面单一且平台明确）；若未来出现第二写者须先回看本条。
+- **决策点**: 方案 1/2 拍板；若选方案 1，可顺手穷尽审计 `Instance` 其余运行期字段有无同类潜在并发写者（扫描模式 `static_cast<Instance*>(x)->field =`，R38 实测全仓测试侧仅 1 处即本例）。
 
 
 
