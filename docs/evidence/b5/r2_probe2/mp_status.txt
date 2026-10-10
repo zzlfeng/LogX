@@ -1,0 +1,6 @@
+
+RealTimeProtectionEnabled AntivirusSignatureLastUpdated
+------------------------- -----------------------------
+                     True 2026/10/10 7:05:09           
+
+

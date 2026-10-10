@@ -1,0 +1,12 @@
+=== R2 begin 2026-10-10_20:58:55 cwd=/d/Project/Android_Project/LogX/logx
+--- 预清点: 残留目录 ---
+logx_test_mem_3560_0
+logx_test_r18_retention_3404_17
+logx_test_r18_retention_8504_17
+logx_test_rand_succ_3404_19
+--- 后清点: 残留目录 ---
+logx_test_mem_23132_0
+logx_test_r18_retention_3404_17
+logx_test_r18_retention_8504_17
+logx_test_rand_succ_3404_19
+=== R2 end hits=0 2026-10-10_20:59:07

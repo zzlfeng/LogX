@@ -1,0 +1,35 @@
+Running main() from C:\b\abs_14_rhzemyc\croot\yaml-cpp-split_1714514162675\work\test\gtest-1.11.0\googletest\src\gtest_main.cc
+[==========] Running 4 tests from 2 test suites.
+[----------] Global test environment set-up.
+[----------] 1 test from StressTest
+[ RUN      ] StressTest.FiftyThreads_HeavyConcurrentWritesWithFlushCompetition
+
+[Stress Metrics] 50 Threads Concurrency Summary:
+  - Expected logs : 25000
+  - Written logs  : 22123 (88.492%)
+  - Dropped events: 189414
+  - Pure write sec: 0.121358 s (182296 logs/s)
+  - Total time sec: 0.125908 s
+  - Total log files generated: 14 (Files rotated successfully!)
+  - Missing records found: 0
+  - Verified Blocks: 468, Monotonic Seqno reached: 468, Raw Disk Records: 22123
+  - Exported records: 22123
+[       OK ] StressTest.FiftyThreads_HeavyConcurrentWritesWithFlushCompetition (281 ms)
+[----------] 1 test from StressTest (281 ms total)
+
+[----------] 3 tests from CrashRecovery
+[ RUN      ] CrashRecovery.GracefulTeardown_StagingDataRecovered
+[       OK ] CrashRecovery.GracefulTeardown_StagingDataRecovered (12 ms)
+[ RUN      ] CrashRecovery.TornBlockAtDiskTail_TruncatedSafelyAndCapturesEvent
+[       OK ] CrashRecovery.TornBlockAtDiskTail_TruncatedSafelyAndCapturesEvent (37 ms)
+[ RUN      ] CrashRecovery.FiftyCycles_RandomTeardownAndRecoveryLoop
+
+[Crash Injection Summary] 50 Cycles Multi-Stage Crash Loop:
+  - Expected logs : 397
+  - Exported logs : 397
+[       OK ] CrashRecovery.FiftyCycles_RandomTeardownAndRecoveryLoop (578 ms)
+[----------] 3 tests from CrashRecovery (627 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 2 test suites ran. (909 ms total)
+[  PASSED  ] 4 tests.

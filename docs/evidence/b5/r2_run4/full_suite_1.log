@@ -1,0 +1,425 @@
+Running main() from C:\b\abs_14_rhzemyc\croot\yaml-cpp-split_1714514162675\work\test\gtest-1.11.0\googletest\src\gtest_main.cc
+[==========] Running 179 tests from 17 test suites.
+[----------] Global test environment set-up.
+[----------] 12 tests from Format
+[ RUN      ] Format.ShortRecord_OnePiece
+[       OK ] Format.ShortRecord_OnePiece (0 ms)
+[ RUN      ] Format.LongRecord_Slices
+[       OK ] Format.LongRecord_Slices (0 ms)
+[ RUN      ] Format.RejectOverMax
+[       OK ] Format.RejectOverMax (0 ms)
+[ RUN      ] Format.RejectLongTag
+[       OK ] Format.RejectLongTag (0 ms)
+[ RUN      ] Format.PadRecord
+[       OK ] Format.PadRecord (0 ms)
+[ RUN      ] Format.ParseSkipsPadAndReassembles
+[       OK ] Format.ParseSkipsPadAndReassembles (0 ms)
+[ RUN      ] Format.TornRecordCksumFails
+[       OK ] Format.TornRecordCksumFails (0 ms)
+[ RUN      ] Format.EdgeDefenses_RejectsInvalidInputs
+[       OK ] Format.EdgeDefenses_RejectsInvalidInputs (0 ms)
+[ RUN      ] Format.MultipleWholeRecordsInOneBlock_StreamParsed
+[       OK ] Format.MultipleWholeRecordsInOneBlock_StreamParsed (0 ms)
+[ RUN      ] Format.PeekAndParseStagingRecordHeader_EquivalenceAndBounds
+[       OK ] Format.PeekAndParseStagingRecordHeader_EquivalenceAndBounds (0 ms)
+[ RUN      ] Format.StagingRecordHeader_WireFormatMakeParseRoundtrip
+[       OK ] Format.StagingRecordHeader_WireFormatMakeParseRoundtrip (0 ms)
+[ RUN      ] Format.MaxLogLength_BoundsFailFastAndBudgetMatrix
+[       OK ] Format.MaxLogLength_BoundsFailFastAndBudgetMatrix (0 ms)
+[----------] 12 tests from Format (0 ms total)
+
+[----------] 8 tests from FormatBounded
+[ RUN      ] FormatBounded.UnderLimit_NoTruncation
+[       OK ] FormatBounded.UnderLimit_NoTruncation (0 ms)
+[ RUN      ] FormatBounded.TruncateSingleSlice_PrefixPreservedWithMarker
+[       OK ] FormatBounded.TruncateSingleSlice_PrefixPreservedWithMarker (0 ms)
+[ RUN      ] FormatBounded.TruncateOversixtyKB_MultiSliceRoundTrip
+[       OK ] FormatBounded.TruncateOversixtyKB_MultiSliceRoundTrip (0 ms)
+[ RUN      ] FormatBounded.NoRoomForMarker_PurePrefix
+[       OK ] FormatBounded.NoRoomForMarker_PurePrefix (0 ms)
+[ RUN      ] FormatBounded.CannotFit_PathologicalTinyLimit
+[       OK ] FormatBounded.CannotFit_PathologicalTinyLimit (0 ms)
+[ RUN      ] FormatBounded.InvalidInputStaysInvalid
+[       OK ] FormatBounded.InvalidInputStaysInvalid (0 ms)
+[ RUN      ] FormatBounded.BudgetSweep_TotalAlwaysFitsLimit
+[       OK ] FormatBounded.BudgetSweep_TotalAlwaysFitsLimit (0 ms)
+[ RUN      ] FormatBounded.NullOutParamsTolerated
+[       OK ] FormatBounded.NullOutParamsTolerated (0 ms)
+[----------] 8 tests from FormatBounded (0 ms total)
+
+[----------] 8 tests from StagingTest
+[ RUN      ] StagingTest.EmptyRingFreeIsSizeMinusOne
+[       OK ] StagingTest.EmptyRingFreeIsSizeMinusOne (1 ms)
+[ RUN      ] StagingTest.FullRingDrops
+[       OK ] StagingTest.FullRingDrops (1 ms)
+[ RUN      ] StagingTest.WrapAroundPadsAndKeepsInvariant
+[       OK ] StagingTest.WrapAroundPadsAndKeepsInvariant (1 ms)
+[ RUN      ] StagingTest.DualHeaderCorruptionBHandWins
+[       OK ] StagingTest.DualHeaderCorruptionBHandWins (2 ms)
+[ RUN      ] StagingTest.FlushAndZeroMaintainsInvariant
+[       OK ] StagingTest.FlushAndZeroMaintainsInvariant (1 ms)
+[ RUN      ] StagingTest.SmallRecordPreservesAllInvariantsAcrossWrap
+[       OK ] StagingTest.SmallRecordPreservesAllInvariantsAcrossWrap (1 ms)
+[ RUN      ] StagingTest.MmapFailure_DegradesToHeapMemory
+[       OK ] StagingTest.MmapFailure_DegradesToHeapMemory (0 ms)
+[ RUN      ] StagingTest.Crc32_StandardTestVectors
+[       OK ] StagingTest.Crc32_StandardTestVectors (0 ms)
+[----------] 8 tests from StagingTest (10 ms total)
+
+[----------] 21 tests from RecoveryTest
+[ RUN      ] RecoveryTest.FreshStart_NoFile
+[       OK ] RecoveryTest.FreshStart_NoFile (1 ms)
+[ RUN      ] RecoveryTest.FileTruncationOnRecovery
+[       OK ] RecoveryTest.FileTruncationOnRecovery (2 ms)
+[ RUN      ] RecoveryTest.RingScanStopsOnTear
+[       OK ] RecoveryTest.RingScanStopsOnTear (1 ms)
+[ RUN      ] RecoveryTest.BlocksWrittenHeaderNotCommitted_BackfillExact
+[       OK ] RecoveryTest.BlocksWrittenHeaderNotCommitted_BackfillExact (6 ms)
+[ RUN      ] RecoveryTest.BlocksWrittenHeaderNotCommitted_RemainderRescanned
+[       OK ] RecoveryTest.BlocksWrittenHeaderNotCommitted_RemainderRescanned (7 ms)
+[ RUN      ] RecoveryTest.TruncatedFile_LostCountNoUnderflow
+[       OK ] RecoveryTest.TruncatedFile_LostCountNoUnderflow (2 ms)
+[ RUN      ] RecoveryTest.CorruptWritePos_ClampedToZero
+[       OK ] RecoveryTest.CorruptWritePos_ClampedToZero (1 ms)
+[ RUN      ] RecoveryTest.CorruptBlockCrc32_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlockCrc32_TruncatedOnRecovery (8 ms)
+[ RUN      ] RecoveryTest.AppendTargetCache_HitFastPath
+[       OK ] RecoveryTest.AppendTargetCache_HitFastPath (6 ms)
+[ RUN      ] RecoveryTest.BothHeadersCorrupt_RebuiltAndTakesOverFileSeqno
+[       OK ] RecoveryTest.BothHeadersCorrupt_RebuiltAndTakesOverFileSeqno (11 ms)
+[ RUN      ] RecoveryTest.RecoveryResume_PreservesSplitNoInAppendTargetCache
+[       OK ] RecoveryTest.RecoveryResume_PreservesSplitNoInAppendTargetCache (2 ms)
+[ RUN      ] RecoveryTest.RecoveryRebuilt_PreservesSplitNoInAppendTargetCache
+[       OK ] RecoveryTest.RecoveryRebuilt_PreservesSplitNoInAppendTargetCache (4 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_BadVersion_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlock_BadVersion_TruncatedOnRecovery (1 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_BadFlag_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlock_BadFlag_TruncatedOnRecovery (1 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_MismatchedRawLenAndPayloadLen_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlock_MismatchedRawLenAndPayloadLen_TruncatedOnRecovery (1 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_OutOfRangeRawLen_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlock_OutOfRangeRawLen_TruncatedOnRecovery (1 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_SeqnoRollbackStopsBackfill_NormalGapAllowed
+[       OK ] RecoveryTest.CorruptBlock_SeqnoRollbackStopsBackfill_NormalGapAllowed (1 ms)
+[ RUN      ] RecoveryTest.Recovery_SumRawLenExceedsCapacity_DoesNotCorruptStaging
+[       OK ] RecoveryTest.Recovery_SumRawLenExceedsCapacity_DoesNotCorruptStaging (2 ms)
+[ RUN      ] RecoveryTest.AppendTargetCache_ContractAndSafeOffsetAssignment
+[       OK ] RecoveryTest.AppendTargetCache_ContractAndSafeOffsetAssignment (0 ms)
+[ RUN      ] RecoveryTest.HintUnreadable_FallsBackToBest_TruncatedNotPropagated
+[       OK ] RecoveryTest.HintUnreadable_FallsBackToBest_TruncatedNotPropagated (2 ms)
+[ RUN      ] RecoveryTest.TornTailWithHeaderAhead_LostCountEqualsSeqnoDiffExactly
+[       OK ] RecoveryTest.TornTailWithHeaderAhead_LostCountEqualsSeqnoDiffExactly (2 ms)
+[----------] 21 tests from RecoveryTest (72 ms total)
+
+[----------] 4 tests from Split
+[ RUN      ] Split.MultipleBlocksAccumulateTo16KBThreshold
+[       OK ] Split.MultipleBlocksAccumulateTo16KBThreshold (0 ms)
+[ RUN      ] Split.SingleRecordLargerThan16KBOwnsBlock
+[       OK ] Split.SingleRecordLargerThan16KBOwnsBlock (0 ms)
+[ RUN      ] Split.WrappingTailTrailingZeroesCloseBlock
+[       OK ] Split.WrappingTailTrailingZeroesCloseBlock (0 ms)
+[ RUN      ] Split.TornTailNotClosedAsValidBlock
+[       OK ] Split.TornTailNotClosedAsValidBlock (0 ms)
+[----------] 4 tests from Split (0 ms total)
+
+[----------] 25 tests from Flush
+[ RUN      ] Flush.BlocksEncodeAndFileWrite_Roundtrip
+[       OK ] Flush.BlocksEncodeAndFileWrite_Roundtrip (0 ms)
+[ RUN      ] Flush.EncryptedBlockFileWriteAndDecode_Roundtrip
+[       OK ] Flush.EncryptedBlockFileWriteAndDecode_Roundtrip (0 ms)
+[ RUN      ] Flush.EndToEndFormattedLog_WriteAndExport
+[       OK ] Flush.EndToEndFormattedLog_WriteAndExport (26 ms)
+[ RUN      ] Flush.ExportHistoricalEncryptedFileWithUnsetFileHeaderFlag_RecoversSuccessfully
+[       OK ] Flush.ExportHistoricalEncryptedFileWithUnsetFileHeaderFlag_RecoversSuccessfully (6 ms)
+[ RUN      ] Flush.RetentionCleanup_DeletesExpiredLogsKeepsStaging
+[       OK ] Flush.RetentionCleanup_DeletesExpiredLogsKeepsStaging (0 ms)
+[ RUN      ] Flush.RetentionCleanup_TriggeredOnFlushBlocking
+[       OK ] Flush.RetentionCleanup_TriggeredOnFlushBlocking (3 ms)
+[ RUN      ] Flush.RetentionCleanup_TriggeredOnDayRollover
+[       OK ] Flush.RetentionCleanup_TriggeredOnDayRollover (0 ms)
+[ RUN      ] Flush.RetentionCleanup_LeapYearAndMonthBoundary
+[       OK ] Flush.RetentionCleanup_LeapYearAndMonthBoundary (0 ms)
+[ RUN      ] Flush.FileSizeThreshold_RotatesToSplitFile
+[       OK ] Flush.FileSizeThreshold_RotatesToSplitFile (93 ms)
+[ RUN      ] Flush.ParseLogFilename_Comprehensive
+[       OK ] Flush.ParseLogFilename_Comprehensive (0 ms)
+[ RUN      ] Flush.FileSizeThreshold_ResumeRotatesToNextSplitWithoutOverwrite
+[       OK ] Flush.FileSizeThreshold_ResumeRotatesToNextSplitWithoutOverwrite (295 ms)
+[ RUN      ] Flush.FileSizeThreshold_DefensiveProbeSkipsExistingSplit
+[       OK ] Flush.FileSizeThreshold_DefensiveProbeSkipsExistingSplit (14 ms)
+[ RUN      ] Flush.ExportWithMultipleRecords_PlaintextMode_ExportsAllLines
+[       OK ] Flush.ExportWithMultipleRecords_PlaintextMode_ExportsAllLines (19 ms)
+[ RUN      ] Flush.ExportEncryptedFile_MissingKey_SkipsGracefully
+[       OK ] Flush.ExportEncryptedFile_MissingKey_SkipsGracefully (30 ms)
+[ RUN      ] Flush.HeapDegraded_WritesAndFlushesCorrectly
+[       OK ] Flush.HeapDegraded_WritesAndFlushesCorrectly (25 ms)
+[ RUN      ] Flush.FileSizeThreshold_RotatesBeyond255_Succeeds
+[       OK ] Flush.FileSizeThreshold_RotatesBeyond255_Succeeds (18 ms)
+[ RUN      ] Flush.FileSizeThreshold_SplitLimit65535_EmitsEventAndSuspends
+[       OK ] Flush.FileSizeThreshold_SplitLimit65535_EmitsEventAndSuspends (27 ms)
+[ RUN      ] Flush.AppendTargetCache_HistoricalStagingLayoutCompatibility
+[       OK ] Flush.AppendTargetCache_HistoricalStagingLayoutCompatibility (17 ms)
+[ RUN      ] Flush.WatermarkReturnsUnderSustainedWrites
+[       OK ] Flush.WatermarkReturnsUnderSustainedWrites (355 ms)
+[ RUN      ] Flush.TimeoutWhenFlusherStalled_EmitsEventAndReturns
+[       OK ] Flush.TimeoutWhenFlusherStalled_EmitsEventAndReturns (5059 ms)
+[ RUN      ] Flush.DiscardPathDoesNotStall
+[       OK ] Flush.DiscardPathDoesNotStall (23 ms)
+[ RUN      ] Flush.Debounce_LowFrequencyWritesFlushedWithinWindow
+[       OK ] Flush.Debounce_LowFrequencyWritesFlushedWithinWindow (97 ms)
+[ RUN      ] Flush.Debounce_BurstAggregatesIntoFewBlocks
+[       OK ] Flush.Debounce_BurstAggregatesIntoFewBlocks (214 ms)
+[ RUN      ] Flush.Export_RejectsInvalidCalendarDates
+[       OK ] Flush.Export_RejectsInvalidCalendarDates (3 ms)
+[ RUN      ] Flush.AppendBlock_NullSaltOnExistingFile_ReusesFileHeaderSalt
+[       OK ] Flush.AppendBlock_NullSaltOnExistingFile_ReusesFileHeaderSalt (6 ms)
+[----------] 25 tests from Flush (6343 ms total)
+
+[----------] 3 tests from ErrorMonitoring
+[ RUN      ] ErrorMonitoring.TruncateEventOnTooLarge_PrefixKeptAndCounted
+[       OK ] ErrorMonitoring.TruncateEventOnTooLarge_PrefixKeptAndCounted (23 ms)
+[ RUN      ] ErrorMonitoring.CannotFitDropPath_PreservedForPathologicalLimit
+[       OK ] ErrorMonitoring.CannotFitDropPath_PreservedForPathologicalLimit (3 ms)
+[ RUN      ] ErrorMonitoring.InitStageEventsCapturedViaConfig
+[       OK ] ErrorMonitoring.InitStageEventsCapturedViaConfig (0 ms)
+[----------] 3 tests from ErrorMonitoring (27 ms total)
+
+[----------] 2 tests from FlusherTest
+[ RUN      ] FlusherTest.FileSizeThreshold_ShouldRotateFileSize_Enforces4GiBCapacity
+[       OK ] FlusherTest.FileSizeThreshold_ShouldRotateFileSize_Enforces4GiBCapacity (0 ms)
+[ RUN      ] FlusherTest.KeyProvider_DrainsEncryptedTailAndNotCalledAfterClose
+[       OK ] FlusherTest.KeyProvider_DrainsEncryptedTailAndNotCalledAfterClose (148 ms)
+[----------] 2 tests from FlusherTest (148 ms total)
+
+[----------] 22 tests from CodecTest
+[ RUN      ] CodecTest.BlockFlagHelper_BitLayoutAndSemantics
+[       OK ] CodecTest.BlockFlagHelper_BitLayoutAndSemantics (0 ms)
+[ RUN      ] CodecTest.ZstdRoundTrip_Compressible
+[       OK ] CodecTest.ZstdRoundTrip_Compressible (0 ms)
+[ RUN      ] CodecTest.ZstdRoundTrip_Incompressible
+[       OK ] CodecTest.ZstdRoundTrip_Incompressible (0 ms)
+[ RUN      ] CodecTest.ZstdRejectsCorruptFrame
+[       OK ] CodecTest.ZstdRejectsCorruptFrame (0 ms)
+[ RUN      ] CodecTest.ZstdRejectsFakeContentsize
+[       OK ] CodecTest.ZstdRejectsFakeContentsize (0 ms)
+[ RUN      ] CodecTest.EncodeBlockCompressesAndRoundTrips
+[       OK ] CodecTest.EncodeBlockCompressesAndRoundTrips (0 ms)
+[ RUN      ] CodecTest.NoneRoundTrip
+[       OK ] CodecTest.NoneRoundTrip (0 ms)
+[ RUN      ] CodecTest.UnknownAlgoFails
+[       OK ] CodecTest.UnknownAlgoFails (0 ms)
+[ RUN      ] CodecTest.GCMRoundTrip_PlainAndCipher
+[       OK ] CodecTest.GCMRoundTrip_PlainAndCipher (0 ms)
+[ RUN      ] CodecTest.GCMRejectsWrongKey
+[       OK ] CodecTest.GCMRejectsWrongKey (0 ms)
+[ RUN      ] CodecTest.GCMRejectsCorruptTagAndCiphertext
+[       OK ] CodecTest.GCMRejectsCorruptTagAndCiphertext (0 ms)
+[ RUN      ] CodecTest.GCM_OfficialNistVectors_Anchor
+[       OK ] CodecTest.GCM_OfficialNistVectors_Anchor (0 ms)
+[ RUN      ] CodecTest.EncodeBlockWithZstdAndAESGCM_RoundTrips
+[       OK ] CodecTest.EncodeBlockWithZstdAndAESGCM_RoundTrips (0 ms)
+[ RUN      ] CodecTest.MakeNonce_ByteOrderAndSaltPreserved
+[       OK ] CodecTest.MakeNonce_ByteOrderAndSaltPreserved (0 ms)
+[ RUN      ] CodecTest.EncodeBlockMissingKey_DowngradesToPlaintext
+[       OK ] CodecTest.EncodeBlockMissingKey_DowngradesToPlaintext (0 ms)
+[ RUN      ] CodecTest.EncodeBlock_CompressionFailureDowngradesToNoneAndDecodesSuccessfully
+[       OK ] CodecTest.EncodeBlock_CompressionFailureDowngradesToNoneAndDecodesSuccessfully (0 ms)
+[ RUN      ] CodecTest.Flusher_CompressionFailureDowngradesAndEmitsDegradedEvent
+[       OK ] CodecTest.Flusher_CompressionFailureDowngradesAndEmitsDegradedEvent (0 ms)
+[ RUN      ] CodecTest.DecodeBlock_RejectsLengthMismatch
+[       OK ] CodecTest.DecodeBlock_RejectsLengthMismatch (0 ms)
+[ RUN      ] CodecTest.LogxOpen_CompressAlgo_FailFast
+[       OK ] CodecTest.LogxOpen_CompressAlgo_FailFast (5 ms)
+[ RUN      ] CodecTest.EncodeBlock_CompressionDowngradeKeepsEncryption
+[       OK ] CodecTest.EncodeBlock_CompressionDowngradeKeepsEncryption (0 ms)
+[ RUN      ] CodecTest.EncodeBlock_ZstdRuntimeFailureDowngradesViaSeam
+[       OK ] CodecTest.EncodeBlock_ZstdRuntimeFailureDowngradesViaSeam (0 ms)
+[ RUN      ] CodecTest.Flusher_ZstdRuntimeFailureDowngradesAndEmitsDegradedEventViaSeam
+[       OK ] CodecTest.Flusher_ZstdRuntimeFailureDowngradesAndEmitsDegradedEventViaSeam (1 ms)
+[----------] 22 tests from CodecTest (8 ms total)
+
+[----------] 25 tests from Robustness
+[ RUN      ] Robustness.UnalignedMemoryAccess_IntegerPrimitives
+[       OK ] Robustness.UnalignedMemoryAccess_IntegerPrimitives (0 ms)
+[ RUN      ] Robustness.UnalignedMemoryAccess_RecordFormatAndParse
+[       OK ] Robustness.UnalignedMemoryAccess_RecordFormatAndParse (0 ms)
+[ RUN      ] Robustness.ClockJump_DayRolloverAtMidnight
+[       OK ] Robustness.ClockJump_DayRolloverAtMidnight (38 ms)
+[ RUN      ] Robustness.ClockRollback_GracefullyHandledWithoutOverwrite
+[       OK ] Robustness.ClockRollback_GracefullyHandledWithoutOverwrite (31 ms)
+[ RUN      ] Robustness.ShortWrite_RollsBackTornBytesAndEmitsEvent
+[       OK ] Robustness.ShortWrite_RollsBackTornBytesAndEmitsEvent (29 ms)
+[ RUN      ] Robustness.ShortWrite_TransientFailureAllowsSubsequentBlocksToResumeCleanly
+[       OK ] Robustness.ShortWrite_TransientFailureAllowsSubsequentBlocksToResumeCleanly (48 ms)
+[ RUN      ] Robustness.ShortWrite_MidStreamEnospcTruncatesTornTail
+[       OK ] Robustness.ShortWrite_MidStreamEnospcTruncatesTornTail (28 ms)
+[ RUN      ] Robustness.Persistence_FlushTriggersFileAndStagingFsync
+[       OK ] Robustness.Persistence_FlushTriggersFileAndStagingFsync (15 ms)
+[ RUN      ] Robustness.Persistence_DurabilitySyncDirectAndGraceful
+[       OK ] Robustness.Persistence_DurabilitySyncDirectAndGraceful (15 ms)
+[ RUN      ] Robustness.Persistence_NewFileTriggersParentDirFsync
+[       OK ] Robustness.Persistence_NewFileTriggersParentDirFsync (14 ms)
+[ RUN      ] Robustness.Persistence_CloseTriggersFinalSync
+[       OK ] Robustness.Persistence_CloseTriggersFinalSync (15 ms)
+[ RUN      ] Robustness.Persistence_FsyncFailureEmitsEventWithoutBlocking
+[       OK ] Robustness.Persistence_FsyncFailureEmitsEventWithoutBlocking (29 ms)
+[ RUN      ] Robustness.Win64HandleTruncation_PalMmapAndThreadHandle64BitSafe
+[       OK ] Robustness.Win64HandleTruncation_PalMmapAndThreadHandle64BitSafe (12 ms)
+[ RUN      ] Robustness.ErrorHandler_ConcurrentReregistrationNoRace
+[       OK ] Robustness.ErrorHandler_ConcurrentReregistrationNoRace (174 ms)
+[ RUN      ] Robustness.WriteInvalidLevel_ClassifiedAsInvalidArg
+[       OK ] Robustness.WriteInvalidLevel_ClassifiedAsInvalidArg (15 ms)
+[ RUN      ] Robustness.ExportErrorPropagation_WriteFailAndCallbackFail
+[       OK ] Robustness.ExportErrorPropagation_WriteFailAndCallbackFail (33 ms)
+[ RUN      ] Robustness.ExportTmpPath_UniquePerCallAndCleaned
+[       OK ] Robustness.ExportTmpPath_UniquePerCallAndCleaned (24 ms)
+[ RUN      ] Robustness.FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault
+[       OK ] Robustness.FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault (66 ms)
+[ RUN      ] Robustness.StatsReservedZeroContract
+[       OK ] Robustness.StatsReservedZeroContract (14 ms)
+[ RUN      ] Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing
+[       OK ] Robustness.PalRmdirErrnoDistinction_NotEmptyVsMissing (0 ms)
+[ RUN      ] Robustness.PalFileSizePath_AttributesBased_SemanticsPreserved
+[       OK ] Robustness.PalFileSizePath_AttributesBased_SemanticsPreserved (0 ms)
+[ RUN      ] Robustness.PalMonotonic_NonDecreasingSaneUnits
+[       OK ] Robustness.PalMonotonic_NonDecreasingSaneUnits (24 ms)
+[ RUN      ] Robustness.PalAtomicAdd_AlignedBehaviorContract
+[       OK ] Robustness.PalAtomicAdd_AlignedBehaviorContract (0 ms)
+[ RUN      ] Robustness.ErrUserPerInstance_IsolationAcrossClose
+[       OK ] Robustness.ErrUserPerInstance_IsolationAcrossClose (5 ms)
+[ RUN      ] Robustness.RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtectsTodayAndFuture
+[       OK ] Robustness.RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtectsTodayAndFuture (3 ms)
+[----------] 25 tests from Robustness (645 ms total)
+
+[----------] 2 tests from PalRobustness
+[ RUN      ] PalRobustness.RandomBytesFailure_RefusesNewFileCreation
+[       OK ] PalRobustness.RandomBytesFailure_RefusesNewFileCreation (24 ms)
+[ RUN      ] PalRobustness.RandomBytesSuccess_ProducesNonTrivialSalt
+[       OK ] PalRobustness.RandomBytesSuccess_ProducesNonTrivialSalt (19 ms)
+[----------] 2 tests from PalRobustness (43 ms total)
+
+[----------] 9 tests from JniString
+[ RUN      ] JniString.AsciiIdentityAndEmpty
+[       OK ] JniString.AsciiIdentityAndEmpty (0 ms)
+[ RUN      ] JniString.ModifiedUtf8NulDecodesToU0000
+[       OK ] JniString.ModifiedUtf8NulDecodesToU0000 (0 ms)
+[ RUN      ] JniString.TwoAndThreeByteBmp
+[       OK ] JniString.TwoAndThreeByteBmp (0 ms)
+[ RUN      ] JniString.FourByteSupplementaryToSurrogatePair
+[       OK ] JniString.FourByteSupplementaryToSurrogatePair (0 ms)
+[ RUN      ] JniString.MixedAsciiAndMultibyteRoundtrip
+[       OK ] JniString.MixedAsciiAndMultibyteRoundtrip (0 ms)
+[ RUN      ] JniString.OverlongEncodingsRejected
+[       OK ] JniString.OverlongEncodingsRejected (0 ms)
+[ RUN      ] JniString.SurrogateAndOutOfRangeRejected
+[       OK ] JniString.SurrogateAndOutOfRangeRejected (0 ms)
+[ RUN      ] JniString.TruncatedAndGarbageResyncWithoutLoss
+[       OK ] JniString.TruncatedAndGarbageResyncWithoutLoss (0 ms)
+[ RUN      ] JniString.EmbeddedNulViaModifiedEncodingSurvives
+[       OK ] JniString.EmbeddedNulViaModifiedEncodingSurvives (0 ms)
+[----------] 9 tests from JniString (0 ms total)
+
+[----------] 3 tests from J04Regression
+[ RUN      ] J04Regression.TooLargeTruncated_ErrHandlerSynchronousOnCallerThread
+[       OK ] J04Regression.TooLargeTruncated_ErrHandlerSynchronousOnCallerThread (15 ms)
+[ RUN      ] J04Regression.TooLargeCannotFit_ErrHandlerSynchronousOnCallerThread
+[       OK ] J04Regression.TooLargeCannotFit_ErrHandlerSynchronousOnCallerThread (2 ms)
+[ RUN      ] J04Regression.StagingFull_ErrHandlerFiresWithoutDeadlockInstanceSurvives
+[       OK ] J04Regression.StagingFull_ErrHandlerFiresWithoutDeadlockInstanceSurvives (27 ms)
+[----------] 3 tests from J04Regression (45 ms total)
+
+[----------] 4 tests from ReviewFixesTest
+[ RUN      ] ReviewFixesTest.P1_1_NoDeadlockWhenCallbackClosesInstance
+[       OK ] ReviewFixesTest.P1_1_NoDeadlockWhenCallbackClosesInstance (11 ms)
+[ RUN      ] ReviewFixesTest.P2_3_PadRecordsIncrementedOnWrap
+[       OK ] ReviewFixesTest.P2_3_PadRecordsIncrementedOnWrap (34 ms)
+[ RUN      ] ReviewFixesTest.P3_6_RecoveryFailureAbortsOpenSafely
+[       OK ] ReviewFixesTest.P3_6_RecoveryFailureAbortsOpenSafely (0 ms)
+[ RUN      ] ReviewFixesTest.R13_N2_ExportCorruptedBlockClearsCarrySliceBuf
+[       OK ] ReviewFixesTest.R13_N2_ExportCorruptedBlockClearsCarrySliceBuf (5 ms)
+[----------] 4 tests from ReviewFixesTest (52 ms total)
+
+[----------] 28 tests from R19Regression
+[ RUN      ] R19Regression.F1_SeamMidStream_SplitsWithinContract
+[       OK ] R19Regression.F1_SeamMidStream_SplitsWithinContract (0 ms)
+[ RUN      ] R19Regression.F1b_SeamAfterFullLengthRecord_SeamAbsorbedIntoBlockTail
+[       OK ] R19Regression.F1b_SeamAfterFullLengthRecord_SeamAbsorbedIntoBlockTail (0 ms)
+[ RUN      ] R19Regression.F9_MidStreamCorruptSeam_NeverFusedIntoBlock
+[       OK ] R19Regression.F9_MidStreamCorruptSeam_NeverFusedIntoBlock (0 ms)
+[ RUN      ] R19Regression.F1c_WrapSeamAtPendingHead_MicroBlockNeverReachesDisk
+[       OK ] R19Regression.F1c_WrapSeamAtPendingHead_MicroBlockNeverReachesDisk (45 ms)
+[ RUN      ] R19Regression.F2_CloseInsideErrorCallback_SurvivesAndDefers
+[       OK ] R19Regression.F2_CloseInsideErrorCallback_SurvivesAndDefers (5 ms)
+[ RUN      ] R19Regression.F3_ShortTornLogFile_SelfHealsAndCounts
+[       OK ] R19Regression.F3_ShortTornLogFile_SelfHealsAndCounts (23 ms)
+[ RUN      ] R19Regression.F6_EncryptWithoutKey_FailFastAndPerBlockExport
+[       OK ] R19Regression.F6_EncryptWithoutKey_FailFastAndPerBlockExport (17 ms)
+[ RUN      ] R19Regression.F6b_EncCapabilityLockedAtFileCreation_BlocksStayPlaintext
+[       OK ] R19Regression.F6b_EncCapabilityLockedAtFileCreation_BlocksStayPlaintext (14 ms)
+[ RUN      ] R19Regression.SchemeC_ActiveFileTarget_KeyProviderCalledOncePerFile
+[       OK ] R19Regression.SchemeC_ActiveFileTarget_KeyProviderCalledOncePerFile (32 ms)
+[ RUN      ] R19Regression.SchemeC_EncryptedFile_MissingKeyAtOpen_RecoversOnSubsequentDrain
+[       OK ] R19Regression.SchemeC_EncryptedFile_MissingKeyAtOpen_RecoversOnSubsequentDrain (61 ms)
+[ RUN      ] R19Regression.F10_FailedOpen_WritesNullOutParam
+[       OK ] R19Regression.F10_FailedOpen_WritesNullOutParam (0 ms)
+[ RUN      ] R19Regression.F14_RebuiltTruncatedFile_SeqnoSkipsGap
+[       OK ] R19Regression.F14_RebuiltTruncatedFile_SeqnoSkipsGap (1 ms)
+[ RUN      ] R19Regression.F14b_NormalPathTruncatedFile_ResumeSeqnoMaxPlusOne
+[       OK ] R19Regression.F14b_NormalPathTruncatedFile_ResumeSeqnoMaxPlusOne (2 ms)
+[ RUN      ] R19Regression.F4_WrapSeam_PostSeamRecordsSurviveRecovery
+[       OK ] R19Regression.F4_WrapSeam_PostSeamRecordsSurviveRecovery (1 ms)
+[ RUN      ] R19Regression.ReadSideAcceptanceDomain_RawLenBounds
+[       OK ] R19Regression.ReadSideAcceptanceDomain_RawLenBounds (0 ms)
+[ RUN      ] R19Regression.ReadSideAcceptanceDomain_SeqnoFlagAndCapacityGuards
+[       OK ] R19Regression.ReadSideAcceptanceDomain_SeqnoFlagAndCapacityGuards (0 ms)
+[ RUN      ] R19Regression.F7_MicroBlockNotSeamPadding_DropsAndEmitsRecoveryEvent
+[       OK ] R19Regression.F7_MicroBlockNotSeamPadding_DropsAndEmitsRecoveryEvent (38 ms)
+[ RUN      ] R19Regression.B7_SameDaySplit_StaleAtcHintRecoversToLatestSplit
+[       OK ] R19Regression.B7_SameDaySplit_StaleAtcHintRecoversToLatestSplit (3 ms)
+[ RUN      ] R19Regression.B8_SameDaySplit_StaleAtcWithCommittedSeqno_NoTruncatedOvercount
+[       OK ] R19Regression.B8_SameDaySplit_StaleAtcWithCommittedSeqno_NoTruncatedOvercount (2 ms)
+[ RUN      ] R19Regression.B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned
+[       OK ] R19Regression.B10_ResidualHigherSplitSeqnoRegression_ClampedAndWarned (2 ms)
+[ RUN      ] R19Regression.B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax
+[       OK ] R19Regression.B10_EmptyResidualSplitWithTornHeader_ClampedToHistoryMax (2 ms)
+[ RUN      ] R19Regression.B10_RebuiltStaging_ResidualHigherSplit_ClampedAndWarned
+[       OK ] R19Regression.B10_RebuiltStaging_ResidualHigherSplit_ClampedAndWarned (2 ms)
+[ RUN      ] R19Regression.B1_NoSpace_DefaultZeroWait_DropsImmediately
+[       OK ] R19Regression.B1_NoSpace_DefaultZeroWait_DropsImmediately (17 ms)
+[ RUN      ] R19Regression.B1_NoSpace_BoundedRetry_SucceedsWithoutDrop
+[       OK ] R19Regression.B1_NoSpace_BoundedRetry_SucceedsWithoutDrop (16 ms)
+[ RUN      ] R19Regression.B1_NoSpace_BoundedRetry_FailFastWhenFlusherDead
+[       OK ] R19Regression.B1_NoSpace_BoundedRetry_FailFastWhenFlusherDead (8 ms)
+[ RUN      ] R19Regression.B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk
+[       OK ] R19Regression.B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk (1057 ms)
+[ RUN      ] R19Regression.B1_EventDrivenBackoff_FastWakeupOnSpaceFreed
+[       OK ] R19Regression.B1_EventDrivenBackoff_FastWakeupOnSpaceFreed (70 ms)
+[ RUN      ] R19Regression.B1_EventDrivenBackoff_CascadingWakeupMultiThread
+[       OK ] R19Regression.B1_EventDrivenBackoff_CascadingWakeupMultiThread (98 ms)
+[----------] 28 tests from R19Regression (1529 ms total)
+
+[----------] 2 tests from Observability
+[ RUN      ] Observability.MemoryRssPss_BoundedGrowthAcrossWriteCycles
+[obs] 内存: RSS 7733248 -> 7733248 B (Δ=0)   PSS 0 -> 0 B (Δ=0)  [负载 40000 条]
+[obs] 本平台不支持 PSS 采集,该项仅报告不判定
+[       OK ] Observability.MemoryRssPss_BoundedGrowthAcrossWriteCycles (2885 ms)
+[ RUN      ] Observability.LatencyJitter_StddevCvWithinSanityBound
+tddevCvWithinSanityBound
+[obs] logx_write 延迟分布 (n=20000)
+      mean   =     398.1 ns   stddev =    1087.9 ns   CV = 2.733
+      median =     200.0 ns   MAD    =     100.0 ns   robustCV = 0.500
+      P50=200 P90=500 P99=3200 P99.9=11000 max=69500 (ns)
+      长尾比: P99/P50 = 16.00x   max/P50 = 347.50x
+[       OK ] Observability.LatencyJitter_StddevCvWithinSanityBound (1542 ms)
+[----------] 2 tests from Observability (4414 ms total)
+
+[----------] 1 test from LeakRegression
+[ RUN      ] LeakRegression.CountingPal_NoResourceLeakAcrossOpenCloseCycles
+[leak] 本平台不支持 OS 级 fd 计数,该项仅报告不判定
+[leak] 6 轮 open/写/flush/close: fd 12/12  mmap 6/6  mutex 6/6  ev 12/12  thread 6/6  (create/destroy)
+[       OK ] LeakRegression.CountingPal_NoResourceLeakAcrossOpenCloseCycles (89 ms)
+[----------] 1 test from LeakRegression (89 ms total)
+
+[----------] Global test environment tear-down
+[==========] 179 tests from 17 test suites ran. (15138 ms total)
+[  PASSED  ] 179 tests.

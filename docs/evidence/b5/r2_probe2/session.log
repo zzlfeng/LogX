@@ -1,0 +1,13 @@
+=== probe2 load experiment begin 2026-10-10_21:44:07
+--- Defender 基线 ---
+
+RealTimeProtectionEnabled AntivirusSignatureLastUpdated
+------------------------- -----------------------------
+                     True 2026/10/10 7:05:09           
+
+
+probe2_rc=0 full_suite_FAILED=1 full_suite_seg=0
+A ancient (expired) [B12] raw_lasterror=2
+[  FAILED  ] Robustness.RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtectsTodayAndFuture (1 ms)
+rounds_requested=60000 rounds_done=60000 warns=0 rc=0
+=== end 2026-10-10_21:45:19

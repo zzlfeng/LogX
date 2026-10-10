@@ -1,0 +1,164 @@
+Running main() from C:\b\abs_14_rhzemyc\croot\yaml-cpp-split_1714514162675\work\test\gtest-1.11.0\googletest\src\gtest_main.cc
+[==========] Running 179 tests from 17 test suites.
+[----------] Global test environment set-up.
+[----------] 12 tests from Format
+[ RUN      ] Format.ShortRecord_OnePiece
+[       OK ] Format.ShortRecord_OnePiece (0 ms)
+[ RUN      ] Format.LongRecord_Slices
+[       OK ] Format.LongRecord_Slices (0 ms)
+[ RUN      ] Format.RejectOverMax
+[       OK ] Format.RejectOverMax (0 ms)
+[ RUN      ] Format.RejectLongTag
+[       OK ] Format.RejectLongTag (0 ms)
+[ RUN      ] Format.PadRecord
+[       OK ] Format.PadRecord (0 ms)
+[ RUN      ] Format.ParseSkipsPadAndReassembles
+[       OK ] Format.ParseSkipsPadAndReassembles (0 ms)
+[ RUN      ] Format.TornRecordCksumFails
+[       OK ] Format.TornRecordCksumFails (0 ms)
+[ RUN      ] Format.EdgeDefenses_RejectsInvalidInputs
+[       OK ] Format.EdgeDefenses_RejectsInvalidInputs (0 ms)
+[ RUN      ] Format.MultipleWholeRecordsInOneBlock_StreamParsed
+[       OK ] Format.MultipleWholeRecordsInOneBlock_StreamParsed (0 ms)
+[ RUN      ] Format.PeekAndParseStagingRecordHeader_EquivalenceAndBounds
+[       OK ] Format.PeekAndParseStagingRecordHeader_EquivalenceAndBounds (0 ms)
+[ RUN      ] Format.StagingRecordHeader_WireFormatMakeParseRoundtrip
+[       OK ] Format.StagingRecordHeader_WireFormatMakeParseRoundtrip (0 ms)
+[ RUN      ] Format.MaxLogLength_BoundsFailFastAndBudgetMatrix
+[       OK ] Format.MaxLogLength_BoundsFailFastAndBudgetMatrix (0 ms)
+[----------] 12 tests from Format (0 ms total)
+
+[----------] 8 tests from FormatBounded
+[ RUN      ] FormatBounded.UnderLimit_NoTruncation
+[       OK ] FormatBounded.UnderLimit_NoTruncation (0 ms)
+[ RUN      ] FormatBounded.TruncateSingleSlice_PrefixPreservedWithMarker
+[       OK ] FormatBounded.TruncateSingleSlice_PrefixPreservedWithMarker (0 ms)
+[ RUN      ] FormatBounded.TruncateOversixtyKB_MultiSliceRoundTrip
+[       OK ] FormatBounded.TruncateOversixtyKB_MultiSliceRoundTrip (0 ms)
+[ RUN      ] FormatBounded.NoRoomForMarker_PurePrefix
+[       OK ] FormatBounded.NoRoomForMarker_PurePrefix (0 ms)
+[ RUN      ] FormatBounded.CannotFit_PathologicalTinyLimit
+[       OK ] FormatBounded.CannotFit_PathologicalTinyLimit (0 ms)
+[ RUN      ] FormatBounded.InvalidInputStaysInvalid
+[       OK ] FormatBounded.InvalidInputStaysInvalid (0 ms)
+[ RUN      ] FormatBounded.BudgetSweep_TotalAlwaysFitsLimit
+[       OK ] FormatBounded.BudgetSweep_TotalAlwaysFitsLimit (0 ms)
+[ RUN      ] FormatBounded.NullOutParamsTolerated
+[       OK ] FormatBounded.NullOutParamsTolerated (0 ms)
+[----------] 8 tests from FormatBounded (0 ms total)
+
+[----------] 8 tests from StagingTest
+[ RUN      ] StagingTest.EmptyRingFreeIsSizeMinusOne
+[       OK ] StagingTest.EmptyRingFreeIsSizeMinusOne (1 ms)
+[ RUN      ] StagingTest.FullRingDrops
+[       OK ] StagingTest.FullRingDrops (1 ms)
+[ RUN      ] StagingTest.WrapAroundPadsAndKeepsInvariant
+[       OK ] StagingTest.WrapAroundPadsAndKeepsInvariant (1 ms)
+[ RUN      ] StagingTest.DualHeaderCorruptionBHandWins
+[       OK ] StagingTest.DualHeaderCorruptionBHandWins (2 ms)
+[ RUN      ] StagingTest.FlushAndZeroMaintainsInvariant
+[       OK ] StagingTest.FlushAndZeroMaintainsInvariant (1 ms)
+[ RUN      ] StagingTest.SmallRecordPreservesAllInvariantsAcrossWrap
+[       OK ] StagingTest.SmallRecordPreservesAllInvariantsAcrossWrap (1 ms)
+[ RUN      ] StagingTest.MmapFailure_DegradesToHeapMemory
+[       OK ] StagingTest.MmapFailure_DegradesToHeapMemory (0 ms)
+[ RUN      ] StagingTest.Crc32_StandardTestVectors
+[       OK ] StagingTest.Crc32_StandardTestVectors (0 ms)
+[----------] 8 tests from StagingTest (9 ms total)
+
+[----------] 21 tests from RecoveryTest
+[ RUN      ] RecoveryTest.FreshStart_NoFile
+[       OK ] RecoveryTest.FreshStart_NoFile (1 ms)
+[ RUN      ] RecoveryTest.FileTruncationOnRecovery
+[       OK ] RecoveryTest.FileTruncationOnRecovery (2 ms)
+[ RUN      ] RecoveryTest.RingScanStopsOnTear
+[       OK ] RecoveryTest.RingScanStopsOnTear (1 ms)
+[ RUN      ] RecoveryTest.BlocksWrittenHeaderNotCommitted_BackfillExact
+[       OK ] RecoveryTest.BlocksWrittenHeaderNotCommitted_BackfillExact (6 ms)
+[ RUN      ] RecoveryTest.BlocksWrittenHeaderNotCommitted_RemainderRescanned
+[       OK ] RecoveryTest.BlocksWrittenHeaderNotCommitted_RemainderRescanned (7 ms)
+[ RUN      ] RecoveryTest.TruncatedFile_LostCountNoUnderflow
+[       OK ] RecoveryTest.TruncatedFile_LostCountNoUnderflow (2 ms)
+[ RUN      ] RecoveryTest.CorruptWritePos_ClampedToZero
+[       OK ] RecoveryTest.CorruptWritePos_ClampedToZero (1 ms)
+[ RUN      ] RecoveryTest.CorruptBlockCrc32_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlockCrc32_TruncatedOnRecovery (8 ms)
+[ RUN      ] RecoveryTest.AppendTargetCache_HitFastPath
+[       OK ] RecoveryTest.AppendTargetCache_HitFastPath (6 ms)
+[ RUN      ] RecoveryTest.BothHeadersCorrupt_RebuiltAndTakesOverFileSeqno
+[       OK ] RecoveryTest.BothHeadersCorrupt_RebuiltAndTakesOverFileSeqno (8 ms)
+[ RUN      ] RecoveryTest.RecoveryResume_PreservesSplitNoInAppendTargetCache
+[       OK ] RecoveryTest.RecoveryResume_PreservesSplitNoInAppendTargetCache (1 ms)
+[ RUN      ] RecoveryTest.RecoveryRebuilt_PreservesSplitNoInAppendTargetCache
+[       OK ] RecoveryTest.RecoveryRebuilt_PreservesSplitNoInAppendTargetCache (3 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_BadVersion_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlock_BadVersion_TruncatedOnRecovery (1 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_BadFlag_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlock_BadFlag_TruncatedOnRecovery (1 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_MismatchedRawLenAndPayloadLen_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlock_MismatchedRawLenAndPayloadLen_TruncatedOnRecovery (0 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_OutOfRangeRawLen_TruncatedOnRecovery
+[       OK ] RecoveryTest.CorruptBlock_OutOfRangeRawLen_TruncatedOnRecovery (1 ms)
+[ RUN      ] RecoveryTest.CorruptBlock_SeqnoRollbackStopsBackfill_NormalGapAllowed
+[       OK ] RecoveryTest.CorruptBlock_SeqnoRollbackStopsBackfill_NormalGapAllowed (1 ms)
+[ RUN      ] RecoveryTest.Recovery_SumRawLenExceedsCapacity_DoesNotCorruptStaging
+[       OK ] RecoveryTest.Recovery_SumRawLenExceedsCapacity_DoesNotCorruptStaging (2 ms)
+[ RUN      ] RecoveryTest.AppendTargetCache_ContractAndSafeOffsetAssignment
+[       OK ] RecoveryTest.AppendTargetCache_ContractAndSafeOffsetAssignment (0 ms)
+[ RUN      ] RecoveryTest.HintUnreadable_FallsBackToBest_TruncatedNotPropagated
+[       OK ] RecoveryTest.HintUnreadable_FallsBackToBest_TruncatedNotPropagated (2 ms)
+[ RUN      ] RecoveryTest.TornTailWithHeaderAhead_LostCountEqualsSeqnoDiffExactly
+[       OK ] RecoveryTest.TornTailWithHeaderAhead_LostCountEqualsSeqnoDiffExactly (2 ms)
+[----------] 21 tests from RecoveryTest (68 ms total)
+
+[----------] 4 tests from Split
+[ RUN      ] Split.MultipleBlocksAccumulateTo16KBThreshold
+[       OK ] Split.MultipleBlocksAccumulateTo16KBThreshold (0 ms)
+[ RUN      ] Split.SingleRecordLargerThan16KBOwnsBlock
+[       OK ] Split.SingleRecordLargerThan16KBOwnsBlock (0 ms)
+[ RUN      ] Split.WrappingTailTrailingZeroesCloseBlock
+[       OK ] Split.WrappingTailTrailingZeroesCloseBlock (0 ms)
+[ RUN      ] Split.TornTailNotClosedAsValidBlock
+[       OK ] Split.TornTailNotClosedAsValidBlock (0 ms)
+[----------] 4 tests from Split (0 ms total)
+
+[----------] 25 tests from Flush
+[ RUN      ] Flush.BlocksEncodeAndFileWrite_Roundtrip
+[       OK ] Flush.BlocksEncodeAndFileWrite_Roundtrip (0 ms)
+[ RUN      ] Flush.EncryptedBlockFileWriteAndDecode_Roundtrip
+[       OK ] Flush.EncryptedBlockFileWriteAndDecode_Roundtrip (0 ms)
+[ RUN      ] Flush.EndToEndFormattedLog_WriteAndExport
+[       OK ] Flush.EndToEndFormattedLog_WriteAndExport (16 ms)
+[ RUN      ] Flush.ExportHistoricalEncryptedFileWithUnsetFileHeaderFlag_RecoversSuccessfully
+[       OK ] Flush.ExportHistoricalEncryptedFileWithUnsetFileHeaderFlag_RecoversSuccessfully (5 ms)
+[ RUN      ] Flush.RetentionCleanup_DeletesExpiredLogsKeepsStaging
+[       OK ] Flush.RetentionCleanup_DeletesExpiredLogsKeepsStaging (1 ms)
+[ RUN      ] Flush.RetentionCleanup_TriggeredOnFlushBlocking
+[       OK ] Flush.RetentionCleanup_TriggeredOnFlushBlocking (3 ms)
+[ RUN      ] Flush.RetentionCleanup_TriggeredOnDayRollover
+[       OK ] Flush.RetentionCleanup_TriggeredOnDayRollover (0 ms)
+[ RUN      ] Flush.RetentionCleanup_LeapYearAndMonthBoundary
+[       OK ] Flush.RetentionCleanup_LeapYearAndMonthBoundary (0 ms)
+[ RUN      ] Flush.FileSizeThreshold_RotatesToSplitFile
+[       OK ] Flush.FileSizeThreshold_RotatesToSplitFile (93 ms)
+[ RUN      ] Flush.ParseLogFilename_Comprehensive
+[       OK ] Flush.ParseLogFilename_Comprehensive (0 ms)
+[ RUN      ] Flush.FileSizeThreshold_ResumeRotatesToNextSplitWithoutOverwrite
+[       OK ] Flush.FileSizeThreshold_ResumeRotatesToNextSplitWithoutOverwrite (294 ms)
+[ RUN      ] Flush.FileSizeThreshold_DefensiveProbeSkipsExistingSplit
+[       OK ] Flush.FileSizeThreshold_DefensiveProbeSkipsExistingSplit (12 ms)
+[ RUN      ] Flush.ExportWithMultipleRecords_PlaintextMode_ExportsAllLines
+[       OK ] Flush.ExportWithMultipleRecords_PlaintextMode_ExportsAllLines (21 ms)
+[ RUN      ] Flush.ExportEncryptedFile_MissingKey_SkipsGracefully
+[       OK ] Flush.ExportEncryptedFile_MissingKey_SkipsGracefully (28 ms)
+[ RUN      ] Flush.HeapDegraded_WritesAndFlushesCorrectly
+[       OK ] Flush.HeapDegraded_WritesAndFlushesCorrectly (9 ms)
+[ RUN      ] Flush.FileSizeThreshold_RotatesBeyond255_Succeeds
+[       OK ] Flush.FileSizeThreshold_RotatesBeyond255_Succeeds (18 ms)
+[ RUN      ] Flush.FileSizeThreshold_SplitLimit65535_EmitsEventAndSuspends
+[       OK ] Flush.FileSizeThreshold_SplitLimit65535_EmitsEventAndSuspends (12 ms)
+[ RUN      ] Flush.AppendTargetCache_HistoricalStagingLayoutCompatibility
+[       OK ] Flush.AppendTargetCache_HistoricalStagingLayoutCompatibility (19 ms)
+[ RUN      ] Flush.WatermarkReturnsUnderSustainedWrites
+[       OK ] Flush.WatermarkReturnsUnderSustainedWrites (352 ms)
+[ RUN      ] Flush.TimeoutWhenFlusherStalled_EmitsEventAndReturns

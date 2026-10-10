@@ -1,0 +1,40 @@
+=== round 0 begin t=1791635786.934295
+  [01_mkdirs_dir] t=1791635786.934520 qpc=3654457549244 ret=0 errno=0(No error) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  [02_rmdir_dir_empty] t=1791635786.934595 qpc=3654457549986 ret=0 errno=0(No error) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  [03_rmdir_dir_missing] t=1791635786.934614 qpc=3654457550171 ret=-1 errno=2(No such file or directory) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  [04_mkdirs_dir2] t=1791635786.934689 qpc=3654457550922 ret=0 errno=0(No error) dir2=present file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,]
+  [05_open_occupied] t=1791635786.935096 qpc=3654457555009 ret=4 errno=0(No error) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [06_write_1b] t=1791635786.935204 qpc=3654457556071 ret=1 errno=0(No error) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [07_close] t=1791635786.935285 qpc=3654457556882 ret=0 errno=0(No error) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [08_rmdir_dir2_nonempty] t=1791635786.935333 qpc=3654457557366 ret=-1 errno=41(Directory not empty) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [09_unlink_occupied] t=1791635786.935428 qpc=3654457558318 ret=0 errno=0(No error) dir2=present file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,]
+  [10_unlink_occupied_again] t=1791635786.935468 qpc=3654457558716 ret=-1 errno=2(No such file or directory) dir2=present file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,]
+  [11_rmdir_dir2_final] t=1791635786.935532 qpc=3654457559350 ret=0 errno=0(No error) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  round 0 PASS
+=== round 1 begin t=1791635786.935990
+  [01_mkdirs_dir] t=1791635786.936109 qpc=3654457565126 ret=0 errno=0(No error) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  [02_rmdir_dir_empty] t=1791635786.936169 qpc=3654457565726 ret=0 errno=0(No error) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  [03_rmdir_dir_missing] t=1791635786.936187 qpc=3654457565899 ret=-1 errno=2(No such file or directory) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  [04_mkdirs_dir2] t=1791635786.936243 qpc=3654457566467 ret=0 errno=0(No error) dir2=present file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,]
+  [05_open_occupied] t=1791635786.936337 qpc=3654457567406 ret=4 errno=0(No error) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [06_write_1b] t=1791635786.936407 qpc=3654457568101 ret=1 errno=0(No error) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [07_close] t=1791635786.936464 qpc=3654457568672 ret=0 errno=0(No error) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [08_rmdir_dir2_nonempty] t=1791635786.936547 qpc=3654457569510 ret=-1 errno=41(Directory not empty) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [09_unlink_occupied] t=1791635786.936671 qpc=3654457570757 ret=0 errno=0(No error) dir2=present file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,]
+  [10_unlink_occupied_again] t=1791635786.936833 qpc=3654457572372 ret=-1 errno=2(No such file or directory) dir2=present file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,]
+  [11_rmdir_dir2_final] t=1791635786.936961 qpc=3654457573645 ret=0 errno=0(No error) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  round 1 PASS
+=== round 2 begin t=1791635786.936994
+  [01_mkdirs_dir] t=1791635786.937108 qpc=3654457575114 ret=0 errno=0(No error) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  [02_rmdir_dir_empty] t=1791635786.937276 qpc=3654457576801 ret=0 errno=0(No error) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  [03_rmdir_dir_missing] t=1791635786.937305 qpc=3654457577081 ret=-1 errno=2(No such file or directory) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  [04_mkdirs_dir2] t=1791635786.937413 qpc=3654457578161 ret=0 errno=0(No error) dir2=present file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,]
+  [05_open_occupied] t=1791635786.937553 qpc=3654457579566 ret=4 errno=0(No error) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [06_write_1b] t=1791635786.937628 qpc=3654457580319 ret=1 errno=0(No error) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [07_close] t=1791635786.937689 qpc=3654457580927 ret=0 errno=0(No error) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [08_rmdir_dir2_nonempty] t=1791635786.937751 qpc=3654457581548 ret=-1 errno=41(Directory not empty) dir2=present file=present cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,occupied.bin,]
+  [09_unlink_occupied] t=1791635786.937832 qpc=3654457582353 ret=0 errno=0(No error) dir2=present file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,]
+  [10_unlink_occupied_again] t=1791635786.937872 qpc=3654457582758 ret=-1 errno=2(No such file or directory) dir2=present file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5 dir2_list=[.,..,]
+  [11_rmdir_dir2_final] t=1791635786.937936 qpc=3654457583394 ret=0 errno=0(No error) dir2=GONE file=GONE cwd=D:\Project\Android_Project\LogX\test_review_tmp_b5
+  round 2 PASS
+=== summary iters_requested=3 rounds_done=3 hits=0

@@ -1,0 +1,1 @@
+/d/Project/Android_Project/LogX/test_review_tmp_b5/r2_loop.sh: line 23:   812 Segmentation fault      "$UNIT" > "$OUT/full_suite_$k.log" 2>&1
