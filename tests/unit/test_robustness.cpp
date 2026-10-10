@@ -2007,11 +2007,24 @@ TEST(Robustness, RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtects
     cfg.log_dir = dir.c_str();
     cfg.staging_path = st_path.c_str();
     cfg.max_log_length = 4096;
-    cfg.retention_days = 7;  // 保留期短于推后跨度, 确保 A 落入超期区
+    // B-12 (方案一): open 时 retention_days = 36500 (100 年, R18-1 判据),
+    // 确保创建循环与时钟推后 20 年期间, 后台 Flusher 跨天 drain 绝不提前回收远古文件 A
+    cfg.retention_days = 36500;
 
     logx_instance_t* inst = nullptr;
     cfg.pal_override = &mock_pal;  // 必须在 logx_open 前定型(消除注入竞态)
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // B-12 (方案三): RAII 自动关闭守卫, 杜绝用例任何断言失败跳出导致活跃实例与 Flusher 线程泄漏
+    struct InstGuard {
+        logx_instance_t*& target;
+        ~InstGuard() {
+            if (target) {
+                logx_close(target);
+                target = nullptr;
+            }
+        }
+    } inst_guard{inst};
 
     // 推后时钟到 2046-09-03, 再按"相对新 now"构造四类文件
     mock_pal.set_clock(kFuture, 120000);
@@ -2041,6 +2054,10 @@ TEST(Robustness, RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtects
 #endif
     }
 
+    // B-12 (方案一): 四类文件建档与断言完毕后, 将保留期恢复为 7 天 (与 flusher.cpp:635
+    // retention_cleanup_impl 调用点现读一致), 再显式触发 retention 清理, 测试意图完整保留且全流程零竞态
+    static_cast<Instance*>(inst)->retention_days = 7;
+
     // 触发 retention 清理(与 Flusher 启动/跨天同一条路径)
     retention_cleanup(static_cast<Instance*>(inst));
 
@@ -2060,6 +2077,7 @@ TEST(Robustness, RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtects
     }
 
     logx_close(inst);
+    inst = nullptr;
 
     for (const auto& f : mock_pal.file_list(dir.c_str())) {
         mock_pal.file_unlink(f.c_str());
