@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.59 (2026-10-11 B-13 闭环——retention_days atomic 化 (方案 1) + Instance 字段并发写者穷尽审计, 零新缺陷)
+> **文档版本**: v1.60 (2026-10-11 B-11 闭环——纪律 B-11-1「NDK 冒烟门禁」入 §4 纪律表, 纯 docs)
+>
+> **v1.60 修订说明**: 2026-10-11 **B-11 方案 A 落地（用户拍板）**: 纪律 **B-11-1（NDK 冒烟门禁）** 入 §4 纪律表（R21-2 的 NDK 侧对偶）——凡批次涉 `core/include`/`core/src`/`tests/**`/`android/**` 任一，收口验证必须含 NDK 冒烟（增量 ninja 即可捕获可编译性断裂；clean-first 仅在声称「0 警告」时强制，衔接四象限口径）；收口提交信息验证段标注「NDK 冒烟 N/N（clean/增量）」；纯 docs 豁免。决策点两子问题落定：执行环境 = 本机 NDK 命令行；触发时机 = 分层触发如上。**Backlog 待拍板自此清零**（B-11/B-13 均闭环）。纯 docs 改动，零代码。
 >
 > **v1.59 修订说明**: 2026-10-11 **B-13 方案 1 落地（用户拍板）**: ① `Instance::retention_days` 升级 `std::atomic<uint32_t>`（`logx_internal.h` 声明一行；读写点 `logx_c.cpp:385` 初始化与 `flusher.cpp:635` 读取走隐式 atomic 语义**零 diff**）+ `is_always_lock_free` `static_assert` 守卫（Instance 经不透明指针跨 C ABI，lock-free 退化即布局破坏——编译期钉住）；`test_robustness.cpp:2059` 注释尾同步（Backlog → 已收口）。② **附带审计（B-13 决策点，穷尽扫描）**: retention_days 为全仓**唯一**跨线程裸写/读 Instance 字段——`max_log_length` 两处测试运行期直写（`test_flusher.cpp:1279`/`test_j04_regression.cpp:184`）的唯读点 `build_records`（`flusher.cpp:1056`）仅由 `logx_write` 在调用方线程同步执行，与写同线程无并发，**非同类**；r19 回归 8 处 `static_cast<Instance*>` 站点全为读或 mock 指针交接；产品侧 config 字段仅 open 期初始化（先于 Flusher 线程启动）。**无 B-14 需要**。③ **验证（R21-2 门禁）**: MSVC clean 58/58 精确 0 警告 + 四套件 179/179+4/4+2/2+3/3 全绿；NDK clean 62/62 精确 0 警告；atomic<uint32_t> lock-free 与原语义等宽对齐，行为零变化，真机复跑待下次批次顺带核对 180 基线。
 >
@@ -266,6 +268,7 @@ gantt
 | **反空洞绿**<br>(R18-2) | 凡针对**未初始化内存**或**取值巧合正确**的回归测试, 写完**必须撤销被测修复跑一遍, 见红方算建立屏障**; 默认状态极易是"绿得毫无意义"。<br>**两个已踩实例**: R16 F-1(`make_slice` 校验和误用加法而非 XOR, 被测路径从未真正执行)、R18 首版 `append_block` 回归(上次调用恰把 `seed_salt` 留在同一栈槽, 未初始化读"碰巧"取到正确值)。<br>**手法**: 破除栈巧合须用 `noinline` 助手以大数组(`volatile uint8_t junk[4096]`)覆写目标栈区为毒值, 参见 `poison_r18_stack`。 | `tests/unit/test_flusher.cpp`(`poison_r18_stack`),<br>`tests/unit/test_review_p1_p4.cpp:191-205`(R16 F-1 现场) |
 | **撤销对照须配正向对照**<br>(R21-1) | R18-2 的撤销实验必须**同批配一组正向对照**：撤销一处已知有效的修复并确认它**变红**，否则无法区分"用例真的不承载修复"与"撤销没生效/二进制陈旧/过滤器写错"。<br>**推论**：判定"用例是否真走到目标分支"**不得凭注释声称**——`F14` 旧版注释写"双 Header 破坏 → rebuilt 路径接管"，实际全新 staging 使 `Staging::open` 判 `fresh=true ⇒ rebuilt=false`（`staging.cpp:220-231`），目标分支从未执行；须以**判别性断言**（如两条路径给出不同 `flushed_len`）或撤销实验证实。<br>**同类恒真断言形状**（见即改）：`EXPECT_TRUE(A \|\| B)` 其中 B 恒成立；把待测形态过滤掉后再断言其区间；断言只比事件 `kind` 而不比文案（同类事件互相顶包）。 | `tests/unit/test_r19_regression.cpp`(`F1c` 计数判别 / `F14`+`F14b` 的 `flushed_len` 路径判别 / `F3` 的 `saw_msg_substring`),<br>`core/src/staging.cpp:220-231`(`rebuilt = !fresh`) |
 | **头文件改动必须全量重建**<br>(R21-2) | 凡改动头文件——尤其 `Instance` / `FileScanResult` / `AppendTargetCache` 等**结构体布局**——必须 `ninja -t clean` 后全量重建，不得依赖增量。<br>**根因**：R20 复核以手工 `cl.exe` 绕过 ninja 编译，`build-full` 的 `.ninja_deps`/`.ninja_log` 与磁盘 `.obj` 失配；R21 实测改 `logx_internal.h`（增删结构体字段）后 ninja 只重编了 `.cpp` 改动方，`logx_c.cpp.obj` 停留在旧布局 ⇒ 混 ABI 二进制（UB，且表现为难以归因的偶发崩溃）。<br>**附带更正（R22 勘误，2026-10-05，原归因证伪）**：R21 曾记「挂死疑为 Git Bash 把 `/c` 转换成 `C:\`、cmd rc=0 空转所致，R21 未复现」——该归因被 R22 反例证伪：纯 PowerShell 会话（无 Git Bash）下全形态挂死（最小单规则工程真实执行挂死、`-j 2` 挂、`pool = console` 挂、零工作量空跑仍挂、VS 官方版 ninja 1.12.1 同挂；`ninja -n` 空跑 0.0s 正常 ⇒ 挂点在执行前的启动机制，jobserver-pipe 变体启动即建命名管道，疑与本会话进程/管道类限制冲突）。R19/R20 的原始挂死记录**恢复采信**，R21 的「未复现」亦真实——挂死是**会话/环境级**的，两类记录分歧在环境而非操作方式。`MSYS_NO_PATHCONV=1` 仍是 Git Bash 下 adb push/cmd 的必要项（既有记录见归档 `docs/changelog/archive-2026-09.md`「一、恢复精确回推 + zstd 真接入」与「M5 验证闭环」两节;2026-10-06 CHANGELOG 拆分前为 :411/:779 行坐标），但它防的是路径转换问题，**不是**挂死的根因。受限会话的构建方案见纪律 **R22-1**。 | `build-full/build_tmp.bat`(增量),<br>`build-full/clean_build.bat`(clean 全量，本地辅助不入库),<br>`core/include/logx_internal.h`(结构体定义) |
+| **NDK 冒烟门禁**<br>(B-11-1) | 凡批次涉及 `core/include`、`core/src`、`tests/**`、`android/**`（JNI/CMakeLists/Kotlin）任一，收口验证必须含 NDK 构建冒烟（`build-android-tests` ninja）；**可编译性冒烟用增量即可**（R35 类跨工具链断裂必在受影响 TU 编译期暴露），**clean-first 仅在声称「0 警告」时强制**（与 MSVC/Clang × 增量/clean 四象限口径纪律衔接）；收口提交信息验证段标注「NDK 冒烟 N/N（clean/增量）」；纯 docs 提交豁免。<br>**根因**：R35 实证 `b3a758d` 起测试缺 `#include <thread>`，MSVC 透传包含掩盖跨工具链断裂、Android/Clang 构建中断 1.5 天且真机链路失联——「MSVC 全绿」不构成 NDK 可编译证据；R37 NDK clean 揪出 3 条存量警告（增量构建曾掩盖）、R38 批次未声称 NDK 靠审查补证，方案 B 式隐性覆盖经实证失效。执行环境为本机 NDK 命令行（CI 缺位为另一长期事项，不在本条展开）。 | `build-android-tests/`(ninja 冒烟),<br>`core/include/`(R21-2 对偶面),<br>收口提交信息(验证段标注) |
 | **ninja 挂死时的等价构建 fallback**<br>(R22-1) | 受限会话中 ninja 全形态挂死时（实证形态见 R21-2「附带更正」勘误段：最小工程真实执行挂死 / 零工作量空跑仍挂 / `ninja -n` 空跑正常 ⇒ 挂点在执行前），**不得**退回手工拼接 cl/lib/link 参数（R20 教训：命令失真 + 混 ABI）。等价方案：`ninja -t commands <target>` 抽取**与 ninja 完全一致**的命令行（含全部编译开关/包含路径，`-t commands` 不执行不建管道故可用）落成 .bat 顺序执行，前置 `vcvars64.bat`。命令数按目标闭包最小化（R22 实测：改 2 个 .cpp ⇒ 2 编译 + lib + 4 链接 = 7 条命令，exit 0 / MSVC 诊断 0）。**边界**：该方案绕过 ninja 依赖图，多文件改动后 `.ninja_deps`/`.obj` 时间戳会失配——用后必须把改动的全部 `.cpp` 及受影响链接目标走一遍 `-t commands` 重建，且**头文件改动禁用本方案**（增量依赖判断不可信，必须回到正常 ninja 或 clean 全量重建，见 R21-2）；恢复可用环境后补跑全量重建核对。 | `build-full/build_tmp.bat`,<br>`ninja -t commands`(只读图查询),<br>`code_review_R22_2026-10-05.md` §四 |
 
 ---
@@ -447,12 +450,13 @@ gantt
 ### B-11 「Android 侧定期构建冒烟」是否固化为流程纪律 (R35 报告 §七·建议②，v1.51 批次留置)
 
 - **记录日期**: 2026-10-09 (R35 报告 §七·建议② 提出"记入流程纪律"，v1.51 收口批次未落地；审查补记为 B-11)
-- **状态**: ⬜ **待拍板**
+- **状态**: ✅ **已闭环 (2026-10-11, 方案 A)**——纪律 **B-11-1（NDK 冒烟门禁）** 已入 §4 纪律表，决策点两子问题（执行环境/触发时机）随纪律行一并落定
 - **背景**: R35 (2026-10-08) 实证 `b3a758d` 起测试缺 `#include <thread>`，MSVC 透传包含掩盖跨工具链断裂、Android/clang 构建中断约 1.5 天且真机链路失联——Windows 主机 MSVC 全绿不能证明 NDK 侧可编译。v1.51 收口批次（`9c7b1b5`）提交信息「建议 1/2/4」按 N-1/N-2/Stage D 编号，R35 报告 §七原始编号 ①(N-1+N-2)/②(Android 冒烟纪律)/③(Stage D bench) 中的建议 ② 未收口且修订说明当时未声明留置。
 - **候选方案**:
   - **方案 A (入纪律表)**: §4 新增纪律行——凡改动测试/核心头文件或跨平台公共代码，收口前必须通过 NDK Clang clean 构建冒烟；「0 警告」声称必须区分工具链口径（R33 N-1 先例：NDK 有 1 条警告时不得笼统声称 0 警告）。
   - **方案 B (维持隐性覆盖)**: 不增设纪律，依赖真机复跑收口时顺带验证 NDK 构建，接受"MSVC 绿 → NDK 断裂"窗口最长一个复跑周期的残余风险。
 - **决策点**: NDK 冒烟的稳定执行环境（本机 NDK 命令行 / CI）；触发时机（每批次收口 vs 仅头文件/跨平台改动触发）。
+- **闭环落地记录 (2026-10-11, 方案 A)**: 纪律 **B-11-1（NDK 冒烟门禁）** 入 §4 纪律表（R21-2 的 NDK 侧对偶）。决策点两子问题落定：①**执行环境** = 本机 NDK 命令行（`build-android-tests` ninja，clean 62 目标 ~1-2 分钟/增量数秒；CI 缺位为 Linux/CI 长期事项不并入）；②**触发时机** = 分层——凡批次涉 `core/include`、`core/src`、`tests/**`、`android/**` 任一即须冒烟（**可编译性用增量 ninja 即可**，R35 类断裂必在受影响 TU 编译期暴露；**clean-first 仅在声称「0 警告」时强制**，与四象限口径纪律衔接），纯 docs 提交豁免。记录口径：收口提交信息验证段标注「NDK 冒烟 N/N（clean/增量）」。
 
 ### B-12 负载下文件可见性异常——close 后紧邻的 file_size_path 返回 -1 并级联实例泄漏与 segfault (B-5 前置协议 R2 实验产出)
 
