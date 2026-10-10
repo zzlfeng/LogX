@@ -28,6 +28,12 @@
 
 using namespace logx;
 
+// 文件作用域常量 (R37 N-2): constexpr 局部量在 MSVC 下无法被显式捕获列表 lambda
+// 引用 (C3493)、Clang 下捕获又触发 -Wunused-lambda-capture——上提至文件作用域后
+// 两侧均无需捕获。
+constexpr int kStressWorkerCount = 50;
+constexpr int kStressLogsPerWorker = 500;  // 50 * 500 = 25,000 条混合变长并发写入
+
 TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
     Pal& pal = default_pal();
     // (T-10) 原子自增替代未播种 rand():消除 CI 重跑/上轮残留目录撞名风险
@@ -38,9 +44,7 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
     pal.file_mkdirs(dir.c_str());
     std::string staging_file = dir + "/staging.mmap";
 
-    constexpr int kWorkerCount = 50;
-    constexpr int kLogsPerWorker = 500;  // 50 * 500 = 25,000 条混合变长并发写入
-    const uint64_t kTotalExpected = static_cast<uint64_t>(kWorkerCount) * kLogsPerWorker;
+    const uint64_t kTotalExpected = static_cast<uint64_t>(kStressWorkerCount) * kStressLogsPerWorker;
 
     logx_config_t cfg{};
     cfg.log_dir = dir.c_str();
@@ -68,13 +72,13 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
     std::atomic<bool> stop_competitor{false};
     std::atomic<uint64_t> total_written{0};
     std::vector<std::thread> workers;
-    workers.reserve(kWorkerCount);
+    workers.reserve(kStressWorkerCount);
 
-    std::vector<std::vector<bool>> written_table(kWorkerCount, std::vector<bool>(kLogsPerWorker, false));
+    std::vector<std::vector<bool>> written_table(kStressWorkerCount, std::vector<bool>(kStressLogsPerWorker, false));
 
     // 1. 启动 50 个 Worker 写线程
-    for (int tid = 0; tid < kWorkerCount; ++tid) {
-        workers.emplace_back([&inst, &pre_gun, &start_gun, &total_written, &written_table, tid, kLogsPerWorker]() {
+    for (int tid = 0; tid < kStressWorkerCount; ++tid) {
+        workers.emplace_back([&inst, &pre_gun, &start_gun, &total_written, &written_table, tid]() {
             char tag_buf[32];
             std::snprintf(tag_buf, sizeof(tag_buf), "Wk_%02d", tid);
 
@@ -122,7 +126,7 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
                 std::this_thread::yield();
             }
 
-            for (int i = kWarmupPerWorker; i < kLogsPerWorker; ++i) {
+            for (int i = kWarmupPerWorker; i < kStressLogsPerWorker; ++i) {
                 write_one(i);
             }
         });
@@ -206,7 +210,7 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
     uint64_t total_blocks_verified = 0;
     uint64_t disk_records_count = 0;
 
-    std::vector<std::vector<bool>> exported_table(kWorkerCount, std::vector<bool>(kLogsPerWorker, false));
+    std::vector<std::vector<bool>> exported_table(kStressWorkerCount, std::vector<bool>(kStressLogsPerWorker, false));
 
     for (const auto& fpath : log_files) {
         int fd = pal.file_open(fpath.c_str(), false, false);
@@ -230,6 +234,10 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
             uint32_t payload_len = get_u32(bhdr + 14);
             uint32_t crc = get_u32(bhdr + 18);
 
+            // 本测试 kAlgoNone + 明文: 存储载荷必等于原始长度, 块头双长度字段交叉互证
+            EXPECT_EQ(raw_len, payload_len)
+                << "raw_len mismatch at file " << fpath << " offset " << off;
+
             // 严格验证 seqno 单调自增, 绝无乱序、跳号或重复!
             EXPECT_EQ(seqno, expected_next_seqno)
                 << "Seqno break at file " << fpath << " offset " << off;
@@ -252,7 +260,7 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
                 if (pos_tid != std::string::npos && pos_seq != std::string::npos) {
                     int tid = std::atoi(s.c_str() + pos_tid + 4);
                     int seq = std::atoi(s.c_str() + pos_seq + 4);
-                    if (tid >= 0 && tid < kWorkerCount && seq >= 0 && seq < kLogsPerWorker) {
+                    if (tid >= 0 && tid < kStressWorkerCount && seq >= 0 && seq < kStressLogsPerWorker) {
                         exported_table[tid][seq] = true;
                     }
                 }
@@ -265,8 +273,8 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
     }
 
     int missing_count = 0;
-    for (int tid = 0; tid < kWorkerCount; ++tid) {
-        for (int i = 0; i < kLogsPerWorker; ++i) {
+    for (int tid = 0; tid < kStressWorkerCount; ++tid) {
+        for (int i = 0; i < kStressLogsPerWorker; ++i) {
             if (written_table[tid][i] && !exported_table[tid][i]) {
                 missing_count++;
             }

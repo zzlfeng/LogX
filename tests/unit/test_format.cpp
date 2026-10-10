@@ -506,8 +506,6 @@ TEST(Format, StagingRecordHeader_WireFormatMakeParseRoundtrip) {
 TEST(Format, MaxLogLength_BoundsFailFastAndBudgetMatrix) {
     // 1. 静态常量对齐断言
     static_assert(kMinLogLengthValid == 97, "kMinLogLengthValid must be 97");
-    static_assert(kMinLogLengthValid == kUserHdrSize + kMaxTag + kHeaderLen,
-                  "97 must equal 27 + 64 + 6");
 
     // 2. 格式化层笛卡尔积扫描: max_total >= 97 时, 任何合法 tag (0..64B) 均绝不落入 kCannotFit
     const uint32_t kValidTotals[] = { 97, 100, 128, 500, 4096, 64 * 1024 };

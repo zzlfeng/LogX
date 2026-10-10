@@ -243,6 +243,9 @@ object LogX {
      * 锁外跑完, 锁内 initCount 检查保证单例语义不变 (spec §7 重复 init 抛异常)。
      */
     fun init(context: Context, config: Config) {
+        // ---- 纯配置校验前置 (R37 N-4): 不消耗 initCount、不加载 native 库即可拒绝病态配置 ----
+        validateInitConfig(config)
+
         // ---- 前奏阶段 (无锁): 等待旧实例静默 + 完成遗留销毁 ----
         val deadline = System.currentTimeMillis() + 1000
         while ((activeQuickOps.get() > 0 || activeExportOps.get() > 0)
@@ -295,12 +298,6 @@ object LogX {
                 require(!stagingDir.absolutePath.contains("/cache/")) {
                     "staging dir must not be in cacheDir"
                 }
-                require(config.maxLogLength < 128 * 1024 - 128 - 1) {
-                    "maxLogLength must be < (dataSize - 1) = 130943"
-                }
-                require(config.maxLogLength >= 97) {
-                    "maxLogLength must be >= 97 (user header 27B + max tag 64B + slice header 6B)"
-                }
 
                 minLevel = config.level
                 val handle = nativeInit(
@@ -332,6 +329,20 @@ object LogX {
                 initCount.set(0)
                 throw t
             }
+        }
+    }
+
+    /**
+     * 纯配置校验 (R37 N-4 可测性抽取): init 前置调用, 亦供 JVM 单测直接钉住边界。
+     * maxLogLength 下界 97 = 用户头 27B + 最大 Tag 64B + 片头 6B (C 侧 kMinLogLengthValid);
+     * 上界 < (dataSize - 1) = 130943, 与 C 侧 logx_open 校验对齐。
+     */
+    internal fun validateInitConfig(config: Config) {
+        require(config.maxLogLength < 128 * 1024 - 128 - 1) {
+            "maxLogLength must be < (dataSize - 1) = 130943"
+        }
+        require(config.maxLogLength >= 97) {
+            "maxLogLength must be >= 97 (user header 27B + max tag 64B + slice header 6B)"
         }
     }
 

@@ -22,6 +22,7 @@ import org.junit.Test
  *   - Level.v 与 C ABI level ∈ {0..5} 契约
  *   - EventKind 映射 (onNativeError 的 kindInt 分支)
  *   - Config 默认值契约 (与 S-04 / E-06 对齐)
+ *   - init 纯配置校验边界 (R37 N-4: maxLogLength 97/130943 双界)
  *   - 重复 init 拦截 / pre-init 状态机 (不触达 nativeInit 失败路径)
  * JNI 全链路正确性由 tests/ C++ gtest 与真机批次覆盖。
  */
@@ -151,5 +152,40 @@ class LogXPureLogicTest {
         assertThrows(UnsatisfiedLinkError::class.java) {
             LogX.loadLibrary("non_existent_lib_for_test")
         }
+    }
+
+    // ---- R37 N-4: init 纯配置校验边界 (与 C 侧 kMinLogLengthValid=97 / dataSize-1 对齐) ----
+    @Test
+    fun validateInitConfig_rejectsMaxLogLengthBelow97() {
+        for (bad in listOf(0, 1, 32, 33, 40, 96)) {
+            val cfg = LogX.Config(
+                logDir = java.io.File("/tmp"), stagingDir = java.io.File("/tmp"),
+                maxLogLength = bad
+            )
+            val e = assertThrows(IllegalArgumentException::class.java) {
+                LogX.validateInitConfig(cfg)
+            }
+            assertTrue("message should mention >= 97, got: ${e.message}", e.message!!.contains(">= 97"))
+        }
+    }
+
+    @Test
+    fun validateInitConfig_rejectsMaxLogLengthAtDataSizeBound() {
+        val cfg = LogX.Config(
+            logDir = java.io.File("/tmp"), stagingDir = java.io.File("/tmp"),
+            maxLogLength = 130943
+        )
+        assertThrows(IllegalArgumentException::class.java) { LogX.validateInitConfig(cfg) }
+    }
+
+    @Test
+    fun validateInitConfig_acceptsBoundaryValues() {
+        // 下界 97 与上界内最大值 130942 必须通过 (96 / 130943 为各自相邻拒绝点)
+        LogX.validateInitConfig(
+            LogX.Config(logDir = java.io.File("/tmp"), stagingDir = java.io.File("/tmp"), maxLogLength = 97)
+        )
+        LogX.validateInitConfig(
+            LogX.Config(logDir = java.io.File("/tmp"), stagingDir = java.io.File("/tmp"), maxLogLength = 130942)
+        )
     }
 }

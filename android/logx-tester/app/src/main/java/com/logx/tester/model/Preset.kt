@@ -96,13 +96,13 @@ object PresetRegistry {
         ),
         Preset(
             id = 7,
-            name = "7. maxLogLength 三档越界",
-            summary = "校验分层：131072(Kotlin require) / 100000(C >64KB) / 0(C ==0)",
-            expectedOutcome = "三种越界分别被 Kotlin require 或 C 侧 INVALID_ARG 拦截，报错各不相同",
+            name = "7. maxLogLength 四档越界",
+            summary = "校验分层：131072(Kotlin require) / 100000(C >64KB) / 96(C <97) / 0(C <97)",
+            expectedOutcome = "四种越界分别被 Kotlin require 或 C 侧 INVALID_ARG 拦截，报错各不相同",
             configModifier = {
                 it.copy(maxLogLength = 131072, useCacheDir = false)
             },
-            suggestedAction = "在参数面板分别尝试调整 maxLogLength 为 131072、100000 和 0 并重启"
+            suggestedAction = "在参数面板分别尝试调整 maxLogLength 为 131072、100000、96 和 0 并重启"
         ),
         Preset(
             id = 8,

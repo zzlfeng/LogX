@@ -596,8 +596,17 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
      - 恢复代码后，确定性复绿，实证屏障刚性；
    - **全量跨平台验证**：
      - MSVC Release：clean 全量重建 58/58 目标 **0 警告 0 错误**；全套件测试通过：单测 179/179、hotpath 2/2、stress 4/4、crash_fork 3/3 全部通过；Stage A~D benchmark 0 丢失；
-     - Android NDK (arm64-v8a / Clang)：`build-android-tests` (27/27) 与 `build-android` (10/10) clean 编译链接 100% 成功；
+     - Android NDK (arm64-v8a / Clang)：`build-android-tests` clean 全量重建 **62/62** 与 `build-android` (10/10) 编译链接 100% 成功（**R37 勘误 2026-10-10**：原声称 27/27 无法对应任何实测切面；R37 独立实测 clean-first 为 62/62，与 R36 时代 `9c7b1b5` 批次「clean 62/62」口径一致）；
      - Kotlin / Gradle：`testDebugUnitTest` 23 任务 BUILD SUCCESSFUL，纯逻辑单测 100% 全绿。
+
+16. **R37 审查收口：N-1~N-5 修复批次 (2026-10-10)**：
+   - **审查对象与裁定**：R37（报告 [`docs/reviews/code_review_R37_2026-10-10.md`](./docs/reviews/code_review_R37_2026-10-10.md)）对 `4f4461c`（B-6 方案 A）裁定产品代码零缺陷，2×P3 + 3×Nit 均在外围层；本批为全部五项的收口；
+   - **N-1 (P3, tester 三层口径收口)**：`android/logx-tester` 的 `ConfigPanel.kt` 预警条件改为 `< 97 || > 65536`（文案对齐「合法区间 (97..65536)」，滑块提示补 <97 档），`Preset.kt` 预设 7 升级为四档越界（131072/100000/96/0），`README.md` 参数表与场景表第 7 行同步 96/97 边界（B-6 下界 97-1）；
+   - **N-2 (P3, NDK 存量警告清零)**：删除 `test_staging.cpp` 未用常量 `kTotal`；`test_concurrent.cpp` 将 `kWorkerCount`/`kLogsPerWorker` 上提为文件作用域 `kStressWorkerCount`/`kStressLogsPerWorker`（消除「Clang 无需捕获警告 vs MSVC C3493 必须捕获」的跨编译器冲突）并删除多余捕获；同文件块头校验将死读取 `raw_len` 转为真实交叉断言（kAlgoNone + 明文下 `raw_len == payload_len` 恒成立）；**NDK clean-first 全量重建 62/62 实测 0 警告**（R33/R36 遗留「NDK 警告清零」声称自此在全量口径下成立）；
+   - **N-3 (Nit, NDK 步数口径勘误)**：条目 15 中 `build-android-tests` 步数由 27/27 勘误为 clean 实测 62/62（见上）；
+   - **N-4 (Nit, Kotlin require 可测化)**：`LogX.kt` 抽取 `internal fun validateInitConfig(config)`（97 下界 + 130943 上界，语义与消息原文不变），`init()` 前置调用（病态配置不再触发 native 库加载、不消耗 initCount）；`LogXPureLogicTest` 新增 3 用例钉住 96/97/130942/130943 双边界（96 与 130943 拒绝、97 与 130942 放行）；
+   - **N-5 (Nit, 自指断言删除)**：删除 `test_format.cpp` 与头文件定义同构的恒真 `static_assert`，保留 `== 97` 字面钉住（R37 变异实验实测两处均 C2338 复红，删除无防护损失）；
+   - **全量验证**：MSVC 增量重建（纯 .cpp 改动）后四套件 **179/179 + 2/2 + 4/4 + 3/3 全绿**（含 stress 新增 raw_len 交叉断言）；NDK clean-first 62/62 **0 警告**；Gradle 8.9 + JDK17 `testDebugUnitTest` 23 任务 BUILD SUCCESSFUL（13 用例 0 失败，含新增 3 例）；`logx-tester :app:compileDebugKotlin` BUILD SUCCESSFUL。
 
 
 ---

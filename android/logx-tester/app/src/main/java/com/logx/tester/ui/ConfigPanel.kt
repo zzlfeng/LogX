@@ -120,8 +120,8 @@ fun ConfigPanel(
             Column {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text("单条上限 maxLogLength: ${config.maxLogLength} 字节", fontWeight = FontWeight.SemiBold)
-                    if (config.maxLogLength > 65536 || config.maxLogLength == 0) {
-                        Text("⚠️ 超出合法区间 (1..65536)", color = Color.Red, fontSize = 12.sp)
+                    if (config.maxLogLength < 97 || config.maxLogLength > 65536) {
+                        Text("⚠️ 超出合法区间 (97..65536)", color = Color.Red, fontSize = 12.sp)
                     }
                 }
                 Slider(
@@ -130,7 +130,7 @@ fun ConfigPanel(
                     valueRange = 0f..131072f,
                     steps = 127
                 )
-                Text("范围 0..131072B。100000 触发 C 侧校验；131072 触发 Kotlin require", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("范围 0..131072B。<97 或 100000 触发 C 侧校验；131072 触发 Kotlin require", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             }
 
             Spacer(modifier = Modifier.height(8.dp))

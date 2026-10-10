@@ -19,7 +19,6 @@ using namespace logx;
 
 namespace {
 constexpr uint32_t kDataSize = 4 * 1024;  // 测试用小尺寸,加速用例
-constexpr uint32_t kTotal    = kDataSize + kHeaderTotal;
 }
 
 class StagingTest : public ::testing::Test {
