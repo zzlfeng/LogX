@@ -108,6 +108,7 @@
 | `8ea0820` | docs: B-5 前置协议收口 (3800 轮 0 命中, 方案 C) + Backlog B-12 立项 (负载下文件可见性异常 2/12 判定门达成, 待拍板) |
 | `2d7a15f` | fix(test): B-12 方案 B——RetentionCleanup 断言失败分支补 GetLastError 区分性归因 (改测试不改产品) |
 | `26d3752` | docs: B-12 定性收口——根因锁定为用例创建循环与后台 Flusher retention 巡扫的时序竞态, 产品零缺陷 |
+| `9ab11b6` | fix(android,docs): tester maxLogLength 越界分层文案勘误 (对齐 Kotlin require 拦截边界) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
