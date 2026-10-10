@@ -102,6 +102,8 @@
 | `9c7b1b5` | fix(format,test,bench,docs): R35 遗留建议 1/2/4 收口——Wire 编译期 Roundtrip 断言、Clang 警告清理与 NO_SPACE 性能基准对比 (计划表 v1.51) |
 | `2947a31` | docs(reviews): R36 审查报告入库——R35 建议收口批次独立复核 (计划表补记 B-11) |
 | `4f4461c` | feat(core,format,test,docs): B-6 方案 A 落地——max_log_length 下界 fail-fast 校验与常量单源化 (计划表 v1.52) |
+| `b81247d` | docs(reviews): R37 审查报告入库——B-6 方案 A 批次 (4f4461c) 独立复核 (产品代码零缺陷, 0xP2+2xP3+3xNit 均外围层) |
+| `b860f93` | fix(android,test,docs): R37 收口批次——N-1~N-5: tester 三层口径对齐 97 下界、NDK 存量警告清零、CHANGELOG 步数勘误、Kotlin validateInitConfig 可测化、自指断言删除 (计划表 v1.53) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
