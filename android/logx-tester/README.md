@@ -56,7 +56,7 @@ adb logcat -s LogX:V TesterTag:V
 | --- | --- | --- | --- |
 | `logDir` | File | `logs` | 日志持久化主目录，位于 `filesDir` 下 |
 | `stagingDir` | File | `logx_staging` | 暂存区 mmap 目录。**严禁包含 `/cache/`**，否则抛 `IllegalArgumentException` |
-| `maxLogLength` | Int | 65536 | 单条日志总长上限。合法范围 `97..65536`；<97 或 >65536 在 C 侧校验失败，>=130943 在 Kotlin 侧被 require 拦截 |
+| `maxLogLength` | Int | 65536 | 单条日志总长上限。合法范围 `97..65536`；<97 或 >=130943 在 Kotlin 侧被 require 拦截，>65536 在 C 侧校验拒绝 |
 | `flushThreshold` | Int | 8192 | 自动唤醒阈值。`0`=纯手动 flush；`-1`=取默认 8KB；其它=字节阈值 |
 | `maxFileSize` | Long | 10MB | 单个日志文件大小硬上限，达到后自动切分滚动（生成 `.log.1`、`.log.2`） |
 | `retentionDays` | Int | 7 | 日志保留期（天），超时文件在启动/退出时被清理 |
@@ -80,7 +80,7 @@ adb logcat -s LogX:V TesterTag:V
 | 4 | ZLIB 拒绝 | `compress=ZLIB` | **init 失败**，返回 `nativeHandle=0`（库内未接入 zlib 压缩） |
 | 5 | 加密缺 KeyProvider | `encrypt=true` + `keyProvider=null` | **init 失败**（C 侧校验拒绝） |
 | 6 | 密钥返回 null 降级 | `keyProvider` 返回 null | **init 成功**，但落盘降级明文，产生 `DEGRADED "missing key; downgrading block to plaintext"` 事件 |
-| 7 | maxLogLength 越界 | 131072 / 100000 / 96 / 0 | 131072 被 Kotlin require 拦截；100000、96 和 0 被 C 侧 `INVALID_ARG` 拦截（96 = B-6 下界 97-1） |
+| 7 | maxLogLength 越界 | 131072 / 100000 / 96 / 0 | 131072、96 和 0 被 Kotlin require 拦截抛异常（96 = B-6 下界 97-1）；100000 穿透至 C 侧被 `INVALID_ARG` 拦截 |
 | 8 | 超长 payload | payload = 70000B | 写入返回 `INVALID`（用户总长 > 60KB 触发 `"invalid log input"`） |
 | 9 | 超 maxLogLength | `maxLogLength=16384` + payload=30000B | 写入返回 `TOO_LARGE`（触发 `"log too large"`） |
 | 10 | 20KB 分片 | payload = 25000B | 写入 OK，内部自动拆为多片 LGXE 记录并正确合并与落盘 |

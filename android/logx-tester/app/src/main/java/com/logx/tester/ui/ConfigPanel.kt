@@ -130,7 +130,7 @@ fun ConfigPanel(
                     valueRange = 0f..131072f,
                     steps = 127
                 )
-                Text("范围 0..131072B。<97 或 100000 触发 C 侧校验；131072 触发 Kotlin require", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Text("范围 0..131072B。<97 或 131072 触发 Kotlin require；100000 触发 C 侧校验", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             }
 
             Spacer(modifier = Modifier.height(8.dp))

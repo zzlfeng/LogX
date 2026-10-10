@@ -97,8 +97,8 @@ object PresetRegistry {
         Preset(
             id = 7,
             name = "7. maxLogLength 四档越界",
-            summary = "校验分层：131072(Kotlin require) / 100000(C >64KB) / 96(C <97) / 0(C <97)",
-            expectedOutcome = "四种越界分别被 Kotlin require 或 C 侧 INVALID_ARG 拦截，报错各不相同",
+            summary = "校验分层：131072(Kotlin require) / 100000(C >64KB) / 96与0(Kotlin require <97)",
+            expectedOutcome = "131072/96/0 由 Kotlin require 拦截抛 IllegalArgumentException，100000 穿透至 C 侧由 INVALID_ARG 拦截",
             configModifier = {
                 it.copy(maxLogLength = 131072, useCacheDir = false)
             },
