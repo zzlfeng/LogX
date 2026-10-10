@@ -106,6 +106,7 @@
 | `b860f93` | fix(android,test,docs): R37 收口批次——N-1~N-5: tester 三层口径对齐 97 下界、NDK 存量警告清零、CHANGELOG 步数勘误、Kotlin validateInitConfig 可测化、自指断言删除 (计划表 v1.53) |
 | `08ee06a` | docs: Android 真机复跑收口——R37 收口批次 Redmi K30 Pro 180/180+2/2+4/4+3/3 全绿 (计划表 v1.54) |
 | `8ea0820` | docs: B-5 前置协议收口 (3800 轮 0 命中, 方案 C) + Backlog B-12 立项 (负载下文件可见性异常 2/12 判定门达成, 待拍板) |
+| `2d7a15f` | fix(test): B-12 方案 B——RetentionCleanup 断言失败分支补 GetLastError 区分性归因 (改测试不改产品) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
