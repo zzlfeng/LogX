@@ -151,6 +151,8 @@ N-1~N-5 已全部收口，验证实测如下：
 
 **审查方法论补记（本批实测新知，供后续轮次引用）**：① build-full 增量构建对头文件变更完全不感知（§三 排除项 7）；② constexpr 局部量在 lambda 显式捕获列表下存在跨编译器语义冲突——Clang C++17 允许无捕获读取（捕获反触发 -Wunused-lambda-capture），MSVC 则要求显式捕获（C3493）——跨平台测试代码中的此类常量应上提文件作用域；③ 本机 Gradle 入口：PATH 中的 gradle-4.10.2 无法用于本项目（AGP 8.5.1 需 ≥8.7），实际入口为 `~/.gradle/wrapper/dists` 下 Gradle 8.9（kotlin-gradle）与 9.4.1（logx-tester）+ JDK17，且须经干净环境（`env -i`）启动，Git Bash 直跑报「Unable to get mutable Windows environment variable map」。
 
+**真机复跑补记（2026-10-10，收口批次提交后）**：Redmi K30 Pro (Android 12, 无线 adb 39389) 四套件 **180/180 + 2/2 + 4/4 + 3/3 全绿**（退出码全 0；主套件含设备专属 1 例，与主机 179 口径一致）。产物 mtime：R37 改动三 TU 重编重链（20:15），liblogx.so 与其余产物经 ninja 全图核验为当前；时钟 1:1 且 auto_time=0 阶跃防护在位。
+
 ---
 
 *审查人：Qoder（R37）；所有实验命令与输出见 §六，收口批次见 §九。*

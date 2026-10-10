@@ -608,7 +608,7 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **N-3 (Nit, NDK 步数口径勘误)**：条目 15 中 `build-android-tests` 步数由 27/27 勘误为 clean 实测 62/62（见上）；
    - **N-4 (Nit, Kotlin require 可测化)**：`LogX.kt` 抽取 `internal fun validateInitConfig(config)`（97 下界 + 130943 上界，语义与消息原文不变），`init()` 前置调用（病态配置不再触发 native 库加载、不消耗 initCount）；`LogXPureLogicTest` 新增 3 用例钉住 96/97/130942/130943 双边界（96 与 130943 拒绝、97 与 130942 放行）；
    - **N-5 (Nit, 自指断言删除)**：删除 `test_format.cpp` 与头文件定义同构的恒真 `static_assert`，保留 `== 97` 字面钉住（R37 变异实验实测两处均 C2338 复红，删除无防护损失）；
-   - **全量验证**：MSVC 增量重建（纯 .cpp 改动）后四套件 **179/179 + 2/2 + 4/4 + 3/3 全绿**（含 stress 新增 raw_len 交叉断言）；NDK clean-first 62/62 **0 警告**；Gradle 8.9 + JDK17 `testDebugUnitTest` 23 任务 BUILD SUCCESSFUL（13 用例 0 失败，含新增 3 例）；`logx-tester :app:compileDebugKotlin` BUILD SUCCESSFUL。
+   - **全量验证**：MSVC 增量重建（纯 .cpp 改动）后四套件 **179/179 + 2/2 + 4/4 + 3/3 全绿**（含 stress 新增 raw_len 交叉断言）；NDK clean-first 62/62 **0 警告**；Gradle 8.9 + JDK17 `testDebugUnitTest` 23 任务 BUILD SUCCESSFUL（13 用例 0 失败，含新增 3 例）；`logx-tester :app:compileDebugKotlin` BUILD SUCCESSFUL；**真机复跑（2026-10-10，Redmi K30 Pro / Android 12，无线 adb 39389）四套件 180/180 + 2/2 + 4/4 + 3/3 全绿**（含设备专属 1 例，与主机 179 口径一致；产物 mtime 经核验，设备时钟 1:1 且 auto_time=0 阶跃防护在位）。
 
 
 ---
