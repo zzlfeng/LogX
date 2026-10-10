@@ -2029,7 +2029,16 @@ TEST(Robustness, RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtects
         ASSERT_GE(fd, 0) << cs.name;
         ASSERT_EQ(mock_pal.file_write(fd, "payload", 7), 7) << cs.name;
         mock_pal.file_close(fd);
-        ASSERT_GT(mock_pal.file_size_path(p.c_str()), 0) << cs.name;
+        int64_t sz0 = mock_pal.file_size_path(p.c_str());
+#if defined(_WIN32)
+        // B-12: file_size_path 失败路径不消费 LastError,可采获 GetFileAttributesExA 原始
+        // 错误码区分「真消失」(2=FILE_NOT_FOUND/3=PATH_NOT_FOUND)与「共享冲突」
+        // (32=SHARING_VIOLATION,AV/索引器瞬时独占);POSIX 分支无此歧义,零改动
+        DWORD b12_le = (sz0 < 0) ? GetLastError() : 0;
+        ASSERT_GT(sz0, 0) << cs.name << " [B12] raw_lasterror=" << b12_le;
+#else
+        ASSERT_GT(sz0, 0) << cs.name;
+#endif
     }
 
     // 触发 retention 清理(与 Flusher 启动/跨天同一条路径)
@@ -2038,7 +2047,13 @@ TEST(Robustness, RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtects
     for (const auto& cs : cases) {
         int64_t sz = mock_pal.file_size_path((dir + "/" + cs.fname).c_str());
         if (cs.should_survive) {
+#if defined(_WIN32)
+            DWORD b12_le = (sz < 0) ? GetLastError() : 0;
+            EXPECT_GT(sz, 0) << cs.name << " must NOT be deleted by retention"
+                             << " [B12] raw_lasterror=" << b12_le;
+#else
             EXPECT_GT(sz, 0) << cs.name << " must NOT be deleted by retention";
+#endif
         } else {
             EXPECT_LT(sz, 0) << cs.name << " must be deleted after 20-year clock jump";
         }
