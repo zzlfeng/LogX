@@ -114,6 +114,7 @@
 | `f5db3d7` | fix(test,docs): R38 收口批次——F-1 良性竞争文档化 + 措辞收敛 + N-1 涉及文件更正; R2 负载复跑 18 轮 0 命中 B-12 闭环经验确认 (计划表 v1.56) |
 | `0d5e80b` | docs: 计划表 v1.57——Backlog 补登 B-13 (retention_days atomic 化彻底化选项, R38 F-1 留置悬空引用补登) |
 | `a3b00ca` | docs(evidence): B-5/B-12 scratch 证据转正 docs/evidence/ + 计划表 v1.58 + 报告 §九.3 拍板补记 |
+| `ba4a980` | fix(core,test,docs): B-13 闭环——retention_days atomic 化 (方案 1) + Instance 字段并发写者穷尽审计 (计划表 v1.59) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
