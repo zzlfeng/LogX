@@ -110,6 +110,8 @@
 | `26d3752` | docs: B-12 定性收口——根因锁定为用例创建循环与后台 Flusher retention 巡扫的时序竞态, 产品零缺陷 |
 | `9ab11b6` | fix(android,docs): tester maxLogLength 越界分层文案勘误 (对齐 Kotlin require 拦截边界) |
 | `b1559e7` | fix(test,docs): B-12 闭环——RetentionCleanup 方案一+方案三落地: 36500 天时序解耦与 InstGuard RAII 守卫加固 (计划表 v1.55) |
+| `ab37c9e` | docs(reviews): R38 审查报告入库——B-12 闭环链 (2d7a15f..b1559e7) 独立复核 (产品零改动零缺陷, 1xP3+1xNit 均测试/文档层) |
+| `f5db3d7` | fix(test,docs): R38 收口批次——F-1 良性竞争文档化 + 措辞收敛 + N-1 涉及文件更正; R2 负载复跑 18 轮 0 命中 B-12 闭环经验确认 (计划表 v1.56) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
