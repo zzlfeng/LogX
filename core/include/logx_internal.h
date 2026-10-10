@@ -31,7 +31,9 @@ struct Instance {
     std::string log_dir;
     std::string staging_path;
     uint32_t    max_log_length = 64 * 1024;  // 64KB 默认 (S-04: 与 Kotlin/JNI 默认值及注释对齐)
-    uint32_t    retention_days = 7;
+    // B-13 方案 1 (R38 F-1): 运行期存在并发写者 (用例侧直改保留期), 读方为 Flusher 线程
+    // retention_cleanup_impl (flusher.cpp:635)——升级 atomic 消除形式数据竞争。
+    std::atomic<uint32_t> retention_days{7};
     uint64_t    max_file_size  = 10 * 1024 * 1024;
     uint32_t    flush_threshold = 8 * 1024;
     uint32_t    staging_wait_ms = 0;  // B-1 方案 A: 环满阻塞等待上限 (毫秒), 0=默认不阻塞
@@ -88,6 +90,11 @@ struct Instance {
     std::atomic<bool> close_on_flusher{false};
     std::atomic<uint64_t> flusher_tid{0};
 };
+
+// B-13: retention_days atomic 须保持 lock-free——Instance 经不透明指针跨越 C ABI,
+// 若退化为锁实现则尺寸/布局改变破坏布局稳定性假设。
+static_assert(std::atomic<uint32_t>::is_always_lock_free,
+              "retention_days atomic must stay lock-free (Instance layout stability across C ABI)");
 
 constexpr uint32_t kFlushBlockingTimeoutMs = 5000;
 

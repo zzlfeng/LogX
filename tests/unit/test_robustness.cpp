@@ -2056,9 +2056,8 @@ TEST(Robustness, RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtects
 
     // B-12 (方案一): 四类文件建档与断言完毕后, 将保留期恢复为 7 天 (与 flusher.cpp:635
     // retention_cleanup_impl 调用点现读一致), 再显式触发 retention 清理, 测试意图完整保留且
-    // 无文件删除时序竞态。R38 F-1: 此写与 Flusher 线程 :635 的读为形式数据竞争, 良性已文档化
-    // (运行期唯一写者即此处; 对齐 32 位存储平台原子; 读旧值 36500 不删任何 fixture, 读新值 7
-    // 仅提前删期望被删的 A——两支结局均与断言期望兼容); 彻底化 (std::atomic) 列 Backlog。
+    // 无文件删除时序竞态。R38 F-1 指出的形式数据竞争已由 B-13 方案 1 atomic 化收口
+    // (logx_internal.h retention_days 为 std::atomic<uint32_t>, 本写即为 atomic store)。
     static_cast<Instance*>(inst)->retention_days = 7;
 
     // 触发 retention 清理(与 Flusher 启动/跨天同一条路径)

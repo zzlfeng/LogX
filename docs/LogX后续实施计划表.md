@@ -1,6 +1,8 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.58 (2026-10-11 B-5/B-12 scratch 证据转正 `docs/evidence/`——纯资产落库, 零代码)
+> **文档版本**: v1.59 (2026-10-11 B-13 闭环——retention_days atomic 化 (方案 1) + Instance 字段并发写者穷尽审计, 零新缺陷)
+>
+> **v1.59 修订说明**: 2026-10-11 **B-13 方案 1 落地（用户拍板）**: ① `Instance::retention_days` 升级 `std::atomic<uint32_t>`（`logx_internal.h` 声明一行；读写点 `logx_c.cpp:385` 初始化与 `flusher.cpp:635` 读取走隐式 atomic 语义**零 diff**）+ `is_always_lock_free` `static_assert` 守卫（Instance 经不透明指针跨 C ABI，lock-free 退化即布局破坏——编译期钉住）；`test_robustness.cpp:2059` 注释尾同步（Backlog → 已收口）。② **附带审计（B-13 决策点，穷尽扫描）**: retention_days 为全仓**唯一**跨线程裸写/读 Instance 字段——`max_log_length` 两处测试运行期直写（`test_flusher.cpp:1279`/`test_j04_regression.cpp:184`）的唯读点 `build_records`（`flusher.cpp:1056`）仅由 `logx_write` 在调用方线程同步执行，与写同线程无并发，**非同类**；r19 回归 8 处 `static_cast<Instance*>` 站点全为读或 mock 指针交接；产品侧 config 字段仅 open 期初始化（先于 Flusher 线程启动）。**无 B-14 需要**。③ **验证（R21-2 门禁）**: MSVC clean 58/58 精确 0 警告 + 四套件 179/179+4/4+2/2+3/3 全绿；NDK clean 62/62 精确 0 警告；atomic<uint32_t> lock-free 与原语义等宽对齐，行为零变化，真机复跑待下次批次顺带核对 180 基线。
 >
 > **v1.58 修订说明**: 2026-10-11 **用户拍板「scratch 证据转正」**: B-5 前置协议全套（探针源码/自检日志/rig 脚本/R1+R2 十二负载轮档案，含 B-12 原始命中证据 `r2_run5/full_suite_1.log`）与 B-12 闭环 R2c 复跑全套（rig + 18 负载轮档案）落库至 **`docs/evidence/b5|b12`**（161 个纯文本文件 1.5M，剔除 5 个二进制 .exe/.obj 可经 `build_probe*.bat` 重建；清单与复现注意见 `docs/evidence/README.md`）；原 scratch 目录保留于仓库上级未删除。B-5/B-12 条目内 scratch 引用同步加转正注记，R38 报告 §九.3 补记拍板结果。
 >
@@ -473,12 +475,13 @@ gantt
 ### B-13 `Instance::retention_days` 形式数据竞争的 atomic 化彻底化选项 (R38 F-1 留置)
 
 - **记录日期**: 2026-10-11 (R38 审查发现 F-1 (P3); 最小收口批次 `f5db3d7` 注释文档化留置, 本条为 v1.56「列 Backlog」悬空引用的补登)
-- **状态**: ⬜ **待拍板**
+- **状态**: ✅ **已闭环 (2026-10-11, 方案 1 atomic 化落地)**——`retention_days` 升级 `std::atomic<uint32_t>` + `is_always_lock_free` static_assert；附带审计确认全仓无同类字段，无 B-14 需要
 - **背景**: `Instance::retention_days` 为普通非原子 `uint32_t`（`logx_internal.h:34`），产品侧读方唯一为 Flusher 线程 `retention_cleanup_impl`（`flusher.cpp:635`；到达路径 `:743` 跨天分支 / `:996` 启动清理），运行期无产品写者。B-12 闭环批次 `b1559e7` 引入仓库**首个运行期并发写者**（`test_robustness.cpp:2059`，用例主线程直改 36500→7），与读方构成 C++ 形式数据竞争（UB）。R38 实测无害：对齐 32 位存储在目标平台（x64/ARM64）硬件原子不撕裂；交错两支结局均与断言期望兼容（读旧值 36500 不删任何 fixture / 读新值 7 仅提前删期望被删的 A，B/C/D 受 `flusher.cpp:662` 双守卫保护）。最小收口已将该良性竞争注释文档化（`f5db3d7`），形式 UB 仍在。
 - **候选方案**:
   - **方案 1 (atomic 化)**: `retention_days` 升级 `std::atomic<uint32_t>`（3 处：`logx_internal.h:34` 声明、`logx_c.cpp:385` 初始化、`flusher.cpp:635` 读取）；字段尺寸/对齐不变，C ABI 无虞；属头文件改动，**须走 R21-2 clean 全量重建门禁**（R37 ① 实证增量构建对头文件变更不感知）。
   - **方案 2 (维持文档化现状)**: 良性竞争已注释文档化，接受形式 UB（实践无害、写者面单一且平台明确）；若未来出现第二写者须先回看本条。
 - **决策点**: 方案 1/2 拍板；若选方案 1，可顺手穷尽审计 `Instance` 其余运行期字段有无同类潜在并发写者（扫描模式 `static_cast<Instance*>(x)->field =`，R38 实测全仓测试侧仅 1 处即本例）。
+- **闭环落地记录 (2026-10-11, 方案 1)**: ①**atomic 化**: `logx_internal.h` 声明升级 `std::atomic<uint32_t>`（结构体既有 atomic 惯例内，E-01/R19 F-2 同风格）+ 结构体外 `static_assert(std::atomic<uint32_t>::is_always_lock_free)`（跨 C ABI 布局稳定性编译期守卫）；读写点 `logx_c.cpp:385`/`flusher.cpp:635` 隐式 atomic 语义**零 diff**；`test_robustness.cpp:2059` 注释尾同步。②**附带审计结论（穷尽扫描）**: retention_days 为全仓唯一跨线程裸写/读 Instance 字段——`max_log_length` 两处测试直写（`test_flusher.cpp:1279`/`test_j04_regression.cpp:184`）唯读点 `build_records`（`flusher.cpp:1056`）仅由 `logx_write` 调用方线程同步执行，与写同线程无并发非同类；r19 回归 8 处 `static_cast<Instance*>` 全为读/mock 指针交接；产品侧 config 字段仅 open 期初始化先于 Flusher 线程启动。**无 B-14**。③**验证（R21-2 门禁）**: MSVC clean 58/58 精确 0 警告 + 四套件 179/179+4/4+2/2+3/3 全绿；NDK clean 62/62 精确 0 警告；真机复跑待下次批次顺带核对 180 基线。
 
 
 
