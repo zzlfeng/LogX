@@ -445,7 +445,7 @@ object LogX {
 
     /**
      * 按日期范围导出 (回调模式)。from/to = yyyyMMdd 闭区间;
-     * 明文临时文件写在 filesDir 下独立临时目录 (禁外部存储、禁 cacheDir); 回调返回或抛出后立即删除。
+     * 明文临时文件写在 logDir 内 (.tmp_export_* 命名, 并发导出不互踩); 回调返回或抛出后立即删除。
      */
     fun export(from: String, to: String, cb: ExportCallback): Int {
         return executeOp(isExport = true) { h ->
