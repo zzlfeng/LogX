@@ -629,6 +629,12 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **设备与时钟**：Redmi K30 Pro (Android 12)，无线 adb 端口 37289（端口轮换第三次记录：40663→39389→37289）；时钟步进实测 1:1（3s→3.051/3.041s，残差为 shell 开销）且 `auto_time=0` 阶跃防护在位；
    - **结果**：四套件 **180/180 + 2/2 + 4/4 + 3/3 全绿，退出码全 0**（设备端重定向落盘执行）——B-13 后新基线成立，为 R37 之后第二次全绿基线。
 
+18. **T5.3 接入指南与离线解码运维手册落地 (2026-10-11)**：
+   - **交付**：`docs/integration_guide.md`（十节接入指南：链路总览、五分钟接入、Config 14 参数全参考——97/130943 fail-fast、flushThreshold 三态、consoleEcho 仅 debug 三易错点、生命周期与线程模型（init 前奏 1s/遗留销毁 ~5s/快慢操作/递延销毁）、AndroidKeyStore 包裹 KeyProvider 完整示例（KID 轮换与降级三态）、export 双形态全状态码、事件与 stats 可观测、备份/多进程、版本兼容、FAQ）与 `docs/ops_troubleshooting.md`（七节排障手册：取证流程、`logx_decode.py` 全参数与错误两分层（结构损坏宁丢不脏 vs 块级占位继续）、事件处置表、症状→根因速查、stats 精确口径（含 B-8 非 SLA 注记）、C ABI 附录、logx-tester 联动）；README「使用示例」挂接双文档并刷新 M5 规划；
+   - **事实锚定**：全部 API/机制条目逐一对照 `LogX.kt` / `logx_c.h` / `logx_decode.py` 当前实现（B-13 后基线）；裁决 export 明文临时文件位置口径 = 实现 `logDir` 内 `.tmp_export_*`（`logx_c.cpp:71`，与 T5.1 XML 注释一致；`LogX.kt:448` KDoc「独立临时目录」措辞不精确，留待后续小批勘误）；
+   - **核验**：解码器明文真实样本（build-full B-1 测试残留日志）实跑 exit=0，输出行格式与手册逐字吻合；`--help` UTF-8 显示正常（早前观察到的乱码系查看端控制台代码页，非文档缺陷）；Kotlin 示例签名逐一对照源码（本机无 kotlinc，未过 Android 编译器，指南中已声明口径）；纯 docs 零代码，B-11-1 门禁豁免；
+   - **M5 剩余**：仅 Release AAR（发布工程动作，单独立批）。
+
 ---
 
 ## 附:构建命令速查

@@ -83,6 +83,8 @@ adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_st
 
 ## 使用示例(Android)
 
+> 完整接入文档（Config 全参数、KeyStore 密钥包裹、生命周期/线程模型、备份与多进程）见 [docs/integration_guide.md](docs/integration_guide.md)；离线解码与线上排障见 [docs/ops_troubleshooting.md](docs/ops_troubleshooting.md)。
+
 ```kotlin
 // Application.onCreate
 LogX.init(this, LogX.Config(
@@ -148,4 +150,4 @@ lifecycleScope.launch(Dispatchers.IO) {
 - ~~离线解码器用实际引擎真机产出日志做最终联调~~ (2026-09-08 真机联调通过, 104/104 精确对账,见下文验证闭环)
 - ✅ **性能基线测试与报告输出 (T5.2, 2026-09-08)**: 新增 `tests/bench/logx_bench.cpp` 基准 harness (`-DLOGX_BUILD_BENCH=ON`) 与 [docs/benchmark_report.md](docs/benchmark_report.md)。双端实测 (Windows x64 + Redmi K30 Pro): 写入延迟桌面 P50 0.2µs / P99 3.1µs (纯路径口径), 真机 P50 3.2µs; 压缩开关对写路径零影响; zstd 落盘体积 -38% (1.52x); so 体积 (arm64 strip, MinSizeRel 全开) 548.9KB。含 v1.0 回归基线声明与 2µs/500KB 目标判定。
 - ✅ **logcat 直通开关 consoleEcho (T5.4, 2026-09-09)**: JNI 层实现 (C ABI 零改动), `Config.consoleEcho` 开启后每条成功落盘记录按 level 六级映射镜像到 logcat (2KB 栈缓冲截断, 丢弃不镜像); 顶层 CMake 补链 liblog。kotlin-gradle 扩展为可安装 smoke 工程, 真机 6/6 echo 按等级正确 (含中文), 纯逻辑单测 9/9 全绿。生产默认关闭 (明文泄露面)。
-- 接入指南与离线解码运维手册 (T5.3)
+- ✅ **接入指南与离线解码运维手册 (T5.3, 2026-10-11)**: 交付 [docs/integration_guide.md](docs/integration_guide.md)（五分钟接入、Config 14 参数全参考、生命周期与线程模型、AndroidKeyStore 包裹 KeyProvider 完整示例、export 协程语义、备份/多进程、版本兼容）与 [docs/ops_troubleshooting.md](docs/ops_troubleshooting.md)（取证流程、logx_decode.py 用法与错误分层、事件处置表、症状→根因速查、stats 口径、C ABI 附录、tester 联动）；README 使用示例节挂接两文档。Release AAR 为后续发布动作（M5 收尾项）。
