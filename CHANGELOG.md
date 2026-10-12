@@ -119,6 +119,7 @@
 | `c88304b` | docs: 计划表 v1.61——真机 180 基线重对 (B-13 lib 后首次复跑四套件 180/180+2/2+4/4+3/3 全绿) + B-5 状态行随方案 C 定性收口勘误 + CHANGELOG 条目 17 |
 | `fe4d0ac` | docs: T5.3 落地——接入指南 integration_guide.md (十节) 与离线解码排障手册 ops_troubleshooting.md (七节) + README 挂接 (计划表 v1.62, M5 仅剩 Release AAR) |
 | `8df8d74` | docs(kt): LogX.kt export KDoc 临时文件位置勘误——logDir 内 .tmp_export_* (对齐 logx_c.cpp 实现与 T5.1 XML 口径, 计划表 v1.63) |
+| `d06dee9` | feat(build,docs): T5.7 Release AAR 落地——logx-aar library 工程单源构建 com.zzlfeng:logx:1.0.0 + 消费冒烟复用 kotlin-gradle (计划表 v1.64, M5 里程碑 100% 完成) |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
