@@ -637,6 +637,12 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **核验**：解码器明文真实样本（build-full B-1 测试残留日志）实跑 exit=0，输出行格式与手册逐字吻合；`--help` UTF-8 显示正常（早前观察到的乱码系查看端控制台代码页，非文档缺陷）；Kotlin 示例签名逐一对照源码（本机无 kotlinc，未过 Android 编译器，指南中已声明口径）；纯 docs 零代码，B-11-1 门禁豁免；
    - **M5 剩余**：仅 Release AAR（发布工程动作，单独立批）。
 
+19. **T5.7 Release AAR 发布件落地，M5 里程碑 100% 完成 (2026-10-11)**：
+   - **工程形态（用户拍板方案 A，单源零拷贝）**：新增 `android/logx-aar/` library 工程（AGP 8.5.1 / Kotlin 1.9.23 / Gradle 8.9，与 kotlin-gradle 对齐），`:logx` 模块 namespace `com.zzlfeng.logx`；Kotlin 经 `srcDir` 单源引用 `android/kotlin/LogX.kt`；native 经模块精简 CMake 单源 `add_subdirectory(<仓库根>/core)`（复用 vendored zstd/mbedtls 接线，并复刻根 CMake 的 `LOGX_WITH_*_DEFAULT` ANDROID 段——否则 `option()` 读到空默认静默落 OFF）+ `logx SHARED = android/cpp/logx_jni.cpp`；ndkVersion 29.0.14206865 / CMake 3.22.1 / minSdk 21 / compileSdk 34 / `abiFilters arm64-v8a`；
+   - **发布件**：maven-publish `com.zzlfeng:logx:1.0.0`（`singleVariant("release")`）；`coroutines-android` 以 `api` 暴露（suspend export 签名外泄 coroutines 类型）；`consumer-rules.pro` keep JNI 静态注册 native 方法名与三个回调 fun interface 方法名（`getKey "(I)[B"`、`onExport "(Ljava/lang/String;Ljava/lang/String;J)I"` 均实证于 logx_jni.cpp）；备份 XML 与 Manifest 片段不入 AAR（app 侧职责，接入指南已载）；
+   - **验证四步**：① `:logx:assembleRelease` BUILD SUCCESSFUL（31 任务）→ AAR 405KB，解包断言 classes.jar 含 LogX + 8 嵌套类族、`jni/arm64-v8a/liblogx.so`（980,864B RelWithDebInfo 未 strip，APK 打包时 AGP 自动 strip）、proguard.txt 载 consumer 规则；② `llvm-nm -D` 六 JNI 导出全在（nativeInit/Close/Write/Flush/Export/GetStats）；③ `publishToMavenLocal` 落 `~/.m2/repository/com/zzlfeng/logx/1.0.0/`（aar+pom+module）；④ **消费冒烟复用现有工程（用户拍板第三点）**：kotlin-gradle 临时切换 mavenLocal 依赖 + 禁 srcDir → `:app:assembleDebug` BUILD SUCCESSFUL（37 任务），APK 实测含 `lib/arm64-v8a/liblogx.so` 与 dex 内 `com/zzlfeng/logx/LogX` 类族，验证后 git 还原零残留；
+   - **门禁与边界**：B-11-1 双验（AAR CMake 配置+编译+链接 31 任务全绿 + 根 build-android-tests ninja no work to do）；真机手工验收（tester 面板按 README 场景表）归用户侧；CMake 首编曾因上溯级数差一级失败（5 级仅至 android/），修正 6 级后通过。
+
 ---
 
 ## 附:构建命令速查
@@ -679,6 +685,16 @@ adb shell "chmod 755 /data/local/tmp/logx_test/*"
 # 在真机上运行测试
 adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_unit_tests"
 adb shell "cd /data/local/tmp/logx_test && export LD_LIBRARY_PATH=. && ./logx_stress_tests"
+```
+
+### Android AAR 发布件 (android/logx-aar, Gradle 8.9 / AGP 8.5.1 / NDK 29.0 / CMake 3.22.1)
+
+```bash
+# 构建与发布 (bat 需 CRLF; 干净环境启动法与 kotlin-gradle 相同, JAVA_HOME=jdk-17.0.4.1)
+gradle :logx:assembleRelease      # 产物 logx/build/outputs/aar/logx-release.aar (~405KB)
+gradle :logx:publishToMavenLocal  # 落 ~/.m2/repository/com/zzlfeng/logx/1.0.0/
+# 消费冒烟 (kotlin-gradle 临时切 mavenLocal 依赖 + 禁 srcDir, 验后 git 还原)
+gradle -p android\kotlin-gradle :app:assembleDebug
 ```
 
 ---
