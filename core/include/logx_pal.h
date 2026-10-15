@@ -18,7 +18,11 @@ namespace logx {
  * writable = true 表示 MAP_SHARED + PROT_WRITE;失败时 out_handle = -1。 */
 struct PalMmap {
     void*     base = nullptr;
-    intptr_t  out_handle = -1;  /* 句柄以便 msync/close (POSIX 存 fd, Win32 存 HANDLE) */
+    /* 句柄以便 msync/close (POSIX 存 fd, Win32 存 HANDLE)。
+     * P-23: 所有权两平台不同——POSIX 侧 out_handle 只是借用的 fd(由调用方
+     * 自行 close, mmap_close 不关); Win32 侧为 CreateFileMapping 得到的
+     * HANDLE(归 mmap_close 关闭)。切勿按字面"统一 close(POSIX 的 out_handle)"。 */
+    intptr_t  out_handle = -1;
     size_t    len = 0;
 };
 
@@ -32,7 +36,10 @@ public:
     virtual int  file_close(int fd) = 0;
     /* ftruncate 到 len;成功 0。 */
     virtual int  file_truncate(int fd, uint64_t len) = 0;
-    /* 循环处理短写,返回写入字节数;失败 -1。 */
+    /* 循环处理短写,返回写入字节数;失败 -1。
+     * P-11: 返回类型为 long, 在 LLP64(Win64)/32 位平台上为 32 位——单次调用
+     * 的 len 不应超过 2^31-1(本库单块 ≤ 64KB, 不触发);实现内部已按 chunk 拆分
+     * 写入, 此契约仅约束调用方入参规模。 */
     virtual long file_write(int fd, const void* buf, size_t len) = 0;
     virtual long file_pwrite(int fd, const void* buf, size_t len, uint64_t offset) = 0;
     /* 循环处理短读(从 offset 起),返回读到的字节数;失败 -1。 */
@@ -58,6 +65,10 @@ public:
     virtual int     mmap_close(const PalMmap& m) = 0;
 
     /* ---- 并发原语 ---- */
+    /* P-2(留档, 待拍板):两平台可重入性当前不一致——Win32 CRITICAL_SECTION 可重入,
+     * POSIX std::mutex 非递归。core 现有持锁路径均为单层取锁, 未触发差异;若未来
+     * 出现"持锁再取锁", Windows 测试会全绿而 Android 死锁。契约方向(非递归 vs 可重入)
+     * 待定后, 二者须取一并写入本注释。 */
     virtual void* mutex_create() = 0;
     virtual void  mutex_destroy(void* h) = 0;
     virtual void  mutex_lock(void* h) = 0;

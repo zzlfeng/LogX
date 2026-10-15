@@ -107,14 +107,22 @@ object LogXProbe {
         val c = Capture()
         slot.set(c)
         val t0 = System.nanoTime()
+        // T-1: 必须读取 LogX.log 返回码 —— 实例被并发 stop/restart 时 executeOp 返回
+        // null → log() 返回 ERR_STATE 且不发任何事件; 仅靠 ThreadLocal 哨兵会把这批
+        // 未实际写入的调用全部计为假 OK, 吞吐/延迟/丢弃指标集体失真。
+        val rc: Int
         try {
-            LogX.log(level, tag, payload)
+            rc = LogX.log(level, tag, payload)
         } finally {
-            slot.set(null)
+            // T-11: 用 remove() 替代 set(null)——set(null) 会在 ThreadLocalMap 留下
+            // 常驻的 null-value entry, 池化线程(Dispatchers.IO)复用重装时缓慢泄漏 entry。
+            slot.remove()
         }
         val dt = System.nanoTime() - t0
         // 问题 P2 修复: 优先按 Native 错误码常量强类型匹配，同时彻底解决 code == -1 兜底分支死代码问题
         return when {
+            // T-1: 无同步事件但返回码非 0 —— 实例未就绪(ERR_STATE)等, 归入失败分支。
+            !c.hit && rc != 0                 -> R.OtherDrop(dt, "log() rc=$rc (instance not ready)")
             !c.hit                             -> R.Ok(dt)
             // B-3 方案B/T5.6: 截断独立事件种类, 按 kind 分流(文案耦合消除)
             c.kind == LogX.EventKind.TRUNCATED -> R.Truncated(dt, c.msg)

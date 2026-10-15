@@ -43,7 +43,20 @@ class PosixMutex : public std::mutex {};
 
 class Event {
 public:
-    Event() { pthread_mutex_init(&mu_, nullptr); pthread_cond_init(&cv_, nullptr); signaled_ = false; }
+    Event() {
+        pthread_mutex_init(&mu_, nullptr);
+        pthread_condattr_t attr;
+        pthread_condattr_init(&attr);
+        // P-4: 条件变量绑定 CLOCK_MONOTONIC——Android 开机后 NITZ/NTP 大幅校时
+        // (回跳/前跳)不再让带超时等待挂起远超 ms 或提前超时。极旧内核 setclock
+        // 失败时回退默认时钟(CLOCK_REALTIME), wait_timeout 与之保持一致。
+        if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0) {
+            monotonic_cond_ = true;
+        }
+        pthread_cond_init(&cv_, &attr);
+        pthread_condattr_destroy(&attr);
+        signaled_ = false;
+    }
     ~Event() { pthread_cond_destroy(&cv_); pthread_mutex_destroy(&mu_); }
     void signal_one() {
         ::pthread_mutex_lock(&mu_);
@@ -65,7 +78,7 @@ public:
             return true;
         }
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
+        clock_gettime(monotonic_cond_ ? CLOCK_MONOTONIC : CLOCK_REALTIME, &ts);
         ts.tv_sec += ms / 1000;
         ts.tv_nsec += (ms % 1000) * 1000000L;
         if (ts.tv_nsec >= 1000000000L) {
@@ -85,6 +98,7 @@ private:
     pthread_mutex_t mu_;
     pthread_cond_t  cv_;
     bool signaled_;
+    bool monotonic_cond_ = false;
 };
 
 class PosixPal : public Pal {
@@ -156,9 +170,22 @@ public:
     }
     int file_fsync(int fd) override {
 #ifdef __APPLE__
-        return ::fcntl(fd, F_FULLFSYNC);
+        // P-3: F_FULLFSYNC 在 NFS / 部分外置卷 / 旧文件系统返回 EINVAL/ENOTSUP,
+        // 原实现会让 Mac 上每次 durability 检查点恒失败(flusher 持续发 IO 事件)。
+        // 失败时回退 fsync(fd)——语义弱于 F_FULLFSYNC 但只轻不重, 检查点可推进。
+        int r = ::fcntl(fd, F_FULLFSYNC);
+        if (r == 0) return 0;
+        if (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP) {
+            return ::fsync(fd);
+        }
+        return r;
 #else
-        return ::fdatasync(fd);
+        // P-18: Linux tmpfs 等内存文件系统上 fdatasync 返 EINVAL, 会让测试环境
+        // 检查点恒失败;EINVAL 时回退 fsync 保证可用性。
+        int r = ::fdatasync(fd);
+        if (r == 0) return 0;
+        if (errno == EINVAL) return ::fsync(fd);
+        return r;
 #endif
     }
     int file_dir_fsync(const char* dir_path) override {
@@ -290,6 +317,10 @@ public:
     }
 
     // ---- 原子 ----
+    // P-19: 经 reinterpret_cast 把 uint64_t* 当 std::atomic<uint64_t>* 使用,
+    // 形式上是 UB, 但依赖"std::atomic<uint64_t> 与 uint64_t 同布局且 lock-free"
+    // 这一实践可行前提(主流 ABI 均满足, core 计数器均 8B 对齐)。C++20 可用
+    // std::atomic_ref 消除该 UB, 当前基线(C++17)保留此写法并留档。
     uint64_t atomic_add(uint64_t* p, int64_t delta) override {
         return std::atomic_fetch_add(reinterpret_cast<std::atomic<uint64_t>*>(p), delta);
     }
@@ -329,7 +360,13 @@ public:
 
     uint32_t pid() override { return static_cast<uint32_t>(::getpid()); }
     uint64_t tid() override {
-#ifdef SYS_gettid
+#if defined(__APPLE__)
+        // P-17: macOS 无 SYS_gettid, 用 pthread_threadid_np 取内核线程 id;
+        // 原 std::hash<thread::id> 回退只保证进程内唯一, 非内核 tid。
+        uint64_t t = 0;
+        ::pthread_threadid_np(nullptr, &t);
+        return t;
+#elif defined(SYS_gettid)
         return static_cast<uint64_t>(::syscall(SYS_gettid));
 #else
         return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));

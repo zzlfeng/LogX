@@ -5,6 +5,7 @@ import com.logx.tester.model.ConsoleLine
 import com.logx.tester.model.LatencyStats
 import com.logx.tester.model.LineKind
 import com.logx.tester.model.TesterMetrics
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -45,8 +46,12 @@ object StressRunner {
         stop()
 
         val job = scope.launch(Dispatchers.Default) {
-            val payload = ByteArray(payloadSize) { (it % 26 + 65).toByte() }
-            val latencies = LongArray(total)
+            // T-15: 公共 API 入参防御 —— total 为负或过大时 LongArray 会抛异常/占用巨量内存。
+            // 与 UI 上限解耦, 在此 coerce 到安全区间(最大 500 万条 ≈ 40MB); 线程数与载荷同样兜底。
+            val safeTotal = total.coerceIn(0, 5_000_000)
+            val safeThreads = threads.coerceIn(1, 256)
+            val payload = ByteArray(payloadSize.coerceIn(0, 64 * 1024)) { (it % 26 + 65).toByte() }
+            val latencies = LongArray(safeTotal)
             val completedCount = AtomicInteger(0)
             val okCount = AtomicLong(0)
             val noSpaceCount = AtomicLong(0)
@@ -56,9 +61,9 @@ object StressRunner {
             val truncatedCount = AtomicLong(0)
 
             // 问题4修复: 使用 Dispatchers.IO.limitedParallelism 支持真正的多物理线程并发
-            val dispatcher = Dispatchers.IO.limitedParallelism(threads)
-            val perThread = total / threads
-            val remainder = total % threads
+            val dispatcher = Dispatchers.IO.limitedParallelism(safeThreads)
+            val perThread = safeTotal / safeThreads
+            val remainder = safeTotal % safeThreads
 
             val tStart = System.currentTimeMillis()
 
@@ -79,7 +84,7 @@ object StressRunner {
                 }
             }
 
-            val deferreds = (0 until threads).map { threadIdx ->
+            val deferreds = (0 until safeThreads).map { threadIdx ->
                 val threadCount = perThread + if (threadIdx == 0) remainder else 0
                 val threadStartOffset = threadIdx * perThread + if (threadIdx > 0) remainder else 0
 
@@ -90,7 +95,11 @@ object StressRunner {
                         val slotIdx = threadStartOffset + i
                         val res = LogXProbe.write(LogX.Level.I, "Stress", payload)
 
-                        latencies[slotIdx] = res.nanos
+                        // T-7: 仅成功(含截断保前缀)路径记录延迟样本 —— 失败/丢弃路径的耗时
+                        // 不属于"写入端到端延迟", 计入会污染 P50/P99(序列化时靠 >0 过滤不掉)。
+                        if (res is LogXProbe.R.Ok || res is LogXProbe.R.Truncated) {
+                            latencies[slotIdx] = res.nanos
+                        }
 
                         when (res) {
                             is LogXProbe.R.Ok -> okCount.incrementAndGet()
@@ -135,7 +144,9 @@ object StressRunner {
             var wasCancelled = false
             try {
                 deferreds.awaitAll()
-            } catch (_: Exception) {
+            } catch (_: CancellationException) {
+                // T-8: 仅协程取消(CancellationException)判为"手动中止"——真异常
+                // (OOM / 非法状态等)不再被吞掉并误标成 wasCancelled, 而是向上抛出可见。
                 wasCancelled = true
             } finally {
                 tickerJob.cancel()

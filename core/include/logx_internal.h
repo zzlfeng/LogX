@@ -23,7 +23,6 @@
 namespace logx {
 
 class Staging;
-class Flusher;
 
 // 单实例引擎;logx_instance_t 在 C ABI 里就是这个指针。
 struct Instance {
@@ -53,7 +52,6 @@ struct Instance {
     std::atomic<bool> flusher_running{false};
 
     Staging*  staging = nullptr;
-    Flusher*  flusher = nullptr;
     std::atomic<int> active_log_fd{-1};
 
     // ---- 错误回调 ----

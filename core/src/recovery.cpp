@@ -284,8 +284,15 @@ bool run_recovery(Instance* inst) {
             if (sum < size) {
                 F = static_cast<uint32_t>((static_cast<uint64_t>(F) + sum) % size);
             } else {
+                // F-31: Σraw_len ≥ 数据区——文件端块长超出 staging 容量, 磁盘已损坏,
+                // 无法对账。不推进 F 会让 [F, w) 已落块数据被重刷(重复块, 读侧
+                // block_header_plausible 判伪)。宁丢不脏: F 置 w 整批丢弃并清环,
+                // DROP 事件保证上层可观测(推进区间由下方不变量收尾补清零)。
                 emit_event(inst, LOGX_EV_RECOVERY, -1,
                            "backfill sum exceeds staging capacity; trusting file seqno");
+                emit_event(inst, LOGX_EV_DROP, -1,
+                           "staging ring dropped: backfill sum exceeds capacity");
+                F = w;
             }
         } else {
             // 回溯失败(IO 错误 / 文件内无更后继的完整块):退化为信任文件 seqno
@@ -373,8 +380,10 @@ bool run_recovery(Instance* inst) {
     }
 
     // 7) 写新 Header(seqno = resume_seqno,flushed_len = f,write_pos = 环扫描末尾)
-    AppendTargetCache atc{};
-    std::memcpy(&atc, inst->staging->raw_base() + 20, sizeof(atc));
+    // F-20: 基底用 pick_header 已验证过的 hdr.target, 不再裸读 Header A(+20):
+    // Header A 撕裂而 B 被选中时, 裸读会把垃圾 ATC 写回 commit_header,
+    // 未来可能生成畸形日期孤儿文件(retention 不删、export 混入)。
+    AppendTargetCache atc = hdr.target;
     // 更新追加目标缓存:指向 resume 目标(暂用 hint 或原 cache)
     if (!rec.target_path.empty()) {
         uint16_t split = 0;

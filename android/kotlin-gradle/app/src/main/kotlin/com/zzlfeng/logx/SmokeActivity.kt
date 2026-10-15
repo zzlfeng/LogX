@@ -13,18 +13,26 @@ import java.io.File
  */
 class SmokeActivity : Activity() {
 
-    private val lines = mutableListOf<String>()
+    // T-6: errorHandler 会被 RECOVERY/IO/DEGRADED 事件的 Flusher 原生线程同步回调,
+    // 若直接写入普通 ArrayList 会与主线程读取竞争; 这里改用线程安全队列, 并在每次
+    // 事件发生时通过 runOnUiThread 即时刷新 UI(而非仅在 onCreate finally 设置一次)。
+    private val lines = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    private var tv: TextView? = null
 
     private fun report(s: String) {
         lines.add(s)
         android.util.Log.i("SmokeTag", s)
+        runOnUiThread {
+            tv?.text = lines.joinToString("\n")
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val tv = TextView(this).apply { setPadding(32, 64, 32, 32) }
-        root.addView(tv)
+        val textView = TextView(this).apply { setPadding(32, 64, 32, 32) }
+        tv = textView
+        root.addView(textView)
         setContentView(root)
 
         try {
@@ -60,8 +68,6 @@ class SmokeActivity : Activity() {
             report("SMOKE PASS")
         } catch (t: Throwable) {
             report("SMOKE FAIL: ${t.javaClass.simpleName}: ${t.message}")
-        } finally {
-            tv.text = lines.joinToString("\n")
         }
     }
 }

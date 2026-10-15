@@ -54,8 +54,8 @@ fun TesterScreen(
     val metrics by viewModel.metrics.collectAsState()
     val lastWriteResult by viewModel.lastWriteResult.collectAsState()
     val logFiles by viewModel.logFiles.collectAsState()
-    val consoleLines by viewModel.consoleLines.collectAsState()
 
+    // T-5: 控制台状态改到 bottomBar 局部读取, 使控制台的 10Hz 行更新不会触发整页重组。
     val isStressRunning by viewModel.isStressRunning.collectAsState()
     val stressProgress by viewModel.stressProgress.collectAsState()
     val stressThroughput by viewModel.stressThroughput.collectAsState()
@@ -97,6 +97,21 @@ fun TesterScreen(
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            )
+        },
+        bottomBar = {
+            // T-5: 控制台移出纵向滚动 Column, 作为 Scaffold 固定底部区域。
+            // 消除 "verticalScroll 内嵌 LazyColumn" 的嵌套滚动手势冲突; 固定高度下
+            // LazyColumn 有界, 不再于无限高父容器中测量异常; 且因状态在此局部读取,
+            // 控制台高频更新只重组该区域而不触发整页重组。
+            val consoleLines by viewModel.consoleLines.collectAsState()
+            val maxConsoleBuffer by viewModel.maxConsoleBuffer.collectAsState()
+            LogConsole(
+                lines = consoleLines,
+                bufferCapacity = maxConsoleBuffer,
+                onCapacityChange = { viewModel.setConsoleBuffer(it) },
+                onClear = { viewModel.clearConsole() },
+                modifier = Modifier.height(372.dp)
             )
         }
     ) { innerPadding ->
@@ -213,16 +228,6 @@ fun TesterScreen(
                     viewModel.startStressTest(threads, total, payload, delay, flushInterval, recordEveryLine)
                 },
                 onStop = { viewModel.stopStressTest() }
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            // 5. 实时日志控制台
-            LogConsole(
-                lines = consoleLines,
-                bufferCapacity = viewModel.maxConsoleBuffer,
-                onCapacityChange = { viewModel.maxConsoleBuffer = it },
-                onClear = { viewModel.clearConsole() }
             )
         }
     }

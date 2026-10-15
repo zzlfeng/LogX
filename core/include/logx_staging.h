@@ -193,6 +193,13 @@ public:
     // 不变量校验(debug 构建调用):除 [f, w) 外全环为零。返回 true = 满足。
     bool debug_check_invariant(uint32_t f, uint32_t w) const;
 
+    // F-10: 读取追加目标缓存。内部走 pick_header——只取双 Header 中"CRC 对且
+    // seqno 新者"的 reserved,输出经过 magic/CRC 校验;双 Header 均坏时返回 false
+    // (调用方回退目录扫描)。与裸读 raw_base()+20 的区别: 撕裂 Header 不会产出
+    // 垃圾缓存(日期/切分序号指向不存在的文件, 诱发孤儿分卷)。
+    // 锁外可调(mmap 指针在生命周期内稳定)。
+    bool read_target_cache(AppendTargetCache* out) const;
+
     // 是否处于 mmap 失败堆内存降级模式 (spec §2 / §10)
     bool is_degraded() const { return is_heap_degraded_; }
 

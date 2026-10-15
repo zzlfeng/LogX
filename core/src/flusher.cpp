@@ -167,6 +167,9 @@ long append_block_raw(int fd,
     EncodedBlock enc;
     if (!encode_block(flag, key32_or_null, seqno, salt, raw_block, raw_len, &enc)) {
         inst->block_write_errors.fetch_add(1);
+        // F-28: 编码(压缩/加密)失败导致整块被丢弃, 仅计数几乎不可观测——
+        // 补 DEGRADED 事件, 让上层监控能看到"数据丢失且原因在编码链"。
+        emit_event(inst, LOGX_EV_DEGRADED, -1, "block encode failed; block dropped");
         return -1;
     }
     // 若发生压缩降级,通知监控层
@@ -606,6 +609,19 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
         // R24 §7.2 方案 C: 若文件声明加密, 一次性解析密钥并缓存进 ActiveFileTarget。
         uint8_t hdr[32];
         if (inst->pal->file_pread(fd, hdr, 32, 0) != 32) { inst->pal->file_close(fd); return -1; }
+        // F-11: 续写前校验文件头 magic+CRC(与 scan_one / export 同款纪律)。
+        // 文件头被外部破坏/撕裂时 salt 与加密位不可信——继续用坏 salt 续写会让
+        // 后续块 nonce 派生错、整文件离线不可解;自愈: 删除文件重开, 走上方新建
+        // 分支重新生成(本轮返回 -1, 下一轮 drain 经 scan/hint 重选目标或重建)。
+        bool hdr_ok = (get_u32(hdr) == kMagicFile) &&
+                      (crc32_update(0, hdr, kFileHeaderSize - 4) == get_u32(hdr + kFileHeaderSize - 4));
+        if (!hdr_ok) {
+            emit_event(inst, LOGX_EV_RECOVERY, -1,
+                       "invalid file header at append-target open; file dropped for rebuild");
+            inst->pal->file_close(fd);
+            inst->pal->file_unlink(path.c_str());
+            return -1;
+        }
         std::memcpy(out_target->salt, hdr + 12, 8);
         out_target->enc_capable = flag_encrypted(hdr[5]);
         out_target->key = nullptr;
@@ -681,11 +697,14 @@ void close_current(FlusherCtx* c, Pal* pal) {
         int fd_to_close = c->target.fd;
         c->target.fd = -1;
         c->target.key = nullptr;
-        if (c->inst) {
-            c->inst->active_log_fd.store(-1, std::memory_order_release);
-        }
+        // F-14: 先 fsync 再发布 active_log_fd=-1——并发 durability_sync
+        // (flush_blocking 调用线程, 30s 检查点在 Flusher 线程)在此窗口内仍能看到
+        // 并同步该 fd;旧序先置 -1 会让它白白丢一次同步机会。
         if (pal->file_fsync(fd_to_close) != 0) {
             if (c->inst) emit_event(c->inst, LOGX_EV_IO, -1, "close file fsync failed");
+        }
+        if (c->inst) {
+            c->inst->active_log_fd.store(-1, std::memory_order_release);
         }
         pal->file_close(fd_to_close);
     }
@@ -706,11 +725,12 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst, bool* ou
         // 优先用 hint(追加目标缓存)
         std::string hint;
         if (inst->staging) {
-            // 从 staging Header reserved[0..15] 读 cache
-            const uint8_t* base = inst->staging->raw_base();
+            // F-10: 经 Staging::read_target_cache 读追加目标缓存——内部走
+            // pick_header(magic+CRC+version 校验), 撕裂 Header 不再产出垃圾
+            // hint, 杜绝"date/split 指向不存在文件 → open_or_create 新建"的
+            // 孤儿分卷路径。
             AppendTargetCache tc;
-            std::memcpy(&tc, base + 20, sizeof(tc));
-            if (tc.date != 0) {
+            if (inst->staging->read_target_cache(&tc) && tc.date != 0) {
                 hint = make_log_path(inst->log_dir, tc.date, atc_split(tc));
             }
         }
@@ -946,6 +966,9 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         const uint8_t* key = encrypt_this_block ? c->target.key : nullptr;
 
         // 5.2 编码 + 写盘;seqno 取自当前 staging Header
+        // F-13: 锁外读 cur_seqno。安全前提: Header.seqno 仅由 Flusher 单线程在
+        // commit_header_locked 内写入(文件单写者, spec §3.1 不变量 4),本处读写
+        // 同线程, 无数据竞争; 启动期 recovery 亦在 Flusher 线程启动前完成。
         uint32_t cur_seqno = get_u32(inst->staging->raw_base() + 8);
         BlockWriteResult wr = write_and_record(inst, c->target.fd,
                                                c->scratch.data() + blk.raw_offset,
@@ -992,7 +1015,8 @@ void drain_once(FlusherCtx* c, Instance* inst) {
 void flusher_loop(Instance* inst) {
     FlusherCtx c{};
     c.inst = inst;
-    inst->flusher_running.store(true);
+    // F-8: 不再重复 store(true)——logx_open 在 thread_start 成功后已置位,
+    // 此处再写既冗余又会在"线程瞬间退出"时覆写竞态;退出时统一 store(false)。
     retention_cleanup_impl(inst);
     uint64_t last_sync_ms = inst->pal->wallclock_ms();
     while (!inst->flusher_exit.load()) {

@@ -236,7 +236,7 @@ fun ConfigPanel(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text("加密开启 (encrypt)", fontWeight = FontWeight.SemiBold)
-                    Text("AES-128-GCM 加密，每块额外 16B 认证标头", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    Text("AES-256-GCM 加密 (32B 密钥)，每块额外 16B 认证标头", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                 }
                 Switch(
                     checked = config.encrypt,
@@ -290,13 +290,25 @@ fun ConfigPanel(
 
             if (config.keyProviderMode == KeyProviderMode.CUSTOM_HEX) {
                 Spacer(modifier = Modifier.height(8.dp))
+                // T-13: 原仅校验长度, 非 Hex 字符(如 "zz..")会在 hexToBytes 解析失败时静默
+                // 退化为 null 密钥(表现为"密钥缺失"); 这里同时校验字符集并给出显式提示。
+                val hexLenOk = config.customKeyHex.length == 64
+                val hexCharsOk = config.customKeyHex.all {
+                    it.isDigit() || it in 'a'..'f' || it in 'A'..'F'
+                }
                 OutlinedTextField(
                     value = config.customKeyHex,
                     onValueChange = { v -> onConfigChange { it.copy(customKeyHex = v) } },
                     label = { Text("自定义 32 字节密钥 (64 位 Hex 字符)") },
-                    isError = config.customKeyHex.length != 64,
+                    isError = !hexLenOk || !hexCharsOk,
                     supportingText = {
-                        Text(if (config.customKeyHex.length == 64) "长度合法 (64字符)" else "当前长度: ${config.customKeyHex.length}/64")
+                        Text(
+                            when {
+                                !hexLenOk -> "当前长度: ${config.customKeyHex.length}/64"
+                                !hexCharsOk -> "⚠️ 含非 Hex 字符，将退化为'密钥缺失'(加密写入会失败)"
+                                else -> "长度合法 (64字符)"
+                            }
+                        )
                     },
                     modifier = Modifier.fillMaxWidth()
                 )

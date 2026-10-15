@@ -4,7 +4,8 @@
 // JNI 只在两者之间做参数转换 / 字符串复制 / 异常抛出。
 //
 // 性能要点:
-//   - 单条日志路径使用 GetStringUTFRegion 栈缓冲读取 tag,
+//   - 单条日志路径使用 GetStringUTFRegion 栈缓冲读取 tag(超长 tag 才退化为
+//     堆缓冲, 见 nativeWrite J-3),
 //     搭配 GetByteArrayRegion 栈缓冲/thread_local 读取 payload, 实现 JNI 边界零堆内存分配 (Zero Heap Allocation),
 //     同时彻底杜绝 GetPrimitiveArrayCritical 临界区内触发错误回调导致的 CheckJNI 崩溃。
 //   - keyProvider 回调里不能重入 LogX(JNI 调用栈已在 native,死锁风险)。
@@ -87,10 +88,48 @@ static jstring make_jstring_utf16(JNIEnv* env, const char* utf8) {
     return s;
 }
 
+// J-3: jstring → 标准 UTF-8(CESU-8 经就地转码修正为 core 契约的标准 UTF-8)。
+// 用于 tag / logDir / stagingPath / export 日期范围等按 UTF-8 契约入 core 的参数。
+// GetStringUTFChars 返回 JVM 只读缓冲, 不可就地改写, 故先拷入 std::string 再转码。
+// J-10: GetStringUTFChars 失败(如 OOM)时清除 pending 异常并返回 false,
+//       调用方据此返回错误码而非让异常穿透到 Kotlin。
+static bool jstring_to_utf8(JNIEnv* env, jstring js, std::string* out) {
+    if (!js || !out) return false;
+    const char* tmp = env->GetStringUTFChars(js, nullptr);
+    if (!tmp) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return false;
+    }
+    size_t n = static_cast<size_t>(env->GetStringUTFLength(js));
+    out->assign(tmp, n);
+    env->ReleaseStringUTFChars(js, tmp);
+    if (n == 0) return true;  // 空串: 免对空 std::string 取 &out[0](UB)
+    size_t nl = logx_jni::cesu8_to_utf8_inplace(&(*out)[0], out->size());
+    out->resize(nl);
+    return true;
+}
+
+// J-2: 错误回调重入守卫。错误回调在调用线程同步执行;若用户回调内再次调用
+// LogX(如 log/flush/close), 会经 core 再次进入本 trampoline, 在非递归 mutex
+// 上构成同线程二次取锁死锁(mutex 契约见 logx_pal.h P-2 留档)。
+// 同线程重入直接丢弃该事件并返回, 既避免死锁也防止回调栈无限增长。
+static thread_local bool tls_in_error_callback = false;
+
+struct ErrorCallbackGuard {
+    ErrorCallbackGuard() { tls_in_error_callback = true; }
+    ~ErrorCallbackGuard() { tls_in_error_callback = false; }
+    ErrorCallbackGuard(const ErrorCallbackGuard&) = delete;
+    ErrorCallbackGuard& operator=(const ErrorCallbackGuard&) = delete;
+};
+
 // J-02: 错误回调上下文按实例持有(经 cfg.err_user 传入 core,由 emit_event
 // 回传),不再使用全局静态 g_err_ctx —— 多实例场景下任一实例关闭只影响自身,
 // 其余实例的回调路径不受干扰;生命周期与实例严格同步。
 static void jni_error_trampoline(void* user, logx_event_kind_e kind, int code, const char* msg) {
+    // J-2: 重入守卫——同线程回调链上再次进入即丢弃(明细见 ErrorCallbackGuard 注释)。
+    if (tls_in_error_callback) return;
+    ErrorCallbackGuard reentry_guard;
+    (void)reentry_guard;
     auto* ctx = static_cast<const JniErrorContext*>(user);
     if (!ctx || !ctx->jvm || !ctx->g_logx_class || !ctx->mid_on_error) {
         return;
@@ -99,6 +138,10 @@ static void jni_error_trampoline(void* user, logx_event_kind_e kind, int code, c
     bool need_detach = false;
     jint getEnvRes = ctx->jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
     if (getEnvRes == JNI_EDETACHED) {
+        // J-17(留档): Flusher 为原生线程, 每发一个事件都要 Attach/Detach 一次,
+        // 属已知开销。保持"用完即 Detach"以确保线程真的退出时不会被 JVM 悬挂
+        // (无线程退出钩子可用); 后续若实测占比显著, 可改为 thread_local 缓存
+        // "已由本层 Attach"状态并延迟到线程退出(需配合 JNI_OnUnload/pthread key)。
 #if defined(__ANDROID__)
         if (ctx->jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
             need_detach = true;
@@ -199,6 +242,17 @@ static int export_trampoline(void* user, const char* date, const char* plaintext
     // 可能出现非 ASCII 字节,NewStringUTF 的 Modified UTF-8 约束同样构成风险。
     jstring jDate = make_jstring_utf16(env, date ? date : "");
     jstring jPath = make_jstring_utf16(env, plaintext_path ? plaintext_path : "");
+    // J-12: 构造失败(如 OOM)必须 null 兜底——原实现把 null 直接传给 Kotlin
+    // 非空参数, NullPointerException 被下方 ExceptionClear 吞掉, 该分卷静默失败。
+    // 清 pending 异常后再用 NewStringUTF 占位空串, 保证回调链路可继续。
+    if (!jDate) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jDate = env->NewStringUTF("");
+    }
+    if (!jPath) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jPath = env->NewStringUTF("");
+    }
 
     jint res = env->CallIntMethod(ctx->cb, ctx->mid, jDate, jPath, static_cast<jlong>(size));
     if (env->ExceptionCheck()) {
@@ -206,8 +260,8 @@ static int export_trampoline(void* user, const char* date, const char* plaintext
         res = -1;
     }
 
-    env->DeleteLocalRef(jDate);
-    env->DeleteLocalRef(jPath);
+    if (jDate) env->DeleteLocalRef(jDate);
+    if (jPath) env->DeleteLocalRef(jPath);
     return static_cast<int>(res);
 }
 
@@ -232,17 +286,28 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
                                       jint stagingWaitMs) {
     if (!jLogDir || !jStagingPath) return 0;
 
+    // J-8: kid 为 jint, 静默 cast 到 uint16_t 会把负值/超 65535 变成另一合法
+    // kid → 密钥错配且无告警。越界直接 fail-fast。
+    if (kid < 0 || kid > 0xFFFF) return 0;
+    // J-9: flushThreshold 仅允许 -1(默认)/ 0(禁用阈值自动唤醒)/ 正值;
+    // ≤-2 的负值 cast 成巨大 uint32 会让阈值永不触发(未定义未拒绝), 直接拒绝。
+    if (flushThreshold < -1) return 0;
+
     // T5.4: consoleEcho 开关在 init 时点定型(Kotlin facade 单实例契约下
     // 进程级存储无歧义;close→re-init 循环会重新走到这里刷新)。
+    // J-18: g_console_echo 为进程级全局, 与 J-02"实例间零共享可变状态"的声明并存——
+    // 这是有意的: 该开关仅映射到 logcat 镜像输出, 在单实例契约下无实害。
     g_console_echo.store(jConsoleEcho == JNI_TRUE, std::memory_order_relaxed);
 
-    const char* log_dir = env->GetStringUTFChars(jLogDir, nullptr);
-    const char* staging_path = env->GetStringUTFChars(jStagingPath, nullptr);
-    if (!log_dir || !staging_path) {
-        if (log_dir) env->ReleaseStringUTFChars(jLogDir, log_dir);
-        if (staging_path) env->ReleaseStringUTFChars(jStagingPath, staging_path);
+    // J-3: 路径入 core 前经标准 UTF-8 转码(改 ANSI/CESU-8 问题见 jstring_to_utf8);
+    // J-10: 读取失败时清 pending 异常并返回 0。
+    std::string log_dir_s, staging_s;
+    if (!jstring_to_utf8(env, jLogDir, &log_dir_s) ||
+        !jstring_to_utf8(env, jStagingPath, &staging_s)) {
         return 0;
     }
+    const char* log_dir = log_dir_s.c_str();
+    const char* staging_path = staging_s.c_str();
 
     JniKeyProviderContext* kp_ctx = nullptr;
     JavaVM* jvm = nullptr;
@@ -255,9 +320,23 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
         if (!g_logx_class) {
             jclass localLogX = env->FindClass("com/zzlfeng/logx/LogX");
             if (localLogX) {
-                g_logx_class = static_cast<jclass>(env->NewGlobalRef(localLogX));
-                g_mid_on_error = env->GetStaticMethodID(localLogX, "onNativeError", "(IILjava/lang/String;)V");
+                jmethodID mid = env->GetStaticMethodID(localLogX, "onNativeError", "(IILjava/lang/String;)V");
+                if (mid) {
+                    g_logx_class = static_cast<jclass>(env->NewGlobalRef(localLogX));
+                    g_mid_on_error = mid;
+                } else {
+                    // J-7: 获取失败必须清 pending 异常——否则 nativeInit 返回后 JVM
+                    // 向 Kotlin 抛 NoSuchMethodError。且不置 g_logx_class, 令下次
+                    // nativeInit 重试(原实现 mid 永久 null → 错误事件永久静默丢失)。
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    __android_log_print(ANDROID_LOG_WARN, LOGX_TAG,
+                                        "onNativeError not found; error events disabled");
+                }
                 env->DeleteLocalRef(localLogX);
+            } else {
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                __android_log_print(ANDROID_LOG_WARN, LOGX_TAG,
+                                    "FindClass(LogX) failed; error events disabled");
             }
         }
         if (g_logx_class && g_mid_on_error) {
@@ -302,8 +381,6 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     logx_instance_t* inst = nullptr;
     logx_status_e rc = logx_open(&cfg, &inst);
 
-    env->ReleaseStringUTFChars(jLogDir, log_dir);
-    env->ReleaseStringUTFChars(jStagingPath, staging_path);
     if (rc != LOGX_OK) {
         if (kp_ctx) {
             env->DeleteGlobalRef(kp_ctx->g_provider);
@@ -349,22 +426,46 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
     if (!handle || !jTag) return LOGX_ERR_INVALID_ARG;
     auto* inst = reinterpret_cast<logx_instance_t*>(handle);
 
-    // 1) Tag 读取: 使用栈缓冲区 + GetStringUTFRegion 避免堆分配
+    // 1) Tag 读取: 栈缓冲区 + GetStringUTFRegion 避免堆分配;
+    // J-3: JNI 产出的是 Modified UTF-8(CESU-8), 需就地转码为 core 契约的标准
+    // UTF-8(补充平面字符 6→4 字节;输出恒 ≤ 输入, 就地写安全)。超长 tag 走
+    // GetStringUTFChars 分支时 JVM 缓冲只读, 故先拷入 std::string 再转码。
     char tag_buf[128];
+    std::string tag_heap;
     const char* tag_ptr = tag_buf;
     jsize tag_len = env->GetStringLength(jTag);
     if (tag_len < static_cast<jsize>(sizeof(tag_buf) / 3)) {
         jsize utf8_len = env->GetStringUTFLength(jTag);
         if (utf8_len < static_cast<jsize>(sizeof(tag_buf))) {
             env->GetStringUTFRegion(jTag, 0, tag_len, tag_buf);
-            tag_buf[utf8_len] = '\0';
+            size_t nl = logx_jni::cesu8_to_utf8_inplace(tag_buf, static_cast<size_t>(utf8_len));
+            tag_buf[nl] = '\0';
+            tag_ptr = tag_buf;
         } else {
-            tag_ptr = env->GetStringUTFChars(jTag, nullptr);
+            // J-10: 失败(如 OOM)清 pending 异常并返回错误码, 不让异常穿透到 Kotlin。
+            const char* tmp = env->GetStringUTFChars(jTag, nullptr);
+            if (!tmp) {
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                return LOGX_ERR_NOMEM;
+            }
+            tag_heap.assign(tmp, static_cast<size_t>(utf8_len));
+            env->ReleaseStringUTFChars(jTag, tmp);
+            size_t nl = logx_jni::cesu8_to_utf8_inplace(&tag_heap[0], tag_heap.size());
+            tag_heap.resize(nl);
+            tag_ptr = tag_heap.c_str();
         }
     } else {
-        tag_ptr = env->GetStringUTFChars(jTag, nullptr);
+        const char* tmp = env->GetStringUTFChars(jTag, nullptr);
+        if (!tmp) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            return LOGX_ERR_NOMEM;
+        }
+        tag_heap.assign(tmp, static_cast<size_t>(env->GetStringUTFLength(jTag)));
+        env->ReleaseStringUTFChars(jTag, tmp);
+        size_t nl = logx_jni::cesu8_to_utf8_inplace(&tag_heap[0], tag_heap.size());
+        tag_heap.resize(nl);
+        tag_ptr = tag_heap.c_str();
     }
-    if (!tag_ptr) return LOGX_ERR_NOMEM;
 
     // 2) Payload 读取: 优先使用栈缓冲 + GetByteArrayRegion 避免堆分配与 GC 阻塞。
     // [CheckJNI 安全保障]: 严禁使用 GetPrimitiveArrayCritical。当 staging 环形缓冲写满(kFull)、
@@ -372,7 +473,8 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
     // 进而执行 make_jstring_utf16 (env->NewString) 和 env->CallStaticVoidMethod。
     // 在持有 Critical 临界区期间执行任何 JNI 调用都会触发 CheckJNI 的致命崩溃:
     // "using JNI after critical get in call to NewString"。
-    // 改用栈缓冲(≤4KB, 覆盖 99.9% 常规日志)配合 thread_local 缓冲(超长日志),
+    // 改用栈缓冲(4KB, 覆盖 99.9% 常规日志)配合 thread_local 缓冲(>4KB 时按需
+    // 扩至 64KB, 与 core kMaxRecordTotal 上限一致; 超出部分截断, core 亦会拒绝),
     // 既保持热路径零堆分配(Zero Heap Allocation)与零 GC 抖动, 又彻底杜绝 JNI 临界区冲突与 GC 阻塞风险。
     constexpr jsize kStackPayloadSize = 4096;
     constexpr jsize kMaxPayloadCapacity = 64 * 1024;
@@ -418,9 +520,8 @@ Java_com_zzlfeng_logx_LogX_nativeWrite(JNIEnv* env, jclass /*clazz*/, jlong hand
         console_echo(level, tag_ptr, echo_buf);
     }
 
-    if (tag_ptr && tag_ptr != tag_buf) {
-        env->ReleaseStringUTFChars(jTag, tag_ptr);
-    }
+    // J-3: tag_ptr 现恒指向 tag_buf 或 tag_heap(均为本地内存), JVM 只读缓冲已即时释放,
+    // 无需再 ReleaseStringUTFChars。
     return static_cast<jint>(wrc);
 }
 
@@ -437,24 +538,26 @@ Java_com_zzlfeng_logx_LogX_nativeExport(JNIEnv* env, jclass /*clazz*/, jlong han
     auto* inst = reinterpret_cast<logx_instance_t*>(handle);
 
     jclass cbClass = env->GetObjectClass(jCallback);
+    if (!cbClass) return -1;
     jmethodID mid = env->GetMethodID(cbClass, "onExport", "(Ljava/lang/String;Ljava/lang/String;J)I");
-    if (!mid) return -1;
+    env->DeleteLocalRef(cbClass);  // mid 为方法 id, 不受 local ref 删除影响
+    if (!mid) {
+        // J-11: GetMethodID 失败(签名不匹配)会置 pending 异常, 必须清除——
+        // 否则异常穿透回 Kotlin, 调用方拿到 NoSuchMethodError 而非 -1。
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return -1;
+    }
 
-    const char* from = env->GetStringUTFChars(jFrom, nullptr);
-    const char* to = env->GetStringUTFChars(jTo, nullptr);
-    if (!from || !to) {
-        if (from) env->ReleaseStringUTFChars(jFrom, from);
-        if (to) env->ReleaseStringUTFChars(jTo, to);
+    // J-3: 日期范围按标准 UTF-8 契约入 core;J-10: 读取失败清异常并返回 -1。
+    std::string from_s, to_s;
+    if (!jstring_to_utf8(env, jFrom, &from_s) || !jstring_to_utf8(env, jTo, &to_s)) {
         return -1;
     }
 
     ExportContext ctx{env, jCallback, mid};
-    logx_status_e rc = logx_export(inst, from, to, export_trampoline, &ctx);
+    logx_status_e rc = logx_export(inst, from_s.c_str(), to_s.c_str(), export_trampoline, &ctx);
 
-    env->ReleaseStringUTFChars(jFrom, from);
-    env->ReleaseStringUTFChars(jTo, to);
-
-    return (rc == LOGX_OK) ? 0 : static_cast<jint>(rc);
+    return static_cast<jint>(rc);
 }
 
 // 诊断统计:读取 core 原子计数器并以 long[] 返回给 Kotlin。

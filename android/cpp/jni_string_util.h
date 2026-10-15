@@ -86,6 +86,49 @@ inline std::vector<uint16_t> utf8_to_utf16(const char* s, size_t len) {
     return out;
 }
 
+// J-3: Modified UTF-8(CESU-8) → 标准 UTF-8 就地转码。
+// JNI 的 GetStringUTFChars/GetStringUTFRegion 产出 CESU-8, 而 core 按标准 UTF-8
+// 契约存储(tag / 路径)。二者差异仅两处:
+//   1) 补充平面字符用代理对编码(6 字节 ED A0.. 后接 ED B0..), 标准 UTF-8 为 4 字节;
+//   2) U+0000 编码为 C0 80(而非 0x00)。
+// 其余 BMP 码点两者比特级完全相同, 故可单趟就地把 6 字节合并为 4 字节。
+// 输出长度恒 ≤ 输入长度, 就地写安全(写指针不超前读指针)。返回新长度。
+// 注: 遇 U+0000 写入单个 0x00 字节——调用方按 C 串语义使用, 其后的内容会被截断
+// (tag 含内嵌 NUL 属病态输入, 不额外处理)。
+inline size_t cesu8_to_utf8_inplace(char* s, size_t len) {
+    auto* p = reinterpret_cast<uint8_t*>(s);
+    size_t w = 0, r = 0;
+    while (r < len) {
+        uint8_t b0 = p[r];
+        // Modified UTF-8 NUL: C0 80 → 0x00
+        if (b0 == 0xC0 && r + 1 < len && p[r + 1] == 0x80) {
+            p[w++] = 0x00;
+            r += 2;
+            continue;
+        }
+        // 高代理(ED A0..AF xx)+ 低代理(ED B0..BF xx) → 4 字节标准 UTF-8
+        if (b0 == 0xED && r + 5 < len &&
+            p[r + 1] >= 0xA0 && p[r + 1] <= 0xAF && p[r + 2] >= 0x80 && p[r + 2] <= 0xBF &&
+            p[r + 3] == 0xED &&
+            p[r + 4] >= 0xB0 && p[r + 4] <= 0xBF && p[r + 5] >= 0x80 && p[r + 5] <= 0xBF) {
+            uint32_t hi = ((static_cast<uint32_t>(p[r + 1]) & 0x0Fu) << 6) |
+                          (static_cast<uint32_t>(p[r + 2]) & 0x3Fu);
+            uint32_t lo = ((static_cast<uint32_t>(p[r + 4]) & 0x0Fu) << 6) |
+                          (static_cast<uint32_t>(p[r + 5]) & 0x3Fu);
+            uint32_t cp = 0x10000u + ((hi - 0xD800u) << 10) + (lo - 0xDC00u);
+            p[w++] = static_cast<uint8_t>(0xF0 | (cp >> 18));
+            p[w++] = static_cast<uint8_t>(0x80 | ((cp >> 12) & 0x3Fu));
+            p[w++] = static_cast<uint8_t>(0x80 | ((cp >> 6) & 0x3Fu));
+            p[w++] = static_cast<uint8_t>(0x80 | (cp & 0x3Fu));
+            r += 6;
+            continue;
+        }
+        p[w++] = b0;  // 其余字节原样(CESU-8 与 UTF-8 一致)
+        ++r;
+    }
+    return w;
+}
+
 }  // namespace logx_jni
 
 #endif /* LOGX_JNI_STRING_UTIL_H */

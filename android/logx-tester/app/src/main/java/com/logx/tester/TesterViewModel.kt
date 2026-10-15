@@ -15,8 +15,10 @@ import com.logx.tester.model.LineKind
 import com.logx.tester.model.Preset
 import com.logx.tester.model.TesterConfig
 import com.logx.tester.model.TesterMetrics
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -26,10 +28,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 data class LogFileInfo(
@@ -81,7 +81,10 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
     private val _consoleLines = MutableStateFlow<List<ConsoleLine>>(emptyList())
     val consoleLines: StateFlow<List<ConsoleLine>> = _consoleLines.asStateFlow()
 
-    var maxConsoleBuffer: Int = 2000
+    // T-2: 控制台缓存上限改为可观察状态 —— 原普通可变字段被 Compose 直接读/写,
+    // 既不会触发重组, 也存在 IO 批处理协程读写与 UI 写冲突的竞态。
+    private val _maxConsoleBuffer = MutableStateFlow(2000)
+    val maxConsoleBuffer: StateFlow<Int> = _maxConsoleBuffer.asStateFlow()
 
     private var batchFlushJob: Job? = null
 
@@ -109,16 +112,34 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
         batchFlushJob = viewModelScope.launch(Dispatchers.Default) {
             while (isActive) {
                 delay(100)
-                // 定期同步原子事件计数与 native 诊断快照
+                // T-12: 先取值再比对, 仅在实际发生变化时才推送新状态,
+                // 避免每 100ms 无条件 copy 触发无效重组(StateFlow 对相同实例不会重复发射)。
+                val degraded = LogXProbe.eventDegradedCount.get()
+                val drop = LogXProbe.eventDropCount.get()
+                val truncated = LogXProbe.eventTruncatedCount.get()
+                val io = LogXProbe.eventIoCount.get()
+                val recovery = LogXProbe.eventRecoveryCount.get()
+                val nativeStats = LogX.getStats()
                 _metrics.update { old ->
-                    old.copy(
-                        eventDegraded = LogXProbe.eventDegradedCount.get(),
-                        eventDrop = LogXProbe.eventDropCount.get(),
-                        eventTruncated = LogXProbe.eventTruncatedCount.get(),
-                        eventIo = LogXProbe.eventIoCount.get(),
-                        eventRecovery = LogXProbe.eventRecoveryCount.get(),
-                        nativeStats = LogX.getStats() ?: old.nativeStats
-                    )
+                    val newStats = nativeStats ?: old.nativeStats
+                    if (old.eventDegraded == degraded &&
+                        old.eventDrop == drop &&
+                        old.eventTruncated == truncated &&
+                        old.eventIo == io &&
+                        old.eventRecovery == recovery &&
+                        old.nativeStats == newStats
+                    ) {
+                        old
+                    } else {
+                        old.copy(
+                            eventDegraded = degraded,
+                            eventDrop = drop,
+                            eventTruncated = truncated,
+                            eventIo = io,
+                            eventRecovery = recovery,
+                            nativeStats = newStats
+                        )
+                    }
                 }
 
                 if (pendingLines.isNotEmpty()) {
@@ -128,10 +149,11 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
                         batch.add(line)
                     }
                     if (batch.isNotEmpty()) {
+                        val capacity = _maxConsoleBuffer.value
                         _consoleLines.update { old ->
                             val combined = old + batch
-                            if (combined.size > maxConsoleBuffer) {
-                                combined.takeLast(maxConsoleBuffer)
+                            if (combined.size > capacity) {
+                                combined.takeLast(capacity)
                             } else {
                                 combined
                             }
@@ -154,12 +176,20 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
         applyAndRestart()
     }
 
+    fun setConsoleBuffer(capacity: Int) {
+        _maxConsoleBuffer.value = capacity.coerceIn(100, 20000)
+    }
+
     fun applyAndRestart() {
         viewModelScope.launch {
             _statusMessage.value = "正在启动实例..."
             appendConsoleLine(tag = "System", text = "正在重启 LogX 单例...", kind = LineKind.SYSTEM)
 
-            val res = EngineController.applyAndRestart(ctx, _config.value)
+            // T-3: init/close 是阻塞 IO + 原生初始化, 必须切到 IO 线程执行,
+            // 否则会在 Main 线程做磁盘/原生初始化而触发 ANR。
+            val res = withContext(Dispatchers.IO) {
+                EngineController.applyAndRestart(ctx, _config.value)
+            }
             when (res) {
                 is StartResult.Ok -> {
                     val c = _config.value
@@ -263,22 +293,25 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
         if (engineState.value != EngineState.Running) return
         viewModelScope.launch(Dispatchers.IO) {
             appendConsoleLine(tag = "Export", text = "正在导出日志 ($from .. $to)...", kind = LineKind.SYSTEM)
-            var totalBytes = 0L
-            var fileCount = 0
+            // T-14: 导出回调由 native 在任意线程触发, 计数与字节累加须用原子量;
+            // 同时补 -2 返回码文案 (Kotlin 侧未初始化会返回 ERR_STATE)。
+            val totalBytes = AtomicLong(0)
+            val fileCount = AtomicInteger(0)
             val code = LogX.export(from, to) { file ->
-                fileCount++
-                totalBytes += file.length()
+                fileCount.incrementAndGet()
+                totalBytes.addAndGet(file.length())
                 appendConsoleLine(tag = "Export", text = "导出一卷: ${file.name} (${file.length()} 字节)", kind = LineKind.SYSTEM)
             }
             val statusDesc = when (code) {
                 0 -> "导出完成 (成功)"
                 -1 -> "实例未初始化"
+                -2 -> "实例未就绪 (ERR_STATE)"
                 -3 -> "LOGX_ERR_IO (IO 错误)"
                 -6 -> "LOGX_ERR_CODEC (编解码/回调失败)"
                 -8 -> "LOGX_ERR_NOT_FOUND (时段内无日志)"
                 else -> "返回码: $code"
             }
-            appendConsoleLine(tag = "Export", text = "$statusDesc, 共 $fileCount 文件, $totalBytes 字节", kind = LineKind.SYSTEM)
+            appendConsoleLine(tag = "Export", text = "$statusDesc, 共 ${fileCount.get()} 文件, ${totalBytes.get()} 字节", kind = LineKind.SYSTEM)
         }
     }
 
@@ -292,9 +325,13 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
             val subDirs = parent.listFiles()?.filter { it.isDirectory && it.name.startsWith(cfg.logDirName) } ?: emptyList()
             val dirsToSearch = (listOf(dir) + subDirs).distinct()
 
+            // T-9: 精确匹配 "<yyyyMMdd>.log" 或 "<yyyyMMdd>.log.<n>" 卷文件,
+            // 避免 contains(".log.") 误匹配 "foo.log.txt"/"x.log.bak" 之类的非日志文件。
+            val logNamePattern = Regex("^\\d{8}\\.log(\\.\\d+)?$")
+
             val files = mutableListOf<LogFileInfo>()
             for (d in dirsToSearch) {
-                d.listFiles()?.filter { it.isFile && (it.name.endsWith(".log") || it.name.contains(".log.")) }
+                d.listFiles()?.filter { it.isFile && logNamePattern.matches(it.name) }
                     ?.forEach { f ->
                         files.add(LogFileInfo(name = "${d.name}/${f.name}", sizeBytes = f.length(), lastModified = f.lastModified()))
                     }
@@ -416,7 +453,14 @@ class TesterViewModel(application: Application) : AndroidViewModel(application) 
         super.onCleared()
         batchFlushJob?.cancel()
         StressRunner.stop()
-        EngineController.stopSync()
+        // T-4: EngineController.stopSync() 内部使用 runBlocking 阻塞调用线程, 而 onCleared
+        // 在 Main 线程回调; 直接调用会阻塞主线程甚至 ANR。改为投递到独立 IO 线程执行,
+        // 并用 NonCancellable 保证即使 viewModelScope 已取消也能跑完 close 流程。
+        CoroutineScope(Dispatchers.IO).launch {
+            withContext(NonCancellable) {
+                EngineController.stopSync()
+            }
+        }
     }
 }
 

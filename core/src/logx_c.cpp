@@ -67,11 +67,12 @@ std::string make_tmp_path(Instance* inst, uint32_t date) {
     if (!inst->pal->random_bytes(&rnd, sizeof(rnd))) {
         rnd = s_tmp_name_seq.fetch_add(1, std::memory_order_relaxed);
     }
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "%s/.tmp_export_%u_%lu_%08x",
-                  inst->log_dir.c_str(), date,
-                  static_cast<unsigned long>(inst->pal->pid()), rnd);
-    return std::string(buf);
+    // F-6: 改动态拼接,不再用 160B 定长 snprintf——log_dir 过长时静默截断会
+    // 产生错误路径(指向不存在的目录,导出回调拿到坏文件名)。
+    char rndbuf[16];
+    std::snprintf(rndbuf, sizeof(rndbuf), "%08x", rnd);
+    return inst->log_dir + "/.tmp_export_" + std::to_string(date) + "_"
+           + std::to_string(static_cast<unsigned long>(inst->pal->pid())) + "_" + rndbuf;
 }
 
 // 解码块 → 明文记录列表(原始 LGXE 序列 / 分片重组后格式化为可读行)。
@@ -345,10 +346,8 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     if (cfg->max_log_length > kMaxRecordTotal) {
         return LOGX_ERR_INVALID_ARG;
     }
-    if (cfg->max_log_length >= kDataSizeDefault) {
-        // 必须 < 数据区 − 1,否则放不进环
-        return LOGX_ERR_INVALID_ARG;
-    }
+    // F-4: 删除死代码——kMaxRecordTotal(64KB) 恒小于 kDataSizeDefault(130944),
+    // 上一分支已保证 max_log_length ≤ kMaxRecordTotal,该"放不进环"校验不可达。
     // 压缩算法配置 fail-fast:请求编译期未接入/未实现的算法时拒绝启动,
     // 避免"每个块都触发运行期降级"的确定性场景(降级链仅用于运行时偶发失败,
     // 见 codec.cpp spec §6 注释)。
@@ -408,6 +407,16 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->mu = inst->pal->mutex_create();
     inst->flush_event = inst->pal->ev_create();
     inst->space_event = inst->pal->ev_create();
+    // P-6: ev_create 失败(如 Win32 CreateEventA 返回 NULL)必须整体失败——
+    // 否则 wait()/wait_timeout() 退化, Flusher 等待循环沦为满 CPU 自旋且无错误
+    // 信号。mutex_create 理论不失败, 一并纳入守卫消除空指针解引用隐患。
+    if (!inst->mu || !inst->flush_event || !inst->space_event) {
+        if (inst->space_event) inst->pal->ev_destroy(inst->space_event);
+        if (inst->flush_event) inst->pal->ev_destroy(inst->flush_event);
+        if (inst->mu) inst->pal->mutex_destroy(inst->mu);
+        delete inst;
+        return LOGX_ERR_STATE;
+    }
     if (inst->pal->threading_init() != 0) {
         if (inst->space_event) inst->pal->ev_destroy(inst->space_event);
         inst->pal->ev_destroy(inst->flush_event);
@@ -493,12 +502,15 @@ logx_status_e logx_write(logx_instance_t* h, int level,
                          const char* tag, const uint8_t* payload, uint32_t payload_len) {
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return LOGX_ERR_STATE;
-    if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
     if (!inst->staging) return LOGX_ERR_STATE;
     if (!tag) return LOGX_ERR_INVALID_ARG;
 
+    // F-1: 先增计数再查 closing——避免 close 恰在"查 closing 与 fetch_add 两步
+    // 之间完成(active_ops==0 走立即销毁)"导致写线程对已 delete 的 inst 增计数(UAF)。
+    // closing 置位后计数由 OpGuard 析构时递减并触发递延销毁, 语义与先前等价。
     inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
     OpGuard guard{inst};
+    if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
 
     // 1) 锁外格式化(包含校验和计算)
     // E-02: 区分"输入非法"与"内容超长"两类失败——非法输入按 INVALID_ARG 上报,
@@ -506,7 +518,9 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     // B-1B 方案B: 内容超长(max_log_length 或 60KB 用户载荷硬上限)不再整条丢弃,
     // 截断保留前缀后照常落环,返回 LOGX_OK;仅病态小上限(截断到空记录仍放不下)
     // 保留丢弃兜底,drop_too_large 只在该路径递增。
-    uint8_t buf[kMaxRecordTotal];
+    // F-9: TLS 化调用方缓冲——每写线程持有 64KB 栈缓冲(与 format 内部 TLS scratch
+    // 合计 ~128KB)对小栈线程(≤256KB)有溢出风险;thread_local 摊薄为各线程一次占用。
+    static thread_local uint8_t buf[kMaxRecordTotal];
     uint32_t total = 0;
     bool truncated = false;
     uint64_t dropped_bytes = 0;
@@ -629,6 +643,11 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     if (st == Staging::WriteStatus::kFull) {
         inst->drop_no_space.fetch_add(1);
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_NO_SPACE, "staging full");
+    } else if (st == Staging::WriteStatus::kTooLarge) {
+        // F-3: write_records 的单条超上限状态单独记账——open 已用 kMaxRecordTotal
+        // 前置校验, 常态不可达;保留显式分支避免被误记入 NO_SPACE, 错误码语义对齐。
+        inst->drop_too_large.fetch_add(1);
+        emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, "record too large for staging");
     }
 
     if (inst->closing.load(std::memory_order_acquire)) {
@@ -636,7 +655,8 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     }
 
     if (need_wake) inst->pal->ev_signal(inst->flush_event);
-    return st == Staging::WriteStatus::kOk ? LOGX_OK : LOGX_ERR_NO_SPACE;
+    if (st == Staging::WriteStatus::kOk) return LOGX_OK;
+    return st == Staging::WriteStatus::kTooLarge ? LOGX_ERR_TOO_LARGE : LOGX_ERR_NO_SPACE;
 }
 
 logx_status_e logx_flush(logx_instance_t* h) {

@@ -38,6 +38,7 @@ import os
 import re
 import struct
 import sys
+import zlib
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 
@@ -67,17 +68,13 @@ MAX_BLOCK_RAW = 20 * 1024 + 6 + 5
 
 # ---------------- 文件格式 helpers ----------------
 def crc32_update(crc: int, data: bytes) -> int:
-    crc = (~crc) & 0xffffffff
-    for b in data:
-        crc = (crc >> 8) ^ CRC_TABLE[(crc ^ b) & 0xff]
-    return (~crc) & 0xffffffff
+    """CRC32(IEEE 802.3, 多项式 0xedb88320)。
 
-CRC_TABLE = []
-for i in range(256):
-    c = i
-    for _ in range(8):
-        c = ((c >> 1) ^ 0xedb88320) if (c & 1) else (c >> 1)
-    CRC_TABLE.append(c)
+    D-9: 改用 zlib.crc32 —— 与纯 Python 逐字节实现语义等价(同一 IETF 多项式、
+    同一初值/终值异或约定), 但由 C 实现, 16MB 块从数秒降到微秒级。
+    zlib.crc32(data, init) 的 init 即上次返回值, 支持增量拼接, 与旧实现一致。
+    """
+    return zlib.crc32(data, crc) & 0xffffffff
 
 def put_u32(v: int) -> bytes:
     return struct.pack('<I', v & 0xffffffff)
@@ -165,8 +162,10 @@ class RecordReassembler:
                 self.in_split = False
             results.append(s.payload)
         elif s.is_first:
-            self.cur_slices = [s.payload]
-            self.in_split = True
+            # D-14: 对齐 C++ format.cpp —— 首片 payload 为空时视为未开启分片流,
+            # 其后中/末片一律丢弃(原实现继续拼接, 与 C++ 的 !empty() 判据不符)。
+            self.cur_slices = [s.payload] if s.payload else []
+            self.in_split = bool(s.payload)
         elif s.is_mid:
             if self.in_split:
                 self.cur_slices.append(s.payload)
@@ -261,7 +260,13 @@ class FileHeader:
     enc: bool
 
 def parse_file_header(b: bytes) -> FileHeader:
-    assert b[:4] == MAGIC_FILE, f"bad file magic: {b[:4]!r}"
+    # D-5: 用显式 raise 替代 assert —— assert 在 python -O 下被整体剔除,
+    # 会静默跳过 magic 校验并把坏文件当合法解析。
+    if b[:4] != MAGIC_FILE:
+        raise RuntimeError(f"bad file magic: {b[:4]!r}")
+    # D-16(归档): 本工具额外校验文件头 CRC, C++ 导出路径 (decode_one_file) 仅校验
+    # magic。差异无害——CRC 覆盖 [0,28) 全字段, 合法文件恒通过; 更严的检查只会在
+    # 文件头被破坏时提前报错, 不会误杀好文件。
     crc_expected = get_u32(b, 28)
     crc_actual = crc32_update(0, b[:28])
     if crc_expected != crc_actual:
@@ -298,6 +303,14 @@ def decode_block_raw(bhdr: bytes, payload: bytes, tag: Optional[bytes],
     actual_crc = crc32_update(0, payload)
     if expected_crc != actual_crc:
         return DecodedBlockResult(seqno, raw_len, error=f"crc32 mismatch: expected {expected_crc:#x} != {actual_crc:#x}")
+
+    # D-13: 交叉校验块头 [22..34) 携带的 nonce 素材(8B salt + 4B BE seqno)。
+    # 写端 append_block_raw 恒写入 file_salt 与本块 seqno, 二者与文件头 salt / 块头
+    # seqno 不符即说明块头被损坏或篡改——CRC 只覆盖 payload, 发现不了这类篡改。
+    stored_salt = bytes(bhdr[22:30])
+    if stored_salt != bytes(file_salt) or bhdr[30:34] != struct.pack('>I', seqno):
+        return DecodedBlockResult(seqno, raw_len,
+                                  error="nonce mismatch: block header salt/seqno inconsistent")
 
     algo = (flag & COMP_MASK) >> FLAG_COMPRESS_SHIFT
     enc = bool(flag & FLAG_ENCRYPTED)
@@ -341,6 +354,11 @@ def block_header_plausible(bhdr: bytes, file_remaining: int,
     合法返回 (seqno, raw_len, payload_len, block_size);
     结构损坏返回 None —— 块边界自描述于块头,此时无法定位下一块,必须终止
     该文件扫描 (宁丢不脏,盲目 continue 会以错误 block_size 滑动整文件错位)。
+
+    D-2(归档): 算法编号放行集合为 {none, zstd, zlib}, 比 C++ block_header_plausible
+    多放行 zlib(algo=2)。这是有意的超集——写端从不产出 zlib, 但本工具作为离线
+    诊断器能解 zlib 块, 遇到历史/实验性 zlib 块时宁可解出来而非判为结构损坏而截断
+    扫描。若未来要求两端字节级一致, 应改为与 C++ 同拒 zlib。
     """
     if len(bhdr) < BLOCK_HEADER_SIZE:
         return None
@@ -402,12 +420,14 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
     off = 32
     prev_seqno = 0
     has_prev_seqno = False
+    stopped_broken = False  # D-12: 记号——因结构损坏终止时不重复报尾部残片
     while off + BLOCK_HEADER_SIZE <= len(data):
         bhdr = data[off:off+BLOCK_HEADER_SIZE]
         hdr = block_header_plausible(bhdr, len(data) - off, prev_seqno, has_prev_seqno)
         if hdr is None:
             # 结构损坏:与 C++ 一致终止扫描 (块边界已不可信)
             errors.append(f"{path} off={off}: bad block header; stop scanning file")
+            stopped_broken = True
             break
         seqno, raw_len, payload_len, block_size = hdr
         prev_seqno = seqno
@@ -423,12 +443,20 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
                                    kid_keys, fh.kid, fh.salt)
         if blk_res.error:
             # 块级解码失败:跳过该块继续 (对齐 C++ 导出路径占位行行为)
-            kind = blk_res.error.split(':', 1)[0]
             errors.append(f"{path} seq={seqno}: {blk_res.error}")
-            if kind == 'crc32 mismatch':
+            if blk_res.error.startswith('crc32 mismatch'):
                 user_records.append(f"[seq={seqno} crc fail]".encode('ascii'))
+            elif blk_res.error.startswith('missing key'):
+                # D-4: 与 C++ decode_one_file 缺 key 占位行严格一致(原实现输出
+                # "[seq=N decode fail]", 与 C++ 的 "[skipped: kid=K missing key
+                # (seq=N)]" 不同, 下游按前缀过滤/统计时行为分叉)。
+                user_records.append(
+                    f"[skipped: kid={fh.kid} missing key (seq={seqno})]".encode('ascii'))
             else:
                 user_records.append(f"[seq={seqno} decode fail]".encode('ascii'))
+            # D-1: 块级解码失败必须清重组器 carry —— 否则上一块遗留的首片会与
+            # 下一块的续片错误拼接, 产出跨"空洞"的伪完整记录(与 C++ 语义不符)。
+            reassembler.drop_carry()
             off += block_size
             continue
         if blk_res.raw_bytes:
@@ -446,12 +474,25 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
         off += block_size
 
     trailing_len = len(data) - off
-    if trailing_len > 0:
-        # R19 F-15: 块尾 <34B 撕裂残片输出警告
+    if trailing_len > 0 and not stopped_broken:
+        # R19 F-15: 块尾 <34B 撕裂残片输出警告。
+        # D-12: 因坏块头终止扫描时, off 停在损坏块起点, 其后既非"撕裂尾部"也已由
+        # 上条 bad block header 报错覆盖, 不再重复报一次尾部残片。
         errors.append(f"{path}: trailing torn tail ({trailing_len}B < {BLOCK_HEADER_SIZE}B)")
     return user_records, errors
 
 # ---------------- 内部用户载荷 → 可读行 ----------------
+def is_placeholder_line(b: bytes) -> bool:
+    """D-4: 判定块级失败占位行(不进入用户载荷解析)。
+
+    覆盖 C++ 导出路径的三种占位:
+      "[seq=N crc fail]" / "[seq=N decode fail]" / "[skipped: kid=K missing key (seq=N)]"
+    """
+    s = b.rstrip()
+    if s.startswith(b'[seq=') and (s.endswith(b' crc fail]') or s.endswith(b' decode fail]')):
+        return True
+    return s.startswith(b'[skipped: kid=') and s.endswith(b')]')
+
 def parse_user_payload(b: bytes) -> Tuple[int, int, int, int, str, bytes]:
     """返回 (ts_ms, pid, tid, level, tag, msg)。"""
     if len(b) < 27:
@@ -461,8 +502,17 @@ def parse_user_payload(b: bytes) -> Tuple[int, int, int, int, str, bytes]:
     tid   = struct.unpack('<Q', b[12:20])[0]
     level = b[20]
     tag_len = struct.unpack('<H', b[21:23])[0]
+    # D-6: 结构越界必须显式报错, 而非靠切片静默截断。原实现 tag_len 超长时
+    # b[23:23+tag_len] 会静默返回短切片, 越界 msg_len 同理——两者都会把损坏记录
+    # 当合法行输出。上限取 C++ 侧 kMaxTag = 64(logx_format.h, strnlen(tag, 65) 判非法)。
+    if tag_len > 64:
+        raise RuntimeError(f"tag_len {tag_len} exceeds 64")
+    if len(b) < 23 + tag_len + 4:
+        raise RuntimeError(f"tag_len {tag_len} exceeds available payload ({len(b)}B)")
     tag = b[23:23+tag_len].decode('utf-8', errors='replace')
     msg_len = struct.unpack('<I', b[23+tag_len:23+tag_len+4])[0]
+    if len(b) < 23 + tag_len + 4 + msg_len:
+        raise RuntimeError(f"msg_len {msg_len} exceeds available payload ({len(b)}B)")
     msg = b[23+tag_len+4:23+tag_len+4+msg_len]
     return ts_ms, pid, tid, level, tag, msg
 
@@ -472,22 +522,57 @@ def parse_kid_map(s: str) -> Dict[int, bytes]:
     for kv in s.split(','):
         kv = kv.strip()
         if not kv: continue
+        # D-11: 缺 '=' 时给出可诊断的报错(原实现 split('=',1) 直接抛 ValueError,
+        # 且调用方未捕获 → 用户看到裸栈回溯而非"[error] invalid --kid-map")。
+        if '=' not in kv:
+            raise RuntimeError(f"malformed kid map entry {kv!r}: expected kid=hexkey")
         kid_s, key_hex = kv.split('=', 1)
-        kid = int(kid_s)
-        key = bytes.fromhex(key_hex)
+        try:
+            kid = int(kid_s)
+        except ValueError:
+            raise RuntimeError(f"malformed kid {kid_s!r}: expected integer")
+        if kid < 0 or kid > 0xFFFF:
+            raise RuntimeError(f"kid {kid} out of range [0,65535]")
+        try:
+            key = bytes.fromhex(key_hex)
+        except ValueError:
+            raise RuntimeError(f"kid {kid}: invalid hex key {key_hex!r}")
         if len(key) != 32:
             raise RuntimeError(f"kid {kid}: key must be 32 bytes (got {len(key)})")
         out[kid] = key
     return out
 
-def log_file_sort_key(filename: str) -> Tuple[int, int]:
-    base = os.path.basename(filename)
-    m = re.match(r'^(\d{8})\.log(?:\.(\d+))?$', base)
+# D-7: 文件名解析与日期合法性校验单源化(与 C++ parse_log_filename /
+# valid_yyyymmdd 同口径)。split 上限 65535 对齐 uint16 字段宽度。
+def valid_yyyymmdd(v: int) -> bool:
+    if v < 19700101 or v > 99991231:
+        return False
+    y, m, d = v // 10000, (v // 100) % 100, v % 100
+    if m < 1 or m > 12 or d < 1:
+        return False
+    leap = (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0))
+    dim = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    return d <= dim[m - 1]
+
+def valid_yyyymmdd_str(s: str) -> bool:
+    return len(s) == 8 and s.isdigit() and valid_yyyymmdd(int(s))
+
+def parse_log_filename(name: str) -> Optional[Tuple[int, int]]:
+    """返回 (date, split);不符命名规范/日期非法/序号越界 → None。"""
+    m = re.match(r'^(\d{8})\.log(?:\.(\d+))?$', os.path.basename(name))
     if not m:
-        return (0, 0)
+        return None
     date = int(m.group(1))
     split = int(m.group(2)) if m.group(2) else 0
+    if not valid_yyyymmdd(date):
+        return None
+    if split < 0 or split > 0xFFFF:
+        return None
     return (date, split)
+
+def log_file_sort_key(filename: str) -> Tuple[int, int]:
+    # D-7: 日期/序号非法时归位 (0,0), 排序仍稳定;匹配过滤由 parse_log_filename 把关。
+    return parse_log_filename(filename) or (0, 0)
 
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(description="LogX 离线日志解码工具")
@@ -498,7 +583,33 @@ def main(argv: List[str]) -> int:
     ap.add_argument('--out', default=None, help='输出目录;省略则输出至 stdout')
     args = ap.parse_args(argv)
 
-    kid_keys = parse_kid_map(args.kid_map) if args.kid_map else {}
+    # D-10: 输出流编码兜底——写入含 NUL/非法 UTF-8 的 tag 时, Windows 控制台
+    # (GBK 代码页) 默认以 strict 模式抛 UnicodeEncodeError 中断整轮导出; 改为
+    # errors='replace' 保证长跑导出不因单条脏数据崩溃。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors='replace')
+        except Exception:
+            pass
+
+    # D-11: kid-map 解析失败给出可诊断报错, 而非裸栈回溯
+    try:
+        kid_keys = parse_kid_map(args.kid_map) if args.kid_map else {}
+    except Exception as e:
+        print(f"[error] invalid --kid-map: {e}", file=sys.stderr)
+        return 1
+
+    # D-8: --from/--to 格式校验(8 位数字 + 日历合法)。原实现直接拿字符串做字典序
+    # 比较, 形如 "20261" 之类非法输入会静默过滤出空集, 用户误以为"没有日志"。
+    if args.from_date is not None and not valid_yyyymmdd_str(args.from_date):
+        print(f"[error] --from must be a valid YYYYMMDD: {args.from_date!r}", file=sys.stderr)
+        return 1
+    if args.to_date is not None and not valid_yyyymmdd_str(args.to_date):
+        print(f"[error] --to must be a valid YYYYMMDD: {args.to_date!r}", file=sys.stderr)
+        return 1
+    if args.from_date and args.to_date and args.from_date > args.to_date:
+        print(f"[error] --from ({args.from_date}) is after --to ({args.to_date})", file=sys.stderr)
+        return 1
 
     # R19 F-9: 校验目录合法性, 区分普通文件与不存在
     if not os.path.isdir(args.log_dir):
@@ -511,7 +622,10 @@ def main(argv: List[str]) -> int:
         print(f"[error] failed to list log_dir: {e}", file=sys.stderr)
         return 1
 
-    matched_names = [n for n in dir_entries if re.match(r'^\d{8}\.log(\.\d+)?$', n)]
+    # D-7: 走 parse_log_filename 统一过滤——除命名格式外, 追加日历合法性与
+    # split(≤65535) 校验, 与 C++ parse_log_filename/valid_yyyymmdd 同口径
+    # (原正则会把 20261399.log / .log.999999 当合法文件收集)。
+    matched_names = [n for n in dir_entries if parse_log_filename(n) is not None]
     # R19 F-8: 按 (date, split) 数值排序, 避免 .log.10 排在 .log.2 之前
     matched_names.sort(key=log_file_sort_key)
     files = [os.path.join(args.log_dir, n) for n in matched_names]
@@ -557,10 +671,12 @@ def main(argv: List[str]) -> int:
             rc = 2
 
         for payload in user_payloads:
-            # 块级解码失败的占位行 ([seq=N crc fail] / [seq=N decode fail]):
-            # 与 C++ 导出路径一致,占位行本身出现在输出流中标记数据空洞,
-            # 不进入用户载荷解析。
-            if payload.startswith(b'[seq=') and (payload.rstrip().endswith(b' crc fail]') or payload.rstrip().endswith(b' decode fail]')):
+            # 块级解码失败的占位行 ([seq=N crc fail] / [seq=N decode fail] /
+            # [skipped: kid=K missing key (seq=N)]): 与 C++ 导出路径一致,
+            # 占位行本身出现在输出流中标记数据空洞, 不进入用户载荷解析。
+            # D-4: 追加识别缺 key 占位行(前两式不含 kid 变体, 会把它当用户载荷
+            # 送进 parse_user_payload 而报 "bad user payload")。
+            if is_placeholder_line(payload):
                 out_fh.write(payload.decode('ascii') + '\n')
                 continue
             try:

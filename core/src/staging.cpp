@@ -134,8 +134,11 @@ bool Staging::pick_header(Header* out, AppendTargetCache* out_target) const {
     uint32_t ca = compute_header_crc(base_);
     uint32_t cb = compute_header_crc(base_ + kHeaderASize);
 
-    bool a_ok = (ha.magic == kMagicStaging) && (ca == ha.header_crc);
-    bool b_ok = (hb.magic == kMagicStaging) && (cb == hb.header_crc);
+    // F-32: 增加 version 校验(写侧恒 1,见 commit_header_locked / wipe_all_locked)。
+    // 未来格式演进时, 旧版本(version≠1)的 Header 在启动期即被先验拒绝
+    // (走整区重建分支), 不给"读错字段"留空间。
+    bool a_ok = (ha.magic == kMagicStaging) && (ha.version == 1) && (ca == ha.header_crc);
+    bool b_ok = (hb.magic == kMagicStaging) && (hb.version == 1) && (cb == hb.header_crc);
 
     Header* chosen = nullptr;
     if (a_ok && b_ok) {
@@ -155,11 +158,21 @@ bool Staging::pick_header(Header* out, AppendTargetCache* out_target) const {
     return true;
 }
 
+bool Staging::read_target_cache(AppendTargetCache* out) const {
+    if (!out) return false;
+    Header h;
+    return pick_header(&h, out);
+}
+
 bool Staging::open(RecoveryState* state, bool* recovered) {
     // 1. open(O_RDWR, create_if_missing)
     fd_ = pal_->file_open(path_.c_str(), true, false);
     if (fd_ < 0) {
         // 文件打开失败: 降级分配堆内存 (spec §2 / §10)
+        // F-25: 堆降级 = 全新空 staging, 数据不可恢复——启动期即发生(文件打不开
+        // 属 mmap 前的 IO 故障), 丢弃内容可接受。注意此处跳过 recovery 对账
+        // (RecoveryState 全零, recovered=false), 上层随后经 is_degraded() 发
+        // DEGRADED 事件;日志文件侧数据不受影响, 后续照常追加。
         try {
             heap_buf_.assign(total_size_, 0);
         } catch (...) {
@@ -178,6 +191,7 @@ bool Staging::open(RecoveryState* state, bool* recovered) {
     if (pal_->file_truncate(fd_, total_size_) != 0) {
         pal_->file_close(fd_);
         fd_ = -1;
+        // F-25: 与上方同款堆降级——见"文件打开失败"分支注释(跳过 recovery 对账)。
         try {
             heap_buf_.assign(total_size_, 0);
         } catch (...) {
@@ -196,6 +210,7 @@ bool Staging::open(RecoveryState* state, bool* recovered) {
     mm_ = pal_->mmap_open(fd_, total_size_, true);
     if (!mm_.base) {
         // mmap 失败: 触发堆内存降级 (spec §2 / §10)
+        // F-25: 与上方同款堆降级——见"文件打开失败"分支注释(跳过 recovery 对账)。
         pal_->file_close(fd_);
         fd_ = -1;
         try {
@@ -266,6 +281,11 @@ void Staging::commit_header_locked(uint32_t seqno, uint32_t f, uint32_t w,
     //     永远不会出现 (A旧,B新) 的逆序窗口;
     //   - 掉电场景下 pick_header 取 CRC 完整且 seqno 较新者,
     //     seq_cst 纪律把"半新半旧"窗口压缩到单个 Header 内部(由 CRC 把关)。
+    // F-23: 需明示——该屏障保证的是**可见序**(synchronizes-with 角度), 不保证
+    // **掉电持久序**(msync 前 A 与 B 谁先落盘不由屏障决定)。掉电瞬间若 B 已持久
+    // 而 A 未持久/半写, 启动时 A 的 CRC 校验失败 → pick_header 落到 B(内容完整),
+    // 语义不丢;"B 持久、A 半写"这类极端窗口的风险由启动恢复对账(读 CRC/seqno
+    // 决策)吸收, 此处不再依赖硬持久序。
     std::atomic_thread_fence(std::memory_order_seq_cst);
     write_header_raw(base_ + kHeaderASize, h);
     std::atomic_thread_fence(std::memory_order_release);

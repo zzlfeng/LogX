@@ -5,11 +5,13 @@ import android.app.Application
 import android.content.Context
 import android.os.Build
 import android.os.Process
+import android.util.Log
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.job
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 
@@ -246,6 +248,12 @@ object LogX {
         // ---- 纯配置校验前置 (R37 N-4): 不消耗 initCount、不加载 native 库即可拒绝病态配置 ----
         validateInitConfig(config)
 
+        // J-16: 已初始化时立即拒绝——免去最长 1s 退栈轮询 + 遗留销毁前奏(慢前奏误导排障)。
+        // 锁内的 initCount 检查仍为权威判据, 覆盖两个线程并发 init 的竞态。
+        if (initCount.get() != 0L) {
+            throw IllegalStateException("LogX.init called more than once")
+        }
+
         // ---- 前奏阶段 (无锁): 等待旧实例静默 + 完成遗留销毁 ----
         val deadline = System.currentTimeMillis() + 1000
         while ((activeQuickOps.get() > 0 || activeExportOps.get() > 0)
@@ -275,6 +283,9 @@ object LogX {
                 // 重复 init: 抛 IllegalStateException (参见 spec §7)。
                 throw IllegalStateException("LogX.init called more than once")
             }
+            // J-15: 记录 init 前用户可能已预设的启动期监听(允许在 init 之前
+            // setErrorHandler), 失败回滚时恢复它而非无条件置 null, 避免清掉用户监听。
+            val prevErrorHandler = errorHandler
             try {
                 if (!isLibraryLoaded) {
                     System.loadLibrary("logx")
@@ -295,7 +306,8 @@ object LogX {
                 val stagingFile = File(stagingDir, stagingFileName)
 
                 // staging 必须 filesDir 系; 禁 cacheDir (系统清理会让 mmap 变孤儿, 见 spec §10)
-                require(!stagingDir.absolutePath.contains("/cache/")) {
+                // J-14: 精确判定是否位于 cacheDir 之下(替代 contains("/cache/") 的子串误判)。
+                require(!isUnderPath(stagingDir, context.cacheDir)) {
                     "staging dir must not be in cacheDir"
                 }
 
@@ -323,9 +335,10 @@ object LogX {
                 // K-03 / R3: 任何失败路径都必须回滚单例状态 —— 否则 errorHandler
                 // 持有的业务回调对象因单例引用无法及时 GC; initCount 归零允许业务
                 // 修正配置后重试 init; isClosed 保持 true 封死 pre-init 写入。
+                // J-15: 恢复 init 前预设的监听(见上 prevErrorHandler 注释)。
                 isClosed = true
                 nativeHandle = 0L
-                errorHandler = null
+                errorHandler = prevErrorHandler
                 initCount.set(0)
                 throw t
             }
@@ -354,12 +367,29 @@ object LogX {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
             am?.runningAppProcesses?.firstOrNull { it.pid == pid }?.processName ?: ""
         }
+        // J-4: 探测失败(API<28 时 runningAppProcesses 为 null/不含自身 pid)不能当主进程处理——
+        // 否则子进程与主进程共用同一 staging mmap, 并发写互相踩踏, 违背 Safe-by-Default。
+        // 以 pid 兜底强制隔离(staging 文件名与目录均按后缀区分)。
+        if (processName.isEmpty()) {
+            return "pid_${Process.myPid()}"
+        }
         val pkgName = context.packageName
         return when {
-            processName.isEmpty() || processName == pkgName -> ""
+            processName == pkgName -> ""
             processName.startsWith("$pkgName:") -> processName.removePrefix("$pkgName:")
             else -> processName.replace("[^a-zA-Z0-9_]".toRegex(), "_")
         }
+    }
+
+    /**
+     * J-14: 判断 dir 是否位于 parent 之下(规范化后按路径段比较, 而非子串 contains)。
+     * 原 `contains("/cache/")` 会误伤 `/cache_x/` 等合法路径; 此处精确匹配
+     * 相等或前缀为 `parent + 分隔符`, 与真实文件系统层级一致。
+     */
+    private fun isUnderPath(dir: File, parent: File): Boolean {
+        val child = dir.absolutePath
+        val p = parent.absolutePath
+        return child == p || child.startsWith(p + File.separator)
     }
 
     /**
@@ -392,7 +422,10 @@ object LogX {
         try {
             errorHandler?.onError(kind, code, message)
         } catch (t: Throwable) {
-            // 保护内核不被业务异常打崩
+            // 保护内核不被业务异常打崩。
+            // J-20: 兜底留痕——原实现静默吞掉业务全部 Throwable, 事件丢失无从排查。
+            // 仅在 handler 真正抛出时输出, 不构成常态噪声。
+            Log.w("LogX", "error handler threw on kind=$kind code=$code", t)
         }
     }
 
@@ -446,11 +479,14 @@ object LogX {
     /**
      * 按日期范围导出 (回调模式)。from/to = yyyyMMdd 闭区间;
      * 明文临时文件写在 logDir 内 (.tmp_export_* 命名, 并发导出不互踩); 回调返回或抛出后立即删除。
+     *
+     * 返回: ERR_OK(0) 成功; 其余为 native 状态码; 实例未初始化/已关闭返回
+     * ERR_STATE(-2)(J-13: 与 log()/flush() 口径一致, 原先返回 -1)。
      */
     fun export(from: String, to: String, cb: ExportCallback): Int {
         return executeOp(isExport = true) { h ->
             nativeExport(h, from, to, cb)
-        } ?: -1
+        } ?: ERR_STATE
     }
 
     /**
@@ -458,14 +494,15 @@ object LogX {
      *
      * 返回值与异常语义 (K-01 / K-02 优化修复):
      *   - 0  = LOGX_OK, 导出成功;
-     *   - -1 = 实例未初始化或已关闭;
+     *   - -1 = 业务 block 抛异常或回调返回非 0 (经 E-03 错误传播链路上报);
+     *   - ERR_STATE(-2) = 实例未初始化或已关闭 (J-13: 与 log()/flush() 口径一致);
      *   - 其他负值 = native 状态码: -6 LOGX_ERR_CODEC = 业务 block 抛异常或
      *     回调返回非 0 (经 E-03 错误传播链路上报); -3 LOGX_ERR_IO = 临时文件
      *     写出失败; -8 LOGX_ERR_NOT_FOUND = 时段内无日志文件;
-     *   - 结构化并发保障: runBlocking(parentContext) 绑定外层挂起点上下文，
-     *     外部协程取消信号能及时传导到 block 中中断执行;
-     *   - 防调度器死锁: 直接在当前 native 调用栈线程上执行事件循环，不向 Dispatchers.IO
-     *     重复调度多余工作线程，杜绝并发限制下 (如 limitedParallelism) 的互锁死锁;
+     *   - 结构化并发保障: runBlocking 绑定外层挂起点的 Job(仅取 Job 位)以保留
+     *     外部取消信号传导;调度器固定 Dispatchers.IO —— J-5: 原先直接继承
+     *     parentContext(含调用方 dispatcher), 从 Main 协程调用会把 block 内
+     *     的明文文件读派发到主线程执行;
      *   - 异常如实传递: 若业务 block 抛出异常，临时文件仍安全删除，并优先将业务真实
      *     异常向外抛出，避免被通用状态码掩盖。
      */
@@ -482,7 +519,8 @@ object LogX {
                         return@nativeExport -1
                     }
                     val cbRet = try {
-                        runBlocking(parentContext) {
+                        // J-5: 只继承 Job 保取消传导, 调度器固定 IO, 不让 block 跑在调用方(如 Main)线程
+                        runBlocking(parentContext.job + Dispatchers.IO) {
                             block(tempFile)
                         }
                         0
@@ -499,7 +537,7 @@ object LogX {
                 }
             }
             userException?.let { throw it }
-            res ?: -1
+            res ?: ERR_STATE
         }
     }
 
@@ -532,23 +570,29 @@ object LogX {
      * 4. 若快操作已退栈且无在途销毁，由 close() 立即同步调用 nativeClose;
      *    否则登记 pendingCloseHandle 交由最后退出的 executeOp 递延销毁。
      *    两种路径均经 getAndSet 仲裁, 句柄保证恰好销毁一次。
-     * 5. nativeClose (含 flush + Flusher join, 最坏 ~5s) 在 @Synchronized 锁内执行;
-     *    建议调用方在后台线程调用 close()。
+     * 5. J-19: 状态翻转在 synchronized(this) 内原子完成, 而 nativeClose(含 flush +
+     *    Flusher join, 最坏 ~5s) 移至锁外执行——避免持 this 锁期间 setErrorHandler/
+     *    init 全部挂起。销毁唯一性由 pendingCloseHandle 的 getAndSet + closeLock 仲裁;
+     *    即便与 init 并发, init 前奏亦会在 closeLock 内领取并销毁遗留句柄, 不会出现
+     *    新旧实例并发操作同一 staging 文件。
      */
-    @Synchronized
     fun close() {
-        val h = nativeHandle
-        if (h == 0L) return
-        isClosed = true
-        nativeHandle = 0L
-        initCount.set(0)
-        // close 后清除回调引用并标记关闭,回调对象可及时释放 (与 K-03 同纪律)
-        errorHandler = null
+        val h: Long
+        val isCurrentThreadInOp: Boolean
+        synchronized(this) {
+            h = nativeHandle
+            if (h == 0L) return
+            isClosed = true
+            nativeHandle = 0L
+            initCount.set(0)
+            errorHandler = null  // close 后清除回调引用, 回调对象可及时释放(与 K-03 同纪律)
 
-        // 登记待销毁句柄，保证必定被且仅被释放一次 (CAS / getAndSet 语义)
-        pendingCloseHandle.set(h)
+            // 登记待销毁句柄，保证必定被且仅被释放一次 (CAS / getAndSet 语义)
+            pendingCloseHandle.set(h)
+            isCurrentThreadInOp = (threadOpDepth.get() ?: 0) > 0
+        }
 
-        val isCurrentThreadInOp = (threadOpDepth.get() ?: 0) > 0
+        // ---- 以下为锁外慢段(J-19): 退栈等待 + nativeClose ----
         if (!isCurrentThreadInOp) {
             // N3: 只等快操作 (200ms); export 属慢操作, 直接走递延
             val deadline = System.currentTimeMillis() + 200

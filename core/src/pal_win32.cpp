@@ -9,8 +9,9 @@
 //   - 时间:QueryPerformanceCounter / GetSystemTimeAsFileTime / GetLocalTime
 //   - 随机:rand_s(系统 RNG)
 //
-// 已知限制:文件/目录 API 用 ANSI(A) 版本,路径需为当前代码页可表示字符;
-// UTF-8 路径支持(转 W API)留待后续。
+// 路径编码:对外接收 UTF-8(const char*),内部统一转宽字符走 W 系 API
+// (CreateFileW / DeleteFileW / FindFirstFileW / CreateDirectoryW 等),
+// 支持任意 Unicode 路径(含中文/emoji),不再受当前 ANSI 代码页限制(P-1)。
 
 // rand_s 需在 include 任何 CRT 头之前定义 _CRT_RAND_S
 #define _CRT_RAND_S
@@ -41,6 +42,31 @@ namespace {
 
 // P-01: Win32 HANDLE 为 64 位指针宽度(void*),必须经 intptr_t / void* 无损往返,
 // 禁止窄化截断进 32 位整型类型。
+
+// P-1: 文件/目录 API 统一走宽字符(W)变体——路径以 UTF-8 入参, 先经
+// MultiByteToWideChar(CP_UTF8) 转 UTF-16, 彻底移除 ANSI(A) 变体对"当前代码页
+// 可表示字符"的限制(中文/emoji/任意 Unicode 路径不再乱码或打不开)。
+// 编码非法(截断的多字节序列)时返回空串, 调用方判空即失败。
+static std::wstring utf8_to_wide(const char* utf8) {
+    if (!utf8 || !*utf8) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, nullptr, 0);
+    if (n <= 0) return std::wstring();
+    // 注意: n 含结尾 NUL, 缓冲区须按 n 分配再截掉末尾 NUL(否则第二次调用写 N 个
+    // 宽字符时越界 1 个 wchar_t)。
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, &w[0], n);
+    w.resize(static_cast<size_t>(n - 1));
+    return w;
+}
+
+static std::string wide_to_utf8(const wchar_t* w, int len) {
+    if (!w || len <= 0) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, len, &s[0], n, nullptr, nullptr);
+    return s;
+}
 
 // P-03: Win32 错误 → errno 转译,file_unlink/file_rmdir 失败时供调用方区分
 // "路径不存在"(ENOENT)与"目录非空"(ENOTEMPTY)等语义,而非一律 -1。
@@ -87,6 +113,7 @@ class Event {
 public:
     Event() : h_(CreateEventA(nullptr, FALSE, FALSE, nullptr)) {}
     ~Event() { if (h_) CloseHandle(h_); }
+    bool valid() const { return h_ != nullptr; }
     void signal_one() { if (h_) SetEvent(h_); }
     void wait() { if (h_) WaitForSingleObject(h_, INFINITE); }
     bool wait_timeout(uint32_t ms) {
@@ -101,13 +128,21 @@ class WinPal : public Pal {
 public:
     // ---- 文件 ----
     int file_open(const char* path, bool create_if_missing, bool append) override {
+        std::wstring wp = utf8_to_wide(path);
+        if (wp.empty()) { errno = ENOENT; return -1; }
         DWORD disp = create_if_missing ? OPEN_ALWAYS : OPEN_EXISTING;
-        HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+        HANDLE h = CreateFileW(wp.c_str(), GENERIC_READ | GENERIC_WRITE,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, disp, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return -1;
-        // P-05: 此处不再 SetFilePointer(FILE_END)——下方 _O_APPEND 已由 CRT 保证
-        // 每次写操作原子性地从文件尾开始,open 时的指针移动既冗余也会误导维护者。
+        if (h == INVALID_HANDLE_VALUE) {
+            // P-16: file_open 失败也转译 errno(原先仅 unlink/rmdir 转译, 上层按
+            // errno 诊断在 Windows 上会拿到陈旧值)。utf8 非法序列 → ENOENT。
+            errno = win32_error_to_errno(GetLastError());
+            return -1;
+        }
+        // P-10: 注释修正——MSVC CRT 的 _O_APPEND 是"用户态 seek+write", 并非内核级
+        // 原子追加; 追加语义的正确性由 core 的"文件单写者"不变量(F-13 前提)兜底,
+        // 此处不再 SetFilePointer(FILE_END), 免冗余且避免误导维护者。
         int flags = _O_RDWR | _O_BINARY;
         if (append) flags |= _O_APPEND;
         int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), flags);
@@ -179,11 +214,12 @@ public:
         return static_cast<int64_t>(sz.QuadPart);
     }
     int64_t file_size_path(const char* path) override {
-        // P-02: 改用 GetFileAttributesExA 读取 WIN32_FILE_ATTRIBUTE_DATA,
+        std::wstring wp = utf8_to_wide(path);
+        // P-02: 改用 GetFileAttributesExW 读取 WIN32_FILE_ATTRIBUTE_DATA,
         // 不再为一次大小查询付出 CreateFile/CloseHandle 的内核句柄往返;
         // 该路径在 retention 扫盘与快照统计中高频调用。
         WIN32_FILE_ATTRIBUTE_DATA fad;
-        if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return -1;
+        if (wp.empty() || !GetFileAttributesExW(wp.c_str(), GetFileExInfoStandard, &fad)) return -1;
         // 64 位无符号拼接高/低 32 位，杜绝有符号移位与按位或的静态检查歧义
         uint64_t sz = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) |
                       static_cast<uint64_t>(fad.nFileSizeLow);
@@ -192,11 +228,15 @@ public:
     int file_fsync(int fd) override {
         HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
         if (h == INVALID_HANDLE_VALUE) return -1;
+        // P-8: FlushFileBuffers 语义重于 fdatasync(数据+元数据同刷)——Windows 无
+        // fdatasync 等价物, 用其替代并接受"只重不轻"。
         return FlushFileBuffers(h) ? 0 : -1;
     }
     int file_dir_fsync(const char* dir_path) override {
-        // 目录句柄 + FlushFileBuffers ≈ 目录项 fsync (需包含写入相关权限以合法执行 FlushFileBuffers)
-        HANDLE h = CreateFileA(dir_path, FILE_LIST_DIRECTORY | FILE_ADD_FILE,
+        // P-7: 与 POSIX 侧不对称——Windows 目录 fsync 需 FILE_ADD_FILE 写权限,
+        // 只读目录会返 -1; POSIX 侧 O_RDONLY 即可。调用方(retention)接受该失败。
+        std::wstring wp = utf8_to_wide(dir_path);
+        HANDLE h = CreateFileW(wp.c_str(), FILE_LIST_DIRECTORY | FILE_ADD_FILE,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
         if (h == INVALID_HANDLE_VALUE) return -1;
@@ -205,12 +245,14 @@ public:
         return ok ? 0 : -1;
     }
     int file_unlink(const char* path) override {
+        std::wstring wp = utf8_to_wide(path);
         // P-03: 失败转译 errno(ENOENT/EBUSY/EACCES...),调用方语义与 POSIX 对齐
-        return translate_win32(DeleteFileA(path));
+        return translate_win32(DeleteFileW(wp.c_str()));
     }
     int file_rmdir(const char* dir_path) override {
+        std::wstring wp = utf8_to_wide(dir_path);
         // P-03: 失败转译 errno;目录非空 → ENOTEMPTY,不存在 → ENOENT
-        return translate_win32(RemoveDirectoryA(dir_path));
+        return translate_win32(RemoveDirectoryW(wp.c_str()));
     }
     int file_mkdirs(const char* dir_path) override {
         std::string s(dir_path ? dir_path : "");
@@ -218,6 +260,9 @@ public:
         while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
         if (s.empty()) return -1;
         // 识别根前缀:盘符(C:) 或根斜杠(/)
+        // P-15: 已知限制——UNC 前缀(\\server\share)与盘符相对路径(C:foo)未特殊
+        // 处理: 前者会把 "\\server" 误当组件交给 CreateDirectory 报错, 后者按
+        // 相对路径处理。core 当前传入的均为本地绝对目录, 不触发这两类; 备注留档。
         std::string root;
         size_t pos = 0;
         if (s.size() >= 2 && s[1] == ':') { root = s.substr(0, 2); pos = 2; }
@@ -227,9 +272,17 @@ public:
             char c = pos < s.size() ? s[pos] : 0;
             if (c == '/' || c == '\\' || c == 0) {
                 if (!acc.empty() && acc != root && acc.size() > root.size()) {
-                    if (!CreateDirectoryA(acc.c_str(), nullptr) &&
-                        GetLastError() != ERROR_ALREADY_EXISTS) {
-                        return -1;
+                    std::wstring accW = utf8_to_wide(acc.c_str());
+                    if (accW.empty()) return -1;
+                    if (!CreateDirectoryW(accW.c_str(), nullptr)) {
+                        DWORD e = GetLastError();
+                        if (e != ERROR_ALREADY_EXISTS) return -1;
+                        // P-14: ERROR_ALREADY_EXISTS 不区分"同名目录/同名文件"——
+                        // 同名普通文件存在时原实现静默当成功, 失败推迟到后续 open
+                        // 且难诊断。此处校验属性, 非目录即失败。
+                        DWORD attrs = GetFileAttributesW(accW.c_str());
+                        if (attrs == INVALID_FILE_ATTRIBUTES ||
+                            !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return -1;
                     }
                 }
             }
@@ -240,21 +293,24 @@ public:
     }
     std::vector<std::string> file_list(const char* dir_path) override {
         std::vector<std::string> out;
-        std::string pat = std::string(dir_path);
-        if (!pat.empty() && pat.back() != '/' && pat.back() != '\\') pat.push_back('\\');
-        pat += "*";
-        WIN32_FIND_DATAA fd;
-        HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+        std::wstring wdir = utf8_to_wide(dir_path);
+        if (wdir.empty()) return out;
+        std::wstring pat = wdir;
+        if (!pat.empty() && pat.back() != L'/' && pat.back() != L'\\') pat.push_back(L'\\');
+        pat += L"*";
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(pat.c_str(), &fd);
         if (h == INVALID_HANDLE_VALUE) return out;
         do {
-            std::string name = fd.cFileName;
-            if (name == "." || name == "..") continue;
+            std::wstring nameW = fd.cFileName;
+            if (nameW == L"." || nameW == L"..") continue;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;  // 仅文件
+            std::string name = wide_to_utf8(nameW.c_str(), static_cast<int>(nameW.size()));
             std::string full = std::string(dir_path);
             if (!full.empty() && full.back() != '/' && full.back() != '\\') full.push_back('/');
             full += name;
             out.push_back(full);  // 统一用 '/' 分隔,消费侧 find_last_of('/') 可解析
-        } while (FindNextFileA(h, &fd));
+        } while (FindNextFileW(h, &fd));
         FindClose(h);
         return out;
     }
@@ -266,9 +322,19 @@ public:
         m.len = len;
         HANDLE fh = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
         if (fh == INVALID_HANDLE_VALUE) return m;
+        // P-5: 校验文件大小与 len 一致——CreateFileMapping(0,0)+MapViewOfFile(0)
+        // 映射的是"文件当前全尺寸", 与传入 len 无关: 文件 < len 时视图小于 m.len,
+        // core 按 len 写视图会越界触发 EXCEPTION_IN_PAGE_ERROR(POSIX 等价 SIGBUS)。
+        // 返回失败让调用方(Staging::open)走堆降级, 不再"靠调用方纪律"。
+        // 映射建立后同样不得再 truncate 该 fd——既有视图会失效/悬空(POSIX 无此坑)。
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(fh, &sz) ||
+            sz.QuadPart < 0 || static_cast<uint64_t>(sz.QuadPart) != static_cast<uint64_t>(len)) {
+            return m;
+        }
         DWORD protect = writable ? PAGE_READWRITE : PAGE_READONLY;
         HANDLE map = CreateFileMappingA(fh, nullptr, protect, 0, 0, nullptr);
-        if (!map) return m;  // 文件必须已 ftruncate 到期望大小
+        if (!map) return m;
         DWORD access = writable ? FILE_MAP_ALL_ACCESS : FILE_MAP_READ;
         void* base = MapViewOfFile(map, access, 0, 0, 0);
         if (!base) { CloseHandle(map); return m; }
@@ -278,7 +344,11 @@ public:
     }
     int mmap_sync(const PalMmap& m, bool synchronous) override {
         if (!m.base) return -1;
-        if (!synchronous) return 0;  // MS_ASYNC:交系统异步回写
+        // P-21: synchronous=false(MS_ASYNC)为静默无操作——Windows 无异步 flush
+        // 原语, 返回 0 表示"已交给系统"; 核心当前仅以 synchronous=true 调用。
+        if (!synchronous) return 0;
+        // P-22: FlushViewOfFile 只保证刷到系统文件缓存, 不等同 msync(MS_SYNC)的
+        // "刷到物理盘"; 调用点(durability_sync)已配对 file_fsync 补偿, 见头契约。
         if (!FlushViewOfFile(m.base, 0)) return -1;  // 0 = 映射全部
         return 0;
     }
@@ -320,12 +390,21 @@ public:
     int thread_join(void* handle) override {
         if (!handle || handle == INVALID_HANDLE_VALUE) return -1;
         HANDLE h = reinterpret_cast<HANDLE>(handle);
-        WaitForSingleObject(h, INFINITE);
+        // P-9: WAIT_FAILED/ABANDONED 必须区分——原实现恒返回 0, 线程被强制终止
+        // (TerminateThread)或句柄异常也会被当成 join 成功, 上层无从发现。
+        DWORD rc = WaitForSingleObject(h, INFINITE);
         CloseHandle(h);  // 线程句柄一次性;join 后释放
-        return 0;
+        return (rc == WAIT_OBJECT_0) ? 0 : -1;
     }
 
-    void* ev_create() override { return new Event(); }
+    void* ev_create() override {
+        // P-6: CreateEventA 失败必须显式上报(nullptr)——否则 wait() 立即返回 /
+        // wait_timeout() 恒 false, Flusher 等待循环退化为满 CPU 自旋且无任何
+        // 错误信号。调用方(logx_open)已判空并整体失败。
+        Event* e = new Event();
+        if (!e->valid()) { delete e; return nullptr; }
+        return e;
+    }
     void  ev_destroy(void* h) override { delete static_cast<Event*>(h); }
     void  ev_signal(void* h) override { static_cast<Event*>(h)->signal_one(); }
     void  ev_wait(void* h) override { static_cast<Event*>(h)->wait(); }
@@ -355,7 +434,9 @@ public:
         // (C++11 magic static 保证线程安全),省去每次调用的高频内核查询。
         static const uint64_t freq = [] {
             LARGE_INTEGER f;
-            QueryPerformanceFrequency(&f);
+            // P-12: QueryPerformanceFrequency 失败/返回 0 时兜底为 1, 避免后续
+            // 除零(实际几乎不可能失败); 该常数在系统运行期固定不变。
+            if (!QueryPerformanceFrequency(&f) || f.QuadPart <= 0) return 1ULL;
             return static_cast<uint64_t>(f.QuadPart);
         }();
         LARGE_INTEGER now;
@@ -373,7 +454,9 @@ public:
                          static_cast<uint64_t>(ft.dwLowDateTime);
         // 1601-01-01 → 1970-01-01 的 100ns 间隔数
         constexpr uint64_t kEpochOffset = 116444736000000000ULL;
-        return (ticks - kEpochOffset) / 10000ULL;
+        // P-13: 系统时间早于 1970 时 ticks < kEpochOffset, 减法会无符号回绕成巨值;
+        // clamp 0 保底(时间戳仅用于排序/过滤, 无意义时间不放大成无限远期)。
+        return (ticks >= kEpochOffset) ? ((ticks - kEpochOffset) / 10000ULL) : 0;
     }
     void wallclock_date(uint32_t* yyyymmdd, uint32_t* hhmmss) override {
         SYSTEMTIME st;
