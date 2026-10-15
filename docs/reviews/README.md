@@ -35,6 +35,7 @@
 | [code_review_R33_2026-10-07.md](code_review_R33_2026-10-07.md) | R33 复核(B-10 方案 1 与 rebuilt 收口批次独立复核) | 主文件近期批次章节 |
 | [code_review_R35_2026-10-08.md](code_review_R35_2026-10-08.md) | R35 复核(R34 批次独立复核 + Android 链路修复 + 真机复跑；R34 无独立报告本体) | 主文件近期批次章节 |
 | [code_review_R36_2026-10-09.md](code_review_R36_2026-10-09.md) | R36 审查(R35 建议收口批次 `9c7b1b5`：Wire roundtrip 断言变异实证 + Stage D 基准独立快跑；0×P2+1×P3+1×Nit 均文档层已当场修正) | 主文件近期批次章节 |
+| [code_review_R39_2026-10-15.md](code_review_R39_2026-10-15.md) | R39 全量审查(非增量：core 逐行深审 + PAL/JNI/解码器/tester 并行代理审查；5 高/28 中/47 低/30 提示，共 110 条) | 未登记(待收口) |
 
 ## 说明
 
