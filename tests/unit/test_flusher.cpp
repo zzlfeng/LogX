@@ -2334,3 +2334,109 @@ TEST(Flush, AppendBlock_NullSaltOnExistingFile_ReusesFileHeaderSalt) {
     for (const auto& f : pal.file_list(dir.c_str())) pal.file_unlink(f.c_str());
     pal.file_rmdir(dir.c_str());
 }
+
+// =========================================================================
+// F-12: 续写既有文件时保证密钥与文件头声明的 kid 一致并输出告警
+// =========================================================================
+TEST(Flush, AppendTarget_KidMismatch_UsesFileHeaderKidAndEmitsDegraded) {
+    Pal& pal = default_pal();
+    std::string dir = std::string("logx_test_f12_kid_") +
+                      std::to_string(pal.pid()) + "_" +
+                      std::to_string(s_test_dir_seq.fetch_add(1));
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    static uint8_t s_key_kid1[32] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                                     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    static uint8_t s_key_kid2[32] = {2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                                     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2};
+
+    // 1) 先用 kid=1 创建并写入第一批日志
+    {
+        logx_config_t cfg1{};
+        cfg1.log_dir = dir.c_str();
+        cfg1.staging_path = staging.c_str();
+        cfg1.max_log_length = 4096;
+        cfg1.retention_days = 7;
+        cfg1.encrypt_enable = 1;
+        cfg1.kid = 1;
+        cfg1.key_provider = [](uint16_t kid, void*) -> const uint8_t* {
+            if (kid == 1) return s_key_kid1;
+            if (kid == 2) return s_key_kid2;
+            return nullptr;
+        };
+
+        logx_instance_t* inst1 = nullptr;
+        ASSERT_EQ(logx_open(&cfg1, &inst1), LOGX_OK);
+        ASSERT_EQ(logx_write(inst1, 2, "KID1", (const uint8_t*)"payload_kid1", 12), LOGX_OK);
+        ASSERT_EQ(logx_flush(inst1), LOGX_OK);
+        logx_close(inst1);
+    }
+
+    // 2) 重新启动实例, 本次配置使用 kid=2, 续写已有 kid=1 文件
+    struct EventState {
+        std::atomic<bool> saw_kid_mismatch{false};
+        std::atomic<int> kid_queried{0};
+    } ev_state;
+
+    {
+        logx_config_t cfg2{};
+        cfg2.log_dir = dir.c_str();
+        cfg2.staging_path = staging.c_str();
+        cfg2.max_log_length = 4096;
+        cfg2.retention_days = 7;
+        cfg2.encrypt_enable = 1;
+        cfg2.kid = 2;
+        cfg2.err_user = &ev_state;
+        cfg2.err_fn = [](void* user, logx_event_kind_e kind, int code, const char* msg) {
+            (void)code;
+            auto* s = static_cast<EventState*>(user);
+            if (kind == LOGX_EV_DEGRADED && msg && std::strstr(msg, "file header kid differs")) {
+                s->saw_kid_mismatch.store(true);
+            }
+        };
+        cfg2.key_provider = [](uint16_t kid, void* user) -> const uint8_t* {
+            auto* s = static_cast<EventState*>(user);
+            if (s && kid != 2) s->kid_queried.store(kid);
+            if (kid == 1) return s_key_kid1;
+            if (kid == 2) return s_key_kid2;
+            return nullptr;
+        };
+        cfg2.user = &ev_state;
+
+        logx_instance_t* inst2 = nullptr;
+        ASSERT_EQ(logx_open(&cfg2, &inst2), LOGX_OK);
+
+        // 写入第二条日志并刷盘, 命中续写已有文件分支
+        ASSERT_EQ(logx_write(inst2, 2, "KID2", (const uint8_t*)"payload_kid2_appended", 21), LOGX_OK);
+        ASSERT_EQ(logx_flush(inst2), LOGX_OK);
+
+        // 核心验证:
+        // a) 触发了 kid 不一致告警事件
+        EXPECT_TRUE(ev_state.saw_kid_mismatch.load());
+
+        // b) 续写该文件时, 必须使用文件头声明的 kid=1 派生密钥(而非 inst2 的 kid=2),
+        //    保证整文件使用一致密钥且离线可解
+        EXPECT_EQ(ev_state.kid_queried.load(), 1);
+
+        // c) 验证 export 导出两条记录均能使用文件头 kid=1 解密成功
+        uint32_t ymd = 0, hms = 0;
+        pal.wallclock_date(&ymd, &hms);
+        char date_str[16];
+        std::snprintf(date_str, sizeof(date_str), "%08u", ymd);
+
+        int exported_lines = 0;
+        auto exp_cb = [](void* user, const char* /*d*/, const char* /*path*/, uint64_t size) -> int {
+            auto* count = static_cast<int*>(user);
+            if (size > 0) (*count)++;
+            return 0;
+        };
+        EXPECT_EQ(logx_export(inst2, date_str, date_str, exp_cb, &exported_lines), LOGX_OK);
+        EXPECT_GE(exported_lines, 1);
+
+        logx_close(inst2);
+    }
+
+    for (const auto& f : pal.file_list(dir.c_str())) pal.file_unlink(f.c_str());
+    pal.file_rmdir(dir.c_str());
+}

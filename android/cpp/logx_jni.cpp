@@ -173,12 +173,28 @@ static void jni_error_trampoline(void* user, logx_event_kind_e kind, int code, c
     }
 }
 
-static thread_local uint8_t g_tls_key_buf[32];
+// J-6: thread_local 密钥缓冲槽。支持同一线程多 kid 混跑时各自拥有独立的 32B
+// 缓冲指针, 杜绝单缓冲复用导致的跨 kid 覆盖与悬垂/错用密钥隐患。
+struct TlsKeySlot {
+    uint16_t kid = 0;
+    bool valid = false;
+    uint8_t key[32] = {0};
+};
+static constexpr size_t kMaxTlsKeySlots = 4;
+static thread_local TlsKeySlot g_tls_key_cache[kMaxTlsKeySlots];
+static thread_local size_t g_tls_key_next = 0;
 
 static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     auto* ctx = static_cast<JniKeyProviderContext*>(user);
     if (!ctx || !ctx->jvm || !ctx->g_provider || !ctx->mid_get_key) {
         return nullptr;
+    }
+
+    // 优先命中本线程缓存槽
+    for (size_t i = 0; i < kMaxTlsKeySlots; ++i) {
+        if (g_tls_key_cache[i].valid && g_tls_key_cache[i].kid == kid) {
+            return g_tls_key_cache[i].key;
+        }
     }
 
     JNIEnv* env = nullptr;
@@ -211,10 +227,11 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     if (jKeyArr) {
         jsize len = env->GetArrayLength(jKeyArr);
         if (len == 32) {
-            // 密钥先拷入 thread_local 缓冲(纯 C++ 存储, detach 不影响其生存期),
-            // 调用方在 trampoline 返回后继续读取该指针是安全的。
-            env->GetByteArrayRegion(jKeyArr, 0, 32, reinterpret_cast<jbyte*>(g_tls_key_buf));
-            res = g_tls_key_buf;
+            size_t slot_idx = (g_tls_key_next++) % kMaxTlsKeySlots;
+            g_tls_key_cache[slot_idx].kid = kid;
+            g_tls_key_cache[slot_idx].valid = true;
+            env->GetByteArrayRegion(jKeyArr, 0, 32, reinterpret_cast<jbyte*>(g_tls_key_cache[slot_idx].key));
+            res = g_tls_key_cache[slot_idx].key;
         }
         env->DeleteLocalRef(jKeyArr);
     }

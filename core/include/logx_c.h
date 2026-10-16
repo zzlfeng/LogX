@@ -85,7 +85,10 @@ typedef struct logx_config {
     uint8_t compress_algo;
     /* 加密总开关(0/1);关闭时新块以明文落盘 */
     uint8_t encrypt_enable;
-    /* 当前写入使用的 KID;导出时按文件头 KID 经 key_provider 取对应密钥 */
+    /* 当前实例写入使用的默认 KID(单实例生命周期内不可变)。新建文件以此 KID 写入文件头;
+     * 续写既有文件时,以既有文件头声明的 KID 为准(F-12: 保证单文件内 KID 100% 统一,
+     * 若文件头 KID 与当前实例配置 KID 不一致,以文件头 KID 派生密钥并发出 DEGRADED 告警)。
+     * 运行期动态多 KID 轮换契约与管理规划于 M6 里程碑专项落地。 */
     uint16_t kid;
 
     /* (kid)->32B 裸密钥;返回 NULL 表示该 KID 不可解。实现必须可应答当前及历史 KID。
@@ -99,9 +102,10 @@ typedef struct logx_config {
      *      两种情形均发 LOGX_EV_DEGRADED 事件。
      *      注意此调用点运行在 **Flusher 后台线程**(JNI 实现须自行 attach/detach);
      *   ③ export: 按文件头 KID 逐块解密。
-     * 返回的指针由实现方持有,调用方不释放、不改动其内容;库侧在单文件追加生命周期内缓存该指针
+     * J-6 规约: 返回的指针由实现方持有,调用方不释放、不改动其内容;库侧在单文件追加生命周期内缓存该指针
      * (②与③的频率均为"每文件一次",仅在缺钥降级态下每轮重试),实现方须保证返回指针持续有效、
-     * 内容稳定,直至下一次调用或实例关闭。 */
+     * 内容稳定,且不同 kid 必须拥有互不覆盖的独立存储区域(如 JNI thread_local 多槽缓存),
+     * 直至下一次同 kid 刷新或实例关闭。 */
     const uint8_t* (*key_provider)(uint16_t kid, void* user);
 
     void* user;                  /* 透传给 key_provider */

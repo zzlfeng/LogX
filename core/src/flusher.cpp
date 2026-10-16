@@ -525,6 +525,7 @@ struct ActiveFileTarget {
     std::string path;
     uint8_t salt[8] = {0};
     bool enc_capable = false;
+    uint16_t kid = 0;               // F-12: 记录本文件头声明绑定的 kid
     const uint8_t* key = nullptr;  // 当前活跃文件的有效密钥缓存 (换文件即失效重取)
 
     void reset() {
@@ -532,6 +533,7 @@ struct ActiveFileTarget {
         path.clear();
         std::memset(salt, 0, sizeof(salt));
         enc_capable = false;
+        kid = 0;
         key = nullptr;
     }
 };
@@ -594,6 +596,7 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
         }
         std::memcpy(out_target->salt, salt, 8);
         out_target->enc_capable = enc_capable;
+        out_target->kid = inst->kid;
         out_target->key = key;
 
         // 新建文件后对文件和父目录 fsync 一次 (spec §10 / T4.0-12)
@@ -624,9 +627,18 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
         }
         std::memcpy(out_target->salt, hdr + 12, 8);
         out_target->enc_capable = flag_encrypted(hdr[5]);
+        out_target->kid = get_u16(hdr + 10);
         out_target->key = nullptr;
         if (out_target->enc_capable && inst->encrypt_enable != 0 && inst->key_provider) {
-            out_target->key = inst->key_provider(inst->kid, inst->key_user);
+            // F-12: 续写密钥与文件头 kid 声明一致性防御。
+            // 契约规定: 单文件必须保持 kid 统一。若已有文件头的 file_kid 与当前 inst->kid
+            // 不一致, 续写块必须使用文件头声明的 file_kid 派生密钥(保证整文件使用一致密钥且离线可解),
+            // 并输出 DEGRADED 告警事件提示上层 kid 发生变化。
+            if (out_target->kid != inst->kid) {
+                emit_event(inst, LOGX_EV_DEGRADED, -1,
+                           "file header kid differs from instance kid; using file header kid for append target");
+            }
+            out_target->key = inst->key_provider(out_target->kid, inst->key_user);
             if (!out_target->key) {
                 emit_event(inst, LOGX_EV_DEGRADED, -1,
                            "missing key; downgrading block to plaintext");
@@ -952,7 +964,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         } else if (!retry_key_probed && c->target.enc_capable && (inst->encrypt_enable != 0) &&
                    !c->target.key && inst->key_provider) {
             retry_key_probed = true;
-            c->target.key = inst->key_provider(inst->kid, inst->key_user);
+            c->target.key = inst->key_provider(c->target.kid, inst->key_user);
             if (!c->target.key) {
                 emit_event(inst, LOGX_EV_DEGRADED, -1,
                            "missing key; downgrading block to plaintext");
