@@ -115,6 +115,12 @@ typedef struct logx_config {
      * 从根源消除"先 open 后改 inst->pal"造成的 Flusher 读 / 测试写数据竞争。
      * 非 NULL 时要求 Pal 对象存活期覆盖整个实例生命周期。 */
     void* pal_override;          /* 实际类型 logx::Pal*;仅测试构建使用 */
+
+    /* J-1/F-2: 实例完全销毁时的清理回调(可选,由 destroy_instance 最终退出前调用)。
+     * 无论同步还是递延销毁,该回调保证在 Flusher 线程已退出、staging 已关闭、
+     * 库内所有对 user/err_user 的访问全部终结后触发。
+     * 若未提供,则由调用方自行根据 logx_close_ex 返回值或生命周期纪律管理。 */
+    void (*on_destroy)(void* user, void* err_user);
 } logx_config_t;
 
 #ifdef __cplusplus
@@ -132,6 +138,12 @@ typedef struct logx_instance logx_instance_t;
 /* ===== 生命周期 ===== */
 logx_status_e logx_open(const logx_config_t* cfg,
                         logx_instance_t** out_inst);
+
+/* J-1/F-2: 带同步/递延状态反馈的关闭接口。
+ * 若提供 out_closed_immediately,当且仅当实例在当前调用中已完成同步销毁(Flusher 已 join,
+ * 内存已释放)时置 true;若因处于 Flusher 线程或活跃回调/调用栈而进入递延销毁,则置 false。
+ * 调用方(如 JNI)若收到 false,不得立即释放由 key_provider/err_fn 引用的底层上下文。 */
+logx_status_e logx_close_ex(logx_instance_t* inst, bool* out_closed_immediately);
 
 logx_status_e logx_close(logx_instance_t* inst);
 

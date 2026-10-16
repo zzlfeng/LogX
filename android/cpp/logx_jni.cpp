@@ -227,6 +227,42 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     return res;
 }
 
+// J-1/F-2: 实例析构清理 trampoline。无论同步销毁还是 Flusher 线程/OpGuard 递延销毁,
+// 均在 core 完全退出并销毁前夕被回调, 安全释放 Java 全局引用与 C++ 上下文。
+static void jni_destroy_trampoline(void* key_user, void* err_user) {
+    auto* kp_ctx = static_cast<JniKeyProviderContext*>(key_user);
+    auto* inst_err_ctx = static_cast<JniErrorContext*>(err_user);
+
+    if (kp_ctx) {
+        if (kp_ctx->jvm && kp_ctx->g_provider) {
+            JNIEnv* env = nullptr;
+            bool need_detach = false;
+            jint getEnvRes = kp_ctx->jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+            if (getEnvRes == JNI_EDETACHED) {
+#if defined(__ANDROID__)
+                if (kp_ctx->jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+                    need_detach = true;
+                }
+#else
+                if (kp_ctx->jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) == JNI_OK) {
+                    need_detach = true;
+                }
+#endif
+            }
+            if (env && kp_ctx->g_provider) {
+                env->DeleteGlobalRef(kp_ctx->g_provider);
+                kp_ctx->g_provider = nullptr;
+            }
+            if (need_detach) {
+                kp_ctx->jvm->DetachCurrentThread();
+            }
+        }
+        delete kp_ctx;
+    }
+
+    delete inst_err_ctx;
+}
+
 struct ExportContext {
     JNIEnv* env;
     jobject cb;
@@ -377,6 +413,7 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
     cfg.user = kp_ctx;
     cfg.err_fn = jni_error_trampoline;
     cfg.err_user = err_ctx;   // J-02: 逐实例上下文,生命周期与实例同步
+    cfg.on_destroy = jni_destroy_trampoline;
 
     logx_instance_t* inst = nullptr;
     logx_status_e rc = logx_open(&cfg, &inst);
@@ -393,30 +430,15 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
 }
 
 JNIEXPORT void JNICALL
-Java_com_zzlfeng_logx_LogX_nativeClose(JNIEnv* env, jclass /*clazz*/, jlong handle) {
+Java_com_zzlfeng_logx_LogX_nativeClose(JNIEnv* /*env*/, jclass /*clazz*/, jlong handle) {
     if (handle == 0) return;
     auto* inst = reinterpret_cast<logx_instance_t*>(handle);
 
-    // J-01: 只读出 kp_ctx,不释放、不置空 —— close 内部 flush_blocking 的
-    // 最后一次 drain 仍需通过它取密钥(否则尾块静默降级明文)。
-    auto* kp_ctx = static_cast<JniKeyProviderContext*>(inst->key_user);
-    // J-02: 本实例的错误上下文同样在 close 完成前保持有效(关闭阶段事件不丢)。
-    auto* inst_err_ctx = static_cast<JniErrorContext*>(inst->err_user);
-
-    // 1) logx_close: flush_blocking(密钥全程可用) → join Flusher → delete inst
+    // J-1/F-2: 关闭实例。若为同步销毁, destroy_instance 内部已通过
+    // cfg.on_destroy (jni_destroy_trampoline) 彻底释放 kp_ctx 与 inst_err_ctx;
+    // 若为处于 Flusher 线程内部或活跃调用栈中的递延销毁, on_destroy 将递延至
+    // Flusher 线程退出或 OpGuard 终结时刻安全触发, 此处绝不提前释放上下文(杜绝 UAF 与悬挂指针)。
     logx_close(inst);
-
-    // 2) Flusher 已 join, trampoline 不可能再被调用,现在释放才安全
-    if (kp_ctx) {
-        if (kp_ctx->g_provider) {
-            env->DeleteGlobalRef(kp_ctx->g_provider);
-        }
-        delete kp_ctx;
-    }
-
-    // 3) J-02: 错误上下文随实例释放。g_logx_class 全局引用为类级常量,
-    //    多实例共享,保留至进程退出,不在此清理(否则其余实例回调静默失效)。
-    delete static_cast<JniErrorContext*>(inst_err_ctx);
 }
 
 JNIEXPORT jint JNICALL

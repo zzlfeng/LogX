@@ -1259,8 +1259,14 @@ void* flusher_main(void* arg) {
     Instance* inst = static_cast<Instance*>(arg);
     inst->flusher_tid.store(inst->pal->tid(), std::memory_order_release);
     flusher_loop(inst);
-    if (inst->close_on_flusher.load(std::memory_order_acquire)) {
-        destroy_instance(inst, /*is_flusher_thread=*/true);
+    // F-2: flusher 线程退出时,无论由 close_on_flusher 还是 close_pending 触发,
+    // 均消费递延销毁标志并执行最终 destroy_instance
+    if (inst->close_on_flusher.load(std::memory_order_acquire) ||
+        inst->close_pending.load(std::memory_order_acquire)) {
+        if (inst->close_pending.exchange(false, std::memory_order_acq_rel) ||
+            inst->close_on_flusher.load(std::memory_order_acquire)) {
+            destroy_instance(inst, /*is_flusher_thread=*/true);
+        }
     }
     return nullptr;
 }

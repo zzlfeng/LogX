@@ -514,6 +514,113 @@ TEST(R19Regression, F2_CloseInsideErrorCallback_SurvivesAndDefers) {
 }
 
 // ============================================================
+// J-1 / F-2: 生命周期闭环与 on_destroy 契约
+// 1) 同步关闭: logx_close_ex 返回 true, on_destroy 在 close 返回前触发
+// 2) 递延关闭: 回调内 logx_close_ex 返回 false, on_destroy 在退栈后触发
+// ============================================================
+TEST(R19Regression, J1_F2_OnDestroySynchronous) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_j1_f2_sync_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    struct DestroyCtx {
+        std::atomic<bool> destroyed{false};
+        void* got_user = nullptr;
+        void* got_err_user = nullptr;
+    };
+    static DestroyCtx dctx;
+    dctx.destroyed.store(false);
+    dctx.got_user = nullptr;
+    dctx.got_err_user = nullptr;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 4096;
+    cfg.retention_days = 7;
+    cfg.user = &dctx;
+    cfg.err_user = &dctx;
+    cfg.on_destroy = [](void* u, void* eu) {
+        auto* dc = static_cast<DestroyCtx*>(u);
+        if (dc) {
+            dc->got_user = u;
+            dc->got_err_user = eu;
+            dc->destroyed.store(true);
+        }
+    };
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    bool closed_immediately = false;
+    EXPECT_EQ(logx_close_ex(inst, &closed_immediately), LOGX_OK);
+    EXPECT_TRUE(closed_immediately);
+    EXPECT_TRUE(dctx.destroyed.load());
+    EXPECT_EQ(dctx.got_user, &dctx);
+    EXPECT_EQ(dctx.got_err_user, &dctx);
+
+    cleanup_dir(dir);
+}
+
+TEST(R19Regression, J1_F2_DeferredCloseLifetimeAndOnDestroy) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_j1_f2_defer_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    struct TestState {
+        logx_instance_t* inst = nullptr;
+        std::atomic<bool> closed_in_cb{false};
+        std::atomic<bool> closed_immediately{true};
+        std::atomic<bool> on_destroy_called_inside_cb{false};
+        std::atomic<bool> on_destroy_called_finally{false};
+        std::atomic<bool> in_callback{false};
+    } state;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 4096;
+    cfg.flush_threshold = 0;
+    cfg.user = &state;
+    cfg.on_destroy = [](void* user, void* /*err_user*/) {
+        auto* s = static_cast<TestState*>(user);
+        if (s->in_callback.load()) {
+            s->on_destroy_called_inside_cb.store(true);
+        }
+        s->on_destroy_called_finally.store(true);
+    };
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    state.inst = inst;
+
+    logx_set_error_handler(inst, [](void* user, logx_event_kind_e kind, int code, const char* msg) {
+        (void)code; (void)msg;
+        auto* s = static_cast<TestState*>(user);
+        if (kind == LOGX_EV_TRUNCATED && !s->closed_in_cb.exchange(true)) {
+            s->in_callback.store(true);
+            bool closed_now = true;
+            EXPECT_EQ(logx_close_ex(s->inst, &closed_now), LOGX_OK);
+            s->closed_immediately.store(closed_now);
+            s->in_callback.store(false);
+        }
+    }, &state);
+
+    std::vector<uint8_t> payload(4096, 'Y');
+    logx_status_e rc = logx_write(inst, 3, "J1F2", payload.data(), static_cast<uint32_t>(payload.size()));
+    EXPECT_TRUE(rc == LOGX_OK || rc == LOGX_ERR_STATE);
+
+    EXPECT_TRUE(state.closed_in_cb.load());
+    EXPECT_FALSE(state.closed_immediately.load());
+    EXPECT_FALSE(state.on_destroy_called_inside_cb.load());
+    EXPECT_TRUE(state.on_destroy_called_finally.load());
+
+    cleanup_dir(dir);
+}
+
+// ============================================================
 // F-3: 0<sz<32 撕裂文件头自愈(R19 探针 G 形态: 旧实现 flush=OK、
 // 文件永不增长、计数器全 0)
 // ============================================================

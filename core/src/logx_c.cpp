@@ -287,7 +287,11 @@ struct OpGuard {
         if (!inst) return;
         int rem = inst->active_ops.fetch_sub(1, std::memory_order_acq_rel) - 1;
         if (rem == 0 && inst->close_pending.load(std::memory_order_acquire)) {
-            destroy_instance(inst, /*is_flusher_thread=*/false);
+            if (inst->in_callback.load(std::memory_order_acquire) == 0) {
+                if (inst->close_pending.exchange(false, std::memory_order_acq_rel)) {
+                    destroy_instance(inst, /*is_flusher_thread=*/false);
+                }
+            }
         }
     }
 };
@@ -322,7 +326,13 @@ void destroy_instance(Instance* inst, bool is_flusher_thread) {
         inst->pal->mutex_destroy(inst->mu);
         inst->mu = nullptr;
     }
+    auto on_destroy = inst->on_destroy;
+    void* key_user = inst->key_user;
+    void* err_user = inst->err_user;
     delete inst;
+    if (on_destroy) {
+        on_destroy(key_user, err_user);
+    }
 }
 
 // ---- C ABI 实现 ----
@@ -399,6 +409,7 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->key_user = cfg->user;
     inst->err_fn = cfg->err_fn;
     inst->err_user = cfg->err_user;
+    inst->on_destroy = cfg->on_destroy;
     // (T-04) 测试专用 PAL 注入 seam:必须在 Flusher 线程启动(thread_start)之前
     // 定型 inst->pal,否则 Flusher 读 inst->pal 与测试写 inst->pal 构成数据竞争。
     inst->pal = cfg->pal_override != nullptr
@@ -468,7 +479,8 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     return LOGX_OK;
 }
 
-logx_status_e logx_close(logx_instance_t* h) {
+logx_status_e logx_close_ex(logx_instance_t* h, bool* out_closed_immediately) {
+    if (out_closed_immediately) *out_closed_immediately = false;
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return LOGX_ERR_INVALID_ARG;
     if (inst->closing.exchange(true, std::memory_order_acq_rel)) {
@@ -495,7 +507,12 @@ logx_status_e logx_close(logx_instance_t* h) {
         return LOGX_OK;
     }
     destroy_instance(inst, false);
+    if (out_closed_immediately) *out_closed_immediately = true;
     return LOGX_OK;
+}
+
+logx_status_e logx_close(logx_instance_t* h) {
+    return logx_close_ex(h, nullptr);
 }
 
 logx_status_e logx_write(logx_instance_t* h, int level,

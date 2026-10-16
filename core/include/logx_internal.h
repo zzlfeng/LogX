@@ -87,6 +87,7 @@ struct Instance {
     std::atomic<bool> close_pending{false};
     std::atomic<bool> close_on_flusher{false};
     std::atomic<uint64_t> flusher_tid{0};
+    void (*on_destroy)(void* user, void* err_user) = nullptr;
 };
 
 // B-13: retention_days atomic 须保持 lock-free——Instance 经不透明指针跨越 C ABI,
@@ -98,6 +99,9 @@ constexpr uint32_t kFlushBlockingTimeoutMs = 5000;
 
 // Spec §4.1 / T4.0-4 / F-10: Flusher 50~100ms Debounce 超时聚合窗口 (取中值 75ms)
 constexpr uint32_t kFlushDebounceMs = 75;
+
+// 实例销毁实现 (R19 F-2 / J-1): is_flusher_thread 为 true 时绝不 join 自身
+void destroy_instance(Instance* inst, bool is_flusher_thread);
 
 // 触发回调的便捷函数;忽略 null 回调。
 // E-01: 快照读取 err_fn/err_user 在 err_mu 保护下完成,消除与
@@ -114,7 +118,18 @@ inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char
     if (fn) {
         fn(user, k, code, msg ? msg : "");
     }
-    inst->in_callback.fetch_sub(1, std::memory_order_acq_rel);
+    int rem = inst->in_callback.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    // F-2: 递延销毁死角收敛——当回调退出且为最后一个持有者时,消费 close_pending 触发销毁
+    if (rem == 0 && inst->active_ops.load(std::memory_order_acquire) == 0 &&
+        inst->close_pending.load(std::memory_order_acquire)) {
+        uint64_t current_tid = inst->pal->tid();
+        bool on_flusher = (inst->flusher_tid.load(std::memory_order_acquire) == current_tid);
+        if (!on_flusher) {
+            if (inst->close_pending.exchange(false, std::memory_order_acq_rel)) {
+                destroy_instance(inst, /*is_flusher_thread=*/false);
+            }
+        }
+    }
 }
 
 // 格式化一个外部 level(0..5)/tag/payload 为 staging 记录字节序列;
