@@ -151,9 +151,9 @@ flowchart TD
    - **裁决建议**: **延后至 M6 里程碑**。
    - **依据**: 当前 LogX 配置仅支持单一固定 kid，运行时不发生热切换，代码中单指针缓存与单一 kid 映射目前绝对安全；可在后续规划动态密钥轮换时作为独立特质设计。
 
-4. **D-3 (中): 解码器 `is_whole` 记录清空 carry 语义分叉**
-   - **裁决建议**: **维持现有实现，文档归档**。
-   - **依据**: Python 解码器作为离线排障工具，在遇到完整记录时重置残片状态，采取更保守的「宁丢不脏」策略是正确的；且写端正常流下不会产生 first→whole→last 的病态分片序列。
+4. **D-3 (中): 解码器 `is_whole` 记录清空 carry 语义分叉（已拍板闭环）**
+   - **裁决结论**: **采纳方案 A 增强版（清 carry 补齐告警，排障透明）**。
+   - **实施方案**: 在 [`decoder/logx_decode.py`](file:///d:/Project/Android_Project/LogX/logx/decoder/logx_decode.py) 的 `RecordReassembler` 中，当 `is_whole` 遇到未闭合分片或 `drop_carry` 被调用时，输出 warning：`"检测到断裂分片流，已丢弃 N 片残片"`，并在 `decode_file_records` 中将告警挂接到文件诊断日志，保证离线解码排障透明可追溯。
 
 ---
 

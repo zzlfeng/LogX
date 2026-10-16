@@ -40,7 +40,7 @@ import struct
 import sys
 import zlib
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Callable
 
 MAGIC_FILE = b'LGXF'
 MAGIC_BLOCK = b'LGXB'
@@ -150,16 +150,27 @@ class LogSlice:
 
 class RecordReassembler:
     """流式分片重组器：支持单块内多条日志与跨块连续分片重组。"""
-    def __init__(self):
+    def __init__(self, on_warning: Optional[Callable[[str], None]] = None):
         self.cur_slices: List[bytes] = []
         self.in_split = False
+        self.on_warning = on_warning
+
+    def _warn(self, msg: str) -> None:
+        if self.on_warning:
+            self.on_warning(msg)
+        else:
+            print(f"[warn] {msg}", file=sys.stderr)
 
     def feed(self, s: LogSlice) -> List[bytes]:
         results = []
         if s.is_whole:
             if self.in_split:
+                n = len(self.cur_slices)
                 self.cur_slices.clear()
                 self.in_split = False
+                if n > 0:
+                    # D-3 拍板落地: 遇整条记录且存在未闭合分片时清空 carry, 并输出 warning 便于排障
+                    self._warn(f"检测到断裂分片流，已丢弃 {n} 片残片")
             results.append(s.payload)
         elif s.is_first:
             # D-14: 对齐 C++ format.cpp —— 首片 payload 为空时视为未开启分片流,
@@ -177,9 +188,14 @@ class RecordReassembler:
                 self.in_split = False
         return results
 
-    def drop_carry(self) -> None:
+    def drop_carry(self, reason: str = "") -> None:
         """(FM-02 对齐) 字节流断裂后,未闭合的跨块分片残片必须整体丢弃 ——
-        重同步点之后找到的首/中片属于新流,与旧残片拼接只会产生错乱输出。"""
+        重同步点之后找到的首/中片属于新流,与旧残片拼接只会产生错乱输出。
+        D-3 拍板落地: 清 carry 时若包含残片, 输出 warning 告知丢弃数量。"""
+        if self.in_split and self.cur_slices:
+            n = len(self.cur_slices)
+            detail = f" ({reason})" if reason else ""
+            self._warn(f"检测到断裂分片流，已丢弃 {n} 片残片{detail}")
         self.cur_slices.clear()
         self.in_split = False
 
@@ -415,7 +431,7 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
 
     user_records: List[bytes] = []
     errors: List[str] = []
-    reassembler = RecordReassembler()
+    reassembler = RecordReassembler(on_warning=lambda w: errors.append(f"{path}: [warn] {w}"))
 
     off = 32
     prev_seqno = 0
@@ -456,7 +472,7 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
                 user_records.append(f"[seq={seqno} decode fail]".encode('ascii'))
             # D-1: 块级解码失败必须清重组器 carry —— 否则上一块遗留的首片会与
             # 下一块的续片错误拼接, 产出跨"空洞"的伪完整记录(与 C++ 语义不符)。
-            reassembler.drop_carry()
+            reassembler.drop_carry(reason=f"block seq={seqno} decode fail")
             off += block_size
             continue
         if blk_res.raw_bytes:
@@ -465,12 +481,12 @@ def decode_file_records(path: str, kid_keys: Dict[int, bytes]) -> Tuple[List[byt
             segments, carry_ok = parse_lgxe_segments(blk_res.raw_bytes)
             for i, seg in enumerate(segments):
                 if i > 0:
-                    reassembler.drop_carry()
+                    reassembler.drop_carry(reason="stream sync boundary")
                 for s in seg:
                     for full_payload in reassembler.feed(s):
                         user_records.append(full_payload)
             if not carry_ok:
-                reassembler.drop_carry()
+                reassembler.drop_carry(reason="stream broken tail")
         off += block_size
 
     trailing_len = len(data) - off
