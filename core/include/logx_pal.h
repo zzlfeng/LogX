@@ -65,10 +65,9 @@ public:
     virtual int     mmap_close(const PalMmap& m) = 0;
 
     /* ---- 并发原语 ---- */
-    /* P-2(留档, 待拍板):两平台可重入性当前不一致——Win32 CRITICAL_SECTION 可重入,
-     * POSIX std::mutex 非递归。core 现有持锁路径均为单层取锁, 未触发差异;若未来
-     * 出现"持锁再取锁", Windows 测试会全绿而 Android 死锁。契约方向(非递归 vs 可重入)
-     * 待定后, 二者须取一并写入本注释。 */
+    /* P-2 契约收敛: 互斥锁严格为**非递归锁(Non-recursive Mutex)**。
+     * 同一线程重复获取将死锁或导致未定义行为。
+     * POSIX 采用 std::mutex, Win32 采用 SRWLOCK(独占模式), 双平台语义与行为 100% 对齐。 */
     virtual void* mutex_create() = 0;
     virtual void  mutex_destroy(void* h) = 0;
     virtual void  mutex_lock(void* h) = 0;

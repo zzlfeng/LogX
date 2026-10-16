@@ -98,14 +98,18 @@ static int translate_win32(BOOL ok) {
     return -1;
 }
 
+// P-2 拍板落地: 统一为非递归互斥锁——将原先可重入的 CRITICAL_SECTION 替换为
+// Windows 原生非递归的 SRWLOCK(Slim Reader/Writer Lock 独占模式)。
+// 性能更高、内存开销更小且与 POSIX 端的 std::mutex 语义 100% 对齐,
+// 消除"持锁再取锁在 Windows 绿灯而 Android 死锁"的跨平台分歧。
 class WinMutex {
 public:
-    WinMutex() { InitializeCriticalSection(&cs_); }
-    ~WinMutex() { DeleteCriticalSection(&cs_); }
-    void lock() { EnterCriticalSection(&cs_); }
-    void unlock() { LeaveCriticalSection(&cs_); }
+    WinMutex() { InitializeSRWLock(&srw_); }
+    ~WinMutex() = default;
+    void lock() { AcquireSRWLockExclusive(&srw_); }
+    void unlock() { ReleaseSRWLockExclusive(&srw_); }
 private:
-    CRITICAL_SECTION cs_;
+    SRWLOCK srw_ = SRWLOCK_INIT;
 };
 
 // 自动重置事件;wait 消费一次信号,与 posix Event 语义一致。
