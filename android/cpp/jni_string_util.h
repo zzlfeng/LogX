@@ -115,7 +115,9 @@ inline size_t cesu8_to_utf8_inplace(char* s, size_t len) {
                           (static_cast<uint32_t>(p[r + 2]) & 0x3Fu);
             uint32_t lo = ((static_cast<uint32_t>(p[r + 4]) & 0x0Fu) << 6) |
                           (static_cast<uint32_t>(p[r + 5]) & 0x3Fu);
-            uint32_t cp = 0x10000u + ((hi - 0xD800u) << 10) + (lo - 0xDC00u);
+            // R40-01: hi 与 lo 已为 10 位相对偏移量(0..1023), 直接按 0x10000 + (hi<<10) + lo 合并,
+            // 严禁再减 0xD800/0xDC00, 否则无符号下溢导致 Emoji 等补充平面字符完全损坏。
+            uint32_t cp = 0x10000u + (hi << 10) + lo;
             p[w++] = static_cast<uint8_t>(0xF0 | (cp >> 18));
             p[w++] = static_cast<uint8_t>(0x80 | ((cp >> 12) & 0x3Fu));
             p[w++] = static_cast<uint8_t>(0x80 | ((cp >> 6) & 0x3Fu));

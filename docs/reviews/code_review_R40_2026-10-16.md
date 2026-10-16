@@ -176,15 +176,15 @@ Test project D:/Project/Android_Project/LogX/logx/build-full
 Total Test time (real) = 17.18 sec
 ```
 
-- **单测覆盖**: 179 项用例（staging 环形会计、格式化切块、双 Header 提交纪律、恢复对账四分支、Zstd 编解码容灾、Win32 宽字符路径与文件自愈）全部通过。
+- **单测覆盖**: 184 项用例（新增 5 项 cesu8_to_utf8_inplace 边界与 Emoji 代理对往返测试；staging 环形会计、格式化切块、双 Header 提交纪律、恢复对账四分支、Zstd 编解码容灾、Win32 宽字符路径与文件自愈等 184/184 100% 全绿）。
 - **并发与热路径**: 50 线程高并发压测零锁死、零撕裂；热路径零堆分配（0 heap allocs）验证通过。
 
 ---
 
 ## 六、行动项清单 (Action Items)
 
-- [ ] **ACT-1 (立即修复)**: 修复 [`android/cpp/jni_string_util.h:116`](file:///d:/Project/Android_Project/LogX/logx/android/cpp/jni_string_util.h#L116) 的代理对计算下溢 Bug，并补充包含 Emoji 的单元测试（R40-01）；
-- [ ] **ACT-2 (立即修复)**: 为 [`core/src/pal_posix.cpp:53`](file:///d:/Project/Android_Project/LogX/logx/core/src/pal_posix.cpp#L53) 增加 `#if !defined(__APPLE__)` 平台守卫（R40-02）；
+- [x] **ACT-1 (已闭环)**: 修复 [`android/cpp/jni_string_util.h:116`](file:///d:/Project/Android_Project/LogX/logx/android/cpp/jni_string_util.h#L116) 的代理对计算下溢 Bug，并在 `tests/unit/test_jni_string.cpp` 补充包含 Emoji、NUL、BMP、极值 U+10FFFF、往返 UTF-16 的 5 项单元测试（R40-01 闭环）；
+- [x] **ACT-2 (已闭环)**: 为 [`core/src/pal_posix.cpp:53`](file:///d:/Project/Android_Project/LogX/logx/core/src/pal_posix.cpp#L53) 增加 `#if !defined(__APPLE__)` 平台守卫，避免 macOS 环境因缺失 `pthread_condattr_setclock` 编译报错（R40-02 闭环）；
 - [ ] **ACT-3 (排期处理)**: 实施 P-2，将 Win32 `CRITICAL_SECTION` 统一为 `SRWLOCK` 非递归锁；
 - [ ] **ACT-4 (专项启动)**: 依照入库的 [`docs/zstd_prune_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/zstd_prune_plan.md)，启动 zstd 源码级裁剪专项（目标 SO < 500KB）。
 

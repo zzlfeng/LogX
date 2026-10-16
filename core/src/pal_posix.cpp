@@ -50,9 +50,12 @@ public:
         // P-4: 条件变量绑定 CLOCK_MONOTONIC——Android 开机后 NITZ/NTP 大幅校时
         // (回跳/前跳)不再让带超时等待挂起远超 ms 或提前超时。极旧内核 setclock
         // 失败时回退默认时钟(CLOCK_REALTIME), wait_timeout 与之保持一致。
+        // R40-02: macOS libc 无 pthread_condattr_setclock, 宏守卫避免 Apple 编译中断。
+#if !defined(__APPLE__)
         if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0) {
             monotonic_cond_ = true;
         }
+#endif
         pthread_cond_init(&cv_, &attr);
         pthread_condattr_destroy(&attr);
         signaled_ = false;

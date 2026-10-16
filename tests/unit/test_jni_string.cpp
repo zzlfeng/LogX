@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+using logx_jni::cesu8_to_utf8_inplace;
 using logx_jni::utf8_to_utf16;
 
 namespace {
@@ -177,3 +178,110 @@ TEST(JniString, EmbeddedNulViaModifiedEncodingSurvives) {
     EXPECT_EQ(r[1], 0x0000);
     EXPECT_EQ(r[2], u'y');
 }
+
+// ---------------- CESU-8 → UTF-8 就地转码测试 (R40-01) ----------------
+
+TEST(JniString, Cesu8AsciiAndEmpty) {
+    std::string s;
+    size_t n = cesu8_to_utf8_inplace(&s[0], 0);
+    EXPECT_EQ(n, 0u);
+
+    std::string ascii = "LogX_Tag_2026";
+    size_t n_ascii = cesu8_to_utf8_inplace(&ascii[0], ascii.size());
+    EXPECT_EQ(n_ascii, ascii.size());
+    EXPECT_EQ(ascii, "LogX_Tag_2026");
+}
+
+TEST(JniString, Cesu8ModifiedNulToStandardNul) {
+    // Modified UTF-8 NUL (C0 80) 就地转换为单个 0x00 字节
+    auto s = bytes({'a', 0xC0, 0x80, 'b'});
+    size_t n = cesu8_to_utf8_inplace(&s[0], s.size());
+    EXPECT_EQ(n, 3u);
+    s.resize(n);
+    EXPECT_EQ(s[0], 'a');
+    EXPECT_EQ(s[1], '\0');
+    EXPECT_EQ(s[2], 'b');
+}
+
+TEST(JniString, Cesu8BmpChineseUnchanged) {
+    // 3 字节 BMP 字符(中文等)在 CESU-8 与标准 UTF-8 下编码完全相同
+    // "日志系统" = E6 97 A5 E5 BF 97 E7 B3 BB E7 BB 9F
+    auto s = bytes({0xE6, 0x97, 0xA5, 0xE5, 0xBF, 0x97, 0xE7, 0xB3, 0xBB, 0xE7, 0xBB, 0x9F});
+    size_t orig_len = s.size();
+    size_t n = cesu8_to_utf8_inplace(&s[0], s.size());
+    EXPECT_EQ(n, orig_len);
+    EXPECT_EQ(s, bytes({0xE6, 0x97, 0xA5, 0xE5, 0xBF, 0x97, 0xE7, 0xB3, 0xBB, 0xE7, 0xBB, 0x9F}));
+}
+
+TEST(JniString, Cesu8EmojiSurrogatePairToUtf8) {
+    // R40-01 核心回归用例:
+    // 1) Emoji 😀 U+1F600:
+    //    UTF-16 代理对: D83D DE00
+    //    CESU-8 6 字节: ED A0 BD ED B8 80
+    //    标准 UTF-8 4 字节: F0 9F 98 80
+    auto s1 = bytes({0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80});
+    size_t n1 = cesu8_to_utf8_inplace(&s1[0], s1.size());
+    EXPECT_EQ(n1, 4u);
+    s1.resize(n1);
+    EXPECT_EQ(s1, bytes({0xF0, 0x9F, 0x98, 0x80}));
+
+    // 2) Emoji 💩 U+1F4A9:
+    //    UTF-16 代理对: D83D DCA9
+    //    CESU-8 6 字节: ED A0 BD ED B2 A9
+    //    标准 UTF-8 4 字节: F0 9F 92 A9
+    auto s2 = bytes({0xED, 0xA0, 0xBD, 0xED, 0xB2, 0xA9});
+    size_t n2 = cesu8_to_utf8_inplace(&s2[0], s2.size());
+    EXPECT_EQ(n2, 4u);
+    s2.resize(n2);
+    EXPECT_EQ(s2, bytes({0xF0, 0x9F, 0x92, 0xA9}));
+
+    // 3) 补充平面极小值 U+10000:
+    //    UTF-16 代理对: D800 DC00
+    //    CESU-8 6 字节: ED A0 80 ED B0 80
+    //    标准 UTF-8 4 字节: F0 90 80 80
+    auto s3 = bytes({0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80});
+    size_t n3 = cesu8_to_utf8_inplace(&s3[0], s3.size());
+    EXPECT_EQ(n3, 4u);
+    s3.resize(n3);
+    EXPECT_EQ(s3, bytes({0xF0, 0x90, 0x80, 0x80}));
+
+    // 4) Unicode 极大值 U+10FFFF:
+    //    UTF-16 代理对: DBFF DFFF
+    //    CESU-8 6 字节: ED AF BF ED BF BF
+    //    标准 UTF-8 4 字节: F4 8F BF BF
+    auto s4 = bytes({0xED, 0xAF, 0xBF, 0xED, 0xBF, 0xBF});
+    size_t n4 = cesu8_to_utf8_inplace(&s4[0], s4.size());
+    EXPECT_EQ(n4, 4u);
+    s4.resize(n4);
+    EXPECT_EQ(s4, bytes({0xF4, 0x8F, 0xBF, 0xBF}));
+}
+
+TEST(JniString, Cesu8MixedRoundtripWithUtf16) {
+    // 构造混合串: "Tag_😀_日志_🎉"
+    // 其中:
+    //   "Tag_" (ASCII)
+    //   😀: U+1F600 (D83D DE00) → CESU-8: ED A0 BD ED B8 80
+    //   "_日志_" (ASCII + 中文)
+    //   🎉: U+1F389 (D83C DF89) → CESU-8: ED A0 BC ED BE 89
+    auto cesu8_str = bytes({
+        'T', 'a', 'g', '_',
+        0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80, // 😀
+        '_', 0xE6, 0x97, 0xA5, 0xE5, 0xBF, 0x97, '_', // _日志_
+        0xED, 0xA0, 0xBC, 0xED, 0xBE, 0x89  // 🎉
+    });
+
+    size_t n = cesu8_to_utf8_inplace(&cesu8_str[0], cesu8_str.size());
+    cesu8_str.resize(n);
+
+    // 标准 UTF-8 应包含 4 字节 emoji + 3 字节中文 + ASCII
+    // 进一步喂入 utf8_to_utf16 解码器验证往返一致性
+    auto u16 = utf8_to_utf16(cesu8_str.data(), cesu8_str.size());
+    ASSERT_EQ(u16.size(), 4u + 2u + 1u + 2u + 1u + 2u); // 4('Tag_') + 2(😀) + 1('_') + 2('日志') + 1('_') + 2(🎉) = 12 uint16
+    EXPECT_EQ(u16[4], 0xD83D);
+    EXPECT_EQ(u16[5], 0xDE00);
+    EXPECT_EQ(u16[7], 0x65E5); // 日
+    EXPECT_EQ(u16[8], 0x5FD7); // 志
+    EXPECT_EQ(u16[10], 0xD83C);
+    EXPECT_EQ(u16[11], 0xDF89);
+}
+
