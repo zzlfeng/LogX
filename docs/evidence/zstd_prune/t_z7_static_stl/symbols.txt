@@ -1,0 +1,9 @@
+dynamic_defined_symbols_static=1110
+dynamic_defined_symbols_shared=429
+heavy_matcher_symbols_static=0
+
+NEEDED static:
+  0x0000000000000001 (NEEDED)       Shared library: [liblog.so]
+  0x0000000000000001 (NEEDED)       Shared library: [libm.so]
+  0x0000000000000001 (NEEDED)       Shared library: [libdl.so]
+  0x0000000000000001 (NEEDED)       Shared library: [libc.so]

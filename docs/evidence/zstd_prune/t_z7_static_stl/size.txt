@@ -1,0 +1,43 @@
+T-Z7 c++_static vs c++_shared 体积对照（2026-10-18）
+配置：MinSizeRel(-Oz -DNDEBUG -g) + zstd 裁剪宏 + D6-B2 热路径 -O2；NDK 29.0.14206865；arm64-v8a；AAR release。
+
+AAR 内 liblogx.so（AGP strip 后）
+  c++_shared : 385,112 B
+  c++_static : 732,344 B
+  delta      : +347,232 B (+90.2%)
+
+AAR 内 libc++_shared.so
+  c++_shared : 1,374,336 B
+  c++_static : 0 B（无该文件）
+
+总 native 载荷（liblogx.so + 随包 STL）
+  c++_shared : 1,759,448 B
+  c++_static : 732,344 B
+  delta      : -1,027,104 B (-58.4%)；static 为 shared 的 41.6%
+
+AAR zip
+  c++_shared : 676,936 B
+  c++_static : 328,090 B
+  delta      : -348,846 B (-51.5%)
+
+G2 门禁（liblogx.so < 512,000 B）
+  c++_shared : PASS（余量 126,888 B）
+  c++_static : FAIL（超出 220,344 B，为门限的 143.0%）
+
+符号与依赖
+  动态定义符号 : shared 429 / static 1,110（static 额外导出 libc++ ABI 符号）
+  重型 matcher : 0（两种配置均为 0）
+  NEEDED static: liblog.so, libm.so, libdl.so, libc.so（无 libc++_shared.so）
+  打包 SO 无 .debug_*、无 .symtab（AGP 已 strip）
+
+ELF size（llvm-size）
+  shared: text 377,378  data 4,584   bss 4,912
+  static: text 706,385  data 22,728  bss 4,304
+
+SHA-256
+  AAR static          : 71df5a4c392f9142a58f35857b8701f5e408ec96196d8ca60590223ee3c80515
+  liblogx.so static   : a40bb206b094bf8cf7d773c61c6da7102ea6818d3a54d82830e950893cad034d
+
+参照（D6-B2 shared，t_z6 证据）
+  AAR                 : 676,936 B
+  liblogx.so          : 385,112 B, SHA-256 0a178d6ea6c8934917d9b32bec6e5c6e829646f7bdab2b2d8fe86f5e390b5b2f

@@ -349,6 +349,7 @@ patch 的收益参考（RelWithDebInfo 最终 SO）：LDM 约 5.8KB，不足以�
 | **T-Z5b** | AAR 结构完整；`CMAKE_BUILD_TYPE=MinSizeRel`、`-Oz -DNDEBUG -g`；打包 SO 无 `.debug_*`/`.symtab`；G2 **PASS（余量 140,456 B）** | `t_z5b_final_aar/result.md` |
 | **T-Z5c** | 压缩比 **1.52x 不变**；纯路径 P50 **3,646→4,844 ns（+32.9%）**、P99 12,604→14,010 ns（+11.2%）；吞吐与 flush P99 在噪声内；归因 `-Oz` | `t_z5c_perf/result.md` |
 | **T-Z6/D6-B2** | 热路径 4 TU 单独 `-O2`；AAR stripped **385,112 B**（PASS，余量 126,888 B）；纯路径 P50 **3,698 ns**、生产 zstd P50 **3,958 ns**（final-A 4,896 / 5,052）；host 57/57 + ctest 4/4、NDK 61/61、真机 197/2/4/3 全绿 | `t_z6_b2_hotpath/result.md` |
+| **T-Z7** | `c++_static` vs `c++_shared` 对照实验；静态使 `liblogx.so` +90.2%（732,344 B 门禁 FAIL），总 native 载荷 −58.4%（0.73 MB），写入性能无实质差异；拍板保持 `c++_shared`，实验记录仅作备忘归档 | `t_z7_static_stl/result.md` |
 
 **T-Z5c 关键数据（3 轮交错中位，Redmi K30 Pro，固定性能模式）：**
 

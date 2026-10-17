@@ -1,0 +1,38 @@
+There are 29 section headers, starting at offset 0xb2578:
+
+Section Headers:
+  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
+  [ 0]                   NULL            0000000000000000 000000 000000 00      0   0  0
+  [ 1] .note.android.ident NOTE          0000000000000238 000238 000098 00   A  0   0  4
+  [ 2] .note.gnu.build-id NOTE           00000000000002d0 0002d0 000024 00   A  0   0  4
+  [ 3] .dynsym           DYNSYM          00000000000002f8 0002f8 0072f0 18   A  8   1  8
+  [ 4] .gnu.version      VERSYM          00000000000075e8 0075e8 000994 02   A  3   0  2
+  [ 5] .gnu.version_r    VERNEED         0000000000007f7c 007f7c 000040 00   A  8   2  4
+  [ 6] .gnu.hash         GNU_HASH        0000000000007fc0 007fc0 001dbc 00   A  3   0  8
+  [ 7] .hash             HASH            0000000000009d7c 009d7c 002658 04   A  3   0  4
+  [ 8] .dynstr           STRTAB          000000000000c3d4 00c3d4 009991 00   A  0   0  1
+  [ 9] .rela.dyn         RELA            0000000000015d68 015d68 00ba18 18   A  3   0  8
+  [10] .rela.plt         RELA            0000000000021780 021780 002d00 18  AI  3  23  8
+  [11] .gcc_except_table PROGBITS        0000000000024480 024480 0019b0 00   A  0   0  4
+  [12] .rodata           PROGBITS        0000000000025e30 025e30 007634 00 AMSR  0   0 16
+  [13] .eh_frame_hdr     PROGBITS        000000000002d464 02d464 003fec 00   A  0   0  4
+  [14] .eh_frame         PROGBITS        0000000000031450 031450 011f74 00   A  0   0  8
+  [15] .text             PROGBITS        00000000000433d0 0433d0 0676a4 00  AX  0   0 16
+  [16] __lcxx_override   PROGBITS        00000000000aaa74 0aaa74 00010c 00  AX  0   0  4
+  [17] .plt              PROGBITS        00000000000aab80 0aab80 001e20 00  AX  0   0 16
+  [18] .data.rel.ro      PROGBITS        00000000000b09a0 0ac9a0 004388 00  WA  0   0  8
+  [19] .fini_array       FINI_ARRAY      00000000000b4d28 0b0d28 000010 00  WA  0   0  8
+  [20] .init_array       INIT_ARRAY      00000000000b4d38 0b0d38 000010 00  WA  0   0  8
+  [21] .dynamic          DYNAMIC         00000000000b4d48 0b0d48 0001d0 10  WA  8   0  8
+  [22] .got              PROGBITS        00000000000b4f18 0b0f18 000198 00  WA  0   0  8
+  [23] .got.plt          PROGBITS        00000000000b50b0 0b10b0 000f18 00  WA  0   0  8
+  [24] .relro_padding    NOBITS          00000000000b5fc8 0b1fc8 000038 00  WA  0   0  1
+  [25] .data             PROGBITS        00000000000b9fc8 0b1fc8 0002a0 00  WA  0   0  8
+  [26] .bss              NOBITS          00000000000ba270 0b2268 001098 00  WA  0   0 16
+  [27] .comment          PROGBITS        0000000000000000 0b2268 0001ed 01  MS  0   0  1
+  [28] .shstrtab         STRTAB          0000000000000000 0b2455 000123 00      0   0  1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  R (retain), p (processor specific)

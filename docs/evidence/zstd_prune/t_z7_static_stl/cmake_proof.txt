@@ -1,0 +1,21 @@
+CMakeCache: android/logx-aar/logx/.cxx/RelWithDebInfo/t193b3y6/arm64-v8a/CMakeCache.txt
+ANDROID_STL:UNINITIALIZED=c++_static
+CMAKE_BUILD_TYPE:STRING=MinSizeRel
+CMAKE_CXX_FLAGS_MINSIZEREL:STRING=-Oz -DNDEBUG -g
+CMAKE_C_FLAGS_MINSIZEREL:STRING=-Oz -DNDEBUG -g
+LOGX_AAR_KEEP_SYMBOLS:BOOL=ON
+LOGX_HOTPATH_O2:BOOL=ON
+
+hotpath flags:
+  FLAGS = -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread -std=c++17 -O2
+  FLAGS = -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread -std=c++17 -O2
+  FLAGS = -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread -std=c++17 -O2
+  FLAGS = -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread -std=c++17 -O2
+
+zstd control:
+  FLAGS = -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread
+
+link flags (static libstdc++ proof):
+  TARGET_PDB = core_build\liblogx_core.pdb
+
+  LINK_FLAGS = -static-libstdc++ -Wl,--build-id=sha1 -Wl,--no-rosegment -Wl,--no-undefined-version -Wl,--fatal-warnings -Wl,--no-undefined -Qunused-arguments  -Wl,--gc-sections
