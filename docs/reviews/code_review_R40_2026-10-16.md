@@ -185,6 +185,6 @@ Total Test time (real) = 17.18 sec
 
 - [x] **ACT-1 (已闭环)**: 修复 [`android/cpp/jni_string_util.h:116`](file:///d:/Project/Android_Project/LogX/logx/android/cpp/jni_string_util.h#L116) 的代理对计算下溢 Bug，并在 `tests/unit/test_jni_string.cpp` 补充包含 Emoji、NUL、BMP、极值 U+10FFFF、往返 UTF-16 的 5 项单元测试（R40-01 闭环）；
 - [x] **ACT-2 (已闭环)**: 为 [`core/src/pal_posix.cpp:53`](file:///d:/Project/Android_Project/LogX/logx/core/src/pal_posix.cpp#L53) 增加 `#if !defined(__APPLE__)` 平台守卫，避免 macOS 环境因缺失 `pthread_condattr_setclock` 编译报错（R40-02 闭环）；
-- [ ] **ACT-3 (排期处理)**: 实施 P-2，将 Win32 `CRITICAL_SECTION` 统一为 `SRWLOCK` 非递归锁；
-- [ ] **ACT-4 (专项启动)**: 依照入库的 [`docs/zstd_prune_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/zstd_prune_plan.md)，启动 zstd 源码级裁剪专项（目标 SO < 500KB）。
+- [x] **ACT-3 (已闭环, 提交 `4041caf`)**: 实施 P-2，将 Win32 `CRITICAL_SECTION` 统一为 `SRWLOCK` 非递归锁；
+- [x] **ACT-4 (已闭环, 提交 `f2b6d3c`)**: 依照入库的 [`docs/zstd_prune_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/zstd_prune_plan.md)，完成 zstd 源码级裁剪专项落地（实测 AAR `liblogx.so` 385,112 B < 512,000 B 门禁达成）。
 

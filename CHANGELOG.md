@@ -120,6 +120,31 @@
 | `fe4d0ac` | docs: T5.3 落地——接入指南 integration_guide.md (十节) 与离线解码排障手册 ops_troubleshooting.md (七节) + README 挂接 (计划表 v1.62, M5 仅剩 Release AAR) |
 | `8df8d74` | docs(kt): LogX.kt export KDoc 临时文件位置勘误——logDir 内 .tmp_export_* (对齐 logx_c.cpp 实现与 T5.1 XML 口径, 计划表 v1.63) |
 | `d06dee9` | feat(build,docs): T5.7 Release AAR 落地——logx-aar library 工程单源构建 com.zzlfeng:logx:1.0.0 + 消费冒烟复用 kotlin-gradle (计划表 v1.64, M5 里程碑 100% 完成) |
+| `e0d7ede` | docs: 登记提交记录表行 d06dee9 |
+| `3944b98` | docs(review): R39 全量代码审查报告——core 逐行深审 + PAL/JNI/解码器/tester 三路并行代理审查，110 条发现(5高/28中/47低/30提示) + reviews 索引登记行 |
+| `5883b14` | docs(plan): zstd 源码级裁剪与 SO 体积精简专项实施计划 (v1.0) 入库 |
+| `a4b44e3` | fix(review): 修复 R39 审查发现（core/PAL/JNI/Kotlin/解码器/tester），拍板项除外 |
+| `6aec1fa` | docs(review): R40 代码审查报告——R39 修复批次 a4b44e3 独立复审，捕获 1 高危 1 中危 + reviews 索引登记行 |
+| `066dcd9` | fix(jni,pal,test): 修复 R40 审查发现（JNI Emoji 代理对计算下溢 + pal_posix macOS 守卫） |
+| `8494cb6` | fix(decoder): D-3 落地——清 carry 时补齐告警（检测到断裂分片流已丢弃残片） |
+| `4041caf` | fix(pal): P-2 落地——Win32 互斥锁 SRWLOCK 化，统一双端为非递归锁契约 |
+| `7baae2b` | fix(core,jni): J-1/F-2 落地——闭环递延 close 生命周期与销毁时序，消除 UAF 与泄漏隐患 |
+| `5a65567` | fix(core,jni,test): F-12/J-6 落地——收敛 kid 密钥契约、续写绑定文件头 kid 与 JNI 多槽缓冲 |
+| `9704832` | docs(review): R41 代码审查报告——R40 修复与 4 项拍板落地批次 a4b44e3..HEAD 独立复审，捕获 1 高危 2 中危 1 低危 1 提示 + reviews 索引登记行 |
+| `4c25912` | fix(core,jni,test): R41 审查发现落地——flusher 递延销毁认领收敛(ACT-1/2)、JNI 密钥缓存抽出 jni_key_cache.h 属主隔离与空槽优先复用(ACT-3/4)、logx_c.h 契约补注 + 新增 JniKeyCache 3 项与 R41 递延 close 并发写压力单测 |
+| `1b2b2fd` | docs(review): R41 报告行动项登记——ACT-1~ACT-5 全部落地勾选并补注实现细节与 M6 规划 |
+| `2e75052` | docs(review): R42 代码审查报告——R41 修复批次 9704832..HEAD 独立复审，捕获 2 中危 1 低危 1 提示(ACT-2/ACT-3 部分通过) + reviews 索引登记行 |
+| `2783c90` | fix(core,jni,test): R42 审查发现落地——建立 seq_cst 全序屏障消除 Dekker 竞态(ACT-1)、引入 generation 根治跨线程 ABA 假命中(ACT-2)、满槽显式返回 nullptr(ACT-3)、.kotlin 忽略(ACT-4) |
+| `bacbc31` | docs(review): R42 报告行动项登记——ACT-1~ACT-4 全部落地勾选并补注实现细节 |
+| `87c883b` | fix(jni,test): R43 复审当场修正——populate_slot 接管槽位前无条件清零旧密钥杜绝跨 owner 驱逐明文残留、契约措辞更正为全局共享容量、补 CrossOwner 独立槽与驱逐清零 2 项单测 |
+| `342aa36` | docs(review): R43 代码审查报告——R42 修复批次 2e75052..HEAD 独立复审，ACT-1~4 判定通过，新捕获 1 中危 close_pending Flusher 盲区泄漏(R43-01) + reviews 索引登记行 |
+| `e4b5a24` | fix(core,test): R43 审查发现落地——emit_event 尾段消费 close_pending 后 Flusher 侧转置 close_on_flusher 移交退出段统一自毁，根治 R43-01 盲区泄漏(ACT-1)；新增盲区定向回归探针(变异验证必红)；P-1 冗余 fence 与 P-2 递增侧 acq_rel 充分性注释补注(ACT-2) |
+| `c90ed75` | docs(review): R43 报告行动项登记——ACT-1/ACT-2 落地勾选，补注移交 close_on_flusher 实现变体与偏差理由、回归探针与变异验证记录 |
+| `bac5ad7` | fix(core,test): R43-02 落地——logx_close_ex 递延分支补充 seq_cst 屏障与双重校验兜底根治 Dekker 漏认领泄漏(ACT-3)、清理单测重复赋值 |
+| `21cb3bb` | docs(review): R43 报告行动项登记——ACT-3 落地勾选并补注 logx_close_ex 双检兜底实现与 Dekker 漏认领消除理由 |
+| `f5d9c27` | fix(jni,test,docs): 代码卫生与报告完善——槽位清扫与失效时重置 kid 保证元数据对称性、补充单测断言、并在 R43 报告正文增补 R43-02 缺陷成因与闭环推演 |
+| `f2b6d3c` | feat(android,core,test,docs): zstd 源码级裁剪与 AAR MinSizeRel 体积门禁落地——G2 385,112 B，D6-B2 热路径 -O2 消除 P50 回归 |
+| `a558fe3` | docs(evidence): 归档 T-Z7 c++_static vs c++_shared 体积与性能对照实验记录并在计划表登记 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -662,6 +687,19 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **真机性能**（Redmi K30 Pro，3 轮交错中位）：纯路径 none P50 **3,698 ns**、生产口径 zstd P50 **3,958 ns**（final-A 4,896 / 5,052 ns，baseline 3,698 / 3,855 ns）；逆序确认轮 B2 3,646 / 3,802 ns；压缩比 1.52x 不变；P50 ≤4.0µs 成功线达标；
    - **回归**：host MSVC clean **57/57** + ctest **4/4**；NDK 26.1 clean **61/61**、0 警告；真机 **197/197 + 2/2 + 4/4 + 3/3**；B2 AAR 消费端 `:app:assembleDebug` 成功；
    - **口径披露**：Stage B 吞吐（37k–110k logs/s）与 flush P99 随执行顺序/热状态漂移，未用于判定；P50 在 3 轮交错与逆序轮均稳定。文档升至 `zstd_prune_plan.md` v1.7、`benchmark_report.md` v1.2；证据 `docs/evidence/zstd_prune/t_z6_b2_hotpath/`。
+
+22. **R39~R43 代码审查与并发安全全链路收口 (2026-10-15~17)**：
+   - **R39 全量深审与基础修复 (`a4b44e3`)**：针对 core/PAL/JNI/Kotlin/解码器/tester 展开逐行全量审查，闭环 110 条发现中的全部低/提示项与无争议中高危项；
+   - **R40 独立复审与平台对齐 (`066dcd9` ~ `5a65567`)**：修复 JNI Emoji 代理对下溢（R40-01）、macOS PAL 守卫（R40-02）；落地 D-3 解码器分片断裂排障告警；落地 P-2 Win32 互斥锁 SRWLOCK 化，统一 Windows/POSIX 双端为严格非递归互斥契约；落地 F-12/J-6 收敛 kid 密钥契约与 JNI 多槽缓冲；
+   - **R41 审查与递延销毁闭环 (`4c25912` ~ `1b2b2fd`)**：消除 `flusher_main` 对 `close_pending` 的越界消费（R41-01）；`close_on_flusher` 认领增加活跃状态校验与转置移交（R41-02）；抽象 `jni_key_cache.h` 独立组件，引入 `owner` 属主隔离，安全清零内存（R41-03）；
+   - **R42 审查与 Dekker 竞态收敛 (`2783c90` ~ `bacbc31`)**：建立 `seq_cst` 全序屏障消除 Dekker 竞态（ACT-1）；`JniKeyCache` 引入全局递增 `gen` 三元匹配，彻底根治跨线程 ABA 假命中（ACT-2）；满槽显式返回 `nullptr` 触发缺钥降级而不破坏在持有效槽位（ACT-3）；
+   - **R43 审查与盲区根除 (`87c883b` ~ `f5d9c27`)**：根治 R43-01 `close_pending` Flusher 盲区泄漏（`emit_event` 转置 `close_on_flusher` 移交退出段统一自毁）；根治 R43-02 `logx_close_ex` 递延分支漏 Dekker 双检兜底造成的漏认领泄漏；`JniKeyCache` 槽位失效与清扫时重置 `kid = 0`，保证元数据对称性；
+   - **全量验证**：MSVC clean 全量构建 0 警告 0 错误；CTest 4/4 套件通过；JniKeyCache 5/5 定向复跑通过；Android NDK Clang clean 61/61 0 警告；真机 197/2/4/3 套件 100% 全绿。
+
+23. **T-Z7 `c++_static` vs `c++_shared` 对照实验与备忘归档 (2026-10-18)**：
+   - **实验目的**：验证在已收口 G2 配置上改用静态 C++ 标准库时的体积与性能影响；
+   - **实测结果**：真机 Redmi K30 Pro 8 轮 60 万级写入复测证实，两者在写入热路径延迟（P50 3,646 vs 3,698 ns）、压缩比（1.52x）与吞吐上**无实质性能差异**；`c++_static` 使 `liblogx.so` strip 后体积由 385,112 B 膨胀至 **732,344 B（+90.2%）**，G2 单文件门禁 FAIL，但总 native 载荷由 1.76 MB 降至 0.73 MB（−58.4%）；
+   - **拍板决策**：用户拍板**继续使用 `c++_shared`**（保持 AAR `liblogx.so` 385,112 B 达标）；实验记录与产物作为备忘入库归档至 `docs/evidence/zstd_prune/t_z7_static_stl/`，不改变交付配置。
 
 ---
 

@@ -35,11 +35,11 @@
 | [code_review_R33_2026-10-07.md](code_review_R33_2026-10-07.md) | R33 复核(B-10 方案 1 与 rebuilt 收口批次独立复核) | 主文件近期批次章节 |
 | [code_review_R35_2026-10-08.md](code_review_R35_2026-10-08.md) | R35 复核(R34 批次独立复核 + Android 链路修复 + 真机复跑；R34 无独立报告本体) | 主文件近期批次章节 |
 | [code_review_R36_2026-10-09.md](code_review_R36_2026-10-09.md) | R36 审查(R35 建议收口批次 `9c7b1b5`：Wire roundtrip 断言变异实证 + Stage D 基准独立快跑；0×P2+1×P3+1×Nit 均文档层已当场修正) | 主文件近期批次章节 |
-| [code_review_R39_2026-10-15.md](code_review_R39_2026-10-15.md) | R39 全量审查(非增量：core 逐行深审 + PAL/JNI/解码器/tester 并行代理审查；5 高/28 中/47 低/30 提示，共 110 条) | 未登记(待收口) |
-| [code_review_R40_2026-10-16.md](code_review_R40_2026-10-16.md) | R40 审查(R39 修复批次 a4b44e3 独立复审：新捕获 1 高危 1 中危，ctest 4/4 全绿) | 未登记(待收口) |
-| [code_review_R41_2026-10-17.md](code_review_R41_2026-10-17.md) | R41 审查(R40 修复与 4 项拍板落地批次 a4b44e3..HEAD 独立复审：捕获 1 高危 2 中危 1 低危 1 提示，ctest 4/4 全绿) | 未登记(待收口) |
-| [code_review_R42_2026-10-17.md](code_review_R42_2026-10-17.md) | R42 审查(R41 修复批次 9704832..HEAD 独立复审：捕获 2 中危 1 低危 1 提示，ACT-2/ACT-3 判定部分通过，ctest 4/4 全绿 + 新增 4 用例定向复跑通过) | 未登记(待收口) |
-| [code_review_R43_2026-10-17.md](code_review_R43_2026-10-17.md) | R43 审查(R42 修复批次 2e75052..HEAD 独立复审：ACT-1~4 判定通过；新捕获 1 中危 R43-01 `close_pending` Flusher 盲区泄漏；当场修正密钥残留+测试回退 2 低危，登记 3 提示；ctest 4/4 全绿 + JniKeyCache 5/5 复跑通过) | 未登记(待收口) |
+| [code_review_R39_2026-10-15.md](code_review_R39_2026-10-15.md) | R39 全量审查(非增量：core 逐行深审 + PAL/JNI/解码器/tester 并行代理审查；5 高/28 中/47 低/30 提示，共 110 条) | 主文件近期批次章节第 22 条 |
+| [code_review_R40_2026-10-16.md](code_review_R40_2026-10-16.md) | R40 审查(R39 修复批次 a4b44e3 独立复审：新捕获 1 高危 1 中危，ctest 4/4 全绿) | 主文件近期批次章节第 22 条 |
+| [code_review_R41_2026-10-17.md](code_review_R41_2026-10-17.md) | R41 审查(R40 修复与 4 项拍板落地批次 a4b44e3..HEAD 独立复审：捕获 1 高危 2 中危 1 低危 1 提示，ctest 4/4 全绿) | 主文件近期批次章节第 22 条 |
+| [code_review_R42_2026-10-17.md](code_review_R42_2026-10-17.md) | R42 审查(R41 修复批次 9704832..HEAD 独立复审：捕获 2 中危 1 低危 1 提示，ACT-2/ACT-3 判定部分通过，ctest 4/4 全绿 + 新增 4 用例定向复跑通过) | 主文件近期批次章节第 22 条 |
+| [code_review_R43_2026-10-17.md](code_review_R43_2026-10-17.md) | R43 审查(R42 修复批次 2e75052..HEAD 独立复审：ACT-1~4 判定通过；新捕获 1 中危 R43-01 `close_pending` Flusher 盲区泄漏；当场修正密钥残留+测试回退 2 低危，登记 3 提示；ctest 4/4 全绿 + JniKeyCache 5/5 复跑通过) | 主文件近期批次章节第 22 条 |
 
 ## 说明
 
