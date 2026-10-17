@@ -339,8 +339,10 @@ TEST(JniKeyCache, InvalidateOwnerAndZeroMemory) {
     // 释放 ctx_a (gen=10)
     cache.invalidate_owner(&ctx_a, /*gen=*/10);
 
-    // ctx_a 失效且内存已被清零
+    // ctx_a 失效且内存已被清零，槽位 kid 与元数据完全复位
     EXPECT_EQ(cache.lookup(&ctx_a, /*gen=*/10, 1), nullptr);
+    EXPECT_EQ(cache.slot(0).kid, 0);
+    EXPECT_FALSE(cache.slot(0).valid);
     for (int i = 0; i < 32; ++i) {
         EXPECT_EQ(k_a[i], 0);
     }

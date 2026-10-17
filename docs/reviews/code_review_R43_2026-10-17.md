@@ -15,8 +15,9 @@
 2. **ACT-2 generation 三元匹配正确**：全局 `gen` 自 1 起永不取 0，`(owner, gen, kid)` 匹配 + 惰性清扫同 owner 陈旧代数槽，ABA 假命中根治成立；`gen` 在 ctx 发布前写入，经 `logx_open` 线程创建具备 happens-before。R42-02 判定通过。
 3. **ACT-3 满槽 nullptr 路径干净**：不破坏在持槽位、无 local ref 泄漏、正确触发 core 缺钥降级。R42-03 判定通过。
 4. **复审新捕获 1 条中危遗留缺陷（R43-01）**：`close_pending` 消费协议存在 flusher 线程盲区——当最后一个回调持有者恰为 Flusher 线程时，三处认领点全部拒领，实例与 JNI 全局引用永久泄漏（方向为泄漏而非 UAF）。该缺陷先于本批存在（R41-01 拒领纪律引入），本批 seq_cst 收敛未触及。
-5. **复审当场修正 2 条低危**（密钥残留清零 + 测试覆盖回退，见 §三），另登记 3 条提示项。
-6. **回归验证**：Windows MSVC x64 `build-full`（zstd + AESGCM）全量重建成功（56/56），`ctest` 4/4 全绿；JniKeyCache 5/5 定向复跑通过（含当场新增 2 用例）。
+5. **复审新捕获第 2 条中危竞态（R43-02）并当场闭环**：`logx_close_ex` 递延分支漏 Dekker 双检兜底——当活跃 op/callback 恰在 `store(close_pending)` 前退栈时错失认领导致实例永久泄漏。对齐 `flusher_main` 退出段补充 `seq_cst` 屏障与双重校验兜底闭环。
+6. **复审当场修正 3 条低危/提示项**（密钥残留清零 + 测试覆盖回退 + 槽位失效 kid 清零，见 §三），另登记 3 条提示项。
+7. **回归验证**：Windows MSVC x64 `build-full`（zstd + AESGCM）全量重建成功（56/56），`ctest` 4/4 全绿；JniKeyCache 5/5 定向复跑通过（含当场新增 2 用例）。
 
 ---
 
@@ -37,6 +38,19 @@
 - **回归探针建议**: 新增定向用例——写入线程全部收敛（`active_ops==0`）后，由 Flusher 事件发射路径（如构造 IO 失败）持有回调期间并发 close，断言 `on_destroy` 最终执行、实例回收。
 - **落地说明（ACT-1）**: 实际采用首选方案的收敛变体——Flusher 侧认领后不就地 `destroy_instance`（`emit_event` 返回点仍在 flusher 写块调用栈内，就地自毁会尾读 UAF），改为转置 `close_on_flusher` 移交 `flusher_main` 退出段统一自毁；探针以轮转建文件缺钥 DEGRADED 构造盲区场景。详见 §七 ACT-1。
 
+### ⚠️ R43-02（中危/并发竞态）`logx_close_ex` 递延分支漏 Dekker 双检兜底 → 偶发漏认领永久泄漏
+
+- **位置**: [logx_c.cpp `logx_close_ex` L506-L514](file:///d:/Project/Android_Project/LogX/logx/core/src/logx_c.cpp#L506-L514)
+- **成因链**:
+  1. 外部关闭线程 T1 调用 `logx_close_ex`，在 L506 读到 `active_ops == 1`（存在写入线程 T2），判定走递延分支；
+  2. 在 T1 执行 L509 `close_pending.store(true)` 之前的间隙，写入线程 T2 的 `OpGuard` 析构：`active_ops` 归零，随后读 `close_pending` 仍为旧值 `false`，T2 认为 close 尚未发生直接退出；
+  3. T1 恢复执行，写 `close_pending=true` 并直接返回 `LOGX_OK`；
+  4. Flusher 线程主循环因 `flusher_exit` 退出，退出段见 `close_on_flusher==false` 跳过自毁；
+  5. **后果**: `active_ops == 0`，`in_callback == 0`，`close_pending == true`，没有任何存活线程会再去检查 `close_pending`，`destroy_instance` 永不触发，导致**实例、Staging 文件与 JNI 上下文永久泄漏**。
+- **性质**: 并发竞态资源泄漏，属于 Dekker「先 Load 后 Store」未配对双重校验的标准形态。
+- **修复方案**: 在 `logx_close_ex` 置位 `close_pending` 后，注入 `std::atomic_thread_fence(seq_cst)` 并执行双重校验（对齐 `flusher_main` 退出段），若活跃计数在置位前已归零，由本调用方兜底认领并执行 `destroy_instance(inst, false)` 自毁。
+- **落地说明（ACT-3）**: 详见 §七 ACT-3。
+
 ---
 
 ## 三、当场修正项（复审期间落地，未提交）
@@ -45,6 +59,7 @@
 |---|---|---|---|
 | 跨 owner 驱逐槽位明文密钥残留 | 低危 | [jni_key_cache.h `populate_slot`](file:///d:/Project/Android_Project/LogX/logx/android/cpp/jni_key_cache.h#L87-L92) | 接管槽位前无条件 `memset` 清零旧密钥字节，消除「被驱逐属主明文残留至 `GetByteArrayRegion` 覆写前」窗口；头注释契约同步补注 |
 | 测试覆盖回退 | 低危 | [test_jni_string.cpp](file:///d:/Project/Android_Project/LogX/logx/tests/unit/test_jni_string.cpp#L389-L456) | 补 2 用例：`CrossOwnerSameKidIndependentSlots`（恢复 R42 重构删除的跨 owner 同 kid 独立槽/互不干扰/单方失效场景）与 `CrossOwnerEvictionZeroesEvictedKeyBeforeHandover`（断言驱逐接管时旧密钥先清零、幸存槽完好） |
+| 槽位失效元数据清零对称性 | 提示 | [jni_key_cache.h](file:///d:/Project/Android_Project/LogX/logx/android/cpp/jni_key_cache.h#L48) | 惰性清扫与 `invalidate_owner` 时一并将 `slots_[i].kid = 0` 归零，保持槽位初始零态对称性 |
 
 ## 四、提示项（不强制）
 

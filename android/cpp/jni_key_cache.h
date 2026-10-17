@@ -45,6 +45,7 @@ public:
                 slots_[i].valid = false;
                 slots_[i].owner = nullptr;
                 slots_[i].gen = 0;
+                slots_[i].kid = 0;
                 std::memset(slots_[i].key, 0, sizeof(slots_[i].key));
             }
         }
@@ -75,6 +76,7 @@ public:
                 slots_[i].valid = false;
                 slots_[i].owner = nullptr;
                 slots_[i].gen = 0;
+                slots_[i].kid = 0;
                 std::memset(slots_[i].key, 0, sizeof(slots_[i].key));
             }
         }
