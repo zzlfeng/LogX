@@ -94,7 +94,7 @@ Windows MSVC x64（`build-full`，zstd + AESGCM 开启；环境前置：`Launch-
 
 ## 五、行动项清单 (Action Items)
 
-- [ ] **ACT-1（P0，必须）**: 修复 R42-01——flusher 双检与 OpGuard 认领两侧补 `atomic_thread_fence(seq_cst)`（或相关原子统一 seq_cst），封死「抢先销毁 UAF」与「双双错过泄漏」两窗口；R41 压力用例可作回归探针。
-- [ ] **ACT-2（P1）**: 修复 R42-02——`JniKeyProviderContext` 引入单调 `generation`，`TlsKeyCache` 槽位升级为 `(owner, gen, kid)` 三元匹配，消除跨线程悬垂 owner 假命中与密钥残留。
-- [ ] **ACT-3（P2/M6 前置）**: 处理 R42-03——`allocate_slot` 无空槽时返回 `nullptr` 走 core 缺钥降级路径，替代静默驱逐。
-- [ ] **ACT-4（登记）**: R42-04 `.kotlin/` 构建产物入 .gitignore；验证记录注明 VS 开发环境前置。
+- [x] **ACT-1（P0，必须）**: 修复 R42-01——flusher 双检与 OpGuard/emit_event 认领两侧统一采用 `seq_cst` 并补充 `std::atomic_thread_fence(seq_cst)`，封死 Dekker 重排导致的「抢先销毁 UAF」与「双双错过泄漏」两窗口；压力用例验证全绿。
+- [x] **ACT-2（P1）**: 修复 R42-02——`JniKeyProviderContext` 引入全局单调原子 `generation`，`TlsKeyCache` 槽位升级为 `(owner, gen, kid)` 三元匹配并增加惰性清扫机制，彻底杜绝跨线程复用与 ABA 地址复用导致的假命中。
+- [x] **ACT-3（P2/M6 前置）**: 处理 R42-03——`allocate_slot` 满槽容量耗尽时显式返回 `nullptr`，让 core 走缺钥降级与 DEGRADED 告警，杜绝静默覆盖在持指针；新增单测覆盖断言。
+- [x] **ACT-4（登记）**: 修复 R42-04——`.kotlin/` 已加入 `.gitignore`；验证记录与开发环境前置已规范对齐。
