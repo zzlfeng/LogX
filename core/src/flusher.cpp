@@ -1271,11 +1271,13 @@ void* flusher_main(void* arg) {
     Instance* inst = static_cast<Instance*>(arg);
     inst->flusher_tid.store(inst->pal->tid(), std::memory_order_release);
     flusher_loop(inst);
-    // R41-01 / ACT-1: flusher 线程严禁消费外部 close_pending。
-    // close_pending 仅在外部有活跃操作(active_ops/in_callback > 0)时置位,
-    // 其递延销毁完全由最外层 OpGuard 析构与 emit_event 尾段认领执行,
+    // R41-01 / ACT-1: flusher 线程严禁在本段之外消费外部 close_pending。
+    // 外部活跃 op 持有的递延销毁由最外层 OpGuard 析构认领执行,
     // 杜绝 flusher 提前自毁导致正在并发写入的线程 UAF。
-    // R41-02 / ACT-2: 仅当 close_on_flusher 为真时处理 Flusher 内部发起的递延销毁:
+    // R43-01 / ACT-1: 唯一例外——当最后持有者恰为 Flusher 自身(处于 emit_event
+    // 调用栈内且 active_ops==0)时,emit_event 尾段消费 close_pending 后不就地销毁,
+    // 而是转置 close_on_flusher 移交至此,由本段在循环完全退出后统一自毁。
+    // R41-02 / ACT-2: 仅当 close_on_flusher 为真时处理 Flusher 侧递延销毁:
     // 认领前须校验 active_ops == 0 && in_callback == 0; 若外部仍有活跃 op,
     // 改置 close_pending 转交外部最后退出的 op 执行销毁。
     if (inst->close_on_flusher.load(std::memory_order_seq_cst)) {
@@ -1288,6 +1290,7 @@ void* flusher_main(void* arg) {
             inst->close_pending.store(true, std::memory_order_seq_cst);
             inst->close_on_flusher.store(false, std::memory_order_seq_cst);
             // R42-01 / ACT-1: 显式 seq_cst 全序屏障，杜绝 Dekker store-load 重排导致的漏认领与 UAF
+            // P-1: 独立 fence 为冗余防御性保留——两侧操作已全部 seq_cst, 屏障本体由 S 全序提供
             std::atomic_thread_fence(std::memory_order_seq_cst);
             // 双重校验: 若活跃 op 恰在置位前全部退出,由 flusher 兜底认领避免泄漏
             if (inst->active_ops.load(std::memory_order_seq_cst) == 0 &&

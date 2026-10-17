@@ -286,6 +286,7 @@ struct OpGuard {
     ~OpGuard() {
         if (!inst) return;
         // R42-01 / ACT-1: seq_cst 全序屏障，杜绝 Dekker store-load 重排导致的漏认领与 UAF
+        // P-1: 独立 fence 为冗余防御性保留——两侧操作已全部 seq_cst, 屏障本体由 S 全序提供
         int rem = inst->active_ops.fetch_sub(1, std::memory_order_seq_cst) - 1;
         if (rem == 0) {
             std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -529,6 +530,8 @@ logx_status_e logx_write(logx_instance_t* h, int level,
     // F-1: 先增计数再查 closing——避免 close 恰在"查 closing 与 fetch_add 两步
     // 之间完成(active_ops==0 走立即销毁)"导致写线程对已 delete 的 inst 增计数(UAF)。
     // closing 置位后计数由 OpGuard 析构时递减并触发递延销毁, 语义与先前等价。
+    // P-2: 递增侧 acq_rel 即为充分——递增属保守方向(只会让 close 更倾向递延),
+    // Dekker 配对建立在 seq_cst 递减侧与 close/flusher 侧的 seq_cst store+load 之间。
     inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
     OpGuard guard{inst};
     if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
@@ -684,6 +687,7 @@ logx_status_e logx_flush(logx_instance_t* h) {
     Instance* inst = static_cast<Instance*>(h);
     if (!inst) return LOGX_ERR_STATE;
     if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
+    // P-2: 递增侧 acq_rel 充分性理由见 logx_write 处注释
     inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
     OpGuard guard{inst};
     return flush_blocking(inst) ? LOGX_OK : LOGX_ERR_TIMEOUT;
@@ -695,6 +699,7 @@ logx_status_e logx_export(logx_instance_t* h, const char* from, const char* to,
     if (!inst) return LOGX_ERR_STATE;
     if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
     if (!from || !to) return LOGX_ERR_INVALID_ARG;
+    // P-2: 递增侧 acq_rel 充分性理由见 logx_write 处注释
     inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
     OpGuard guard{inst};
     ExportRequest req;

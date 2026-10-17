@@ -690,6 +690,115 @@ TEST(R19Regression, R41_DeferredClose_ConcurrentWrites_NoUAF) {
     cleanup_dir(dir);
 }
 
+#if LOGX_WITH_AESGCM
+// ============================================================
+// R43-01 / ACT-1: close_pending Flusher 盲区泄漏回归探针。
+// 构造"最后持有者恰为 Flusher 线程"(active_ops==0 且 in_callback 全由
+// Flusher 自身回调贡献): open 后置 armed 使 key_provider 从此返回 NULL;
+// 小 max_file_size + 16KB 写 → Flusher drain 时轮转建新文件 → 建文件探测
+// 缺钥发 DEGRADED(该探测点运行在 Flusher 线程), err_fn 仅在非主线程事件
+// 上阻塞把 Flusher 扣在回调栈内; 主线程(写已退栈)此刻 logx_close_ex
+// 走 close_pending 递延。
+// 修复前: emit_event 尾段 on_flusher 拒领、flusher_main 退出段只消费
+// close_on_flusher → close_pending 永无人认领 → on_destroy 永不执行(泄漏);
+// 修复后: emit_event 尾段消费 close_pending 转置 close_on_flusher 移交,
+// 退出段自毁, on_destroy 必执行。
+// ============================================================
+TEST(R19Regression, R43_DeferredClose_FlusherCallbackBlindSpot_OnDestroyRuns) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r43_blind_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    struct SyncState {
+        std::thread::id main_tid{};
+        std::atomic<bool> armed{false};          // open 后置位: 从此探测一律缺钥
+        std::atomic<bool> flusher_in_cb{false};
+        std::atomic<bool> release_cb{false};
+        std::atomic<bool> blocked_once{false};
+        std::atomic<bool> destroyed{false};
+    } state;
+    state.main_tid = std::this_thread::get_id();
+
+    struct KeyCtx {
+        uint8_t key[32];
+        SyncState* st;                           // 非捕获 lambda 经 user 指针取 state
+    } kctx;
+    for (int i = 0; i < 32; ++i) kctx.key[i] = static_cast<uint8_t>(0x50 + i);
+    kctx.st = &state;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.retention_days = 36500;
+    cfg.max_file_size = 4096;              // 16KB 块必然触发 Flusher drain 中轮转建新文件
+    cfg.flush_threshold = 4096;            // 超阈值异步唤醒 Flusher(写退栈后 drain)
+    cfg.compress_algo = 0;
+    cfg.encrypt_enable = 1;
+    cfg.kid = 43;
+    cfg.user = &kctx;
+    cfg.key_provider = [](uint16_t, void* u) -> const uint8_t* {
+        auto* c = static_cast<KeyCtx*>(u);
+        // open 期探测给钥(目标文件建在 open 阶段, 主线程); armed 后一律缺钥
+        // → Flusher 轮转建文件探测缺钥 → DEGRADED on Flusher
+        return c->st->armed.load(std::memory_order_acquire) ? nullptr : c->key;
+    };
+    cfg.err_user = &state;
+    cfg.err_fn = [](void* u, logx_event_kind_e kind, int /*code*/, const char* /*msg*/) {
+        auto* s = static_cast<SyncState*>(u);
+        if (kind != LOGX_EV_DEGRADED) return;
+        // 只扣住 Flusher 线程(非主线程)的首个 DEGRADED; open 期主线程事件放行
+        if (s->main_tid == std::this_thread::get_id()) return;
+        if (s->blocked_once.exchange(true)) return;
+        s->flusher_in_cb.store(true);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!s->release_cb.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+    cfg.on_destroy = [](void* /*user*/, void* eu) {
+        static_cast<SyncState*>(eu)->destroyed.store(true);
+    };
+    cfg.err_user = &state;  // on_destroy 的 err_user 参数即 cfg.err_user
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // open 完成(目标文件已建、密钥已锁) → 从此缺钥
+    state.armed.store(true, std::memory_order_release);
+
+    std::vector<uint8_t> payload(16 * 1024, 'B');
+    ASSERT_EQ(logx_write(inst, 3, "R43", payload.data(),
+                         static_cast<uint32_t>(payload.size())), LOGX_OK);
+
+    // 写线程已退栈(active_ops==0); 等 Flusher 进入轮转建文件缺钥回调栈
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!state.flusher_in_cb.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(state.flusher_in_cb.load())
+        << "Flusher 必须进入轮转建文件 missing-key DEGRADED 回调(用例前提失效)";
+
+    // 命中盲区: in_callback==1(Flusher 贡献) && active_ops==0 → 递延 close
+    bool closed_immediately = true;
+    EXPECT_EQ(logx_close_ex(inst, &closed_immediately), LOGX_OK);
+    EXPECT_FALSE(closed_immediately);
+
+    // 放行 Flusher 回调: emit_event 尾段应消费 close_pending 并转置 close_on_flusher 移交
+    state.release_cb.store(true);
+
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!state.destroyed.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(state.destroyed.load())
+        << "R43-01: close_pending Flusher 盲区——on_destroy 永不执行, 实例与 JNI 上下文泄漏";
+
+    cleanup_dir(dir);
+}
+#endif
+
 // ============================================================
 // F-3: 0<sz<32 撕裂文件头自愈(R19 探针 G 形态: 旧实现 flush=OK、
 // 文件永不增长、计数器全 0)

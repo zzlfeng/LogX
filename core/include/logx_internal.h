@@ -110,6 +110,8 @@ void destroy_instance(Instance* inst, bool is_flusher_thread);
 // R19 F-2: in_callback 跟踪回调调用深度, 供 logx_close 检测重入并实施递延销毁。
 inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char* msg) {
     if (!inst) return;
+    // P-2: 递增侧 acq_rel 即为充分——递增属保守方向(只会让 close 更倾向递延),
+    // Dekker 配对建立在 seq_cst 递减侧与 close/flusher 侧的 seq_cst store+load 之间。
     inst->in_callback.fetch_add(1, std::memory_order_acq_rel);
     inst->err_mu.lock();
     logx_error_fn fn = inst->err_fn;
@@ -119,6 +121,7 @@ inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char
         fn(user, k, code, msg ? msg : "");
     }
     // R42-01 / ACT-1: seq_cst 全序屏障，杜绝 Dekker store-load 重排导致的漏认领与 UAF
+    // P-1: 独立 fence 为冗余防御性保留——两侧操作已全部 seq_cst, 屏障本体由 S 全序提供
     int rem = inst->in_callback.fetch_sub(1, std::memory_order_seq_cst) - 1;
     // F-2: 递延销毁死角收敛——当回调退出且为最后一个持有者时,消费 close_pending 触发销毁
     if (rem == 0) {
@@ -127,8 +130,13 @@ inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char
             inst->close_pending.load(std::memory_order_seq_cst)) {
             uint64_t current_tid = inst->pal->tid();
             bool on_flusher = (inst->flusher_tid.load(std::memory_order_seq_cst) == current_tid);
-            if (!on_flusher) {
-                if (inst->close_pending.exchange(false, std::memory_order_seq_cst)) {
+            if (inst->close_pending.exchange(false, std::memory_order_seq_cst)) {
+                if (on_flusher) {
+                    // R43-01 / ACT-1: Flusher 正处于 emit_event 调用栈内,回调返回后调用方
+                    // 仍将持续引用 inst,严禁就地销毁(保留 R41-01 防尾读 UAF 纪律的本意);
+                    // 改转 close_on_flusher 移交,由 flusher_main 退出段在循环完全退出后自毁。
+                    inst->close_on_flusher.store(true, std::memory_order_seq_cst);
+                } else {
                     destroy_instance(inst, /*is_flusher_thread=*/false);
                 }
             }
