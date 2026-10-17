@@ -35,6 +35,7 @@
   - 首选：`emit_event` 退出点当 `active_ops==0 && close_pending` 时允许 Flusher 自领，按线程身份传 `destroy_instance(inst, /*is_flusher_thread=*/on_flusher)`——自毁路径已支持（不 join 自身、跳过 `flush_blocking`），与 `close_on_flusher` 语义合流；R41-01「严禁消费外部 close_pending」纪律可收窄为「存在外部活跃 op 时严禁」，因该纪律本意是防外部 op 尾读 UAF，`active_ops==0` 时外部仅剩已返回的 close 调用方（递延语义下不再触碰 inst）；
   - 或：`logx_close_ex` 区分「`in_callback` 全部由 Flusher 贡献」（需 per-线程归属计数）直接走 `close_on_flusher` 通道——改动面更大，不推荐。
 - **回归探针建议**: 新增定向用例——写入线程全部收敛（`active_ops==0`）后，由 Flusher 事件发射路径（如构造 IO 失败）持有回调期间并发 close，断言 `on_destroy` 最终执行、实例回收。
+- **落地说明（ACT-1）**: 实际采用首选方案的收敛变体——Flusher 侧认领后不就地 `destroy_instance`（`emit_event` 返回点仍在 flusher 写块调用栈内，就地自毁会尾读 UAF），改为转置 `close_on_flusher` 移交 `flusher_main` 退出段统一自毁；探针以轮转建文件缺钥 DEGRADED 构造盲区场景。详见 §七 ACT-1。
 
 ---
 
@@ -90,5 +91,5 @@ JniKeyCache 定向复跑（含当场新增 2 用例）：
 
 ## 七、行动项清单 (Action Items)
 
-- [ ] **ACT-1（P1）**: 修复 R43-01——`emit_event` 退出点允许 Flusher 在 `active_ops==0` 时自领 `close_pending`（`destroy_instance(inst, is_flusher_thread=true)`），或等价方案；新增「Flusher 回调内递延 close」定向回归用例断言 `on_destroy` 执行。
-- [ ] **ACT-2（登记）**: 提示项 P-1/P-2 注释补注（冗余 fence 说明、递增侧 acq_rel 理由），可并入下次代码批次顺带处理。
+- [x] **ACT-1（P1）**: 修复 R43-01——`emit_event` 退出点当 `active_ops==0 && close_pending` 时不再按 `on_flusher` 拒领，改为 `exchange` 消费后按线程身份分支：非 Flusher 线程维持 `destroy_instance(inst, false)` 就地销毁；Flusher 线程**不就地销毁**（与首选方案的偏差：`emit_event` 返回后调用方——`append_block_raw`/`drain_once` 等——仍将持续引用 `inst`，就地自毁将复刻 R41-01 尾读 UAF），转置 `close_on_flusher=true` 移交，由 `flusher_main` 退出段在循环完全退出后统一 `destroy_instance(inst, true)` 自毁。R41-01 纪律相应收窄为「严禁在 emit_event 调用栈内就地销毁外部 close_pending」。新增定向回归用例 `R19Regression.R43_DeferredClose_FlusherCallbackBlindSpot_OnDestroyRuns`（armed 缺钥窗口 + `max_file_size=4096` 迫使 Flusher 轮转建文件探测缺钥 + `err_fn` 按线程判别扣住 Flusher 回调栈）：修复后绿（49ms），变异验证（临时还原 `if (!on_flusher)` 拒领旧逻辑）必红（5021ms 超时，`on_destroy` 永不执行），探针有效。
+- [x] **ACT-2（登记）**: 提示项 P-1/P-2 注释补注已落地——P-1：`emit_event` / `OpGuard` / `flusher_main` 三处 fence 补注「冗余、防御性保留，屏障本体由 seq_cst S 全序提供」；P-2：`in_callback`（`logx_internal.h`）与 `active_ops` 递增侧（`logx_c.cpp` 的 `logx_write` / `logx_flush` / `logx_export`）补注「acq_rel 充分性理由：递增属保守方向，Dekker 配对建立在 seq_cst 递减侧」。
