@@ -59,6 +59,13 @@ target_include_directories(logx_unit_tests PRIVATE
     # 静态链接进本测试);include 路径在 logx_core 为 PRIVATE,此处需显式补。
     ${CMAKE_SOURCE_DIR}/third_party/mbedtls/include
 )
+# D2:level 0-22 级联 smoke 直接调用 zstd C ABI;仅在真实 zstd 接入时编译。
+if(LOGX_WITH_ZSTD)
+    target_sources(logx_unit_tests PRIVATE test_zstd_cascade.cpp)
+    target_include_directories(logx_unit_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/third_party/zstd/lib
+    )
+endif()
 add_test(NAME logx_unit_tests COMMAND logx_unit_tests)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(logx_unit_tests PRIVATE -Wall -Wextra)

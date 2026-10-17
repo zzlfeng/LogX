@@ -1,0 +1,116 @@
+LogX 性能基线基准 (T5.2)  stage_a_n=20000 stage_b_m=50000 stage_d_k=10000
+计时器开销: 单次 steady_clock::now() 均值 ~= 160 ns (sink=9037720849730688639 防优化消除)
+输出目录: /data/local/tmp/logx_bench_profiles/out_i_final_1/run_0
+
+==== Stage A: 单条写入延迟分布 (单线程热路径, payload=200B, N=20000, 突发256条后flush清空) ====
+
+-- compress=none  thr=8KB(生产默认) --
+  聚合吞吐: 25234 logs/s (含每256条阻塞 flush 与其计时,仅供量级参考)
+  logx_write 延迟 (n=20000):
+    mean  =      9070 ns (   9.071 us)
+    P50   =      5312 ns (   5.312 us)
+    P90   =      8802 ns (   8.802 us)
+    P99   =    104270 ns ( 104.270 us)
+    P99.9 =    151667 ns ( 151.667 us)
+    max   =   2371094 ns (2371.094 us)
+    ---- 抖动(jitter) ----
+    stddev  =   24212.1 ns    CV(stddev/mean)     = 2.669
+    MAD     =       364 ns    robustCV(MAD/P50)   = 0.069
+    长尾比: P99/P50 = 19.63x    max/P50 = 446.37x
+
+-- compress=zstd  thr=8KB(生产默认) --
+  聚合吞吐: 27790 logs/s (含每256条阻塞 flush 与其计时,仅供量级参考)
+  logx_write 延迟 (n=20000):
+    mean  =      7354 ns (   7.355 us)
+    P50   =      5000 ns (   5.000 us)
+    P90   =      6719 ns (   6.719 us)
+    P99   =     49584 ns (  49.584 us)
+    P99.9 =    197657 ns ( 197.657 us)
+    max   =    602395 ns ( 602.395 us)
+    ---- 抖动(jitter) ----
+    stddev  =   14161.7 ns    CV(stddev/mean)     = 1.926
+    MAD     =       104 ns    robustCV(MAD/P50)   = 0.021
+    长尾比: P99/P50 = 9.92x    max/P50 = 120.48x
+
+-- compress=none  thr=0(纯路径) --
+  聚合吞吐: 25651 logs/s (含每256条阻塞 flush 与其计时,仅供量级参考)
+  logx_write 延迟 (n=20000):
+    mean  =      5648 ns (   5.649 us)
+    P50   =      4791 ns (   4.791 us)
+    P90   =      5416 ns (   5.416 us)
+    P99   =     14427 ns (  14.427 us)
+    P99.9 =     99167 ns (  99.167 us)
+    max   =    688698 ns ( 688.698 us)
+    ---- 抖动(jitter) ----
+    stddev  =    8559.7 ns    CV(stddev/mean)     = 1.515
+    MAD     =        52 ns    robustCV(MAD/P50)   = 0.011
+    长尾比: P99/P50 = 3.01x    max/P50 = 143.75x
+
+-- compress=zstd  thr=0(纯路径) --
+  聚合吞吐: 28705 logs/s (含每256条阻塞 flush 与其计时,仅供量级参考)
+  logx_write 延迟 (n=20000):
+    mean  =      5502 ns (   5.503 us)
+    P50   =      4740 ns (   4.740 us)
+    P90   =      5469 ns (   5.469 us)
+    P99   =     14010 ns (  14.010 us)
+    P99.9 =    101615 ns ( 101.615 us)
+    max   =    562187 ns ( 562.187 us)
+    ---- 抖动(jitter) ----
+    stddev  =    8079.4 ns    CV(stddev/mean)     = 1.468
+    MAD     =        53 ns    robustCV(MAD/P50)   = 0.011
+    长尾比: P99/P50 = 2.96x    max/P50 = 118.60x
+
+==== Stage B: 纯写吞吐与落盘体积 (混合变长 80~1536B, 80%文本+20%伪随机, M=50000, NO_SPACE 有界重试) ====
+
+-- compress=none --
+  纯写吞吐: 102781 logs/s, 79.2 MB/s (payload 40409896 B / 0.486 s, NO_SPACE 重试 2662 次)
+  落盘体积: 43013788 B (含块头/CRC), payload/落盘压缩比 = 0.94x
+
+-- compress=zstd --
+  纯写吞吐: 76598 logs/s, 59.0 MB/s (payload 40409896 B / 0.653 s, NO_SPACE 重试 2811 次)
+  落盘体积: 26570157 B (含块头/CRC), payload/落盘压缩比 = 1.52x
+
+==== Stage C: logx_flush 阻塞耗时 (每轮写 100 条 ~200B 后 flush, 模拟退后台) ====
+  logx_flush 耗时 (n=300):
+    mean  =   7109137 ns (7109.138 us)
+    P50   =   7267761 ns (7267.761 us)
+    P90   =   7504479 ns (7504.479 us)
+    P99   =  10476614 ns (10476.614 us)
+    P99.9 =  15291875 ns (15291.875 us)
+    max   =  15291875 ns (15291.875 us)
+    ---- 抖动(jitter) ----
+    stddev  = 1386734.3 ns    CV(stddev/mean)     = 0.195
+    MAD     =    122812 ns    robustCV(MAD/P50)   = 0.017
+    长尾比: P99/P50 = 1.44x    max/P50 = 2.10x
+
+==== Stage D: NO_SPACE 退避机制对比 (4 线程并发持续压满 128KB 环, payload=515B, 总计10000条) ====
+
+-- 模式 1: 外部轮询退避 (staging_wait_ms=0, 满环 sleep 2ms 轮询) --
+  纯写吞吐: 90488 logs/s, 44.44 MB/s (总耗时 0.111 s, 真实丢失: 0 条)
+  logx_write 延迟 (含轮询等待) (n=10000):
+    mean  =     39824 ns (  39.825 us)
+    P50   =      3594 ns (   3.594 us)
+    P90   =      6823 ns (   6.823 us)
+    P99   =   2088125 ns (2088.125 us)
+    P99.9 =   2804844 ns (2804.844 us)
+    max   =   7289323 ns (7289.323 us)
+    ---- 抖动(jitter) ----
+    stddev  =  288341.7 ns    CV(stddev/mean)     = 7.240
+    MAD     =       521 ns    robustCV(MAD/P50)   = 0.145
+    长尾比: P99/P50 = 581.00x    max/P50 = 2028.19x
+
+-- 模式 2: 库内事件驱动退避 (staging_wait_ms=1000, space_event 级联令牌即刻唤醒) --
+  纯写吞吐: 128737 logs/s, 63.23 MB/s (总耗时 0.078 s, 真实丢失: 0 条)
+  logx_write 延迟 (含事件等待) (n=10000):
+    mean  =     28564 ns (  28.564 us)
+    P50   =      4010 ns (   4.010 us)
+    P90   =     10521 ns (  10.521 us)
+    P99   =    268646 ns ( 268.646 us)
+    P99.9 =   3186719 ns (3186.719 us)
+    max   =   7850365 ns (7850.365 us)
+    ---- 抖动(jitter) ----
+    stddev  =  217087.5 ns    CV(stddev/mean)     = 7.600
+    MAD     =      1093 ns    robustCV(MAD/P50)   = 0.273
+    长尾比: P99/P50 = 66.99x    max/P50 = 1957.70x
+
+==== 基准完成 ====

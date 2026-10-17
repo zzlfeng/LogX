@@ -4,6 +4,11 @@ plugins {
     id("maven-publish")
 }
 
+// 默认 ON;仅 T-Z0 的「有/无 -g」A/B 对照可传 -PlogxKeepSymbols=OFF。
+val logxKeepSymbols = (findProperty("logxKeepSymbols") as String?) ?: "ON"
+// D6-B2: 写入热路径 TU 单独 -O2;可传 -PlogxHotpathO2=OFF 做方案 A/B 对照。
+val logxHotpathO2 = (findProperty("logxHotpathO2") as String?) ?: "ON"
+
 android {
     namespace = "com.zzlfeng.logx"
     compileSdk = 34
@@ -15,6 +20,18 @@ android {
         consumerProguardFiles("consumer-rules.pro")
         ndk {
             abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += listOf(
+                    "-DLOGX_AAR_NATIVE_MIN_SIZE=ON",
+                    "-DLOGX_AAR_KEEP_SYMBOLS=$logxKeepSymbols",
+                    "-DLOGX_HOTPATH_O2=$logxHotpathO2",
+                    // 2026-10-17 拍板:c++_shared,使 liblogx.so 门禁与 benchmark 口径一致;
+                    // AAR 会同时打包 libc++_shared.so,总 native 载荷单独记录。
+                    "-DANDROID_STL=c++_shared",
+                )
+            }
         }
     }
     compileOptions {

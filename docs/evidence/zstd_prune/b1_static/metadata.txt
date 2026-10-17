@@ -1,0 +1,6 @@
+T-Z1/T-Z5a B1 (pruned), AAR static libc++ (default)
+NDK: 29.0.14206865
+ABI/API: arm64-v8a / android-21
+Flags: -Oz -DNDEBUG -g
+Macros: 6x ZSTD_EXCLUDE_* (not DFAST), ZSTD_STRIP_ERROR_STRINGS, ZSTD_NO_TRACE
+Units: 25 -> 23 (pool.c/threading.c removed; zstd_lazy.c/zstd_opt.c kept as empty TUs)

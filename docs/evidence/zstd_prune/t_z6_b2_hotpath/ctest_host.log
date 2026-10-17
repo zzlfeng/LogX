@@ -1,0 +1,14 @@
+Internal ctest changing into directory: D:/Project/Android_Project/LogX/logx/build-full
+Test project D:/Project/Android_Project/LogX/logx/build-full
+    Start 1: logx_unit_tests
+1/4 Test #1: logx_unit_tests ..................   Passed   17.70 sec
+    Start 2: logx_hotpath_alloc_tests
+2/4 Test #2: logx_hotpath_alloc_tests .........   Passed    0.32 sec
+    Start 3: logx_stress_tests
+3/4 Test #3: logx_stress_tests ................   Passed    1.08 sec
+    Start 4: logx_crash_fork_tests
+4/4 Test #4: logx_crash_fork_tests ............   Passed    2.01 sec
+
+100% tests passed, 0 tests failed out of 4
+
+Total Test time (real) =  21.13 sec

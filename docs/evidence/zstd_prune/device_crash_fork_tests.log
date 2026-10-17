@@ -1,0 +1,14 @@
+[==========] Running 3 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 3 tests from RealProcessKill
+[ RUN      ] RealProcessKill.StagingDataRecoveredZeroLoss
+[       OK ] RealProcessKill.StagingDataRecoveredZeroLoss (20 ms)
+[ RUN      ] RealProcessKill.MidBlockWrite_ExactReconciliation
+[       OK ] RealProcessKill.MidBlockWrite_ExactReconciliation (20 ms)
+[ RUN      ] RealProcessKill.FiftyCyclesForkLoop
+[       OK ] RealProcessKill.FiftyCyclesForkLoop (2675 ms)
+[----------] 3 tests from RealProcessKill (2718 ms total)
+
+[----------] Global test environment tear-down
+[==========] 3 tests from 1 test suite ran. (2718 ms total)
+[  PASSED  ] 3 tests.

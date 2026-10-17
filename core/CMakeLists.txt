@@ -32,6 +32,20 @@ endif()
 add_library(logx_core STATIC ${LOGX_CORE_SOURCES})
 set_target_properties(logx_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# D6-B2: MinSizeRel 下将写入热路径 TU 单独提升为 -O2。
+# 不能对 logx_core 整体加 -O2: zstd/mbedtls 也在本 target, 会抵消体积裁剪。
+# 仅 Clang/GNU 使用 -O2 语法; host MSVC 保持默认, 该选项只由 AAR release 打开。
+option(LOGX_HOTPATH_O2 "Compile write hot-path TUs with -O2 under MinSizeRel" OFF)
+if(LOGX_HOTPATH_O2 AND CMAKE_BUILD_TYPE STREQUAL "MinSizeRel"
+   AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    set_source_files_properties(
+        src/logx_c.cpp
+        src/flusher.cpp
+        src/format.cpp
+        src/staging.cpp
+        PROPERTIES COMPILE_OPTIONS "-O2")
+endif()
+
 target_include_directories(logx_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -70,8 +84,6 @@ if(LOGX_WITH_ZSTD)
         ${LOGX_ZSTD_DIR}/common/entropy_common.c
         ${LOGX_ZSTD_DIR}/common/error_private.c
         ${LOGX_ZSTD_DIR}/common/fse_decompress.c
-        ${LOGX_ZSTD_DIR}/common/pool.c
-        ${LOGX_ZSTD_DIR}/common/threading.c
         ${LOGX_ZSTD_DIR}/common/xxhash.c
         ${LOGX_ZSTD_DIR}/common/zstd_common.c
         ${LOGX_ZSTD_DIR}/compress/fse_compress.c
@@ -93,6 +105,21 @@ if(LOGX_WITH_ZSTD)
         ${LOGX_ZSTD_DIR}/decompress/zstd_decompress_block.c
     )
     target_include_directories(logx_core PRIVATE ${LOGX_ZSTD_DIR})
+    # 源码级裁剪(0-diff):仅用上游 EXCLUDE 宏剔除 Level 5+ 匹配引擎。
+    # 不得定义 ZSTD_EXCLUDE_DFAST_BLOCK_COMPRESSOR:LogX Level 3 依赖 dfast。
+    # ZSTD_NO_TRACE 会改变 CCtx/DCtx 布局,所有 zstd TU 必须 clean 重建。
+    target_compile_definitions(logx_core PRIVATE
+        ZSTD_EXCLUDE_GREEDY_BLOCK_COMPRESSOR=1
+        ZSTD_EXCLUDE_LAZY_BLOCK_COMPRESSOR=1
+        ZSTD_EXCLUDE_LAZY2_BLOCK_COMPRESSOR=1
+        ZSTD_EXCLUDE_BTLAZY2_BLOCK_COMPRESSOR=1
+        ZSTD_EXCLUDE_BTOPT_BLOCK_COMPRESSOR=1
+        ZSTD_EXCLUDE_BTULTRA_BLOCK_COMPRESSOR=1
+        ZSTD_STRIP_ERROR_STRINGS=1
+        ZSTD_NO_TRACE=1
+    )
+    # 单线程:pool.c/threading.c 无引用已移除;若未来定义 ZSTD_MULTITHREAD,
+    # 必须恢复这两个文件并接入 zstdmt_compress.c。
     # zstd 以静态方式编入,不导出符号(SHARED 目标 liblogx.so 现有可见性保持)
     if(BUILD_SHARED_LIBS)
         set_target_properties(logx_core PROPERTIES POSITION_INDEPENDENT_CODE ON)

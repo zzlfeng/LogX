@@ -1,0 +1,2 @@
+bba97a8fa1082841c57b4cb2f3595167d279562f77821706186340245b42e889 *docs/evidence/zstd_prune/b1_shared_g0/liblogx-stripped-g0.so
+e021fa2be4a5d3a2685189b5e2980cf1e51ff60232e130891363d7d70ffc5ac8 *docs/evidence/zstd_prune/b1_shared_g0/liblogx-unstripped-g0.so

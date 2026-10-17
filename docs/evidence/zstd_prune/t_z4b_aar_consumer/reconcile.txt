@@ -1,0 +1,12 @@
+20261017.log errors= []
+20261017.log.1 errors= []
+20261017.log.2 errors= []
+export_counts = [45, 66, 30]
+decode_counts = [45, 66, 30]
+total_export = 141 total_decode = 141
+export[0] matches log volume(s): [0]
+export[1] matches log volume(s): [1]
+export[2] matches log volume(s): [2]
+concatenated_equal = True
+tags = {'Main': 20, 'Big': 1, 'Split': 120}
+big_msg_len = 40960

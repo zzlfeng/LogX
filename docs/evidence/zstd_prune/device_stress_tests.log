@@ -1,0 +1,35 @@
+Running main() from D:/Project/Android_Project/LogX/logx/build-android-tests/_deps/googletest-src/googletest/src/gtest_main.cc
+[==========] Running 4 tests from 2 test suites.
+[----------] Global test environment set-up.
+[----------] 1 test from StressTest
+[ RUN      ] StressTest.FiftyThreads_HeavyConcurrentWritesWithFlushCompetition
+
+[Stress Metrics] 50 Threads Concurrency Summary:
+  - Expected logs : 25000
+  - Written logs  : 18344 (73.376%)
+  - Dropped events: 361857
+  - Pure write sec: 0.656613 s (27937.3 logs/s)
+  - Total time sec: 0.657429 s
+  - Total log files generated: 11 (Files rotated successfully!)
+  - Missing records found: 0
+  - Verified Blocks: 387, Monotonic Seqno reached: 387, Raw Disk Records: 18344
+  - Exported records: 18344
+[       OK ] StressTest.FiftyThreads_HeavyConcurrentWritesWithFlushCompetition (1025 ms)
+[----------] 1 test from StressTest (1025 ms total)
+
+[----------] 3 tests from CrashRecovery
+[ RUN      ] CrashRecovery.GracefulTeardown_StagingDataRecovered
+[       OK ] CrashRecovery.GracefulTeardown_StagingDataRecovered (12 ms)
+[ RUN      ] CrashRecovery.TornBlockAtDiskTail_TruncatedSafelyAndCapturesEvent
+[       OK ] CrashRecovery.TornBlockAtDiskTail_TruncatedSafelyAndCapturesEvent (13 ms)
+[ RUN      ] CrashRecovery.FiftyCycles_RandomTeardownAndRecoveryLoop
+
+[Crash Injection Summary] 50 Cycles Multi-Stage Crash Loop:
+  - Expected logs : 397
+  - Exported logs : 397
+[       OK ] CrashRecovery.FiftyCycles_RandomTeardownAndRecoveryLoop (821 ms)
+[----------] 3 tests from CrashRecovery (848 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 2 test suites ran. (1874 ms total)
+[  PASSED  ] 4 tests.

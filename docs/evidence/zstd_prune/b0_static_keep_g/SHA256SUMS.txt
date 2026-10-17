@@ -1,0 +1,3 @@
+342bc94e767f7282c679fa25a4bf7d6cea0f84d66cb2bb448997e77c326f1b60 *docs/evidence/zstd_prune/b0_static_keep_g/liblogx-stripped.so
+cb3bbcbe8d09e1adb5f6c4d7e882aa1ec76d79d4303a8e4d7c641ba0f2664d28 *docs/evidence/zstd_prune/b0_static_keep_g/liblogx-unstripped.so
+bc365299d0f8e46893dd27567935d124b5e98d7f4583efb3b90117ae64bc84dc *docs/evidence/zstd_prune/b0_static_keep_g/logx-release-b0.aar

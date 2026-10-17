@@ -1,0 +1,2 @@
+5c4b056cff5dae1eaf2a0d29bb57e6f17960e63f3301323077af3e5e2f7217db *aar_libs/jni/arm64-v8a/liblogx.so
+c4c2fe5cbcb1fba0003a31fc7ab29a9bb12df6cc187ec45a806462540e83d93b *aar_libs/jni/arm64-v8a/libc++_shared.so

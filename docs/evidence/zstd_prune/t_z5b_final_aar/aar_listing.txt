@@ -1,0 +1,14 @@
+Archive:  ../../../../android/logx-aar/logx/build/outputs/aar/logx-release.aar
+  Length      Date    Time    Name
+---------  ---------- -----   ----
+        0  1980-02-01 00:00   R.txt
+      203  1980-02-01 00:00   AndroidManifest.xml
+    31952  1980-02-01 00:00   classes.jar
+      830  1980-02-01 00:00   proguard.txt
+      156  1980-02-01 00:00   META-INF/com/android/build/gradle/aar-metadata.properties
+        0  1980-02-01 00:00   jni/
+        0  1980-02-01 00:00   jni/arm64-v8a/
+  1374336  1980-02-01 00:00   jni/arm64-v8a/libc++_shared.so
+   371544  1980-02-01 00:00   jni/arm64-v8a/liblogx.so
+---------                     -------
+  1779021                     9 files

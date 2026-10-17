@@ -1,0 +1,9 @@
+T-Z1/T-Z5a B1 (pruned), FINAL release config: c++_shared
+NDK: 29.0.14206865
+ABI/API: arm64-v8a / android-21
+Build: gradle --offline :logx:assembleRelease (Gradle 8.10, AGP 8.5.1, CMake 3.22.1)
+Flags: -Oz -DNDEBUG -g
+Macros: 6x ZSTD_EXCLUDE_* (not DFAST), ZSTD_STRIP_ERROR_STRINGS, ZSTD_NO_TRACE
+Units: 25 -> 23 (pool.c/threading.c removed; zstd_lazy.c/zstd_opt.c kept as empty TUs)
+Gate: liblogx.so < 512,000 B -> PASS (371,544 B)
+AAR also packages libc++_shared.so = 1,374,336 B (total native payload 1,745,880 B; not in gate)

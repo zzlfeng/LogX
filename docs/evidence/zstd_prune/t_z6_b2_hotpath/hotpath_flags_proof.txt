@@ -1,0 +1,7 @@
+# B2 per-TU compile flags (AAR build.ninja, MinSizeRel)
+# source => FLAGS (clang: last -O wins)
+logx_c.cpp => -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread -std=c++17 -O2
+flusher.cpp => -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread -std=c++17 -O2
+format.cpp => -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread -std=c++17 -O2
+staging.cpp => -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security   -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread -std=c++17 -O2
+zstd_compress.c => -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -Oz -DNDEBUG -g -fPIC -Wall -Wextra -Wno-unused-parameter -pthread

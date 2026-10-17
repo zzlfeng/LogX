@@ -1,0 +1,7 @@
+export_records = 104
+decoder_records = 104
+decoder_errors = []
+byte_equal = True
+tags = {'Main': 20, 'Big': 1, 'Split': 83}
+big_records = 1 msg_len = 40960
+split_records = 83

@@ -1,0 +1,4 @@
+5c4b056cff5dae1eaf2a0d29bb57e6f17960e63f3301323077af3e5e2f7217db *docs/evidence/zstd_prune/b1_shared_keep_g/liblogx-from-aar.so
+5c4b056cff5dae1eaf2a0d29bb57e6f17960e63f3301323077af3e5e2f7217db *docs/evidence/zstd_prune/b1_shared_keep_g/liblogx-stripped.so
+02c64a7d3aa75281bc7877bd87c20eb90652bdcb43b95771dc1da6b2b9873f86 *docs/evidence/zstd_prune/b1_shared_keep_g/liblogx-unstripped.so
+c7ab3696a1f79277bedea4d5a7e19c6feef41089f26914afa4d5df3f30c7c6bc *docs/evidence/zstd_prune/b1_shared_keep_g/logx-release-b1.aar

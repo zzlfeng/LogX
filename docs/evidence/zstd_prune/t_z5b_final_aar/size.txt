@@ -1,0 +1,2 @@
+   text	   data	    bss	    dec	    hex	filename
+ 363634	   4744	   6192	 374570	  5b72a	aar_libs/jni/arm64-v8a/liblogx.so

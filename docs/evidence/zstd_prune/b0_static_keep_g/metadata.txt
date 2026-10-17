@@ -1,0 +1,6 @@
+T-Z0 B0 (unpruned), AAR static libc++ (default)
+NDK: 29.0.14206865
+ABI/API: arm64-v8a / android-21
+Build: gradle --offline :logx:assembleRelease (Gradle 8.10, AGP 8.5.1, CMake 3.22.1)
+Flags: -Oz -DNDEBUG -g
+KEEP_SYMBOLS: ON

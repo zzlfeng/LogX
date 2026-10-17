@@ -1,0 +1,2 @@
+aar_libs/jni/arm64-v8a/liblogx.so 371544
+aar_libs/jni/arm64-v8a/libc++_shared.so 1374336

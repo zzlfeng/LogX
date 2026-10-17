@@ -1,0 +1,48 @@
+## interleaved baseline (AAR RelWithDebInfo c++_static) (3 runs)
+none/0: P50=3646 ns, P99=13073 ns
+zstd/0: P50=3646 ns, P99=12604 ns
+none/8KB: P50=3803 ns, P99=106146 ns
+zstd/8KB: P50=3802 ns, P99=51614 ns
+B none=103383 logs/s, B zstd=67823 logs/s, ratio=1.52x
+flush P99=10.04 ms
+
+## interleaved final (G2 AAR MinSizeRel c++_shared pruned) (3 runs)
+none/0: P50=4844 ns, P99=14531 ns
+zstd/0: P50=4844 ns, P99=14010 ns
+none/8KB: P50=5312 ns, P99=104427 ns
+zstd/8KB: P50=5052 ns, P99=50104 ns
+B none=111605 logs/s, B zstd=72309 logs/s, ratio=1.52x
+flush P99=10.48 ms
+
+## attribution baseline (3 runs)
+none/0: P50=3646 ns, P99=13334 ns
+zstd/0: P50=3646 ns, P99=12448 ns
+none/8KB: P50=4063 ns, P99=103438 ns
+zstd/8KB: P50=3854 ns, P99=53386 ns
+B none=106485 logs/s, B zstd=76740 logs/s, ratio=1.52x
+flush P99=10.24 ms
+
+## attribution B0 (MinSizeRel, c++_static, unpruned) (3 runs)
+none/0: P50=4896 ns, P99=14791 ns
+zstd/0: P50=4896 ns, P99=14427 ns
+none/8KB: P50=5469 ns, P99=105364 ns
+zstd/8KB: P50=5104 ns, P99=51823 ns
+B none=110469 logs/s, B zstd=69000 logs/s, ratio=1.52x
+flush P99=9.09 ms
+
+## attribution B1static (MinSizeRel, c++_static, pruned) (3 runs)
+none/0: P50=4896 ns, P99=16302 ns
+zstd/0: P50=4895 ns, P99=13958 ns
+none/8KB: P50=5104 ns, P99=104635 ns
+zstd/8KB: P50=5052 ns, P99=53959 ns
+B none=93875 logs/s, B zstd=69079 logs/s, ratio=1.52x
+flush P99=9.59 ms
+
+## attribution final (3 runs)
+none/0: P50=4844 ns, P99=15990 ns
+zstd/0: P50=4844 ns, P99=13802 ns
+none/8KB: P50=5052 ns, P99=105000 ns
+zstd/8KB: P50=5052 ns, P99=52032 ns
+B none=109868 logs/s, B zstd=66192 logs/s, ratio=1.52x
+flush P99=8.72 ms
+

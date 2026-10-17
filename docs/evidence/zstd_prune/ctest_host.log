@@ -1,0 +1,13 @@
+Test project D:/Project/Android_Project/LogX/logx/build-full
+    Start 1: logx_unit_tests
+1/4 Test #1: logx_unit_tests ..................   Passed   16.72 sec
+    Start 2: logx_hotpath_alloc_tests
+2/4 Test #2: logx_hotpath_alloc_tests .........   Passed    0.31 sec
+    Start 3: logx_stress_tests
+3/4 Test #3: logx_stress_tests ................   Passed    1.15 sec
+    Start 4: logx_crash_fork_tests
+4/4 Test #4: logx_crash_fork_tests ............   Passed    2.13 sec
+
+100% tests passed, 0 tests failed out of 4
+
+Total Test time (real) =  20.32 sec

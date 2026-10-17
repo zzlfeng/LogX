@@ -1,0 +1,2 @@
+   text	   data	    bss	    dec	    hex	filename
+ 377378	   4584	   4912	 386874	  5e73a	D:/Project/Android_Project/LogX/logx/docs/evidence/zstd_prune/t_z6_b2_hotpath/liblogx-b2-stripped.so

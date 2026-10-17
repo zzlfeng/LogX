@@ -1,0 +1,5 @@
+T-Z0 D4-A A/B, OFF arm (no debug info)
+NDK: 29.0.14206865
+ABI/API: arm64-v8a / android-21
+Flags: -Oz -DNDEBUG -g0
+KEEP_SYMBOLS: OFF

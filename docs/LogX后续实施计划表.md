@@ -1,6 +1,10 @@
 # LogX 日志库后续实施路线与任务计划表
 
-> **文档版本**: v1.64 (2026-10-11 T5.7 Release AAR 落地——M5 里程碑 100% 完成)
+> **文档版本**: v1.66 (2026-10-17 D6-B2 热路径 `-O2` 关闭——AAR 385,112 B，P50 回归消除)
+>
+> **v1.66 修订说明**: 2026-10-17 **D6 拍板 B2 并实测关闭（详见 [docs/zstd_prune_plan.md](./zstd_prune_plan.md) v1.7）**: 仅对写入热路径 `logx_c.cpp`/`flusher.cpp`/`format.cpp`/`staging.cpp` 在 MinSizeRel 下追加 `-O2`（`LOGX_HOTPATH_O2=ON`），zstd/mbedtls 保持 `-Oz`，`third_party/zstd` 仍 0-diff。AAR 内 stripped `liblogx.so` **385,112 B < 512,000 B（余量 126,888 B）**；真机 3 轮交错 + 逆序轮：纯路径 P50 **3,698 ns**、生产口径 zstd P50 **3,958 ns**（final-A 4,896 / 5,052；baseline 3,698 / 3,855），P50 ≤4.0µs 成功线达标，压缩比 1.52x 不变。回归：host clean 57/57 + ctest 4/4、NDK 26.1 clean 61/61（0 警告）、真机 197/197 + 2/2 + 4/4 + 3/3、B2 AAR 消费端 `assembleDebug` 成功。总 native 载荷单列 1,759,448 B（不参与门禁）。**D6 关闭，zstd 专项无遗留待拍板项**；`zstd_prune_plan.md` v1.7、`benchmark_report.md` v1.2。本条为专项交付记录，不重开 Backlog 编号。
+>
+> **v1.65 修订说明**: 2026-10-17 **zstd 裁剪专项 T-Z0~T-Z6 收口（详见 [docs/zstd_prune_plan.md](./zstd_prune_plan.md) v1.6）**: G2 发布 AAR 内 `jni/arm64-v8a/liblogx.so` strip 后 **371,544 B < 512,000 B 门禁（余量 140,456 B）**；`third_party/zstd` 全程 0-diff，经 6 个 `ZSTD_EXCLUDE_*` + `ZSTD_STRIP_ERROR_STRINGS` + `ZSTD_NO_TRACE` 宏裁剪（shared 口径收益 148,920 B），AAR native 切 MinSizeRel `-Oz -DNDEBUG -g`（D4-A 符号保留）+ `c++_shared`。验证：MSVC clean 0 警告、单测 197/197 + 2/2 + 4/4 + 3/3；NDK 26.1 clean 61/61、真机四套件全绿；独立解码 104/104 与 AAR 消费端 141/141 逐字节一致；level 0–22 级联 smoke PASS。**总 native 载荷单列 1,745,880 B（不参与门禁）**。T-Z5c 真机复测：压缩比 1.52x 不变、P99/吞吐/flush 无实质劣化，但纯路径 P50 3,646→4,844 ns（+32.9%），归因 `-Oz`；**唯一遗留为 D6 性能取舍待拍板**（接受 vs 热路径单文件 `-O2`），未决前不改构建 flags/产品代码。本条为专项交付记录，不重开 Backlog 编号。
 >
 > **v1.64 修订说明**: 2026-10-11 **T5.7 落地（用户拍板: 方案 A + com.zzlfeng:logx:1.0.0 + 消费冒烟复用现有工程 + arm64-v8a）**: ① **工程** `android/logx-aar/` library (AGP 8.5.1/Kotlin 1.9.23/Gradle 8.9), Kotlin srcDir 单源引用 LogX.kt, native 精简 CMake 单源 `add_subdirectory(core)`(复刻 `LOGX_WITH_*_DEFAULT` ANDROID 段防空默认静默 OFF) + logx_jni.cpp; ② **发布件** com.zzlfeng:logx:1.0.0, coroutines `api` 语义, consumer-rules keep JNI 静态注册名与回调方法名; ③ **验证四步全过**: assembleRelease 31 任务 → AAR 解包断言(类族/so/proguard) → llvm-nm 六 JNI 导出全在 → publishToMavenLocal → **消费冒烟复用 kotlin-gradle**(临时切 mavenLocal+禁 srcDir, assembleDebug 后 APK 实测含 so 与 dex 类族, git 还原零残留); ④ **M5 至此 100% 完成**; B-11-1 双验(AAR CMake 31 任务 + 根 ninja no work to do); 真机手工验收归用户。纯新增工程文件, 零产品代码改动。
 >

@@ -1,0 +1,4 @@
+3b488d02dd0b7220557a507255dcceb0fabe9e5288a70e088392f92f47557e22 *docs/evidence/zstd_prune/b0_static_g0/CMakeCache.txt
+14d26d61058c826fdb1a99abb8ec8da7e896a9bc882e7d48cd23ff372c9f5e5f *docs/evidence/zstd_prune/b0_static_g0/liblogx-stripped-g0.so
+b31a9ba438e4645e094a713e4800a8fc3bdded8c6aab4f3e23ceec9b20b3d5b1 *docs/evidence/zstd_prune/b0_static_g0/liblogx-unstripped-g0.so
+03ef65995770ae80113f37865db5be9e299a00aadc053451648a5f9a24799104 *docs/evidence/zstd_prune/b0_static_g0/logx-release-b0-g0.aar

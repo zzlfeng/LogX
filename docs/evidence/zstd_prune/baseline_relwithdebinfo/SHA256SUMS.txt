@@ -1,0 +1,3 @@
+881a5d33eca2975e4dcdd3797cdd3e837b338caa8dbc0c45c3b131aeb32fbeb3 *liblogx-stripped-before.so
+394c9f35f58ab096ca3c81e2850cb4b83253d359bf63fbaa97fdcec078467a9d *liblogx-unstripped-before.so
+625abcc4eda1e4d0ffea764cca5a6420c682a4b2cda6e79da60f1d86f3a5ff64 *logx-release-before.aar
