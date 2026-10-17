@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <jni_string_util.h>
+#include <jni_key_cache.h>
 
 #include <string>
 #include <vector>
@@ -283,5 +284,95 @@ TEST(JniString, Cesu8MixedRoundtripWithUtf16) {
     EXPECT_EQ(u16[8], 0x5FD7); // 志
     EXPECT_EQ(u16[10], 0xD83C);
     EXPECT_EQ(u16[11], 0xDF89);
+}
+
+// ============================================================
+// R41-03 / ACT-3: JNI TLS 多槽密钥缓存属主隔离与命中测试
+// ============================================================
+TEST(JniKeyCache, OwnerIsolationAndHit) {
+    logx_jni::TlsKeyCache<4> cache;
+    int ctx_a = 1;
+    int ctx_b = 2;
+
+    uint8_t* k1_a = cache.allocate_slot(&ctx_a, 7);
+    std::memset(k1_a, 0x11, 32);
+
+    // 同 owner + 同 kid: 必须命中
+    const uint8_t* hit_a = cache.lookup(&ctx_a, 7);
+    ASSERT_NE(hit_a, nullptr);
+    EXPECT_EQ(hit_a[0], 0x11);
+    EXPECT_EQ(hit_a, k1_a);
+
+    // 不同 owner + 同 kid: 严禁跨实例命中 (R41-03)
+    const uint8_t* miss_b = cache.lookup(&ctx_b, 7);
+    EXPECT_EQ(miss_b, nullptr);
+
+    // 为 ctx_b 分配同 kid=7 的独立密钥
+    uint8_t* k1_b = cache.allocate_slot(&ctx_b, 7);
+    std::memset(k1_b, 0x22, 32);
+
+    // 两者互不干扰且拥有独立内存
+    EXPECT_NE(k1_a, k1_b);
+    EXPECT_EQ(cache.lookup(&ctx_a, 7)[0], 0x11);
+    EXPECT_EQ(cache.lookup(&ctx_b, 7)[0], 0x22);
+}
+
+// ============================================================
+// R41-03 / ACT-3: 属主失效清理与密钥清零
+// ============================================================
+TEST(JniKeyCache, InvalidateOwnerAndZeroMemory) {
+    logx_jni::TlsKeyCache<4> cache;
+    int ctx_a = 1;
+    int ctx_b = 2;
+
+    uint8_t* k_a = cache.allocate_slot(&ctx_a, 1);
+    std::memset(k_a, 0xAA, 32);
+    uint8_t* k_b = cache.allocate_slot(&ctx_b, 2);
+    std::memset(k_b, 0xBB, 32);
+
+    // 释放 ctx_a
+    cache.invalidate_owner(&ctx_a);
+
+    // ctx_a 失效且内存已被清零
+    EXPECT_EQ(cache.lookup(&ctx_a, 1), nullptr);
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_EQ(k_a[i], 0);
+    }
+
+    // ctx_b 不受任何影响
+    const uint8_t* hit_b = cache.lookup(&ctx_b, 2);
+    ASSERT_NE(hit_b, nullptr);
+    EXPECT_EQ(hit_b[0], 0xBB);
+}
+
+// ============================================================
+// R41-04 / ACT-4: 空槽优先复用与多槽轮转
+// ============================================================
+TEST(JniKeyCache, SlotReuseAndRoundRobin) {
+    logx_jni::TlsKeyCache<4> cache;
+    int ctx = 1;
+
+    // 填满 4 槽
+    for (uint16_t kid = 0; kid < 4; ++kid) {
+        uint8_t* k = cache.allocate_slot(&ctx, kid);
+        k[0] = static_cast<uint8_t>(kid + 1);
+    }
+    for (uint16_t kid = 0; kid < 4; ++kid) {
+        ASSERT_NE(cache.lookup(&ctx, kid), nullptr);
+        EXPECT_EQ(cache.lookup(&ctx, kid)[0], kid + 1);
+    }
+
+    // 驱逐/失效 owner
+    cache.invalidate_owner(&ctx);
+
+    // 再次分配 4 槽: 应当优先按有效性复用前序空槽
+    for (uint16_t kid = 10; kid < 14; ++kid) {
+        uint8_t* k = cache.allocate_slot(&ctx, kid);
+        k[0] = static_cast<uint8_t>(kid);
+    }
+    for (uint16_t kid = 10; kid < 14; ++kid) {
+        ASSERT_NE(cache.lookup(&ctx, kid), nullptr);
+        EXPECT_EQ(cache.lookup(&ctx, kid)[0], kid);
+    }
 }
 

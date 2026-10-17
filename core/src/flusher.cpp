@@ -1271,13 +1271,29 @@ void* flusher_main(void* arg) {
     Instance* inst = static_cast<Instance*>(arg);
     inst->flusher_tid.store(inst->pal->tid(), std::memory_order_release);
     flusher_loop(inst);
-    // F-2: flusher 线程退出时,无论由 close_on_flusher 还是 close_pending 触发,
-    // 均消费递延销毁标志并执行最终 destroy_instance
-    if (inst->close_on_flusher.load(std::memory_order_acquire) ||
-        inst->close_pending.load(std::memory_order_acquire)) {
-        if (inst->close_pending.exchange(false, std::memory_order_acq_rel) ||
-            inst->close_on_flusher.load(std::memory_order_acquire)) {
-            destroy_instance(inst, /*is_flusher_thread=*/true);
+    // R41-01 / ACT-1: flusher 线程严禁消费外部 close_pending。
+    // close_pending 仅在外部有活跃操作(active_ops/in_callback > 0)时置位,
+    // 其递延销毁完全由最外层 OpGuard 析构与 emit_event 尾段认领执行,
+    // 杜绝 flusher 提前自毁导致正在并发写入的线程 UAF。
+    // R41-02 / ACT-2: 仅当 close_on_flusher 为真时处理 Flusher 内部发起的递延销毁:
+    // 认领前须校验 active_ops == 0 && in_callback == 0; 若外部仍有活跃 op,
+    // 改置 close_pending 转交外部最后退出的 op 执行销毁。
+    if (inst->close_on_flusher.load(std::memory_order_acquire)) {
+        if (inst->active_ops.load(std::memory_order_acquire) == 0 &&
+            inst->in_callback.load(std::memory_order_acquire) == 0) {
+            if (inst->close_on_flusher.exchange(false, std::memory_order_acq_rel)) {
+                destroy_instance(inst, /*is_flusher_thread=*/true);
+            }
+        } else {
+            inst->close_pending.store(true, std::memory_order_release);
+            inst->close_on_flusher.store(false, std::memory_order_release);
+            // 双重校验: 若活跃 op 恰在置位前全部退出,由 flusher 兜底认领避免泄漏
+            if (inst->active_ops.load(std::memory_order_acquire) == 0 &&
+                inst->in_callback.load(std::memory_order_acquire) == 0) {
+                if (inst->close_pending.exchange(false, std::memory_order_acq_rel)) {
+                    destroy_instance(inst, /*is_flusher_thread=*/true);
+                }
+            }
         }
     }
     return nullptr;

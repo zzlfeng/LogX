@@ -621,6 +621,76 @@ TEST(R19Regression, J1_F2_DeferredCloseLifetimeAndOnDestroy) {
 }
 
 // ============================================================
+// R41-01 / ACT-1: 递延 close 与并发写竞态无 UAF 压力测试
+// 验证: 外部写线程并发写入时, 触发递延 close, flusher 绝不提前自毁,
+// 递延销毁由写线程全部退栈后安全认领触发 on_destroy, 杜绝 UAF。
+// ============================================================
+TEST(R19Regression, R41_DeferredClose_ConcurrentWrites_NoUAF) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r41_act1_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    for (int iter = 0; iter < 10; ++iter) {
+        struct TestState {
+            std::atomic<bool> destroyed{false};
+            std::atomic<bool> stop_writers{false};
+        } state;
+
+        logx_config_t cfg{};
+        cfg.log_dir = dir.c_str();
+        cfg.staging_path = staging.c_str();
+        cfg.max_log_length = 4096;
+        cfg.flush_threshold = 0;
+        cfg.user = &state;
+        cfg.on_destroy = [](void* user, void* /*err_user*/) {
+            auto* s = static_cast<TestState*>(user);
+            if (s) {
+                s->destroyed.store(true, std::memory_order_release);
+            }
+        };
+
+        logx_instance_t* inst = nullptr;
+        ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+        constexpr int kNumThreads = 4;
+        std::vector<std::thread> writers;
+        writers.reserve(kNumThreads);
+
+        std::vector<uint8_t> payload(64, 'X');
+        for (int i = 0; i < kNumThreads; ++i) {
+            writers.emplace_back([inst, &state, &payload]() {
+                while (!state.stop_writers.load(std::memory_order_relaxed)) {
+                    logx_status_e rc = logx_write(inst, 3, "ACT1", payload.data(), static_cast<uint32_t>(payload.size()));
+                    if (rc != LOGX_OK && rc != LOGX_ERR_STATE) {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // 让写线程跑片刻产生持续的 active_ops
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+        // 触发 close, 此刻高概率命中 active_ops > 0 走递延关闭
+        bool closed_immediately = false;
+        EXPECT_EQ(logx_close_ex(inst, &closed_immediately), LOGX_OK);
+
+        // 通知写线程退出循环
+        state.stop_writers.store(true, std::memory_order_release);
+
+        for (auto& t : writers) {
+            if (t.joinable()) t.join();
+        }
+
+        // 验证 on_destroy 最终必须被执行(递延闭环无泄漏)
+        EXPECT_TRUE(state.destroyed.load(std::memory_order_acquire));
+    }
+
+    cleanup_dir(dir);
+}
+
+// ============================================================
 // F-3: 0<sz<32 撕裂文件头自愈(R19 探针 G 形态: 旧实现 flush=OK、
 // 文件永不增长、计数器全 0)
 // ============================================================

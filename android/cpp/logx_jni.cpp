@@ -17,6 +17,7 @@
 #include "logx_c.h"
 #include "logx_internal.h"
 #include "jni_string_util.h"
+#include "jni_key_cache.h"
 
 #include <atomic>
 #include <cstring>
@@ -173,16 +174,10 @@ static void jni_error_trampoline(void* user, logx_event_kind_e kind, int code, c
     }
 }
 
-// J-6: thread_local 密钥缓冲槽。支持同一线程多 kid 混跑时各自拥有独立的 32B
-// 缓冲指针, 杜绝单缓冲复用导致的跨 kid 覆盖与悬垂/错用密钥隐患。
-struct TlsKeySlot {
-    uint16_t kid = 0;
-    bool valid = false;
-    uint8_t key[32] = {0};
-};
+// J-6 / R41-03 / R41-04: thread_local 密钥多槽缓冲(kMaxTlsKeySlots=4)。
+// 支持单线程多 kid 独立缓冲, 且带 owner 属主指针隔离与空槽优先复用策略。
 static constexpr size_t kMaxTlsKeySlots = 4;
-static thread_local TlsKeySlot g_tls_key_cache[kMaxTlsKeySlots];
-static thread_local size_t g_tls_key_next = 0;
+static thread_local logx_jni::TlsKeyCache<kMaxTlsKeySlots> g_tls_key_cache;
 
 static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     auto* ctx = static_cast<JniKeyProviderContext*>(user);
@@ -190,11 +185,9 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
         return nullptr;
     }
 
-    // 优先命中本线程缓存槽
-    for (size_t i = 0; i < kMaxTlsKeySlots; ++i) {
-        if (g_tls_key_cache[i].valid && g_tls_key_cache[i].kid == kid) {
-            return g_tls_key_cache[i].key;
-        }
+    // 优先命中本线程缓存槽 (R41-03: owner 与 kid 双匹配, 杜绝跨实例污染)
+    if (const uint8_t* cached = g_tls_key_cache.lookup(ctx, kid)) {
+        return cached;
     }
 
     JNIEnv* env = nullptr;
@@ -227,11 +220,9 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     if (jKeyArr) {
         jsize len = env->GetArrayLength(jKeyArr);
         if (len == 32) {
-            size_t slot_idx = (g_tls_key_next++) % kMaxTlsKeySlots;
-            g_tls_key_cache[slot_idx].kid = kid;
-            g_tls_key_cache[slot_idx].valid = true;
-            env->GetByteArrayRegion(jKeyArr, 0, 32, reinterpret_cast<jbyte*>(g_tls_key_cache[slot_idx].key));
-            res = g_tls_key_cache[slot_idx].key;
+            uint8_t* slot_key = g_tls_key_cache.allocate_slot(ctx, kid);
+            env->GetByteArrayRegion(jKeyArr, 0, 32, reinterpret_cast<jbyte*>(slot_key));
+            res = slot_key;
         }
         env->DeleteLocalRef(jKeyArr);
     }
@@ -249,6 +240,11 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
 static void jni_destroy_trampoline(void* key_user, void* err_user) {
     auto* kp_ctx = static_cast<JniKeyProviderContext*>(key_user);
     auto* inst_err_ctx = static_cast<JniErrorContext*>(err_user);
+
+    // R41-03: 销毁时清理当前线程属于该 ctx 的缓存槽, 并将密钥安全清零
+    if (kp_ctx) {
+        g_tls_key_cache.invalidate_owner(kp_ctx);
+    }
 
     if (kp_ctx) {
         if (kp_ctx->jvm && kp_ctx->g_provider) {
