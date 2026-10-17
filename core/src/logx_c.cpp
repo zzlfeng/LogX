@@ -285,11 +285,15 @@ struct OpGuard {
     Instance* inst;
     ~OpGuard() {
         if (!inst) return;
-        int rem = inst->active_ops.fetch_sub(1, std::memory_order_acq_rel) - 1;
-        if (rem == 0 && inst->close_pending.load(std::memory_order_acquire)) {
-            if (inst->in_callback.load(std::memory_order_acquire) == 0) {
-                if (inst->close_pending.exchange(false, std::memory_order_acq_rel)) {
-                    destroy_instance(inst, /*is_flusher_thread=*/false);
+        // R42-01 / ACT-1: seq_cst 全序屏障，杜绝 Dekker store-load 重排导致的漏认领与 UAF
+        int rem = inst->active_ops.fetch_sub(1, std::memory_order_seq_cst) - 1;
+        if (rem == 0) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (inst->close_pending.load(std::memory_order_seq_cst)) {
+                if (inst->in_callback.load(std::memory_order_seq_cst) == 0) {
+                    if (inst->close_pending.exchange(false, std::memory_order_seq_cst)) {
+                        destroy_instance(inst, /*is_flusher_thread=*/false);
+                    }
                 }
             }
         }
@@ -493,15 +497,15 @@ logx_status_e logx_close_ex(logx_instance_t* h, bool* out_closed_immediately) {
     bool on_flusher = (inst->flusher_tid.load(std::memory_order_acquire) == current_tid);
     if (on_flusher) {
         // R19 F-2: 处于 Flusher 线程内部，实施递延由 flusher_main 退出时销毁，杜绝 join 自身死锁
-        inst->close_on_flusher.store(true, std::memory_order_release);
+        inst->close_on_flusher.store(true, std::memory_order_seq_cst);
         inst->flusher_exit.store(true, std::memory_order_release);
         if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
         return LOGX_OK;
     }
-    if (inst->in_callback.load(std::memory_order_acquire) > 0 ||
-        inst->active_ops.load(std::memory_order_acquire) > 0) {
+    if (inst->in_callback.load(std::memory_order_seq_cst) > 0 ||
+        inst->active_ops.load(std::memory_order_seq_cst) > 0) {
         // R19 F-2: 处于调用方线程的回调或活跃调用栈内部，实施递延销毁，由最外层 OpGuard 析构完成
-        inst->close_pending.store(true, std::memory_order_release);
+        inst->close_pending.store(true, std::memory_order_seq_cst);
         inst->flusher_exit.store(true, std::memory_order_release);
         if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
         return LOGX_OK;

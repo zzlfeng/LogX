@@ -59,10 +59,14 @@ void console_echo(int level, const char* tag, const char* msg) {
     __android_log_print(priority, log_tag, "%s", msg ? msg : "");
 }
 
+// R42-02 / ACT-2: 全局单调递增实例代数计数器，杜绝跨线程复用/ABA地址复用导致的陈旧密钥假命中
+static std::atomic<uint64_t> g_jni_ctx_generation{1};
+
 struct JniKeyProviderContext {
     JavaVM* jvm = nullptr;
     jobject g_provider = nullptr;
     jmethodID mid_get_key = nullptr;
+    uint64_t gen = 0;  // 单调实例代数
 };
 
 struct JniErrorContext {
@@ -185,8 +189,8 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
         return nullptr;
     }
 
-    // 优先命中本线程缓存槽 (R41-03: owner 与 kid 双匹配, 杜绝跨实例污染)
-    if (const uint8_t* cached = g_tls_key_cache.lookup(ctx, kid)) {
+    // 优先命中本线程缓存槽 (R42-02: owner + gen + kid 三元匹配, 彻底杜绝跨线程复用与 ABA 地址复用伪命中)
+    if (const uint8_t* cached = g_tls_key_cache.lookup(ctx, ctx->gen, kid)) {
         return cached;
     }
 
@@ -220,9 +224,14 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     if (jKeyArr) {
         jsize len = env->GetArrayLength(jKeyArr);
         if (len == 32) {
-            uint8_t* slot_key = g_tls_key_cache.allocate_slot(ctx, kid);
-            env->GetByteArrayRegion(jKeyArr, 0, 32, reinterpret_cast<jbyte*>(slot_key));
-            res = slot_key;
+            uint8_t* slot_key = g_tls_key_cache.allocate_slot(ctx, ctx->gen, kid);
+            if (slot_key) {
+                env->GetByteArrayRegion(jKeyArr, 0, 32, reinterpret_cast<jbyte*>(slot_key));
+                res = slot_key;
+            } else {
+                // R42-03 / ACT-3: 满槽容量耗尽(超限), 绝不破坏已有有效槽位, 显式返回 nullptr 触发 core 缺钥降级
+                res = nullptr;
+            }
         }
         env->DeleteLocalRef(jKeyArr);
     }
@@ -241,9 +250,9 @@ static void jni_destroy_trampoline(void* key_user, void* err_user) {
     auto* kp_ctx = static_cast<JniKeyProviderContext*>(key_user);
     auto* inst_err_ctx = static_cast<JniErrorContext*>(err_user);
 
-    // R41-03: 销毁时清理当前线程属于该 ctx 的缓存槽, 并将密钥安全清零
+    // R41-03 / R42-02: 销毁时清理当前线程属于该 (ctx, gen) 的缓存槽, 并将密钥安全清零
     if (kp_ctx) {
-        g_tls_key_cache.invalidate_owner(kp_ctx);
+        g_tls_key_cache.invalidate_owner(kp_ctx, kp_ctx->gen);
     }
 
     if (kp_ctx) {
@@ -401,6 +410,7 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
             kp_ctx->jvm = jvm;
             kp_ctx->g_provider = env->NewGlobalRef(jKeyProvider);
             kp_ctx->mid_get_key = mid;
+            kp_ctx->gen = g_jni_ctx_generation.fetch_add(1, std::memory_order_relaxed);
         }
     }
 

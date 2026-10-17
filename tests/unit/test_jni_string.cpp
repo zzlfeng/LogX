@@ -287,92 +287,102 @@ TEST(JniString, Cesu8MixedRoundtripWithUtf16) {
 }
 
 // ============================================================
-// R41-03 / ACT-3: JNI TLS 多槽密钥缓存属主隔离与命中测试
+// R41-03 / R42-02: JNI TLS 多槽密钥缓存属主与代数隔离测试 (防 ABA 假命中)
 // ============================================================
-TEST(JniKeyCache, OwnerIsolationAndHit) {
+TEST(JniKeyCache, OwnerAndGenerationIsolation) {
     logx_jni::TlsKeyCache<4> cache;
     int ctx_a = 1;
     int ctx_b = 2;
 
-    uint8_t* k1_a = cache.allocate_slot(&ctx_a, 7);
+    uint8_t* k1_a = cache.allocate_slot(&ctx_a, /*gen=*/1, 7);
+    ASSERT_NE(k1_a, nullptr);
     std::memset(k1_a, 0x11, 32);
 
-    // 同 owner + 同 kid: 必须命中
-    const uint8_t* hit_a = cache.lookup(&ctx_a, 7);
+    // 同 owner + 同 gen + 同 kid: 必须命中
+    const uint8_t* hit_a = cache.lookup(&ctx_a, /*gen=*/1, 7);
     ASSERT_NE(hit_a, nullptr);
     EXPECT_EQ(hit_a[0], 0x11);
     EXPECT_EQ(hit_a, k1_a);
 
     // 不同 owner + 同 kid: 严禁跨实例命中 (R41-03)
-    const uint8_t* miss_b = cache.lookup(&ctx_b, 7);
+    const uint8_t* miss_b = cache.lookup(&ctx_b, /*gen=*/1, 7);
     EXPECT_EQ(miss_b, nullptr);
 
-    // 为 ctx_b 分配同 kid=7 的独立密钥
-    uint8_t* k1_b = cache.allocate_slot(&ctx_b, 7);
-    std::memset(k1_b, 0x22, 32);
+    // R42-02: 同一内存地址 ctx_a 被重用 (ABA), 但代数 gen=2: 严禁假命中旧密钥!
+    const uint8_t* miss_reused_addr = cache.lookup(&ctx_a, /*gen=*/2, 7);
+    EXPECT_EQ(miss_reused_addr, nullptr);
 
-    // 两者互不干扰且拥有独立内存
-    EXPECT_NE(k1_a, k1_b);
-    EXPECT_EQ(cache.lookup(&ctx_a, 7)[0], 0x11);
-    EXPECT_EQ(cache.lookup(&ctx_b, 7)[0], 0x22);
+    // 为 ctx_a (新代数 gen=2) 分配新密钥: 此时安全接管/复用
+    uint8_t* k2_a = cache.allocate_slot(&ctx_a, /*gen=*/2, 7);
+    ASSERT_NE(k2_a, nullptr);
+    std::memset(k2_a, 0x33, 32);
+
+    EXPECT_EQ(cache.lookup(&ctx_a, /*gen=*/2, 7)[0], 0x33);
+    EXPECT_EQ(cache.lookup(&ctx_a, /*gen=*/1, 7), nullptr); // 旧代数已失效
 }
 
 // ============================================================
-// R41-03 / ACT-3: 属主失效清理与密钥清零
+// R41-03 / R42-02: 属主与代数失效清理与密钥清零
 // ============================================================
 TEST(JniKeyCache, InvalidateOwnerAndZeroMemory) {
     logx_jni::TlsKeyCache<4> cache;
     int ctx_a = 1;
     int ctx_b = 2;
 
-    uint8_t* k_a = cache.allocate_slot(&ctx_a, 1);
+    uint8_t* k_a = cache.allocate_slot(&ctx_a, /*gen=*/10, 1);
+    ASSERT_NE(k_a, nullptr);
     std::memset(k_a, 0xAA, 32);
-    uint8_t* k_b = cache.allocate_slot(&ctx_b, 2);
+    uint8_t* k_b = cache.allocate_slot(&ctx_b, /*gen=*/20, 2);
+    ASSERT_NE(k_b, nullptr);
     std::memset(k_b, 0xBB, 32);
 
-    // 释放 ctx_a
-    cache.invalidate_owner(&ctx_a);
+    // 释放 ctx_a (gen=10)
+    cache.invalidate_owner(&ctx_a, /*gen=*/10);
 
     // ctx_a 失效且内存已被清零
-    EXPECT_EQ(cache.lookup(&ctx_a, 1), nullptr);
+    EXPECT_EQ(cache.lookup(&ctx_a, /*gen=*/10, 1), nullptr);
     for (int i = 0; i < 32; ++i) {
         EXPECT_EQ(k_a[i], 0);
     }
 
     // ctx_b 不受任何影响
-    const uint8_t* hit_b = cache.lookup(&ctx_b, 2);
+    const uint8_t* hit_b = cache.lookup(&ctx_b, /*gen=*/20, 2);
     ASSERT_NE(hit_b, nullptr);
     EXPECT_EQ(hit_b[0], 0xBB);
 }
 
 // ============================================================
-// R41-04 / ACT-4: 空槽优先复用与多槽轮转
+// R42-03 / ACT-3: 满槽容量耗尽显式返回 nullptr (严禁静默覆盖在持指针)
 // ============================================================
-TEST(JniKeyCache, SlotReuseAndRoundRobin) {
+TEST(JniKeyCache, FullCapacityReturnsNullptrAndSafeReuse) {
     logx_jni::TlsKeyCache<4> cache;
     int ctx = 1;
+    uint64_t gen = 100;
 
     // 填满 4 槽
     for (uint16_t kid = 0; kid < 4; ++kid) {
-        uint8_t* k = cache.allocate_slot(&ctx, kid);
+        uint8_t* k = cache.allocate_slot(&ctx, gen, kid);
+        ASSERT_NE(k, nullptr);
         k[0] = static_cast<uint8_t>(kid + 1);
     }
     for (uint16_t kid = 0; kid < 4; ++kid) {
-        ASSERT_NE(cache.lookup(&ctx, kid), nullptr);
-        EXPECT_EQ(cache.lookup(&ctx, kid)[0], kid + 1);
+        ASSERT_NE(cache.lookup(&ctx, gen, kid), nullptr);
+        EXPECT_EQ(cache.lookup(&ctx, gen, kid)[0], kid + 1);
     }
 
-    // 驱逐/失效 owner
-    cache.invalidate_owner(&ctx);
+    // 同一活跃 (ctx, gen) 请求第 5 个不同 kid: 槽位耗尽, 显式返回 nullptr (杜绝覆盖在持槽位)
+    uint8_t* overflow_k = cache.allocate_slot(&ctx, gen, 99);
+    EXPECT_EQ(overflow_k, nullptr);
 
-    // 再次分配 4 槽: 应当优先按有效性复用前序空槽
-    for (uint16_t kid = 10; kid < 14; ++kid) {
-        uint8_t* k = cache.allocate_slot(&ctx, kid);
-        k[0] = static_cast<uint8_t>(kid);
+    // 前 4 个槽位内容严禁被破坏
+    for (uint16_t kid = 0; kid < 4; ++kid) {
+        EXPECT_EQ(cache.lookup(&ctx, gen, kid)[0], kid + 1);
     }
-    for (uint16_t kid = 10; kid < 14; ++kid) {
-        ASSERT_NE(cache.lookup(&ctx, kid), nullptr);
-        EXPECT_EQ(cache.lookup(&ctx, kid)[0], kid);
-    }
+
+    // 模拟新实例代数 gen=101 接入: 应当安全复用陈旧槽位
+    uint8_t* new_gen_k = cache.allocate_slot(&ctx, /*gen=*/101, 55);
+    ASSERT_NE(new_gen_k, nullptr);
+    new_gen_k[0] = 0x88;
+    EXPECT_EQ(cache.lookup(&ctx, /*gen=*/101, 55)[0], 0x88);
 }
 

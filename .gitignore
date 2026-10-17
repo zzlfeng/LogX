@@ -25,6 +25,7 @@ Testing/
 .gradle/
 .externalNativeBuild/
 .cxx/
+.kotlin/
 local.properties
 *.apk
 *.aab

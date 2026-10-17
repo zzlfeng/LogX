@@ -118,15 +118,19 @@ inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char
     if (fn) {
         fn(user, k, code, msg ? msg : "");
     }
-    int rem = inst->in_callback.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    // R42-01 / ACT-1: seq_cst 全序屏障，杜绝 Dekker store-load 重排导致的漏认领与 UAF
+    int rem = inst->in_callback.fetch_sub(1, std::memory_order_seq_cst) - 1;
     // F-2: 递延销毁死角收敛——当回调退出且为最后一个持有者时,消费 close_pending 触发销毁
-    if (rem == 0 && inst->active_ops.load(std::memory_order_acquire) == 0 &&
-        inst->close_pending.load(std::memory_order_acquire)) {
-        uint64_t current_tid = inst->pal->tid();
-        bool on_flusher = (inst->flusher_tid.load(std::memory_order_acquire) == current_tid);
-        if (!on_flusher) {
-            if (inst->close_pending.exchange(false, std::memory_order_acq_rel)) {
-                destroy_instance(inst, /*is_flusher_thread=*/false);
+    if (rem == 0) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (inst->active_ops.load(std::memory_order_seq_cst) == 0 &&
+            inst->close_pending.load(std::memory_order_seq_cst)) {
+            uint64_t current_tid = inst->pal->tid();
+            bool on_flusher = (inst->flusher_tid.load(std::memory_order_seq_cst) == current_tid);
+            if (!on_flusher) {
+                if (inst->close_pending.exchange(false, std::memory_order_seq_cst)) {
+                    destroy_instance(inst, /*is_flusher_thread=*/false);
+                }
             }
         }
     }
