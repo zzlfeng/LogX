@@ -90,8 +90,8 @@ Windows MSVC x64（`build-full`，zstd + AESGCM 开启）全量重建后：
 
 ## 五、行动项清单 (Action Items)
 
-- [ ] **ACT-1（P0，必须）**: 修复 R41-01——删除 `flusher_main` 对 `close_pending` 的消费，递延销毁认领唯一归属 OpGuard/emit_event；并补一条「close 递延 + 并发写」定向压力单测（TSAN/多轮跑）。
-- [ ] **ACT-2（P1）**: 修复 R41-02——`close_on_flusher` 认领前校验 `active_ops/in_callback` 归零，非零时转 `close_pending` 移交。
-- [ ] **ACT-3（P1）**: 修复 R41-03——TLS 密钥槽缓存键增加 `owner` 指针（ctx+kid 双匹配）。
-- [ ] **ACT-4（P2/M6 前置）**: 处理 R41-04——多槽缓存淘汰策略与「互不覆盖」契约对齐，或在契约中明文限制单线程活跃 kid ≤ 槽数。
-- [ ] **ACT-5（登记）**: R41-05 认领模式理论竞态记入已知限制，待生命周期专项（带外控制块）根治。
+- [x] **ACT-1（P0，必须）**: 修复 R41-01——删除 `flusher_main` 对 `close_pending` 的消费，递延销毁认领唯一归属 OpGuard/emit_event；补齐 `R41_DeferredClose_ConcurrentWrites_NoUAF` 10 轮高并发写定向单测。
+- [x] **ACT-2（P1）**: 修复 R41-02——`close_on_flusher` 认领前增加 `active_ops == 0 && in_callback == 0` 守卫，非零时转 `close_pending` 移交并提供双检兜底。
+- [x] **ACT-3（P1）**: 修复 R41-03——抽出 `jni_key_cache.h`，`TlsKeyCache` 增加 `owner` 属主指针（ctx+kid 双匹配），并在销毁时主动清理当前线程槽位且安全清零内存。
+- [x] **ACT-4（P2/M6 前置）**: 处理 R41-04——`logx_c.h` 注释补充说明当前单线程活跃不同 kid 数量 ≤ 4，且 `allocate_slot` 优先复用无效空槽；更大规模动态多 KID 轮换规划于 M6 专项落地。
+- [x] **ACT-5（登记）**: R41-05 认领模式理论竞态已登记为已知限制（无外部堆控制块时的既有模式），待生命周期专项统一根治。
