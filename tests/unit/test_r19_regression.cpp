@@ -760,7 +760,6 @@ TEST(R19Regression, R43_DeferredClose_FlusherCallbackBlindSpot_OnDestroyRuns) {
     cfg.on_destroy = [](void* /*user*/, void* eu) {
         static_cast<SyncState*>(eu)->destroyed.store(true);
     };
-    cfg.err_user = &state;  // on_destroy 的 err_user 参数即 cfg.err_user
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);

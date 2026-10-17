@@ -509,6 +509,17 @@ logx_status_e logx_close_ex(logx_instance_t* h, bool* out_closed_immediately) {
         inst->close_pending.store(true, std::memory_order_seq_cst);
         inst->flusher_exit.store(true, std::memory_order_release);
         if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
+        // R43-02: 显式 seq_cst 屏障与双重校验——对齐 flusher_main 退出段
+        // 若活跃 op/callback 恰在 store(close_pending) 前全部退出并错失认领,
+        // 由本调用方兜底认领销毁, 消除 Dekker 漏认领导致的永久泄漏
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (inst->in_callback.load(std::memory_order_seq_cst) == 0 &&
+            inst->active_ops.load(std::memory_order_seq_cst) == 0) {
+            if (inst->close_pending.exchange(false, std::memory_order_seq_cst)) {
+                destroy_instance(inst, /*is_flusher_thread=*/false);
+                if (out_closed_immediately) *out_closed_immediately = true;
+            }
+        }
         return LOGX_OK;
     }
     destroy_instance(inst, false);
