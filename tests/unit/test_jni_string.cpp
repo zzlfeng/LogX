@@ -386,3 +386,72 @@ TEST(JniKeyCache, FullCapacityReturnsNullptrAndSafeReuse) {
     EXPECT_EQ(cache.lookup(&ctx, /*gen=*/101, 55)[0], 0x88);
 }
 
+// ============================================================
+// R43: 跨 owner 同 kid 并存时各自分配独立槽、双密钥互不干扰
+// (恢复 R42 重构时删除的 OwnerIsolationAndHit 覆盖场景)
+// ============================================================
+TEST(JniKeyCache, CrossOwnerSameKidIndependentSlots) {
+    logx_jni::TlsKeyCache<4> cache;
+    int ctx_a = 1;
+    int ctx_b = 2;
+
+    uint8_t* k_a = cache.allocate_slot(&ctx_a, /*gen=*/1, 7);
+    ASSERT_NE(k_a, nullptr);
+    std::memset(k_a, 0x11, 32);
+
+    // ctx_b 分配同 kid=7: 必须获得独立槽位, 不与 ctx_a 共享内存
+    uint8_t* k_b = cache.allocate_slot(&ctx_b, /*gen=*/2, 7);
+    ASSERT_NE(k_b, nullptr);
+    std::memset(k_b, 0x22, 32);
+
+    EXPECT_NE(k_a, k_b);
+    EXPECT_EQ(cache.lookup(&ctx_a, /*gen=*/1, 7)[0], 0x11);
+    EXPECT_EQ(cache.lookup(&ctx_b, /*gen=*/2, 7)[0], 0x22);
+
+    // 一方失效不得影响另一方
+    cache.invalidate_owner(&ctx_a, /*gen=*/1);
+    EXPECT_EQ(cache.lookup(&ctx_a, /*gen=*/1, 7), nullptr);
+    const uint8_t* hit_b = cache.lookup(&ctx_b, /*gen=*/2, 7);
+    ASSERT_NE(hit_b, nullptr);
+    EXPECT_EQ(hit_b[0], 0x22);
+}
+
+// ============================================================
+// R43: 跨 owner 驱逐接管槽位时, 旧密钥字节必须先清零 (杜绝明文残留窗口)
+// ============================================================
+TEST(JniKeyCache, CrossOwnerEvictionZeroesEvictedKeyBeforeHandover) {
+    logx_jni::TlsKeyCache<2> cache;
+    int ctx_a = 1;
+    int ctx_b = 2;
+
+    // ctx_a 占满 2 槽并写入非零密钥
+    uint8_t* k_a0 = cache.allocate_slot(&ctx_a, /*gen=*/1, 10);
+    uint8_t* k_a1 = cache.allocate_slot(&ctx_a, /*gen=*/1, 11);
+    ASSERT_NE(k_a0, nullptr);
+    ASSERT_NE(k_a1, nullptr);
+    std::memset(k_a0, 0xAA, 32);
+    std::memset(k_a1, 0xBB, 32);
+
+    // ctx_b 接入: 空槽已耗尽, 必须经步骤 2 跨 owner 驱逐一个 ctx_a 槽位
+    uint8_t* k_b = cache.allocate_slot(&ctx_b, /*gen=*/2, 20);
+    ASSERT_NE(k_b, nullptr);
+
+    // 关键断言: 接管指针指向的槽位内旧密钥必须已被清零
+    // (模拟真实时序——调用方拿到指针后、GetByteArrayRegion 覆写前的窗口)
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_EQ(k_b[i], 0) << "byte " << i << " 残留被驱逐属主明文密钥";
+    }
+
+    // 驱逐只影响被接管槽: ctx_a 另一个槽位必须完好
+    const bool a0_intact = cache.lookup(&ctx_a, /*gen=*/1, 10) != nullptr;
+    const bool a1_intact = cache.lookup(&ctx_a, /*gen=*/1, 11) != nullptr;
+    EXPECT_TRUE(a0_intact != a1_intact);  // 恰有一个幸存
+    const uint8_t* survivor = a0_intact ? cache.lookup(&ctx_a, 1, 10)
+                                        : cache.lookup(&ctx_a, 1, 11);
+    EXPECT_EQ(survivor[0], a0_intact ? 0xAA : 0xBB);
+
+    // 写入新密钥后三元匹配正常命中, 且与幸存旧槽互不干扰
+    std::memset(k_b, 0xCC, 32);
+    EXPECT_EQ(cache.lookup(&ctx_b, /*gen=*/2, 20)[0], 0xCC);
+}
+

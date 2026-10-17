@@ -6,7 +6,8 @@
 //     彻底杜绝跨线程复用(如 Kotlin Dispatchers.IO)及堆内存地址重用(ABA)导致的陈旧密钥假命中;
 //   - 优先惰性清扫同 owner 但 gen 陈旧的僵尸槽位, 避免跨实例堆地址重用时占用槽位与残留明文;
 //   - 优先复用无效空槽与陈旧代数槽位;
-//   - 容量耗尽(当前活跃不同 kid > N)时显式返回 nullptr 触发 core 降级, 严禁静默覆盖在持指针;
+//   - 任何槽位接管(含跨 owner 驱逐)在覆写元数据前必先清零旧密钥字节, 杜绝被驱逐属主的明文残留窗口;
+//   - 容量耗尽(全局活跃不同 kid > N, 容量由各 owner 共享)时显式返回 nullptr 触发 core 降级, 严禁静默覆盖在持指针;
 //   - 支持按属主和代数失效清理并安全清零密钥内存。
 #ifndef LOGX_JNI_KEY_CACHE_H
 #define LOGX_JNI_KEY_CACHE_H
@@ -84,6 +85,10 @@ public:
 
 private:
     uint8_t* populate_slot(size_t idx, const void* owner, uint64_t gen, uint16_t kid) {
+        // R43: 接管槽位前无条件清零旧密钥字节。步骤 2 跨 owner 驱逐时,
+        // 被驱逐属主的明文密钥若不先清零, 会残留至调用方 GetByteArrayRegion 覆写为止,
+        // 与"安全清零密钥内存"契约不符; 空槽路径清零为幂等无害操作。
+        std::memset(slots_[idx].key, 0, sizeof(slots_[idx].key));
         slots_[idx].owner = owner;
         slots_[idx].gen = gen;
         slots_[idx].kid = kid;
