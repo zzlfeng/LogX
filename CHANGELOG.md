@@ -145,9 +145,14 @@
 | `f5d9c27` | fix(jni,test,docs): 代码卫生与报告完善——槽位清扫与失效时重置 kid 保证元数据对称性、补充单测断言、并在 R43 报告正文增补 R43-02 缺陷成因与闭环推演 |
 | `f2b6d3c` | feat(android,core,test,docs): zstd 源码级裁剪与 AAR MinSizeRel 体积门禁落地——G2 385,112 B，D6-B2 热路径 -O2 消除 P50 回归 |
 | `a558fe3` | docs(evidence): 归档 T-Z7 c++_static vs c++_shared 体积与性能对照实验记录并在计划表登记 |
+| `073a4e5`~`a2ceb4c` | docs: T5.8 生命周期堆控制块专项立项——发布状态回退为未发布、实施计划入库、R44 方案评审（3×P0/4×P1/6×P2，裁定 v1.0 不可直接实施） |
+| `431d5ee` | refactor(core,pal,test,docs): T5.8 生命周期堆控制块重构落地——CB 墓碑模型根治尾读 UAF，收敛 Dekker 竞态与原生句柄泄漏 |
+| `eba54ff`~`e834e60` | docs(review): R45 代码审查与复核——4×P0/3×P1/5×P2（R45-08 经复核由 P1 下调 P2） |
+| `0ef345f` | fix(core,jni,test,docs): R45 审查 12 项缺陷收口（ACT-1~8）——闭合 CB 墓碑并发内存序、递延排空与跨线程 TLS 密钥惰性清零 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
+> 注 3:`073a4e5`~`a2ceb4c` 与 `eba54ff`~`e834e60` 两行为**区间行**(同一批次内的纯文档提交合并登记),依据「本文件维护纪律」第 1 条「新批次收口只补批次行,不逐提交回填」;T5.8 专项此前提交记录表止于 R43,整条链路为本次补登。
 
 ---
 
@@ -700,6 +705,15 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **实验目的**：验证在已收口 G2 配置上改用静态 C++ 标准库时的体积与性能影响；
    - **实测结果**：真机 Redmi K30 Pro 8 轮 60 万级写入复测证实，两者在写入热路径延迟（P50 3,646 vs 3,698 ns）、压缩比（1.52x）与吞吐上**无实质性能差异**；`c++_static` 使 `liblogx.so` strip 后体积由 385,112 B 膨胀至 **732,344 B（+90.2%）**，G2 单文件门禁 FAIL，但总 native 载荷由 1.76 MB 降至 0.73 MB（−58.4%）；
    - **拍板决策**：用户拍板**继续使用 `c++_shared`**（保持 AAR `liblogx.so` 385,112 B 达标）；实验记录与产物作为备忘入库归档至 `docs/evidence/zstd_prune/t_z7_static_stl/`，不改变交付配置。
+
+24. **T5.8 生命周期堆控制块专项：方案评审 → 重构落地 → R45 收口 → R46 复核 (2026-10-18~24)**：
+   - **方案评审 (`a2ceb4c`，R44 批次)**：针对 [实施计划 v1.0](./docs/lifecycle_control_block_plan.md) 提出 **3×P0 / 4×P1 / 6×P2**，裁定"方向正确，但 v1.0 不能直接进入实施"——裸句柄尾读 UAF 仅从 `Instance` 平移到控制块未根除、递延销毁路径完全未 `flush` 致在途日志丢失、引用协议内存序不完备；梳理 6 大决策项待拍板。全文见 [`docs/reviews/code_review_R44_2026-10-18.md`](./docs/reviews/code_review_R44_2026-10-18.md)。
+   - **决策定稿与计划升级**：`docs/lifecycle_control_block_decisions.md` 与计划文档升至 **v1.2**，六项拍板——① **CB 墓碑模型**（销毁仅释放 `Instance` 主体，控制块永久保留，彻底消除裸句柄首行解引用 UAF）；② **强引用 + `active_ops` 精确静止判定且含回调在飞门禁**（`active_ops == 0 && in_callback == 0`，一次判定非零即递延，绝不自旋）；③ **`cb->inst` 原子化 + `exchange(nullptr)` 唯一胜出**认领；④ 关闭期事件放行 + 回调门禁；⑤ PAL 扩展 `thread_detach` 根治 Flusher 自毁句柄泄漏；⑥ 不透明句柄 + `tests/test_accessor.h` 测试 seam（28 处强转 + 7 处状态直访迁移）+ `set_error_handler`/`get_stats` 生命周期守卫。
+   - **重构落地 (`431d5ee`)**：按上述决策完成 CB 墓碑、`OpGuard` 热路径守卫、`destroy_instance` 统一收尾、`test_accessor.h` 迁移与文档 v1.2 同步；`InstanceControlBlock` 收敛至 **64B（`sizeof` 实测 64、`alignof` 实测 8）**，`static_assert` 约束单缓存行。
+   - **R45 审查与复核 (`eba54ff` → `e834e60`)**：独立复审捕获 **4×P0 / 3×P1 / 5×P2**（R45-08 经复核由 P1 下调 P2）——`OpGuard` 早退分支漏认领致永久泄漏、拆除 `seq_cst` 引发 4 组 Dekker 重排、递延 `close` 尾读 UAF 与过早停 Flusher 致关停未排空、`set_error_handler`/`get_stats` 缺 `OpGuard` 仍是 UAF 面，另有 `thread_detach` 空洞绿测试、`key_provider` 未纳入回调门禁、`on_destroy` 跨线程触发致宿主 TLS 密钥残留等。全文见 [`docs/reviews/code_review_R45_2026-10-24.md`](./docs/reviews/code_review_R45_2026-10-24.md)。
+   - **修复收口 (`0ef345f`，14 文件 +709/−273)**：ACT-1~8 全部落地——两处早退回滚在 `active_ops` 归零时触发 `check_deferred_dispose_on_exit`；`OpGuard`/`emit_event`/`invoke_key_provider`/`check_deferred`/`close_ex`/`flusher_main` 六处恢复 `seq_cst`；`close_requested.store` 后移使递延路径不再裸读 `inst`，`flusher_exit` 改由 `destroy_instance` 在 `flush_blocking` 之后置位；两接口接入 `OpGuard` 并在 `err_mu` 内同步 `on_destroy_err_user`；`FlusherSelfDestroyThreadDetachNoLeak` 改由 Flusher 线程真实触发并断言 `thread_detach_count == 1 / thread_join_count == 0`；`key_provider` 封装进 `in_callback` 门禁；`test_accessor.h` 迁入 `tests/` 并补齐 3 个 target 的 include 路径；`on_destroy` 线程契约补注与 JNI 已销毁代数水位惰性清扫。
+   - **R46 独立复核 (`code_review_R46_2026-10-24.md`)**：实证 **203/203 单测、4/4 压力测试、生命周期并发用例 20 轮无抖动**，无 P0/P1 阻断项、可入库；但"12 项全量收口"应修正为 **7 项成立 / 4 项部分 / 1 项未完成**（未完成：R45-11 文档与实装对齐），另新发现 **4×P2 + 8×P3**。
+   - **R46 待收口项（下一批次输入）**：`P2-01` `flusher.cpp:1155` 仍裸调 `key_provider`（当前仅测试可达，进生产即复现 R45-06 死锁）；`P2-02` `logx_set_error_handler(nullptr)` 返回码由 `INVALID_ARG` 静默改为 `STATE` 未在头文件与 CHANGELOG 声明；`P2-03` `OpenCloseMemoryBounded` 内存上界断言为恒真式（`sizeof × 10000 ≤ 640KB`），R45-10 门禁实质未建立；`P2-04` 新增 key_provider 用例在 `logx_open` 后改写非原子字段，与运行中 Flusher 构成数据竞争；`P3-01`~`P3-08` 覆盖 `check_deferred` 隐式 join 不变量、`cb->pal` 非原子并发读写、`logx_c.h` 线程模型文案自相矛盾、计划文档字段脱节、ACT 勾选与登记、64B 断言未约束对齐、同步快路径 `out_closed_immediately` 语义失真、TLS 明文仅"下次 lookup"清零。
 
 ---
 

@@ -1,10 +1,12 @@
 # LogX T5.8 生命周期堆控制块（Control Block）待决策项方案分析与裁决建议
 
-> **文档版本**: v1.2 (2026-10-24)  
+> **文档版本**: v1.3 (2026-10-24)  
 > **任务编号**: T5.8（生命周期堆控制块重构专项，根治 R41-05 尾读 UAF）  
-> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.2  
-> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)  
-> **当前状态**: ✅ 已拍板并完成 R45 复审补强落地  
+> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.3  
+> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)  
+> **当前状态**: ✅ 六项决策已正式拍板并落地（`431d5ee` 实施 + `0ef345f` 收口）；R46 复核裁定 R45 十二项 **7 成立 / 4 部分 / 1 未完成**，余量清单见计划文档 §七，**专项尚未收口**
+>
+> **v1.3 修订说明（依据 R46 复核报告）**：决策层结论不变（六项拍板均成立、无需重新裁决），仅校正落地状态口径——不透明句柄/守卫（决策五）已全量落地，但 `key_provider` 门禁仍有 1 处漏改（`flusher.cpp:1155`）、`on_destroy` 线程契约文案自相矛盾、TLS 明文仅"下次 lookup"清零；`active_ops` 静止判定（决策二）与 `thread_detach`（决策四）的**行为实现成立**，但配套测试存在恒真断言与数据竞争。上述均属实现细节余量，不改变决策本身。
 >
 > **v1.1 修订说明（独立复核：对照 R44 原文、实施计划 v1.0、现行实现与测试代码逐项核实）**：
 > 1. **决策二/三补回"回调在飞门禁"**：同步关停判定必须为 `active_ops == 0 && in_callback == 0`（或等价 `flusher_busy`）。v1.0 转写 R44 方案 B 时丢失了 `in_callback == 0` 条件——按 v1.0 原文实施，R43 形态（Flusher 阻塞在用户回调内时另一线程 close，`active_ops==0` 恰成立）会走同步路径：`flush_blocking` 因 Flusher 阻塞 5s 超时返回 false，`thread_join` 等待回调返回，而 R43 用例在 close 返回后才放行回调 ⇒ **无界死锁**。现行代码正是靠 `in_callback > 0 → 递延`（[logx_c.cpp:506](file:///d:/Project/Android_Project/LogX/logx/core/src/logx_c.cpp#L506)）规避该形态。
