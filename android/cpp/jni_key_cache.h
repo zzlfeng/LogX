@@ -12,11 +12,25 @@
 #ifndef LOGX_JNI_KEY_CACHE_H
 #define LOGX_JNI_KEY_CACHE_H
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
 namespace logx_jni {
+
+// R45-12: 单调推进全局已销毁实例代数水位线 (watermark = max(watermark, destroyed_gen))。
+// 当 on_destroy 漂移至 Flusher 或并发工作线程执行时，各宿主/业务线程在后续 lookup/allocate_slot
+// 入口据此水位惰性清零并驱逐已销毁实例残留的明文密钥槽位。
+inline void advance_destroyed_watermark(std::atomic<uint64_t>& watermark, uint64_t destroyed_gen) noexcept {
+    if (destroyed_gen == 0) return;
+    uint64_t cur = watermark.load(std::memory_order_relaxed);
+    while (cur < destroyed_gen &&
+           !watermark.compare_exchange_weak(cur, destroyed_gen,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+    }
+}
 
 template <size_t N = 4>
 class TlsKeyCache {
@@ -29,7 +43,11 @@ public:
         uint8_t key[32] = {0};
     };
 
-    const uint8_t* lookup(const void* owner, uint64_t gen, uint16_t kid) const {
+    const uint8_t* lookup(const void* owner, uint64_t gen, uint16_t kid,
+                          uint64_t destroyed_watermark = 0) {
+        // R45-12: 将同 owner 异 gen 及跨 owner 已销毁代数水位的惰性清扫前移至 lookup 入口，
+        // 确保即使后续 Kotlin key_provider 回调抛异常未进 allocate_slot，陈旧明文槽位也能在首次探测时清零。
+        scrub_stale_slots(owner, gen, destroyed_watermark);
         for (size_t i = 0; i < N; ++i) {
             if (slots_[i].valid && slots_[i].owner == owner && slots_[i].gen == gen && slots_[i].kid == kid) {
                 return slots_[i].key;
@@ -38,17 +56,10 @@ public:
         return nullptr;
     }
 
-    uint8_t* allocate_slot(const void* owner, uint64_t gen, uint16_t kid) {
-        // 0. R42-02: 惰性清扫同 owner 但 gen 陈旧的残留槽位(ABA 地址复用), 释放槽位并安全清零
-        for (size_t i = 0; i < N; ++i) {
-            if (slots_[i].valid && slots_[i].owner == owner && slots_[i].gen != gen) {
-                slots_[i].valid = false;
-                slots_[i].owner = nullptr;
-                slots_[i].gen = 0;
-                slots_[i].kid = 0;
-                std::memset(slots_[i].key, 0, sizeof(slots_[i].key));
-            }
-        }
+    uint8_t* allocate_slot(const void* owner, uint64_t gen, uint16_t kid,
+                           uint64_t destroyed_watermark = 0) {
+        // 0. R42-02 / R45-12: 惰性清扫同 owner 异 gen (ABA 复用) 及异 owner 已达销毁水位的残留槽位
+        scrub_stale_slots(owner, gen, destroyed_watermark);
 
         // 1. 优先复用当前未激活的空槽 (!valid)
         for (size_t i = 0; i < N; ++i) {
@@ -73,11 +84,7 @@ public:
     void invalidate_owner(const void* owner, uint64_t gen) {
         for (size_t i = 0; i < N; ++i) {
             if (slots_[i].owner == owner && (gen == 0 || slots_[i].gen == gen)) {
-                slots_[i].valid = false;
-                slots_[i].owner = nullptr;
-                slots_[i].gen = 0;
-                slots_[i].kid = 0;
-                std::memset(slots_[i].key, 0, sizeof(slots_[i].key));
+                clear_slot(i);
             }
         }
     }
@@ -86,6 +93,29 @@ public:
     static constexpr size_t capacity() { return N; }
 
 private:
+    void clear_slot(size_t idx) {
+        slots_[idx].valid = false;
+        slots_[idx].owner = nullptr;
+        slots_[idx].gen = 0;
+        slots_[idx].kid = 0;
+        std::memset(slots_[idx].key, 0, sizeof(slots_[idx].key));
+    }
+
+    void scrub_stale_slots(const void* owner, uint64_t gen, uint64_t destroyed_watermark) {
+        for (size_t i = 0; i < N; ++i) {
+            if (!slots_[i].valid) continue;
+            const bool same_owner_stale_gen = (slots_[i].owner == owner && slots_[i].gen != gen);
+            // 异 owner 且代数不高于已销毁水位: 先清零再驱逐；
+            // 通过 slots_[i].owner != owner 豁免当前活跃调用方自身，闭合 J-6 单文件多 kid 指针稳定规约。
+            const bool other_owner_destroyed = (slots_[i].owner != owner &&
+                                                destroyed_watermark > 0 &&
+                                                slots_[i].gen <= destroyed_watermark);
+            if (same_owner_stale_gen || other_owner_destroyed) {
+                clear_slot(i);
+            }
+        }
+    }
+
     uint8_t* populate_slot(size_t idx, const void* owner, uint64_t gen, uint16_t kid) {
         // R43: 接管槽位前无条件清零旧密钥字节。步骤 2 跨 owner 驱逐时,
         // 被驱逐属主的明文密钥若不先清零, 会残留至调用方 GetByteArrayRegion 覆写为止,

@@ -2875,27 +2875,259 @@ TEST(ControlBlockLifetime, ConcurrentDoubleCloseIdempotent) {
 
 
 
-// 4. 2000 轮快速 open/close 墓碑内存上界压测 (R44-01 / 决策一)
+// 4. 10000 轮快速 open/close 墓碑内存上界压测 (R44-01 / R45-10 / 决策一)
 TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
+    static_assert(sizeof(InstanceControlBlock) <= 64,
+                  "InstanceControlBlock must fit within a single 64-byte cache line");
+
+    // 轻量包装 Pal: 绕过测试循环中的磁盘同步 I/O (mmap_sync/file_fsync)，
+    // 专注验证 10k 轮真实 logx_open/logx_close 生命周期下 Instance/Staging 完整释放且 CB 墓碑内存有界。
+    class FastNoSyncPal : public Pal {
+    public:
+        explicit FastNoSyncPal(Pal* r) : r_(r) {}
+        int file_open(const char* p, bool cr, bool ap) override { return r_->file_open(p, cr, ap); }
+        int file_close(int fd) override { return r_->file_close(fd); }
+        int file_truncate(int fd, uint64_t l) override { return r_->file_truncate(fd, l); }
+        long file_write(int fd, const void* b, size_t l) override { return r_->file_write(fd, b, l); }
+        long file_pwrite(int fd, const void* b, size_t l, uint64_t o) override { return r_->file_pwrite(fd, b, l, o); }
+        long file_pread(int fd, void* b, size_t l, uint64_t o) override { return r_->file_pread(fd, b, l, o); }
+        int64_t file_size(int fd) override { return r_->file_size(fd); }
+        int64_t file_size_path(const char* p) override { return r_->file_size_path(p); }
+        int file_fsync(int) override { return 0; }
+        int file_dir_fsync(const char*) override { return 0; }
+        int file_unlink(const char* p) override { return r_->file_unlink(p); }
+        int file_mkdirs(const char* d) override { return r_->file_mkdirs(d); }
+        int file_rmdir(const char* d) override { return r_->file_rmdir(d); }
+        std::vector<std::string> file_list(const char* d) override { return r_->file_list(d); }
+        PalMmap mmap_open(int fd, size_t l, bool w) override { return r_->mmap_open(fd, l, w); }
+        int mmap_sync(const PalMmap&, bool) override { return 0; }
+        int mmap_close(const PalMmap& m) override { return r_->mmap_close(m); }
+        void* mutex_create() override { return r_->mutex_create(); }
+        void mutex_destroy(void* m) override { r_->mutex_destroy(m); }
+        void mutex_lock(void* m) override { r_->mutex_lock(m); }
+        void mutex_unlock(void* m) override { r_->mutex_unlock(m); }
+        int threading_init() override { return r_->threading_init(); }
+        int thread_start(void* (*fn)(void*), void* arg, void** out) override { return r_->thread_start(fn, arg, out); }
+        int thread_join(void* t) override { return r_->thread_join(t); }
+        int thread_detach(void* t) override { return r_->thread_detach(t); }
+        void* ev_create() override { return r_->ev_create(); }
+        void ev_destroy(void* e) override { r_->ev_destroy(e); }
+        void ev_signal(void* e) override { r_->ev_signal(e); }
+        void ev_wait(void* e) override { r_->ev_wait(e); }
+        bool ev_wait_timeout(void* e, uint32_t ms) override { return r_->ev_wait_timeout(e, ms); }
+        uint64_t atomic_add(uint64_t* p, int64_t d) override { return r_->atomic_add(p, d); }
+        uint64_t atomic_load(uint64_t* p) override { return r_->atomic_load(p); }
+        uint64_t monotonic_ns() override { return r_->monotonic_ns(); }
+        uint64_t wallclock_ms() override { return r_->wallclock_ms(); }
+        void wallclock_date(uint32_t* yyyymmdd, uint32_t* hhmmss) override { r_->wallclock_date(yyyymmdd, hhmmss); }
+        uint32_t pid() override { return r_->pid(); }
+        uint64_t tid() override { return r_->tid(); }
+        void sleep_ms(uint32_t ms) override { r_->sleep_ms(ms); }
+        bool random_bytes(void* out, size_t l) override { return r_->random_bytes(out, l); }
+        void debug_log(const char* s) override { r_->debug_log(s); }
+    private:
+        Pal* r_;
+    };
+
     Pal& pal = default_pal();
+    FastNoSyncPal fast_pal(&pal);
     std::string dir = make_tmp_dir("logx_test_cb_mem_bound_");
     pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    std::atomic<int> destroy_cnt{0};
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.flush_threshold = 0;
+    cfg.pal_override = &fast_pal;
+    cfg.user = &destroy_cnt;
+    cfg.on_destroy = [](void* u, void*) {
+        static_cast<std::atomic<int>*>(u)->fetch_add(1, std::memory_order_relaxed);
+    };
+
+    constexpr int kRounds = 10000;
+    int opened_cnt = 0;
+    for (int i = 0; i < kRounds; ++i) {
+        logx_instance_t* inst = nullptr;
+        ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+        ASSERT_NE(inst, nullptr);
+        ++opened_cnt;
+        ASSERT_EQ(logx_close(inst), LOGX_OK);
+        // 每次 close 后陈旧墓碑句柄访问必须安全且 inst 已置空
+        EXPECT_EQ(logx::test::test_get_instance(inst), nullptr);
+    }
+    EXPECT_EQ(opened_cnt, kRounds);
+    EXPECT_EQ(destroy_cnt.load(), kRounds);
+    // 10k 轮 CB 墓碑总结构体净体积上界 <= 640KB (64B * 10000)
+    EXPECT_LE(sizeof(InstanceControlBlock) * static_cast<size_t>(kRounds), 640u * 1024u);
+    cleanup_dir(dir);
+}
+
+// 5. R45-06 (ACT-6): Flusher 线程阻塞于 key_provider 回调期间，并发 logx_close 必须转递延，绝不死锁
+TEST(ControlBlockLifetime, FlusherBlockedInKeyProviderConcurrentCloseNoDeadlock) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r45_kp_block_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    struct KpSync {
+        std::atomic<bool> entered_kp{false};
+        std::atomic<bool> release_kp{false};
+        std::atomic<bool> destroyed{false};
+    } sync;
 
     logx_config_t cfg{};
     cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
     cfg.max_log_length = 64 * 1024;
-    cfg.flush_threshold = 0;
+    cfg.flush_threshold = 0; // 先禁用自动唤醒，待注入 key_provider 后再触发
+    cfg.user = &sync;
+    cfg.on_destroy = [](void* u, void*) {
+        static_cast<KpSync*>(u)->destroyed.store(true, std::memory_order_release);
+    };
 
-    constexpr int kRounds = 2000;
-    for (int i = 0; i < kRounds; ++i) {
-        std::string staging = dir + "/staging_" + std::to_string(i % 10) + ".mmap";
-        cfg.staging_path = staging.c_str();
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // 通过测试 seam 挂载阻塞式 key_provider (兼容桌面 LOGX_WITH_AESGCM=OFF 构建)
+    Instance* raw_inst = logx::test::test_get_instance(inst);
+    ASSERT_NE(raw_inst, nullptr);
+    raw_inst->encrypt_enable = true;
+    raw_inst->kid = 1;
+    raw_inst->key_user = &sync;
+    raw_inst->key_provider = [](uint16_t, void* u) -> const uint8_t* {
+        auto* s = static_cast<KpSync*>(u);
+        s->entered_kp.store(true, std::memory_order_release);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!s->release_kp.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return nullptr; // 返回 nullptr 触发明文降级，无需真实 AES-GCM 链接
+    };
+
+    // 写入一条记录并手动唤醒 Flusher 进入 open_or_create_append_target -> invoke_key_provider
+    const char* msg = "kp_in_callback_guard_test";
+    ASSERT_EQ(logx_write(inst, 2, "KP", reinterpret_cast<const uint8_t*>(msg),
+                         static_cast<uint32_t>(std::strlen(msg))),
+              LOGX_OK);
+    raw_inst->pal->ev_signal(raw_inst->flush_event);
+
+    auto enter_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!sync.entered_kp.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < enter_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(sync.entered_kp.load()) << "Flusher 应当已进入 key_provider 回调";
+
+    // 此时 Flusher 仍阻塞在 key_provider 内(只有 close 返回后才放行 release_kp)；
+    // 若 key_provider 未计入 in_callback，logx_close_ex 会误入同步路径并在 thread_join 上死锁 5s+!
+    bool closed_imm = true;
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(logx_close_ex(inst, &closed_imm), LOGX_OK);
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    EXPECT_FALSE(closed_imm) << "key_provider 在途时 logx_close_ex 必须走递延路径";
+    EXPECT_LT(elapsed_ms, 1000) << "递延 close 必须立即返回，不得阻塞等待 Flusher";
+
+    // 放行 key_provider，验证 Flusher 完成尾轮刷盘后正常自毁并触发 on_destroy
+    sync.release_kp.store(true, std::memory_order_release);
+    auto destroy_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!sync.destroyed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < destroy_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EXPECT_TRUE(sync.destroyed.load());
+
+    cleanup_dir(dir);
+}
+
+// 6. R45-03 (ACT-3) & R45-07 (ACT-4): 递延 close 期间在途写必须在销毁前刷入 .log 文件，
+//    且 logx_set_error_handler 动态更新后的 err_user 必须同步传递给 on_destroy
+TEST(ControlBlockLifetime, DeferredCloseFlushesInFlightWriteAndUpdatesErrUser) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_r45_deferred_flush_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    struct DestroyProbe {
+        std::atomic<bool> destroyed{false};
+        void* got_err_user = nullptr;
+        std::atomic<bool> saw_flush_skipped{false};
+    } probe;
+
+    int initial_err_tag = 111;
+    int updated_err_tag = 222;
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 512; // 短上限以便触发 TRUNCATED 同步回调拦截
+    cfg.flush_threshold = 0;
+    cfg.user = &probe;
+    cfg.err_user = &initial_err_tag;
+    cfg.on_destroy = [](void* u, void* eu) {
+        auto* p = static_cast<DestroyProbe*>(u);
+        p->got_err_user = eu;
+        p->destroyed.store(true, std::memory_order_release);
+    };
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    // R45-07: 动态更换 err_user 为 &updated_err_tag，同时在回调内对超大日志触发递延 close
+    struct CbCtx {
         logx_instance_t* inst = nullptr;
-        if (logx_open(&cfg, &inst) == LOGX_OK) {
-            logx_close(inst);
+        DestroyProbe* probe = nullptr;
+        int* tag_ptr = nullptr;
+        std::atomic<bool> closed_once{false};
+    } cb_ctx{inst, &probe, &updated_err_tag, {false}};
+
+    ASSERT_EQ(logx_set_error_handler(inst, [](void* u, logx_event_kind_e kind, int, const char* msg) {
+        auto* c = static_cast<CbCtx*>(u);
+        if (kind == LOGX_EV_IO && msg && std::strstr(msg, "flush skipped") != nullptr) {
+            c->probe->saw_flush_skipped.store(true, std::memory_order_release);
+        }
+        if (kind == LOGX_EV_TRUNCATED && !c->closed_once.exchange(true, std::memory_order_acq_rel)) {
+            bool imm = true;
+            // 此时正处于 logx_write 的 OpGuard 作用域内 (active_ops == 1, in_callback == 1, !on_flusher)
+            // logx_close_ex 必须走递延路径，且不得提前关停 Flusher!
+            EXPECT_EQ(logx_close_ex(c->inst, &imm), LOGX_OK);
+            EXPECT_FALSE(imm);
+        }
+    }, &cb_ctx), LOGX_OK);
+
+    // 1. 先写入一条正常日志进入 staging 缓冲(flush_threshold=0 尚未刷盘)；
+    // 2. 紧接着在同一次或下一次 logx_write 持 OpGuard (active_ops=1) 期间触发 TRUNCATED 回调，
+    //    回调内调用 logx_close_ex 走递延路径；
+    // 3. 若递延路径过早置 flusher_exit=true，Flusher 会在 ~OpGuard 前退出导致 flush_blocking 跳过；
+    //    修复后 ~OpGuard 退出时触发 destroy_instance -> flush_blocking，将在途 staging 数据完整刷入 .log!
+    const char* normal_msg = "in_flight_staged_record_must_reach_log_file";
+    ASSERT_EQ(logx_write(inst, 2, "R45_03", reinterpret_cast<const uint8_t*>(normal_msg),
+                         static_cast<uint32_t>(std::strlen(normal_msg))),
+              LOGX_OK);
+
+    std::string big_msg(1024, 'Z');
+    EXPECT_EQ(logx_write(inst, 2, "R45_03", reinterpret_cast<const uint8_t*>(big_msg.data()),
+                         static_cast<uint32_t>(big_msg.size())),
+              LOGX_OK);
+
+    EXPECT_TRUE(probe.destroyed.load()) << "~OpGuard 退出时应已完成递延销毁";
+    EXPECT_FALSE(probe.saw_flush_skipped.load()) << "递延销毁时 Flusher 仍在运行，flush_blocking 不得跳过";
+    EXPECT_EQ(probe.got_err_user, &cb_ctx) << "R45-07: on_destroy 必须收到 logx_set_error_handler 更新后的 err_user";
+
+    // 验证 .log 文件已真正生成且非空（无需依赖下次启动 recovery）
+    bool has_non_empty_log = false;
+    for (const auto& f : pal.file_list(dir.c_str())) {
+        if (f.find(".log") != std::string::npos && pal.file_size_path(f.c_str()) > 32) {
+            has_non_empty_log = true;
+            break;
         }
     }
-    // 顺利跑完 2000 轮 open/close 且无崩溃、无死锁即达标
+    EXPECT_TRUE(has_non_empty_log) << "R45-03: 递延关闭前在途写入的数据必须已即时落入 .log 文件";
+
     cleanup_dir(dir);
 }
 

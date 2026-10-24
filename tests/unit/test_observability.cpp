@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -272,8 +273,10 @@ public:
         std::atomic<int64_t> mutex_create{0},  mutex_destroy{0};
         std::atomic<int64_t> ev_create{0},     ev_destroy{0};
         std::atomic<int64_t> thread_create{0}, thread_destroy{0};
+        std::atomic<int64_t> thread_join_count{0}, thread_detach_count{0};
     };
     Counters c;
+    std::atomic<bool> fail_fsync{false};
 
     int file_open(const char* p, bool cr, bool ap) override {
         const int fd = real_->file_open(p, cr, ap);
@@ -292,7 +295,10 @@ public:
     long file_pread(int fd, void* b, size_t l, uint64_t o) override { return real_->file_pread(fd, b, l, o); }
     int64_t file_size(int fd) override { return real_->file_size(fd); }
     int64_t file_size_path(const char* p) override { return real_->file_size_path(p); }
-    int  file_fsync(int fd) override { return real_->file_fsync(fd); }
+    int  file_fsync(int fd) override {
+        if (fail_fsync.load(std::memory_order_acquire)) return -1;
+        return real_->file_fsync(fd);
+    }
     int  file_dir_fsync(const char* d) override { return real_->file_dir_fsync(d); }
     int  file_unlink(const char* p) override { return real_->file_unlink(p); }
     int  file_mkdirs(const char* d) override { return real_->file_mkdirs(d); }
@@ -332,12 +338,18 @@ public:
     }
     int thread_join(void* h) override {
         const int rc = real_->thread_join(h);
-        if (rc == 0) c.thread_destroy.fetch_add(1, std::memory_order_relaxed);
+        if (rc == 0) {
+            c.thread_destroy.fetch_add(1, std::memory_order_relaxed);
+            c.thread_join_count.fetch_add(1, std::memory_order_relaxed);
+        }
         return rc;
     }
     int thread_detach(void* h) override {
         const int rc = real_->thread_detach(h);
-        if (rc == 0) c.thread_destroy.fetch_add(1, std::memory_order_relaxed);
+        if (rc == 0) {
+            c.thread_destroy.fetch_add(1, std::memory_order_relaxed);
+            c.thread_detach_count.fetch_add(1, std::memory_order_relaxed);
+        }
         return rc;
     }
 
@@ -630,7 +642,7 @@ TEST(LeakRegression, CountingPal_NoResourceLeakAcrossOpenCloseCycles) {
 }
 
 
-// T5.8 / R44-05: Flusher 回调内自销毁 thread_detach 句柄回收测试
+// T5.8 / R44-05 / R45-05: Flusher 回调内自销毁 thread_detach 句柄回收测试 (遵守 R18-2 反空洞绿纪律)
 TEST(LeakRegression, FlusherSelfDestroyThreadDetachNoLeak) {
     Pal& real_pal = default_pal();
     CountingPal counting_pal(&real_pal);
@@ -639,22 +651,29 @@ TEST(LeakRegression, FlusherSelfDestroyThreadDetachNoLeak) {
     std::string staging = dir + "/staging.mmap";
 
     std::atomic<bool> in_flusher_cb{false};
+    std::atomic<uint64_t> cb_tid{0};
     std::atomic<bool> destroyed{false};
 
     struct Context {
         logx_instance_t* inst = nullptr;
+        Pal* pal = nullptr;
         std::atomic<bool>* in_flusher_cb = nullptr;
+        std::atomic<uint64_t>* cb_tid = nullptr;
         std::atomic<bool>* destroyed = nullptr;
     } ctx;
 
+    ctx.pal = &counting_pal;
     ctx.in_flusher_cb = &in_flusher_cb;
+    ctx.cb_tid = &cb_tid;
     ctx.destroyed = &destroyed;
 
-    auto err_cb = [](void* user, logx_event_kind_e, int, const char*) {
+    auto err_cb = [](void* user, logx_event_kind_e kind, int, const char*) {
         auto* c = static_cast<Context*>(user);
-        c->in_flusher_cb->store(true, std::memory_order_release);
-        // 在回调内部调用 logx_close
-        logx_close(c->inst);
+        if (kind == LOGX_EV_IO && !c->in_flusher_cb->exchange(true, std::memory_order_acq_rel)) {
+            c->cb_tid->store(c->pal->tid(), std::memory_order_release);
+            // 在 Flusher 后台线程回调内部调用 logx_close，触发 Flusher 自毁路径 (thread_detach)
+            logx_close(c->inst);
+        }
     };
 
     auto on_destroy = [](void* user, void*) {
@@ -666,7 +685,7 @@ TEST(LeakRegression, FlusherSelfDestroyThreadDetachNoLeak) {
     cfg.log_dir = dir.c_str();
     cfg.staging_path = staging.c_str();
     cfg.max_log_length = 64 * 1024;
-    cfg.flush_threshold = 1024;
+    cfg.flush_threshold = 1; // 写入即唤醒 Flusher 后台线程
     cfg.pal_override = &counting_pal;
     cfg.err_fn = err_cb;
     cfg.err_user = &ctx;
@@ -677,17 +696,37 @@ TEST(LeakRegression, FlusherSelfDestroyThreadDetachNoLeak) {
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     ctx.inst = inst;
 
-    // 手动在内部触发一个事件，模拟回调
-    emit_event(logx::test::test_get_instance(inst), LOGX_EV_DEGRADED, -1, "test callback self-close");
+    // 等待 Flusher 线程登记其真实 TID
+    uint64_t flusher_tid = 0;
+    auto tid_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((flusher_tid = logx::test::test_get_flusher_tid(inst)) == 0 &&
+           std::chrono::steady_clock::now() < tid_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_NE(flusher_tid, 0u);
 
-    // 等待销毁完成
+    // 注入 file_fsync 失败，并写入一条日志唤醒 Flusher 后台线程建文件刷盘，
+    // 使 Flusher 线程自身触发 emit_event(LOGX_EV_IO) 并在回调中调用 logx_close
+    counting_pal.fail_fsync.store(true, std::memory_order_release);
+    const char* msg = "trigger_flusher_self_destroy";
+    ASSERT_EQ(logx_write(inst, 2, "DETACH", reinterpret_cast<const uint8_t*>(msg),
+                         static_cast<uint32_t>(std::strlen(msg))),
+              LOGX_OK);
+
+    // 等待 Flusher 自销毁完成
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!destroyed.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    EXPECT_TRUE(in_flusher_cb.load());
+    EXPECT_EQ(cb_tid.load(), flusher_tid) << "回调必须在 Flusher 后台线程上触发";
     EXPECT_TRUE(destroyed.load());
 
-    // 核心断言 (R44-05): thread_create 与 thread_destroy 必须严格配对 (detach 回收了句柄)
+    // 核心断言 (R44-05 / R45-05 / R18-2): 必须真实走 thread_detach 而非 thread_join，且句柄严格配对
+    EXPECT_EQ(counting_pal.c.thread_detach_count.load(), 1)
+        << "Flusher 自销毁必须调用 pal->thread_detach";
+    EXPECT_EQ(counting_pal.c.thread_join_count.load(), 0)
+        << "Flusher 自销毁严禁调用 pal->thread_join";
     EXPECT_EQ(counting_pal.c.thread_create.load(), counting_pal.c.thread_destroy.load())
         << "Flusher 自销毁未泄漏线程句柄";
 

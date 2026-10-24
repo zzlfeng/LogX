@@ -38,6 +38,7 @@ endif()
 
 target_include_directories(logx_stress_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_SOURCE_DIR}/tests
 )
 
 add_test(NAME logx_stress_tests COMMAND logx_stress_tests)
@@ -62,6 +63,7 @@ endif()
 
 target_include_directories(logx_crash_fork_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_SOURCE_DIR}/tests
 )
 
 add_test(NAME logx_crash_fork_tests COMMAND logx_crash_fork_tests)

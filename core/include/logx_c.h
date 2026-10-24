@@ -121,9 +121,12 @@ typedef struct logx_config {
      * 非 NULL 时要求 Pal 对象存活期覆盖整个实例生命周期。 */
     void* pal_override;          /* 实际类型 logx::Pal*;仅测试构建使用 */
 
-    /* J-1/F-2: 实例完全销毁时的清理回调(可选,由 destroy_instance 最终退出前调用)。
+    /* J-1/F-2 / R45-12: 实例完全销毁时的清理回调(可选,由 destroy_instance 最终退出前调用)。
      * 无论同步还是递延销毁,该回调保证在 Flusher 线程已退出、staging 已关闭、
      * 库内所有对 user/err_user 的访问全部终结后触发。
+     * 线程模型约束: 执行线程为最后完成销毁认领的线程(可能是调用 logx_close 的线程、
+     * 最后退出的并发操作线程或 Flusher 后台线程),实现方不得依赖回调线程身份,
+     * 亦不得仅依赖在 on_destroy 内清理跨线程 thread_local 状态。
      * 若未提供,则由调用方自行根据 logx_close_ex 返回值或生命周期纪律管理。 */
     void (*on_destroy)(void* user, void* err_user);
 } logx_config_t;

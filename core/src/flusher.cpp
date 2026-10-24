@@ -581,9 +581,7 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
         bool enc_capable = true;
         const uint8_t* key = nullptr;
         if (inst->encrypt_enable != 0) {
-            if (inst->key_provider) {
-                key = inst->key_provider(inst->kid, inst->key_user);
-            }
+            key = invoke_key_provider(inst, inst->kid);
             if (!key) {
                 enc_capable = false;
                 emit_event(inst, LOGX_EV_DEGRADED, -1,
@@ -638,7 +636,7 @@ int open_or_create_append_target(Instance* inst, const std::string& hint_path,
                 emit_event(inst, LOGX_EV_DEGRADED, -1,
                            "file header kid differs from instance kid; using file header kid for append target");
             }
-            out_target->key = inst->key_provider(out_target->kid, inst->key_user);
+            out_target->key = invoke_key_provider(inst, out_target->kid);
             if (!out_target->key) {
                 emit_event(inst, LOGX_EV_DEGRADED, -1,
                            "missing key; downgrading block to plaintext");
@@ -964,7 +962,7 @@ void drain_once(FlusherCtx* c, Instance* inst) {
         } else if (!retry_key_probed && c->target.enc_capable && (inst->encrypt_enable != 0) &&
                    !c->target.key && inst->key_provider) {
             retry_key_probed = true;
-            c->target.key = inst->key_provider(c->target.kid, inst->key_user);
+            c->target.key = invoke_key_provider(inst, c->target.kid);
             if (!c->target.key) {
                 emit_event(inst, LOGX_EV_DEGRADED, -1,
                            "missing key; downgrading block to plaintext");
@@ -1274,12 +1272,12 @@ void* flusher_main(void* arg) {
         cb->flusher_tid.store(inst->pal->tid(), std::memory_order_release);
     }
     flusher_loop(inst);
-    // T5.8: 循环完全退出后，若处于 closing 状态且在途活跃操作与回调均已归零，
-    // 通过 inst.exchange(nullptr) 唯一胜出原子认领自毁。
-    if (cb && cb->close_requested.load(std::memory_order_acquire)) {
-        if (cb->active_ops.load(std::memory_order_acquire) == 0 &&
-            cb->in_callback.load(std::memory_order_acquire) == 0) {
-            if (cb->close_requested.exchange(false, std::memory_order_acq_rel)) {
+    // T5.8 / R45-02: 循环完全退出后，若处于 closing 状态且在途活跃操作与回调均已归零，
+    // 通过 seq_cst 全序屏障 + inst.exchange(nullptr) 唯一胜出原子认领自毁。
+    if (cb && cb->close_requested.load(std::memory_order_seq_cst)) {
+        if (cb->active_ops.load(std::memory_order_seq_cst) == 0 &&
+            cb->in_callback.load(std::memory_order_seq_cst) == 0) {
+            if (cb->close_requested.exchange(false, std::memory_order_seq_cst)) {
                 Instance* target = cb->inst.exchange(nullptr, std::memory_order_acq_rel);
                 if (target != nullptr) {
                     destroy_instance(cb, target, /*is_flusher_thread=*/true);

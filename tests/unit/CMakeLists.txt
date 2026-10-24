@@ -53,6 +53,7 @@ if(WIN32)
 endif()
 target_include_directories(logx_unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_SOURCE_DIR}/tests
     # J-03: JNI 纯逻辑头(jni_string_util.h)在 android/cpp,桌面单测直接包含验证
     ${CMAKE_SOURCE_DIR}/android/cpp
     # C-04 真机用例直接调用 vendored mbedtls C ABI(aesce.c 符号经 logx_core
@@ -92,6 +93,7 @@ if(NOT WIN32)
 endif()
 target_include_directories(logx_hotpath_alloc_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_SOURCE_DIR}/tests
 )
 add_test(NAME logx_hotpath_alloc_tests COMMAND logx_hotpath_alloc_tests)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

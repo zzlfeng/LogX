@@ -1,10 +1,10 @@
 # LogX T5.8 生命周期堆控制块（Control Block）待决策项方案分析与裁决建议
 
-> **文档版本**: v1.1 (2026-10-23)  
+> **文档版本**: v1.2 (2026-10-24)  
 > **任务编号**: T5.8（生命周期堆控制块重构专项，根治 R41-05 尾读 UAF）  
-> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.0（待据此修订至 v1.1）  
-> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)  
-> **当前状态**: 📋 v1.1 已按独立复核结论修订完成，待用户确认后据此修订实施计划至 v1.1  
+> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.2  
+> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)  
+> **当前状态**: ✅ 已拍板并完成 R45 复审补强落地  
 >
 > **v1.1 修订说明（独立复核：对照 R44 原文、实施计划 v1.0、现行实现与测试代码逐项核实）**：
 > 1. **决策二/三补回"回调在飞门禁"**：同步关停判定必须为 `active_ops == 0 && in_callback == 0`（或等价 `flusher_busy`）。v1.0 转写 R44 方案 B 时丢失了 `in_callback == 0` 条件——按 v1.0 原文实施，R43 形态（Flusher 阻塞在用户回调内时另一线程 close，`active_ops==0` 恰成立）会走同步路径：`flush_blocking` 因 Flusher 阻塞 5s 超时返回 false，`thread_join` 等待回调返回，而 R43 用例在 close 返回后才放行回调 ⇒ **无界死锁**。现行代码正是靠 `in_callback > 0 → 递延`（[logx_c.cpp:506](file:///d:/Project/Android_Project/LogX/logx/core/src/logx_c.cpp#L506)）规避该形态。
@@ -51,7 +51,8 @@
   - **墓碑模型的落地硬约束（复核新增，必须写入 v1.1 计划）**：
     1. **`cb->inst` 必须为 `std::atomic<Instance*>`**：陈旧裸句柄在**无任何引用**的情况下读取 `inst`，而 dispose 胜出者会写 `inst = nullptr`；普通指针的并发读写构成 C++11 数据竞争（UB），不能用"实际不会崩"辩护。读侧以 acquire 载入、判空后使用；
     2. **销毁认领采用 `inst.exchange(nullptr)` 唯一胜出语义**：递延分支的收尾者、`close` 兜底、最后一个退出者可能并发尝试销毁，`exchange(nullptr)` 天然保证恰好一个胜出者执行 `dispose_instance`，替代被删除的 `close_pending.exchange` 认领原语；败者直接返回；
-    3. **dispose 完成前必须清空 `cb->pal`**（对齐 R44-10）：防止陈旧句柄/二次 close 经 CB 解引用已析构的 Pal。
+    3. **dispose 完成前必须清空 `cb->pal` 并清零 `cb->flusher_tid`**（对齐 R44-08 / R44-10 / R45-09）：防止陈旧句柄/二次 close 经 CB 解引用已析构的 Pal 或发生 TID 复用误判；
+    4. **`on_destroy` 执行线程契约与 `thread_local` 约束（R45-12）**：递延销毁下 `on_destroy` 在最后完成销毁认领的线程（可能是 `logx_close` 调用线程、最后退出的并发操作线程或 Flusher 后台线程）上执行；实现方不得依赖回调线程身份，亦不得仅在 `on_destroy` 内清理跨线程 `thread_local` 状态（JNI 层通过登记全局已销毁代数水位并在 `lookup`/`allocate_slot` 入口跨 `owner` 惰性清零驱逐闭合）。
 
 ---
 

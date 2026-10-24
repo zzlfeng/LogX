@@ -457,3 +457,60 @@ TEST(JniKeyCache, CrossOwnerEvictionZeroesEvictedKeyBeforeHandover) {
     EXPECT_EQ(cache.lookup(&ctx_b, /*gen=*/2, 20)[0], 0xCC);
 }
 
+// ============================================================
+// R45-12 / ACT-8: lookup 入口即清扫同 owner 异 gen 槽位，且支持按全局已销毁代数水位跨 owner 清零驱逐
+// ============================================================
+TEST(JniKeyCache, LookupEntryScrubsStaleAndDestroyedWatermarkSlots) {
+    logx_jni::TlsKeyCache<4> cache;
+    int ctx_a = 1;
+    int ctx_b = 2;
+    int ctx_c = 3;
+
+    // 1. 验证同 owner 异 gen 在 lookup 入口即被清零驱逐（无需等到 allocate_slot）
+    uint8_t* k_a1 = cache.allocate_slot(&ctx_a, /*gen=*/1, /*kid=*/7);
+    ASSERT_NE(k_a1, nullptr);
+    std::memset(k_a1, 0x5A, 32);
+    ASSERT_TRUE(cache.slot(0).valid);
+
+    // 模拟 ABA 地址复用后首次 lookup 失配（且假设随后 Kotlin 回调抛异常不走 allocate_slot）
+    EXPECT_EQ(cache.lookup(&ctx_a, /*gen=*/2, /*kid=*/7), nullptr);
+    EXPECT_FALSE(cache.slot(0).valid);
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_EQ(cache.slot(0).key[i], 0) << "lookup 入口必须立即清零同 owner 异 gen 陈旧槽";
+    }
+
+    // 2. 验证跨线程 on_destroy 登记已销毁代数水位后，异 owner 在空槽未耗尽时也能在 lookup 入口清零旧实例残留槽
+    std::atomic<uint64_t> watermark{0};
+    uint8_t* k_old = cache.allocate_slot(&ctx_a, /*gen=*/3, /*kid=*/10);
+    uint8_t* k_b_kid1 = cache.allocate_slot(&ctx_b, /*gen=*/4, /*kid=*/20);
+    ASSERT_NE(k_old, nullptr);
+    ASSERT_NE(k_b_kid1, nullptr);
+    std::memset(k_old, 0xAA, 32);
+    std::memset(k_b_kid1, 0xBB, 32);
+
+    // 模拟实例 C (gen=5) 先于实例 B (gen=4) 乱序销毁，以及实例 A (gen=3) 在异线程销毁: 水位推进至 5
+    logx_jni::advance_destroyed_watermark(watermark, 3);
+    logx_jni::advance_destroyed_watermark(watermark, 5);
+    logx_jni::advance_destroyed_watermark(watermark, 2); // 乱序小代数不得回退水位
+    EXPECT_EQ(watermark.load(), 5u);
+
+    // 存活实例 B (gen=4 <= watermark=5) 在本线程查询新 kid=21:
+    // - 异 owner 的 ctx_a (gen=3 <= 5) 槽位必须被立即清零并驱逐；
+    // - 当前调用方自身 ctx_b (gen=4 <= 5) 已缓存的 kid=20 槽位必须被豁免保留（闭合 J-6 单文件指针稳定规约）!
+    EXPECT_EQ(cache.lookup(&ctx_b, /*gen=*/4, /*kid=*/21, watermark.load()), nullptr);
+    EXPECT_FALSE(cache.slot(0).valid) << "异 owner 且 gen <= watermark 的槽位必须被驱逐";
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_EQ(cache.slot(0).key[i], 0) << "异 owner 被水位驱逐时明文必须清零";
+    }
+    EXPECT_TRUE(cache.slot(1).valid) << "当前活跃调用方自身的已缓存槽位必须豁免保留";
+    EXPECT_EQ(cache.slot(1).key[0], 0xBB);
+
+    // 随后新实例 C2 (ctx_c, gen=6 > watermark=5) 在本线程 lookup 时，因 ctx_b 成为异 owner 且 gen=4 <= 5，也会被安全清零
+    EXPECT_EQ(cache.lookup(&ctx_c, /*gen=*/6, /*kid=*/30, watermark.load()), nullptr);
+    EXPECT_FALSE(cache.slot(1).valid);
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_EQ(cache.slot(1).key[i], 0);
+    }
+}
+
+

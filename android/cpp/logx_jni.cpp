@@ -178,10 +178,11 @@ static void jni_error_trampoline(void* user, logx_event_kind_e kind, int code, c
     }
 }
 
-// J-6 / R41-03 / R41-04: thread_local 密钥多槽缓冲(kMaxTlsKeySlots=4)。
-// 支持单线程多 kid 独立缓冲, 且带 owner 属主指针隔离与空槽优先复用策略。
+// J-6 / R41-03 / R41-04 / R45-12: thread_local 密钥多槽缓冲(kMaxTlsKeySlots=4) 与全局已销毁代数水位线。
+// 支持单线程多 kid 独立缓冲, 且带 owner 属主指针隔离、已销毁代数水位跨 owner 惰性清零与空槽优先复用策略。
 static constexpr size_t kMaxTlsKeySlots = 4;
 static thread_local logx_jni::TlsKeyCache<kMaxTlsKeySlots> g_tls_key_cache;
+static std::atomic<uint64_t> g_jni_destroyed_gen_watermark{0};
 
 static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     auto* ctx = static_cast<JniKeyProviderContext*>(user);
@@ -189,8 +190,10 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
         return nullptr;
     }
 
-    // 优先命中本线程缓存槽 (R42-02: owner + gen + kid 三元匹配, 彻底杜绝跨线程复用与 ABA 地址复用伪命中)
-    if (const uint8_t* cached = g_tls_key_cache.lookup(ctx, ctx->gen, kid)) {
+    const uint64_t watermark = g_jni_destroyed_gen_watermark.load(std::memory_order_relaxed);
+
+    // 优先命中本线程缓存槽 (R42-02 / R45-12: 入口惰性清扫陈旧槽 + owner/gen/kid 三元匹配)
+    if (const uint8_t* cached = g_tls_key_cache.lookup(ctx, ctx->gen, kid, watermark)) {
         return cached;
     }
 
@@ -224,7 +227,7 @@ static const uint8_t* jni_key_provider_trampoline(uint16_t kid, void* user) {
     if (jKeyArr) {
         jsize len = env->GetArrayLength(jKeyArr);
         if (len == 32) {
-            uint8_t* slot_key = g_tls_key_cache.allocate_slot(ctx, ctx->gen, kid);
+            uint8_t* slot_key = g_tls_key_cache.allocate_slot(ctx, ctx->gen, kid, watermark);
             if (slot_key) {
                 env->GetByteArrayRegion(jKeyArr, 0, 32, reinterpret_cast<jbyte*>(slot_key));
                 res = slot_key;
@@ -250,8 +253,9 @@ static void jni_destroy_trampoline(void* key_user, void* err_user) {
     auto* kp_ctx = static_cast<JniKeyProviderContext*>(key_user);
     auto* inst_err_ctx = static_cast<JniErrorContext*>(err_user);
 
-    // R41-03 / R42-02: 销毁时清理当前线程属于该 (ctx, gen) 的缓存槽, 并将密钥安全清零
+    // R41-03 / R42-02 / R45-12: 登记已销毁代数水位(供跨线程惰性清零残留槽)并即时清理当前线程缓存槽
     if (kp_ctx) {
+        logx_jni::advance_destroyed_watermark(g_jni_destroyed_gen_watermark, kp_ctx->gen);
         g_tls_key_cache.invalidate_owner(kp_ctx, kp_ctx->gen);
     }
 

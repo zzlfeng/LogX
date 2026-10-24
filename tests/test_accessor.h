@@ -28,26 +28,26 @@ inline Instance* test_get_instance(Instance* inst) {
 
 inline void test_set_closing(logx_instance_t* h, bool closing) {
     if (auto* cb = test_get_cb(h)) {
-        cb->is_closing.store(closing, std::memory_order_release);
+        cb->is_closing.store(closing, std::memory_order_seq_cst);
     }
 }
 
 inline void test_set_closing(Instance* inst, bool closing) {
     if (inst && inst->cb) {
-        inst->cb->is_closing.store(closing, std::memory_order_release);
+        inst->cb->is_closing.store(closing, std::memory_order_seq_cst);
     }
 }
 
 inline bool test_get_closing(logx_instance_t* h) {
     if (auto* cb = test_get_cb(h)) {
-        return cb->is_closing.load(std::memory_order_acquire);
+        return cb->is_closing.load(std::memory_order_seq_cst);
     }
     return false;
 }
 
 inline bool test_get_closing(Instance* inst) {
     if (inst && inst->cb) {
-        return inst->cb->is_closing.load(std::memory_order_acquire);
+        return inst->cb->is_closing.load(std::memory_order_seq_cst);
     }
     return false;
 }
@@ -78,13 +78,24 @@ inline void test_set_retention_days(Instance* inst, uint32_t days) {
     }
 }
 
-// 模拟进程强杀/崩溃：绕过正常 close flush, 强制停止 flusher 并释放资源
+// 模拟进程强杀/崩溃：绕过正常 close flush, 强制停止 flusher 并释放资源。
+// 注意 (R45-08): 本函数仅用于单线程崩溃恢复模拟测试，故意销毁控制块 (delete cb)
+// 而不做墓碑保留，严禁用于正常并发关闭路径或陈旧句柄访问测试。
 inline void test_simulate_crash_destroy(logx_instance_t*& h) {
     if (!h) return;
     auto* cb = test_get_cb(h);
-    Instance* raw_inst = cb ? cb->inst.exchange(nullptr) : nullptr;
+    if (cb) {
+        cb->is_closing.store(true, std::memory_order_seq_cst);
+    }
+    Instance* raw_inst = cb ? cb->inst.exchange(nullptr, std::memory_order_acq_rel) : nullptr;
     if (raw_inst) {
-        raw_inst->flusher_exit.store(true);
+        raw_inst->flusher_exit.store(true, std::memory_order_release);
+        if (raw_inst->flush_event && raw_inst->pal) {
+            raw_inst->pal->ev_signal(raw_inst->flush_event);
+        }
+        if (raw_inst->space_event && raw_inst->pal) {
+            raw_inst->pal->ev_signal(raw_inst->space_event);
+        }
         if (raw_inst->flusher_thread) {
             raw_inst->pal->thread_join(raw_inst->flusher_thread);
             raw_inst->flusher_thread = nullptr;
@@ -104,3 +115,4 @@ inline void test_simulate_crash_destroy(logx_instance_t*& h) {
 }  // namespace logx
 
 #endif  // LOGX_TEST_ACCESSOR_H
+

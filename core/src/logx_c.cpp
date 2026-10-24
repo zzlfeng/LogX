@@ -87,10 +87,7 @@ bool decode_one_file(Instance* inst, const std::string& path, uint64_t end_size,
     uint16_t kid_in_file = get_u16(hdr + 10);
     uint8_t salt[8];
     std::memcpy(salt, hdr + 12, 8);
-    const uint8_t* key32 = nullptr;
-    if (inst->key_provider) {
-        key32 = inst->key_provider(kid_in_file, inst->key_user);
-    }
+    const uint8_t* key32 = invoke_key_provider(inst, kid_in_file);
     uint64_t off = 32;
     std::vector<uint8_t> carry_slice_buf;
     uint32_t prev_seqno = 0;
@@ -290,15 +287,25 @@ struct OpGuard {
         auto* c = reinterpret_cast<InstanceControlBlock*>(h);
         if (c->is_closing.load(std::memory_order_acquire)) return;
 
-        c->active_ops.fetch_add(1, std::memory_order_acquire);
-        if (c->is_closing.load(std::memory_order_relaxed)) {
-            c->active_ops.fetch_sub(1, std::memory_order_release);
+        // R45-02 (Dekker 组 1): 必须使用 seq_cst 确保 fetch_add(1) 与后续 is_closing.load
+        // 不会与 logx_close_ex 的 is_closing.exchange(true, seq_cst) -> active_ops.load(seq_cst) 发生 Store-Load 重排
+        c->active_ops.fetch_add(1, std::memory_order_seq_cst);
+        if (c->is_closing.load(std::memory_order_seq_cst)) {
+            // R45-01: 递增后的早退回滚若恰好将 active_ops 减至 0，必须触发递延认领检查，
+            // 否则在回滚窗口内转入递延的 logx_close_ex 与 flusher_main 会双双漏认领导致永久泄漏。
+            int rem = c->active_ops.fetch_sub(1, std::memory_order_seq_cst) - 1;
+            if (rem == 0) {
+                check_deferred_dispose_on_exit(c);
+            }
             return;
         }
 
         Instance* i = c->inst.load(std::memory_order_acquire);
         if (!i) {
-            c->active_ops.fetch_sub(1, std::memory_order_release);
+            int rem = c->active_ops.fetch_sub(1, std::memory_order_seq_cst) - 1;
+            if (rem == 0) {
+                check_deferred_dispose_on_exit(c);
+            }
             return;
         }
 
@@ -308,8 +315,9 @@ struct OpGuard {
 
     ~OpGuard() {
         if (cb) {
-            int rem = cb->active_ops.fetch_sub(1, std::memory_order_acq_rel) - 1;
-            if (rem == 0 && cb->is_closing.load(std::memory_order_acquire)) {
+            // R45-02 (Dekker 组 2/4): 必须使用 seq_cst 全序屏障
+            int rem = cb->active_ops.fetch_sub(1, std::memory_order_seq_cst) - 1;
+            if (rem == 0 && cb->is_closing.load(std::memory_order_seq_cst)) {
                 check_deferred_dispose_on_exit(cb);
             }
         }
@@ -338,7 +346,6 @@ void destroy_instance(InstanceControlBlock* cb, Instance* inst, bool is_flusher_
             if (pal) pal->thread_detach(inst->flusher_thread);
         }
         inst->flusher_thread = nullptr;
-        if (cb) cb->flusher_thread = nullptr;
     }
     delete inst->staging;
     inst->staging = nullptr;
@@ -361,6 +368,7 @@ void destroy_instance(InstanceControlBlock* cb, Instance* inst, bool is_flusher_
     delete inst;
 
     if (cb) {
+        cb->flusher_tid.store(0, std::memory_order_release); // R44-08 / R45-09: 清零 flusher_tid 防 TID 复用误判
         cb->pal = nullptr; // R44-10: 清空 pal 避免陈旧句柄解引用已析构的 Pal
     }
 
@@ -506,7 +514,6 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     if (inst->pal->thread_start(&flusher_main, inst, &inst->flusher_thread) != 0) {
         return cleanup_open_failure(LOGX_ERR_STATE);
     }
-    cb->flusher_thread = inst->flusher_thread;
     inst->flusher_running.store(true, std::memory_order_release);
 
     *out_inst = reinterpret_cast<logx_instance_t*>(cb);
@@ -519,23 +526,28 @@ logx_status_e logx_close_ex(logx_instance_t* h, bool* out_closed_immediately) {
     auto* cb = reinterpret_cast<InstanceControlBlock*>(h);
 
     // 1. 原子置位 is_closing (仅首个调用者生效，后续并发 close 幂等返回 OK)
-    if (cb->is_closing.exchange(true, std::memory_order_acq_rel)) {
+    // R45-02: 必须使用 seq_cst 与 OpGuard/emit_event/invoke_key_provider 构成 Dekker 全序屏障
+    if (cb->is_closing.exchange(true, std::memory_order_seq_cst)) {
         return LOGX_OK;
     }
 
+    // 当前线程是 is_closing.exchange(true) 唯一胜出者，且在 cb->close_requested.store(true) 之前
+    // 任何其他线程均不可能抢先认领销毁，故此处访问 inst 与 cb->pal 绝对安全。
     Instance* inst = cb->inst.load(std::memory_order_acquire);
-    if (inst && inst->space_event && cb->pal) {
-        cb->pal->ev_signal(inst->space_event);
+    Pal* pal = cb->pal;
+    if (inst && inst->space_event && pal) {
+        pal->ev_signal(inst->space_event);
     }
 
-    uint64_t current_tid = cb->pal ? cb->pal->tid() : 0;
-    bool on_flusher = (cb->flusher_tid.load(std::memory_order_acquire) == current_tid);
+    uint64_t current_tid = pal ? pal->tid() : 0;
+    bool on_flusher = (current_tid != 0 &&
+                       cb->flusher_tid.load(std::memory_order_acquire) == current_tid);
 
     // 2. 检查一次静止条件 (仅非 Flusher 线程且外部在途操作与回调均为 0)
     // 决策二方案 B: 必须严格满足 active_ops == 0 && in_callback == 0
     if (!on_flusher &&
-        cb->active_ops.load(std::memory_order_acquire) == 0 &&
-        cb->in_callback.load(std::memory_order_acquire) == 0) {
+        cb->active_ops.load(std::memory_order_seq_cst) == 0 &&
+        cb->in_callback.load(std::memory_order_seq_cst) == 0) {
 
         // ---- 同步快速路径 ----
         Instance* target = cb->inst.exchange(nullptr, std::memory_order_acq_rel);
@@ -547,18 +559,27 @@ logx_status_e logx_close_ex(logx_instance_t* h, bool* out_closed_immediately) {
     }
 
     // ---- 递延关闭路径 (非零即递延，绝不自旋等待) ----
-    cb->close_requested.store(true, std::memory_order_release);
-
-    if (inst) {
+    // R45-03:
+    // (1) 非 Flusher 线程在 active_ops > 0 时严禁提前置位 inst->flusher_exit，
+    //     否则 Flusher 提前退出会导致最后退出的写线程在 destroy_instance 中 flush_blocking 失败；
+    // (2) 若在 Flusher 线程直接调用且无在途操作/回调，在置位 close_requested 前先行通知退出；
+    //     常规 Flusher 回调栈内调用时 in_callback > 0，将由回调退出点 check_deferred_dispose_on_exit
+    //     在确认 active_ops == 0 && in_callback == 0 后置位 flusher_exit；
+    // (3) 严禁在 close_requested.store(true) 之后再解引用裸 inst 或 cb->pal（其他线程可能已抢先销毁）。
+    if (on_flusher && inst &&
+        cb->active_ops.load(std::memory_order_seq_cst) == 0 &&
+        cb->in_callback.load(std::memory_order_seq_cst) == 0) {
         inst->flusher_exit.store(true, std::memory_order_release);
-        if (inst->flush_event && cb->pal) cb->pal->ev_signal(inst->flush_event);
+        if (inst->flush_event && pal) pal->ev_signal(inst->flush_event);
     }
+
+    cb->close_requested.store(true, std::memory_order_seq_cst);
 
     // 兜底双检: 若活跃 op/callback 恰在 store(close_requested) 前退出完毕，且非 Flusher 线程，兜底认领
     if (!on_flusher &&
-        cb->active_ops.load(std::memory_order_acquire) == 0 &&
-        cb->in_callback.load(std::memory_order_acquire) == 0) {
-        if (cb->close_requested.exchange(false, std::memory_order_acq_rel)) {
+        cb->active_ops.load(std::memory_order_seq_cst) == 0 &&
+        cb->in_callback.load(std::memory_order_seq_cst) == 0) {
+        if (cb->close_requested.exchange(false, std::memory_order_seq_cst)) {
             Instance* target = cb->inst.exchange(nullptr, std::memory_order_acq_rel);
             if (target != nullptr) {
                 destroy_instance(cb, target, /*is_flusher_thread=*/false);
@@ -751,14 +772,17 @@ logx_status_e logx_export(logx_instance_t* h, const char* from, const char* to,
 }
 
 logx_status_e logx_set_error_handler(logx_instance_t* h, logx_error_fn fn, void* user) {
-    if (!h) return LOGX_ERR_INVALID_ARG;
-    auto* cb = reinterpret_cast<InstanceControlBlock*>(h);
-    if (cb->is_closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
-    Instance* inst = cb->inst.load(std::memory_order_acquire);
-    if (!inst) return LOGX_ERR_STATE;
+    if (!h) return LOGX_ERR_STATE;
+    OpGuard guard{h};
+    if (!guard.is_valid()) return LOGX_ERR_STATE;
+    Instance* inst = guard.inst;
+    InstanceControlBlock* cb = guard.cb;
     std::lock_guard<std::mutex> lk(inst->err_mu);
     inst->err_fn = fn;
     inst->err_user = user;
+    if (cb) {
+        cb->on_destroy_err_user = user; // R44-09 / R45-07: 同步更新销毁回调错误上下文快照
+    }
     return LOGX_OK;
 }
 
@@ -768,16 +792,12 @@ void logx_get_stats(logx_instance_t* h, logx_stats_t* out) {
         std::memset(out, 0, sizeof(*out));
         return;
     }
-    auto* cb = reinterpret_cast<InstanceControlBlock*>(h);
-    if (cb->is_closing.load(std::memory_order_acquire)) {
+    OpGuard guard{h};
+    if (!guard.is_valid()) {
         std::memset(out, 0, sizeof(*out));
         return;
     }
-    Instance* inst = cb->inst.load(std::memory_order_acquire);
-    if (!inst) {
-        std::memset(out, 0, sizeof(*out));
-        return;
-    }
+    Instance* inst = guard.inst;
     out->drop_no_space    = inst->drop_no_space.load();
     out->drop_too_large   = inst->drop_too_large.load();
     out->truncated_blocks = inst->truncated_blocks.load();
