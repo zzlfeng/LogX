@@ -447,6 +447,9 @@ Java_com_zzlfeng_logx_LogX_nativeInit(JNIEnv* env, jclass /*clazz*/,
 
     if (rc != LOGX_OK) {
         if (kp_ctx) {
+            // R46 P3-08: open 期探活可能已在当前宿主线程 TLS 填入密钥，open 失败时立即清零并登记水位
+            logx_jni::advance_destroyed_watermark(g_jni_destroyed_gen_watermark, kp_ctx->gen);
+            g_tls_key_cache.invalidate_owner(kp_ctx, kp_ctx->gen);
             env->DeleteGlobalRef(kp_ctx->g_provider);
             delete kp_ctx;
         }
@@ -466,6 +469,10 @@ Java_com_zzlfeng_logx_LogX_nativeClose(JNIEnv* /*env*/, jclass /*clazz*/, jlong 
     // 若为处于 Flusher 线程内部或活跃调用栈中的递延销毁, on_destroy 将递延至
     // Flusher 线程退出或 OpGuard 终结时刻安全触发, 此处绝不提前释放上下文(杜绝 UAF 与悬挂指针)。
     logx_close(inst);
+
+    // R46 P3-08: 无论同步销毁(可能已在异线程完成)还是递延销毁，顺手按当前已销毁代数水位
+    // 显式清扫调用 nativeClose 的宿主线程自身 TLS 密钥槽，收窄宿主线程空闲时的明文驻留窗口。
+    g_tls_key_cache.scrub_by_watermark(g_jni_destroyed_gen_watermark.load(std::memory_order_acquire));
 }
 
 JNIEXPORT jint JNICALL

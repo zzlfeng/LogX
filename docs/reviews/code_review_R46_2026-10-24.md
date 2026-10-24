@@ -113,12 +113,12 @@
 - **影响范围**: 当前 `append_block` 全仓仅测试可达，故实际影响为"ACT-6 的'全量'声明不成立"；**一旦该函数被生产路径复用**，将原样复现 R45-06 的死锁形态（Flusher 阻塞于用户密钥回调期间并发 close 误入同步路径 → `thread_join` 死锁），且该函数无 `OpGuard`，并发 close 下直接访问 `inst` 还有 UAF 窗口。
 - **修改建议**: 改为 `key = invoke_key_provider(inst, inst->kid); if (!key) enc_capable = false;`，与 `open_or_create_append_target:583-591` 保持同构。
 
-### P2-02（公开契约变更未声明）`logx_set_error_handler` 空句柄返回码被静默改变
+### P2-02（公开契约注释待补齐）`logx_set_error_handler` 空句柄返回码恢复为 `LOGX_ERR_STATE`，头文件未显式写明各接口空句柄契约
 
 - **位置**: `core/src/logx_c.cpp:775`（`return LOGX_ERR_STATE`），公开头 `core/include/logx_c.h:190`
-- **问题**: 旧行为 `LOGX_ERR_INVALID_ARG` → 新行为 `LOGX_ERR_STATE`。头文件对该接口**没有任何空句柄契约说明**，CHANGELOG 未登记（本提交未改 `CHANGELOG.md`）。同族口径也不一致：`logx_close(nullptr)→INVALID_ARG`、`logx_write/export/get_stats→STATE`。
-- **影响范围**: 公开 C ABI 行为变更。宿主若按 `INVALID_ARG` 做分支（如参数错误告警）会静默改变行为；对"空句柄"语义的跨版本一致性构成破坏。
-- **修改建议**: ① 在 `logx_c.h` 逐接口写明空句柄返回码（建议全族统一为 `LOGX_ERR_STATE`）；② 在 CHANGELOG 增加一条 `Changed` 记录；③ 若需保持向后兼容，可先按旧码返回并在文档标注后续版本统一。
+- **问题**: 历史基线（`431d5ee~1` 及此前版本）中 `logx_set_error_handler(nullptr, ...)` 原本即返回 `LOGX_ERR_STATE`；未发布的中间重构提交 `431d5ee` 误将其改为了 `LOGX_ERR_INVALID_ARG`（见 R45-04），`0ef345f` 将其**恢复为原有的 `LOGX_ERR_STATE`**。但公开头 `logx_c.h` 对各接口的空句柄返回码（`logx_close(nullptr)→INVALID_ARG` vs `logx_write/flush/export/set_error_handler(nullptr)→STATE`）缺乏统一显式说明。
+- **影响范围**: 属于未发布中间提交的回归修复（非对外破坏性变更）；但在公开头文件中显式写明各接口对空句柄与已关闭墓碑句柄的返回码契约，可避免宿主误判。
+- **修改建议**: ① 在 `logx_c.h` 生命周期契约段写明各接口对空句柄及陈旧墓碑句柄的返回码；② 在 CHANGELOG 同步记录。
 
 ### P2-03（空洞断言，R45-10 未实质闭环）10k 轮"内存上界"断言恒真
 
@@ -175,12 +175,12 @@
 - **影响范围**: 仅性能语义（CB 是每实例一次分配、热路径只读 `is_closing`/`active_ops`，伪共享影响有限）。
 - **修改建议**: 要么把文案改为"sizeof ≤ 64B"（如实描述），要么真正加 `alignas(64)` 并把断言改为 `sizeof == 64 && alignof == 64`（注意与 `new` 的对齐支持）。
 
-### P3-07（语义失真，当前无消费方）同步快路径在未认领成功时仍报"立即关闭"
+### P3-07（防御性分支对称性打磨，当前不可达且无消费方）同步快路径置 `*out_closed_immediately = true` 未放入 `if (target != nullptr)` 块内
 
 - **位置**: `core/src/logx_c.cpp:553-557`
-- **问题**: `cb->inst.exchange(nullptr)` 返回 `nullptr`（已被他线程认领）时仍置 `*out_closed_immediately = true`，但此刻实例可能仍在 `flush_blocking`+`thread_join` 中未销毁完成。
-- **影响范围**: 本提交前已存在；JNI 侧 `nativeClose` 不消费该出参，故无实际后果；但公开头文件对该出参的语义描述不含此情形。
-- **修改建议**: 仅在 `target != nullptr` 时置真，或把头文件语义细化为"本调用完成或确认他方已认领销毁"。
+- **问题**: `if (target != nullptr)` 块外无条件置 `*out_closed_immediately = true`。注：由于到达 `:553` 的线程是 `is_closing.exchange(true)` 的唯一胜出者，且此时 `:576` 的 `close_requested.store(true)` 尚未执行，全仓其余 `inst.exchange(nullptr)` 均受 `close_requested.exchange(false)` 保护，故正常生命周期下此处的 `target` 恒非空（`target == nullptr` 为不可达防御分支）；但将其移入 `if (target != nullptr)` 内可与 `:584-587` 兜底双检分支保持严格对称。
+- **影响范围**: 无实际运行时后果；属防御性代码对称性与语义严谨性打磨。
+- **修改建议**: 仅在 `target != nullptr` 时置 `*out_closed_immediately = true`。
 
 ### P3-08（安全目标部分达成）TLS 明文密钥仅"下次 lookup 时"清零
 
@@ -207,11 +207,11 @@
 
 **建议的收口顺序**：
 
-| 顺序 | 项 | 理由 |
-|---|---|---|
-| 1 | P2-01 补 `append_block` 门禁 | 与 ACT-6 同类缺陷，改动 3 行，消除潜在 P1 |
-| 2 | P2-04 消除测试数据竞争 | 影响 CI 稳定性，改动局限在用例 |
-| 3 | P2-03 换成真实内存断言 | 否则 R45-10 的门禁形同虚设 |
-| 4 | P2-02 契约与 CHANGELOG 登记 | 公开行为变更应有痕迹 |
-| 5 | P3-01/02/03/04 | 注释与文档修订，零风险 |
-| 6 | P3-05/06/07/08 | 流程与语义打磨 |
+| 顺序 | 项 | 理由 | 状态 |
+|---|---|---|:---:|
+| 1 | P2-01 补 `append_block` 门禁 | 与 ACT-6 同类缺陷，改动 3 行，消除潜在 P1 | ✅ 已闭环 |
+| 2 | P2-04 消除测试数据竞争 | 影响 CI 稳定性，改动局限在用例 | ✅ 已闭环 |
+| 3 | P2-03 换成真实内存断言 | 否则 R45-10 的门禁形同虚设 | ✅ 已闭环 |
+| 4 | P2-02 契约与 CHANGELOG 登记 | 公开头显式写明空句柄/陈旧句柄返回码契约 | ✅ 已闭环 |
+| 5 | P3-01/02/03/04 | 注释与文档修订、`cb->pal` 原子化，零风险 | ✅ 已闭环 |
+| 6 | P3-05/06/07/08 | 流程与语义打磨、`nativeClose` 主动清扫宿主 TLS | ✅ 已闭环 |

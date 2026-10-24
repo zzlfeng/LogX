@@ -511,6 +511,18 @@ TEST(JniKeyCache, LookupEntryScrubsStaleAndDestroyedWatermarkSlots) {
     for (int i = 0; i < 32; ++i) {
         EXPECT_EQ(cache.slot(1).key[i], 0);
     }
+
+    // 3. R46 P3-08: 验证 scrub_by_watermark 可供 nativeClose 在递延关闭时主动清扫当前宿主线程已达水位的全部残留槽
+    uint8_t* k_host = cache.allocate_slot(&ctx_c, /*gen=*/6, /*kid=*/30, watermark.load());
+    ASSERT_NE(k_host, nullptr);
+    std::memset(k_host, 0xCC, 32);
+    ASSERT_TRUE(cache.slot(0).valid);
+    logx_jni::advance_destroyed_watermark(watermark, 6);
+    cache.scrub_by_watermark(watermark.load());
+    EXPECT_FALSE(cache.slot(0).valid);
+    for (int i = 0; i < 32; ++i) {
+        EXPECT_EQ(cache.slot(0).key[i], 0) << "scrub_by_watermark 必须立即清零宿主线程已销毁代数的明文密钥";
+    }
 }
 
 

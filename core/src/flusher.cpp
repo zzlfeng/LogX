@@ -1148,11 +1148,10 @@ bool append_block(Instance* inst,
         if (inst->pal->file_pread(fd, salt, 8, 12) != 8) { inst->pal->file_close(fd); return false; }
     }
     if (sz == 0) {
-        // R20 复核 (F-6 残留): 与 open_or_create_append_target 同款纪律,
-        // 建文件时刻探测密钥, 文件头加密位与预期块形态一致。
+        // R20 复核 (F-6 残留) + R46 P2-01 (ACT-6 补齐): 与 open_or_create_append_target 同款纪律,
+        // 建文件时刻经 invoke_key_provider(纳入 in_callback 门禁)探测密钥, 文件头加密位与预期块形态一致。
         bool enc_capable = true;
-        if (inst->encrypt_enable != 0 &&
-            (!inst->key_provider || !inst->key_provider(inst->kid, inst->key_user))) {
+        if (inst->encrypt_enable != 0 && !invoke_key_provider(inst, inst->kid)) {
             enc_capable = false;
             emit_event(inst, LOGX_EV_DEGRADED, -1,
                        "key unavailable at file creation; file header written without encrypted bit");

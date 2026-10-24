@@ -78,6 +78,31 @@ inline void test_set_retention_days(Instance* inst, uint32_t days) {
     }
 }
 
+// R46 P2-04: 无数据竞争注入 key_provider 的测试辅助。
+// 必须先暂停并 join Flusher 线程，在单线程静止态下修改 encrypt_enable/kid/key_user/key_provider，
+// 再重新启动 Flusher 线程，彻底消除对运行中 Flusher 写入非原子字段的形式数据竞争(UB)。
+inline void test_inject_key_provider_quiesced(logx_instance_t* h,
+                                              uint16_t kid,
+                                              const uint8_t* (*kp)(uint16_t, void*),
+                                              void* key_user) {
+    Instance* inst = test_get_instance(h);
+    if (!inst || !inst->pal) return;
+    if (inst->flusher_thread) {
+        inst->flusher_exit.store(true, std::memory_order_release);
+        if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
+        inst->pal->thread_join(inst->flusher_thread);
+        inst->flusher_thread = nullptr;
+    }
+    inst->flusher_exit.store(false, std::memory_order_release);
+    inst->encrypt_enable = true;
+    inst->kid = kid;
+    inst->key_user = key_user;
+    inst->key_provider = kp;
+    if (inst->pal->thread_start(&flusher_main, inst, &inst->flusher_thread) == 0) {
+        inst->flusher_running.store(true, std::memory_order_release);
+    }
+}
+
 // 模拟进程强杀/崩溃：绕过正常 close flush, 强制停止 flusher 并释放资源。
 // 注意 (R45-08): 本函数仅用于单线程崩溃恢复模拟测试，故意销毁控制块 (delete cb)
 // 而不做墓碑保留，严禁用于正常并发关闭路径或陈旧句柄访问测试。

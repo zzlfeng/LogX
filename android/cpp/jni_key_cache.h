@@ -89,6 +89,14 @@ public:
         }
     }
 
+    // R46 P3-08: 显式按全局已销毁代数水位清扫当前线程 TLS 槽位。
+    // 供 nativeClose 在递延关闭路径返回时主动清零调用方宿主线程(如 open 探活或 export 解密线程)的已销毁或待销毁槽位，
+    // 最大限度收窄空闲宿主线程的 TLS 明文密钥驻留窗口。
+    void scrub_by_watermark(uint64_t destroyed_watermark) {
+        if (destroyed_watermark == 0) return;
+        scrub_stale_slots(nullptr, 0, destroyed_watermark);
+    }
+
     const Slot& slot(size_t idx) const { return slots_[idx]; }
     static constexpr size_t capacity() { return N; }
 

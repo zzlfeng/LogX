@@ -330,7 +330,7 @@ struct OpGuard {
 
 void destroy_instance(InstanceControlBlock* cb, Instance* inst, bool is_flusher_thread) {
     if (!inst) return;
-    Pal* pal = cb ? cb->pal : inst->pal;
+    Pal* pal = cb ? cb->pal.load(std::memory_order_acquire) : inst->pal;
     // 先做一次同步 flush,确保 staging 全部落块(仅非 Flusher 线程可调用, 杜绝自死锁)
     if (!is_flusher_thread) {
         flush_blocking(inst);
@@ -369,7 +369,7 @@ void destroy_instance(InstanceControlBlock* cb, Instance* inst, bool is_flusher_
 
     if (cb) {
         cb->flusher_tid.store(0, std::memory_order_release); // R44-08 / R45-09: 清零 flusher_tid 防 TID 复用误判
-        cb->pal = nullptr; // R44-10: 清空 pal 避免陈旧句柄解引用已析构的 Pal
+        cb->pal.store(nullptr, std::memory_order_release);   // R44-10 / R46 P3-02: 原子置空 pal 避免陈旧句柄解引用已析构的 Pal
     }
 
     if (on_destroy) {
@@ -466,7 +466,7 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->pal = cfg->pal_override != nullptr
         ? static_cast<Pal*>(cfg->pal_override)
         : &default_pal();
-    cb->pal = inst->pal;
+    cb->pal.store(inst->pal, std::memory_order_relaxed);
 
     inst->mu = inst->pal->mutex_create();
     inst->flush_event = inst->pal->ev_create();
@@ -534,7 +534,7 @@ logx_status_e logx_close_ex(logx_instance_t* h, bool* out_closed_immediately) {
     // 当前线程是 is_closing.exchange(true) 唯一胜出者，且在 cb->close_requested.store(true) 之前
     // 任何其他线程均不可能抢先认领销毁，故此处访问 inst 与 cb->pal 绝对安全。
     Instance* inst = cb->inst.load(std::memory_order_acquire);
-    Pal* pal = cb->pal;
+    Pal* pal = cb->pal.load(std::memory_order_acquire);
     if (inst && inst->space_event && pal) {
         pal->ev_signal(inst->space_event);
     }
@@ -553,8 +553,8 @@ logx_status_e logx_close_ex(logx_instance_t* h, bool* out_closed_immediately) {
         Instance* target = cb->inst.exchange(nullptr, std::memory_order_acq_rel);
         if (target != nullptr) {
             destroy_instance(cb, target, /*is_flusher_thread=*/false);
+            if (out_closed_immediately) *out_closed_immediately = true; // R46 P3-07: 仅真实认领销毁成功时置真
         }
-        if (out_closed_immediately) *out_closed_immediately = true;
         return LOGX_OK;
     }
 

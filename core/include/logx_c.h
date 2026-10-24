@@ -121,12 +121,14 @@ typedef struct logx_config {
      * 非 NULL 时要求 Pal 对象存活期覆盖整个实例生命周期。 */
     void* pal_override;          /* 实际类型 logx::Pal*;仅测试构建使用 */
 
-    /* J-1/F-2 / R45-12: 实例完全销毁时的清理回调(可选,由 destroy_instance 最终退出前调用)。
-     * 无论同步还是递延销毁,该回调保证在 Flusher 线程已退出、staging 已关闭、
-     * 库内所有对 user/err_user 的访问全部终结后触发。
+    /* J-1/F-2 / R45-12 / R46 P3-03: 实例完全销毁时的清理回调(可选,由 destroy_instance 最终退出前调用)。
+     * 无论同步还是递延销毁,该回调保证在 Flusher 主循环已退出(flusher_loop 已完成尾轮刷盘与同步并退出)、
+     * staging 已关闭、库内所有对 user/err_user 的访问全部终结后触发。
      * 线程模型约束: 执行线程为最后完成销毁认领的线程(可能是调用 logx_close 的线程、
-     * 最后退出的并发操作线程或 Flusher 后台线程),实现方不得依赖回调线程身份,
-     * 亦不得仅依赖在 on_destroy 内清理跨线程 thread_local 状态。
+     * 最后退出的并发操作线程或正在退出途中的 Flusher 后台线程),实现方不得依赖回调线程身份,
+     * 亦不得仅依赖在 on_destroy 内清理跨线程 thread_local 状态(R46 P3-08: 跨线程 TLS 缓存如 JNI 密钥槽
+     * 采用调用方线程主动清扫 + 全局已销毁代数水位惰性清扫策略,销毁后不再触发回调的完全空闲线程其 TLS
+     * 槽位将保留至下次探测或线程终结)。
      * 若未提供,则由调用方自行根据 logx_close_ex 返回值或生命周期纪律管理。 */
     void (*on_destroy)(void* user, void* err_user);
 } logx_config_t;
@@ -144,6 +146,11 @@ typedef struct logx_instance logx_instance_t;
 #endif
 
 /* ===== 生命周期 ===== */
+/* 空句柄/陈旧句柄返回码契约 (R45-04 / R46 P2-02):
+ *   - logx_open: out_inst == NULL 或 cfg 必填项非法返回 LOGX_ERR_INVALID_ARG;
+ *   - logx_close / logx_close_ex: inst == NULL 返回 LOGX_ERR_INVALID_ARG;已关闭的陈旧墓碑句柄幂等返回 LOGX_OK;
+ *   - logx_write / logx_flush / logx_export / logx_set_error_handler: inst == NULL 或已关闭墓碑句柄统一返回 LOGX_ERR_STATE;
+ *   - logx_get_stats: inst == NULL 或已关闭墓碑句柄时将 *out 清零返回。 */
 logx_status_e logx_open(const logx_config_t* cfg,
                         logx_instance_t** out_inst);
 

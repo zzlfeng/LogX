@@ -149,6 +149,7 @@
 | `431d5ee` | refactor(core,pal,test,docs): T5.8 生命周期堆控制块重构落地——CB 墓碑模型根治尾读 UAF，收敛 Dekker 竞态与原生句柄泄漏 |
 | `eba54ff`~`e834e60` | docs(review): R45 代码审查与复核——4×P0/3×P1/5×P2（R45-08 经复核由 P1 下调 P2） |
 | `0ef345f` | fix(core,jni,test,docs): R45 审查 12 项缺陷收口（ACT-1~8）——闭合 CB 墓碑并发内存序、递延排空与跨线程 TLS 密钥惰性清零 |
+| `1bc549a`~`4b1b16d` | docs(review): R46 审查报告入库（7 成立 / 4 部分 / 1 未完成，新捕获 4×P2+8×P3）及 T5.8 文档同步 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -712,8 +713,8 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **重构落地 (`431d5ee`)**：按上述决策完成 CB 墓碑、`OpGuard` 热路径守卫、`destroy_instance` 统一收尾、`test_accessor.h` 迁移与文档 v1.2 同步；`InstanceControlBlock` 收敛至 **64B（`sizeof` 实测 64、`alignof` 实测 8）**，`static_assert` 约束单缓存行。
    - **R45 审查与复核 (`eba54ff` → `e834e60`)**：独立复审捕获 **4×P0 / 3×P1 / 5×P2**（R45-08 经复核由 P1 下调 P2）——`OpGuard` 早退分支漏认领致永久泄漏、拆除 `seq_cst` 引发 4 组 Dekker 重排、递延 `close` 尾读 UAF 与过早停 Flusher 致关停未排空、`set_error_handler`/`get_stats` 缺 `OpGuard` 仍是 UAF 面，另有 `thread_detach` 空洞绿测试、`key_provider` 未纳入回调门禁、`on_destroy` 跨线程触发致宿主 TLS 密钥残留等。全文见 [`docs/reviews/code_review_R45_2026-10-24.md`](./docs/reviews/code_review_R45_2026-10-24.md)。
    - **修复收口 (`0ef345f`，14 文件 +709/−273)**：ACT-1~8 全部落地——两处早退回滚在 `active_ops` 归零时触发 `check_deferred_dispose_on_exit`；`OpGuard`/`emit_event`/`invoke_key_provider`/`check_deferred`/`close_ex`/`flusher_main` 六处恢复 `seq_cst`；`close_requested.store` 后移使递延路径不再裸读 `inst`，`flusher_exit` 改由 `destroy_instance` 在 `flush_blocking` 之后置位；两接口接入 `OpGuard` 并在 `err_mu` 内同步 `on_destroy_err_user`；`FlusherSelfDestroyThreadDetachNoLeak` 改由 Flusher 线程真实触发并断言 `thread_detach_count == 1 / thread_join_count == 0`；`key_provider` 封装进 `in_callback` 门禁；`test_accessor.h` 迁入 `tests/` 并补齐 3 个 target 的 include 路径；`on_destroy` 线程契约补注与 JNI 已销毁代数水位惰性清扫。
-   - **R46 独立复核 (`code_review_R46_2026-10-24.md`)**：实证 **203/203 单测、4/4 压力测试、生命周期并发用例 20 轮无抖动**，无 P0/P1 阻断项、可入库；但"12 项全量收口"应修正为 **7 项成立 / 4 项部分 / 1 项未完成**（未完成：R45-11 文档与实装对齐），另新发现 **4×P2 + 8×P3**。
-   - **R46 待收口项（下一批次输入）**：`P2-01` `flusher.cpp:1155` 仍裸调 `key_provider`（当前仅测试可达，进生产即复现 R45-06 死锁）；`P2-02` `logx_set_error_handler(nullptr)` 返回码由 `INVALID_ARG` 静默改为 `STATE` 未在头文件与 CHANGELOG 声明；`P2-03` `OpenCloseMemoryBounded` 内存上界断言为恒真式（`sizeof × 10000 ≤ 640KB`），R45-10 门禁实质未建立；`P2-04` 新增 key_provider 用例在 `logx_open` 后改写非原子字段，与运行中 Flusher 构成数据竞争；`P3-01`~`P3-08` 覆盖 `check_deferred` 隐式 join 不变量、`cb->pal` 非原子并发读写、`logx_c.h` 线程模型文案自相矛盾、计划文档字段脱节、ACT 勾选与登记、64B 断言未约束对齐、同步快路径 `out_closed_immediately` 语义失真、TLS 明文仅"下次 lookup"清零。
+   - **R46 独立复核 (`code_review_R46_2026-10-24.md`)**：实证 **203/203 单测、4/4 压力测试、生命周期并发用例 20 轮无抖动**，无 P0/P1 阻断项、可入库；但"12 项全量收口"修正为 **7 项成立 / 4 项部分 / 1 项未完成**，另新发现 **4×P2 + 8×P3**。
+   - **R46 全部发现当场收口闭环**：`P2-01` `flusher.cpp:1154` `append_block` 补走 `invoke_key_provider`；`P2-02` 在 `logx_c.h` 显式写明各接口空句柄与已关闭墓碑句柄返回码契约（纠偏历史基线：重构前 `logx_set_error_handler(nullptr)` 即返回 `LOGX_ERR_STATE`，`0ef345f` 系恢复 `431d5ee` 引入的未发布回归）；`P2-03` `OpenCloseMemoryBounded` 升级为 `FastCountingPal` 五类底层资源 100% 配对净零 + 预热后 10k 轮进程真实内存增量 ≤ 8MB 双重刚性断言；`P2-04` 新增 `test_inject_key_provider_quiesced` 先停止并 join Flusher 再注入回调，彻底消除对运行中 Flusher 改写非原子字段的数据竞争；`P3-01`~`P3-08` 补齐 `check_deferred` 隐式 join 不变量注释、`cb->pal` 升级为 `std::atomic<Pal*>`、`logx_c.h` 修正为"Flusher 主循环已退出"、计划与决策文档升至 v1.4、R45 ACT-1~8 全量勾选闭环、64B 断言文案对齐、同步快路径 `out_closed_immediately` 移入 `if (target != nullptr)` 内、`TlsKeyCache` 新增 `scrub_by_watermark` 并在 `nativeClose`/`nativeOpen` 失败路径主动清扫宿主线程 TLS；MSVC clean 构建 + CTest 4/4 与 Android NDK Clang clean 61/61 TU 0 警告全绿通过。
 
 ---
 

@@ -48,6 +48,19 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#elif defined(__linux__) || defined(__ANDROID__)
+#include <unistd.h>
+#endif
+
 using namespace logx;
 
 namespace {
@@ -2875,18 +2888,58 @@ TEST(ControlBlockLifetime, ConcurrentDoubleCloseIdempotent) {
 
 
 
-// 4. 10000 轮快速 open/close 墓碑内存上界压测 (R44-01 / R45-10 / 决策一)
+// 4. 10000 轮快速 open/close 墓碑内存上界压测 (R44-01 / R45-10 / R46 P2-03 / 决策一)
 TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
     static_assert(sizeof(InstanceControlBlock) <= 64,
-                  "InstanceControlBlock must fit within a single 64-byte cache line");
+                  "InstanceControlBlock size must stay <= 64 bytes for bounded tombstone footprint");
+
+    // 采样当前进程常驻集 / 提交内存 (R46 P2-03: 真实运行期内存上界断言，拒绝恒真式)
+    auto sample_proc_mem_bytes = []() -> uint64_t {
+#if defined(_WIN32)
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        if (::GetProcessMemoryInfo(::GetCurrentProcess(),
+                                   reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                                   sizeof(pmc))) {
+            return static_cast<uint64_t>(pmc.PrivateUsage > 0 ? pmc.PrivateUsage : pmc.WorkingSetSize);
+        }
+        return 0;
+#elif defined(__linux__) || defined(__ANDROID__)
+        std::FILE* f = std::fopen("/proc/self/statm", "r");
+        if (!f) return 0;
+        unsigned long total_pages = 0, resident_pages = 0;
+        const int n = std::fscanf(f, "%lu %lu", &total_pages, &resident_pages);
+        std::fclose(f);
+        if (n != 2) return 0;
+        long ps = ::sysconf(_SC_PAGESIZE);
+        if (ps <= 0) ps = 4096;
+        return static_cast<uint64_t>(resident_pages) * static_cast<uint64_t>(ps);
+#else
+        return 0;
+#endif
+    };
 
     // 轻量包装 Pal: 绕过测试循环中的磁盘同步 I/O (mmap_sync/file_fsync)，
+    // 同时严格追踪 fd / mmap / mutex / event / thread 全部 5 类资源配对计数 (R46 P2-03)，
     // 专注验证 10k 轮真实 logx_open/logx_close 生命周期下 Instance/Staging 完整释放且 CB 墓碑内存有界。
-    class FastNoSyncPal : public Pal {
+    class FastCountingPal : public Pal {
     public:
-        explicit FastNoSyncPal(Pal* r) : r_(r) {}
-        int file_open(const char* p, bool cr, bool ap) override { return r_->file_open(p, cr, ap); }
-        int file_close(int fd) override { return r_->file_close(fd); }
+        explicit FastCountingPal(Pal* r) : r_(r) {}
+        std::atomic<int64_t> fd_open_cnt{0}, fd_close_cnt{0};
+        std::atomic<int64_t> mmap_open_cnt{0}, mmap_close_cnt{0};
+        std::atomic<int64_t> mu_create_cnt{0}, mu_destroy_cnt{0};
+        std::atomic<int64_t> ev_create_cnt{0}, ev_destroy_cnt{0};
+        std::atomic<int64_t> th_start_cnt{0}, th_end_cnt{0};
+
+        int file_open(const char* p, bool cr, bool ap) override {
+            int fd = r_->file_open(p, cr, ap);
+            if (fd >= 0) fd_open_cnt.fetch_add(1, std::memory_order_relaxed);
+            return fd;
+        }
+        int file_close(int fd) override {
+            int rc = r_->file_close(fd);
+            if (rc == 0) fd_close_cnt.fetch_add(1, std::memory_order_relaxed);
+            return rc;
+        }
         int file_truncate(int fd, uint64_t l) override { return r_->file_truncate(fd, l); }
         long file_write(int fd, const void* b, size_t l) override { return r_->file_write(fd, b, l); }
         long file_pwrite(int fd, const void* b, size_t l, uint64_t o) override { return r_->file_pwrite(fd, b, l, o); }
@@ -2899,19 +2952,54 @@ TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
         int file_mkdirs(const char* d) override { return r_->file_mkdirs(d); }
         int file_rmdir(const char* d) override { return r_->file_rmdir(d); }
         std::vector<std::string> file_list(const char* d) override { return r_->file_list(d); }
-        PalMmap mmap_open(int fd, size_t l, bool w) override { return r_->mmap_open(fd, l, w); }
+        PalMmap mmap_open(int fd, size_t l, bool w) override {
+            PalMmap m = r_->mmap_open(fd, l, w);
+            if (m.base != nullptr) mmap_open_cnt.fetch_add(1, std::memory_order_relaxed);
+            return m;
+        }
         int mmap_sync(const PalMmap&, bool) override { return 0; }
-        int mmap_close(const PalMmap& m) override { return r_->mmap_close(m); }
-        void* mutex_create() override { return r_->mutex_create(); }
-        void mutex_destroy(void* m) override { r_->mutex_destroy(m); }
+        int mmap_close(const PalMmap& m) override {
+            if (m.base == nullptr) return r_->mmap_close(m);
+            int rc = r_->mmap_close(m);
+            if (rc == 0) mmap_close_cnt.fetch_add(1, std::memory_order_relaxed);
+            return rc;
+        }
+        void* mutex_create() override {
+            void* m = r_->mutex_create();
+            if (m) mu_create_cnt.fetch_add(1, std::memory_order_relaxed);
+            return m;
+        }
+        void mutex_destroy(void* m) override {
+            if (m) mu_destroy_cnt.fetch_add(1, std::memory_order_relaxed);
+            r_->mutex_destroy(m);
+        }
         void mutex_lock(void* m) override { r_->mutex_lock(m); }
         void mutex_unlock(void* m) override { r_->mutex_unlock(m); }
         int threading_init() override { return r_->threading_init(); }
-        int thread_start(void* (*fn)(void*), void* arg, void** out) override { return r_->thread_start(fn, arg, out); }
-        int thread_join(void* t) override { return r_->thread_join(t); }
-        int thread_detach(void* t) override { return r_->thread_detach(t); }
-        void* ev_create() override { return r_->ev_create(); }
-        void ev_destroy(void* e) override { r_->ev_destroy(e); }
+        int thread_start(void* (*fn)(void*), void* arg, void** out) override {
+            int rc = r_->thread_start(fn, arg, out);
+            if (rc == 0) th_start_cnt.fetch_add(1, std::memory_order_relaxed);
+            return rc;
+        }
+        int thread_join(void* t) override {
+            int rc = r_->thread_join(t);
+            if (rc == 0) th_end_cnt.fetch_add(1, std::memory_order_relaxed);
+            return rc;
+        }
+        int thread_detach(void* t) override {
+            int rc = r_->thread_detach(t);
+            if (rc == 0) th_end_cnt.fetch_add(1, std::memory_order_relaxed);
+            return rc;
+        }
+        void* ev_create() override {
+            void* e = r_->ev_create();
+            if (e) ev_create_cnt.fetch_add(1, std::memory_order_relaxed);
+            return e;
+        }
+        void ev_destroy(void* e) override {
+            if (e) ev_destroy_cnt.fetch_add(1, std::memory_order_relaxed);
+            r_->ev_destroy(e);
+        }
         void ev_signal(void* e) override { r_->ev_signal(e); }
         void ev_wait(void* e) override { r_->ev_wait(e); }
         bool ev_wait_timeout(void* e, uint32_t ms) override { return r_->ev_wait_timeout(e, ms); }
@@ -2930,7 +3018,7 @@ TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
     };
 
     Pal& pal = default_pal();
-    FastNoSyncPal fast_pal(&pal);
+    FastCountingPal fast_pal(&pal);
     std::string dir = make_tmp_dir("logx_test_cb_mem_bound_");
     pal.file_mkdirs(dir.c_str());
     std::string staging = dir + "/staging.mmap";
@@ -2947,6 +3035,16 @@ TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
         static_cast<std::atomic<int>*>(u)->fetch_add(1, std::memory_order_relaxed);
     };
 
+    // 先预热 50 轮使 CRT / 线程池 / 页面分配器进入稳态，再采集内存基线
+    constexpr int kWarmup = 50;
+    for (int i = 0; i < kWarmup; ++i) {
+        logx_instance_t* w_inst = nullptr;
+        ASSERT_EQ(logx_open(&cfg, &w_inst), LOGX_OK);
+        ASSERT_EQ(logx_close(w_inst), LOGX_OK);
+    }
+    destroy_cnt.store(0, std::memory_order_relaxed);
+    const uint64_t mem_before = sample_proc_mem_bytes();
+
     constexpr int kRounds = 10000;
     int opened_cnt = 0;
     for (int i = 0; i < kRounds; ++i) {
@@ -2958,14 +3056,30 @@ TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
         // 每次 close 后陈旧墓碑句柄访问必须安全且 inst 已置空
         EXPECT_EQ(logx::test::test_get_instance(inst), nullptr);
     }
+    const uint64_t mem_after = sample_proc_mem_bytes();
+
     EXPECT_EQ(opened_cnt, kRounds);
     EXPECT_EQ(destroy_cnt.load(), kRounds);
-    // 10k 轮 CB 墓碑总结构体净体积上界 <= 640KB (64B * 10000)
-    EXPECT_LE(sizeof(InstanceControlBlock) * static_cast<size_t>(kRounds), 640u * 1024u);
+
+    // R46 P2-03 刚性断言 1: 全部 5 类底层资源必须 100% 严格配对释放 (若注释掉 delete inst->staging 或 destroy_instance 即必红)
+    EXPECT_EQ(fast_pal.fd_open_cnt.load(), fast_pal.fd_close_cnt.load());
+    EXPECT_EQ(fast_pal.mmap_open_cnt.load(), fast_pal.mmap_close_cnt.load());
+    EXPECT_EQ(fast_pal.mu_create_cnt.load(), fast_pal.mu_destroy_cnt.load());
+    EXPECT_EQ(fast_pal.ev_create_cnt.load(), fast_pal.ev_destroy_cnt.load());
+    EXPECT_EQ(fast_pal.th_start_cnt.load(), fast_pal.th_end_cnt.load());
+
+    // R46 P2-03 刚性断言 2: 实测进程内存增长上界 <= 8MB
+    // (10k 个 64B CB 墓碑含分配器元数据约 ~1MB; 若 Staging 128KB/轮或 Instance 泄漏则高达 >1.2GB 必红)
+    if (mem_before > 0 && mem_after > mem_before) {
+        const uint64_t growth_bytes = mem_after - mem_before;
+        EXPECT_LE(growth_bytes, 8ull * 1024ull * 1024ull)
+            << "10k open/close 内存增量越界 (before=" << mem_before << ", after=" << mem_after << ")";
+    }
     cleanup_dir(dir);
 }
 
-// 5. R45-06 (ACT-6): Flusher 线程阻塞于 key_provider 回调期间，并发 logx_close 必须转递延，绝不死锁
+// 5. R45-06 (ACT-6) & R46 P2-01/P2-04: Flusher 线程阻塞于 key_provider 回调期间，并发 logx_close 必须转递延，绝不死锁；
+//    同时覆盖 append_block 入口的 invoke_key_provider 门禁保护
 TEST(ControlBlockLifetime, FlusherBlockedInKeyProviderConcurrentCloseNoDeadlock) {
     Pal& pal = default_pal();
     std::string dir = make_tmp_dir("logx_test_r45_kp_block_");
@@ -2976,13 +3090,15 @@ TEST(ControlBlockLifetime, FlusherBlockedInKeyProviderConcurrentCloseNoDeadlock)
         std::atomic<bool> entered_kp{false};
         std::atomic<bool> release_kp{false};
         std::atomic<bool> destroyed{false};
+        std::atomic<int>  max_in_callback_seen{0};
+        logx_instance_t*  handle_for_probe{nullptr};
     } sync;
 
     logx_config_t cfg{};
     cfg.log_dir = dir.c_str();
     cfg.staging_path = staging.c_str();
     cfg.max_log_length = 64 * 1024;
-    cfg.flush_threshold = 0; // 先禁用自动唤醒，待注入 key_provider 后再触发
+    cfg.flush_threshold = 0; // 先禁用自动唤醒，待静止态注入 key_provider 后再触发
     cfg.user = &sync;
     cfg.on_destroy = [](void* u, void*) {
         static_cast<KpSync*>(u)->destroyed.store(true, std::memory_order_release);
@@ -2990,15 +3106,17 @@ TEST(ControlBlockLifetime, FlusherBlockedInKeyProviderConcurrentCloseNoDeadlock)
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    sync.handle_for_probe = inst;
 
-    // 通过测试 seam 挂载阻塞式 key_provider (兼容桌面 LOGX_WITH_AESGCM=OFF 构建)
-    Instance* raw_inst = logx::test::test_get_instance(inst);
-    ASSERT_NE(raw_inst, nullptr);
-    raw_inst->encrypt_enable = true;
-    raw_inst->kid = 1;
-    raw_inst->key_user = &sync;
-    raw_inst->key_provider = [](uint16_t, void* u) -> const uint8_t* {
+    // R46 P2-04: 通过 test_inject_key_provider_quiesced 先暂停并 join Flusher 线程，
+    // 在静止态下挂载阻塞式 key_provider 后重启 Flusher，彻底消除对运行中 Flusher 写入非原子字段的数据竞争(UB)
+    auto blocking_kp = [](uint16_t, void* u) -> const uint8_t* {
         auto* s = static_cast<KpSync*>(u);
+        if (auto* cb = logx::test::test_get_cb(s->handle_for_probe)) {
+            int cur = cb->in_callback.load(std::memory_order_seq_cst);
+            int prev = s->max_in_callback_seen.load(std::memory_order_relaxed);
+            while (cur > prev && !s->max_in_callback_seen.compare_exchange_weak(prev, cur)) {}
+        }
         s->entered_kp.store(true, std::memory_order_release);
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (!s->release_kp.load(std::memory_order_acquire) &&
@@ -3007,6 +3125,31 @@ TEST(ControlBlockLifetime, FlusherBlockedInKeyProviderConcurrentCloseNoDeadlock)
         }
         return nullptr; // 返回 nullptr 触发明文降级，无需真实 AES-GCM 链接
     };
+    logx::test::test_inject_key_provider_quiesced(inst, /*kid=*/1, blocking_kp, &sync);
+
+    Instance* raw_inst = logx::test::test_get_instance(inst);
+    ASSERT_NE(raw_inst, nullptr);
+
+    // R46 P2-01: 先直接验证 append_block 建文件探测分支已纳入 invoke_key_provider (in_callback > 0)
+    {
+        sync.release_kp.store(true, std::memory_order_release); // 首轮直通探针
+        uint8_t salt[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        std::vector<uint8_t> raw_blk = make_entry(32, 'A');
+        uint64_t b_start = 0, b_end = 0;
+        EXPECT_TRUE(append_block(raw_inst, salt, /*kid=*/1, raw_blk.data(),
+                                 static_cast<uint32_t>(raw_blk.size()), /*seqno=*/1,
+                                 /*flag=*/0, &b_start, &b_end));
+        EXPECT_GE(sync.max_in_callback_seen.load(), 1)
+            << "R46 P2-01: append_block 调用 key_provider 时必须经 invoke_key_provider 递增 in_callback";
+        // 删除 append_block 生成的测试文件，以便后续 Flusher 重新走建文件探测分支阻塞
+        for (const auto& f : pal.file_list(dir.c_str())) {
+            if (f.find(".log") != std::string::npos) {
+                pal.file_unlink(f.c_str());
+            }
+        }
+        sync.entered_kp.store(false, std::memory_order_release);
+        sync.release_kp.store(false, std::memory_order_release);
+    }
 
     // 写入一条记录并手动唤醒 Flusher 进入 open_or_create_append_target -> invoke_key_provider
     const char* msg = "kp_in_callback_guard_test";

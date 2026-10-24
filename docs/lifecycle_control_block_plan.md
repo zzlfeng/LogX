@@ -1,15 +1,14 @@
 # LogX 1.x 生命周期堆控制块（Control Block）重构实施计划 (T5.8 / R41-05 根治)
 
-> **版本**: v1.3 (2026-10-24)  
+> **版本**: v1.4 (2026-10-24)  
 > **任务编号**: T5.8 (登记于 `docs/LogX后续实施计划表.md` §2 阶段三任务表)  
-> **当前状态**: 🔧 **主体已落地（`431d5ee` 重构 + `0ef345f` 收口），尚未收口完成**——R46 复核判定 R45 十二项为 **7 成立 / 4 部分 / 1 未完成**，另新发现 **4×P2 + 8×P3** 待闭环（清单见 §七）；发布状态仍为「未发布 / 进行中」  
-> **关联裁决**: [`lifecycle_control_block_decisions.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_decisions.md) v1.3 (6 大决策项正式拍板)  
+> **当前状态**: ✅ **代码与双端编译已全量收口完成（`431d5ee` 重构 + `0ef345f` R45 收口 + R46 4×P2/8×P3 全量闭环）**——MSVC clean 0 警告 + CTest 4/4（203 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复）全绿 + Android NDK Clang clean 61/61 TU 0 警告通过；仅待真机复跑 P50 ≤ 4.2µs 确认后恢复正式发布状态  
+> **关联裁决**: [`lifecycle_control_block_decisions.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_decisions.md) v1.4 (6 大决策项正式拍板)  
 > **关联审查**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)  
 >
-> **v1.3 修订摘要（相比 v1.2，依据 R46 复核报告）**：
-> 1. **状态口径纠偏**：v1.2 声称"已按 R45 审查结论完成修复并对齐实装代码"过于乐观——R46 逐项核实为 7 成立 / 4 部分 / 1 未完成，本节状态改为"主体已落地、待收口"。
-> 2. **§3.1 步骤 6 字段勘误（R46 P3-04）**：`431d5ee` 已删除 `InstanceControlBlock::flusher_thread`（线程句柄仅存于 `Instance`），原文 `cb->flusher_thread = inst->flusher_thread;` 为失效描述，改为按实装直述 `thread_start` 调用。
-> 3. **新增 §七 未闭合项清单**：把 R46 的 4×P2 + 8×P3 逐条登记到本文档，作为下一批次的唯一输入，避免只存在于审查报告而丢失跟踪。
+> **v1.4 修订摘要（相比 v1.3，R46 4×P2 + 8×P3 全量代码闭环）**：
+> 1. **闭环 P2-01~04**：`flusher.cpp:1154` `append_block` 补走 `invoke_key_provider`；`logx_c.h` 补齐各接口空句柄/陈旧墓碑句柄返回码契约注释（纠偏 P2-02 历史基线定性）；`OpenCloseMemoryBounded` 升级为 `FastCountingPal` 五类底层资源 100% 配对净零 + 预热后 10k 轮进程真实内存增量 ≤ 8MB 双重刚性断言；新增 `test_inject_key_provider_quiesced` 先静止 Flusher 再挂载回调，消除测试数据竞争。
+> 2. **闭环 P3-01~08**：`cb->pal` 升级为 `std::atomic<Pal*>`；补齐 `check_deferred_dispose_on_exit` Flusher 分支隐式 join 不变量注释；修正 `logx_c.h` `on_destroy` 文案为"Flusher 主循环已退出"；修正 64B `static_assert` 文案；`logx_close_ex` 同步快路径将 `*out_closed_immediately = true` 移入 `if (target != nullptr)` 内；`TlsKeyCache` 新增 `scrub_by_watermark` 并在 `nativeClose` 及 `nativeOpen` 失败分支主动清扫宿主线程 TLS。
 >
 > **v1.1 关键修订摘要（相比 v1.0）**：
 > 1. **根治 R44-01（尾读 UAF）**：采纳 **CB 墓碑模型 (Tombstone)**，实例销毁仅物理释放 `Instance` 数据主体，控制块 CB 永久保留。彻底消除裸句柄在入口首行解引用已释放内存的 UAF 窗口；顺带消除 `weak_count` 及其配套复杂拓扑。
@@ -96,7 +95,7 @@ struct InstanceControlBlock {
     std::atomic<uint64_t>  flusher_tid{0};         // Flusher 线程 TID (用于自销毁检测)
 
     std::atomic<Instance*> inst{nullptr};          // 实例主体指针 (原子指针，负责认领销毁)
-    Pal*                   pal{nullptr};           // 平台抽象层指针
+    std::atomic<Pal*>      pal{nullptr};           // 平台抽象层指针 (R46 P3-02: 原子化消除跨线程读写竞争)
 
     // 销毁回调与上下文 (J-1/F-2 / R45-12 契约)
     void (*on_destroy)(void* user, void* err_user){nullptr};
@@ -105,7 +104,7 @@ struct InstanceControlBlock {
 };
 
 static_assert(sizeof(InstanceControlBlock) <= 64,
-              "InstanceControlBlock must fit within a single 64-byte cache line");
+              "InstanceControlBlock size must stay <= 64 bytes for bounded tombstone footprint");
 
 // 统一释放 Instance 资源主体 (仅由 inst.exchange(nullptr) 胜出者调用一次)
 void destroy_instance(InstanceControlBlock* cb, Instance* inst, bool is_flusher_thread);
@@ -422,31 +421,31 @@ sequenceDiagram
 
 ---
 
-## 七、 R46 复核未闭合项清单（下一批次唯一输入）
+## 七、 R46 复核项闭环台账（4×P2 + 8×P3 已全部闭环）
 
-> 来源：[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md) §四/§六。R46 裁定 `0ef345f` **无 P0/P1 阻断项、可入库**，但"12 项全量收口"应修正为 **7 成立 / 4 部分 / 1 未完成**；下列 12 项（4×P2 + 8×P3）为本专项收口前必须闭环的余量。
+> 来源：[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md) §四/§六。下列 12 项（4×P2 + 8×P3）已全部完成代码与文档闭环：
 
-### 7.1 P2（4 项，建议优先）
+### 7.1 P2（4 项，已全部闭环）
 
-| 编号 | 位置 | 问题 | 影响 | 收口动作 |
-|---|---|---|---|---|
-| **P2-01** | `core/src/flusher.cpp:1155` | `append_block` 内仍裸调 `inst->key_provider(inst->kid, inst->key_user)`，未走 `invoke_key_provider` 门禁（ACT-6 漏改第 4 处） | 当前仅单元测试可达；一旦接入生产路径即原样复现 R45-06 的 `thread_join` 死锁，且无 `OpGuard` 保护 | 改走 `invoke_key_provider`；同时补 `append_block` 生产路径可达性门禁或注释明示"仅测试用"，并补"Flusher 阻塞于 key_provider 期间并发 close 不死锁"用例 |
-| **P2-02** | `core/src/logx_c.cpp`（`logx_set_error_handler`）、`core/include/logx_c.h` | 空句柄返回码由 `LOGX_ERR_INVALID_ARG` 静默改为 `LOGX_ERR_STATE`，头文件无空句柄契约、CHANGELOG 未登记 | 公开 C ABI 行为变更无痕；与 `logx_close`/`logx_export`/`logx_write` 全族的 `INVALID_ARG` 口径不一致，宿主分支判断易出错 | 二选一：① 恢复 `INVALID_ARG`（推荐，保持全族一致）；② 若确需 `STATE`，在 `logx_c.h` 显式写明空句柄语义并在 CHANGELOG 登记 |
-| **P2-03** | `tests/unit/test_r19_regression.cpp:2964` | 10k 轮内存上界断言为 `sizeof(InstanceControlBlock) * 10000 <= 640KB` 的恒真式 | 删掉 `delete inst` 也照样通过 ⇒ R45-10 的门禁实质未建立，泄漏无任何拦截能力 | 改为可失败的真实断言（CB/Instance 分配计数净零，或稳态 RSS 增量上界），并按 R18-2 做撤销变异验证必红 |
-| **P2-04** | `tests/unit/test_r19_regression.cpp`（新增 key_provider 用例） | 在 `logx_open` 之后改写 `encrypt_enable`/`kid`/`key_provider` 等非原子字段，与运行中的 Flusher 并发读 | 形式上的数据竞争（UB）；CI 偶发假绿/假红，且污染"并发正确性"证据链 | 改为 open 前配置；确需运行期变更时，经同步点先行静止 Flusher（或把这些字段升为 atomic，属更大改动，需单独评估） |
-
-### 7.2 P3（8 项）
-
-| 编号 | 位置 | 问题 | 收口动作 |
+| 编号 | 位置 | 问题 | 收口结果 |
 |---|---|---|---|
-| **P3-01** | `core/src/logx_c.cpp`（`check_deferred_dispose_on_exit` Flusher 分支） | 以 `cb->inst.load()` 重新取 `inst`，其安全性依赖"此路径上 Flusher 必已不再解引用 inst"的 join 不变量，但该不变量未在任何注释中写明 | 补注释声明不变量与成立理由，或改为由调用方传参避免二次读取 |
-| **P3-02** | `core/include/logx_internal.h`（`InstanceControlBlock::pal`） | `cb->pal` 为非原子指针，销毁认领者写 `nullptr` 与并发读存在跨线程读写竞争 | 升为 `std::atomic<Pal*>`，或在契约注释中限定"仅在 `inst` 已认领后访问"并说明为何不构成竞争 |
-| **P3-03** | `core/include/logx_c.h`（`on_destroy` 契约段） | 新增文案"Flusher 线程已退出"与"可能在 Flusher 线程执行"自相矛盾 | 改写为"执行线程为最后完成销毁认领的线程（可能是 Flusher 线程）；回调返回后库不再访问任何实例资源" |
-| **P3-04** | 本文档 §3.1 步骤 6 | 引用 `431d5ee` 已删除的 `cb->flusher_thread` 字段 | ✅ **本批次（v1.3）已闭环** |
-| **P3-05** | `docs/reviews/code_review_R45_*.md`、`CHANGELOG.md` | R45 报告 8 个 ACT 复选框未勾选、修复批次未登记 | ✅ **本批次已闭环**（ACT 按 R46 判定标注勾选/部分/未完成；CHANGELOG 第 24 条已登记提交与批次） |
-| **P3-06** | `core/include/logx_internal.h`（64B 断言） | `static_assert(sizeof(...) <= 64)` 只约束尺寸，实测 `alignof` 仅 8 ⇒ 未达成"独占单缓存行"的原意 | 加 `alignas(64)`，或补 `alignof` 断言；若有意不要求对齐，则把注释"single 64-byte cache line"改为"size ≤ 64B" |
-| **P3-07** | `core/src/logx_c.cpp`（`logx_close_ex` 同步快路径） | 未成功认领（`exchange(nullptr)` 落空）时仍回填 `*out_closed_immediately = true`，语义失真 | 以认领结果回填该出参（认领失败应为 `false`）；当前无消费方，属语义正确性打磨 |
-| **P3-08** | `android/cpp/jni_key_cache.h` / `logx_jni.cpp` | TLS 明文密钥仅"下次 `lookup`/`allocate_slot` 时"惰性清零；线程空闲或不再调用日志接口时明文长期驻留 | 接受并写入契约（声明残留窗口）或提供显式 scrub 入口；不建议为此引入跨线程强制清槽 |
+| **P2-01** | `core/src/flusher.cpp:1154` | `append_block` 内仍裸调 `inst->key_provider`，未走 `invoke_key_provider` 门禁 | ✅ **已闭环**：已改为 `!invoke_key_provider(inst, inst->kid)`，并在单测中显式验证 `append_block` 触发 `in_callback > 0` |
+| **P2-02** | `core/include/logx_c.h`、`CHANGELOG.md` | `logx_set_error_handler(nullptr)` 恢复历史 `LOGX_ERR_STATE` 返回码，公开头缺统一空句柄契约说明 | ✅ **已闭环**：已在 `logx_c.h` 生命周期段显式列出各接口对空句柄及已关闭墓碑句柄的返回码契约，并在 R46 报告与 CHANGELOG 纠偏历史基线定性 |
+| **P2-03** | `tests/unit/test_r19_regression.cpp` | `OpenCloseMemoryBounded` 原断言为编译期恒真式 | ✅ **已闭环**：升级为 `FastCountingPal` 五类资源（fd/mmap/mutex/event/thread）100% 配对净零 + 预热后 10k 轮进程真实内存增量 ≤ 8MB 双重刚性断言 |
+| **P2-04** | `tests/test_accessor.h`、`test_r19_regression.cpp` | 在 `logx_open` 后直接改写运行中 Flusher 读取的非原子字段 | ✅ **已闭环**：新增 `test_inject_key_provider_quiesced` 先停止并 join Flusher，在单线程静止态下注入配置后再重启 Flusher |
+
+### 7.2 P3（8 项，已全部闭环）
+
+| 编号 | 位置 | 问题 | 收口结果 |
+|---|---|---|---|
+| **P3-01** | `core/include/logx_internal.h` | `check_deferred_dispose_on_exit` Flusher 分支 `cb->inst.load` 依赖隐式 join 不变量 | ✅ **已闭环**：已在分支处补齐完整生命周期不变量注释 |
+| **P3-02** | `core/include/logx_internal.h`、`logx_c.cpp` | `cb->pal` 为非原子指针，销毁置空与并发读存在形式竞争 | ✅ **已闭环**：`cb->pal` 已升级为 `std::atomic<Pal*>`（保持 `sizeof(InstanceControlBlock) == 64`） |
+| **P3-03** | `core/include/logx_c.h` | `on_destroy` 契约"Flusher 线程已退出"与"可能在 Flusher 线程执行"表述冲突 | ✅ **已闭环**：已修正为"保证在 Flusher 主循环已退出（`flusher_loop` 已完成尾轮刷盘与同步并退出）后触发" |
+| **P3-04** | 本文档 §3.1 步骤 6 | 引用 `431d5ee` 已删除的 `cb->flusher_thread` 字段 | ✅ **已闭环** |
+| **P3-05** | `docs/reviews/code_review_R45_*.md`、`CHANGELOG.md` | R45 报告 8 个 ACT 复选框勾选与修复记录登记 | ✅ **已闭环**（ACT-1~8 全量勾选 `[x]`；CHANGELOG 第 24 条已完整登记） |
+| **P3-06** | `core/include/logx_internal.h` | 64B `static_assert` 文案写"single 64-byte cache line"但未设 64B 对齐 | ✅ **已闭环**：已将断言文案修正为如实描述尺寸上界 `size must stay <= 64 bytes for bounded tombstone footprint` |
+| **P3-07** | `core/src/logx_c.cpp` | `logx_close_ex` 同步快路径置 `*out_closed_immediately = true` 在 `if (target != nullptr)` 块外 | ✅ **已闭环**：已移入 `if (target != nullptr)` 块内，与兜底双检分支严格对称 |
+| **P3-08** | `android/cpp/jni_key_cache.h`、`logx_jni.cpp` | 递延销毁时调用方宿主线程 TLS 密钥仅在下次探测时惰性清零 | ✅ **已闭环**：`TlsKeyCache` 新增 `scrub_by_watermark`，在 `nativeClose` 返回前与 `nativeOpen` 失败分支主动清扫宿主线程 TLS，并在 `logx_c.h` 写明契约 |
 
 ### 7.3 收口顺序建议（沿用 R46 §六）
 

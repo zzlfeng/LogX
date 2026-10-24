@@ -34,7 +34,7 @@ struct InstanceControlBlock {
     std::atomic<uint64_t>  flusher_tid{0};         // Flusher 线程 TID (用于自销毁检测)
 
     std::atomic<Instance*> inst{nullptr};          // 实例主体指针 (原子指针，负责认领销毁)
-    Pal*                   pal{nullptr};           // 平台抽象层指针
+    std::atomic<Pal*>      pal{nullptr};           // 平台抽象层指针 (R46 P3-02: 原子化消除跨线程读写竞争)
 
     // 销毁回调与上下文 (J-1/F-2 契约)
     void (*on_destroy)(void* user, void* err_user){nullptr};
@@ -42,8 +42,9 @@ struct InstanceControlBlock {
     void*                  on_destroy_err_user{nullptr};
 };
 
+// R46 P3-06: 约束 CB 尺寸 <= 64B (墓碑常驻内存上界 <= 64B/实例; 常规 new 分配对齐为 alignof(max_align_t))
 static_assert(sizeof(InstanceControlBlock) <= 64,
-              "InstanceControlBlock must fit within a single 64-byte cache line");
+              "InstanceControlBlock size must stay <= 64 bytes for bounded tombstone footprint");
 
 // 单实例引擎主体数据
 struct Instance {
@@ -124,7 +125,7 @@ inline void check_deferred_dispose_on_exit(InstanceControlBlock* cb) {
     if (!cb->close_requested.load(std::memory_order_seq_cst)) return;
     if (cb->active_ops.load(std::memory_order_seq_cst) == 0 &&
         cb->in_callback.load(std::memory_order_seq_cst) == 0) {
-        Pal* pal = cb->pal;
+        Pal* pal = cb->pal.load(std::memory_order_acquire);
         uint64_t current_tid = pal ? pal->tid() : 0;
         bool on_flusher = (current_tid != 0 &&
                            cb->flusher_tid.load(std::memory_order_acquire) == current_tid);
@@ -136,9 +137,13 @@ inline void check_deferred_dispose_on_exit(InstanceControlBlock* cb) {
                 }
             }
         } else {
-            // R45-03: 若静止点落在 Flusher 线程自身(如 emit_event / key_provider 回调栈退出点)，
+            // R45-03 / R46 P3-01: 若静止点落在 Flusher 线程自身(如 emit_event / key_provider 回调栈退出点)，
             // 严禁就地销毁，此时在 Flusher 线程栈内置位 flusher_exit 并唤醒，
             // 让 flusher_loop 走完尾轮 drain_once + durability_sync 后在 flusher_main 退出段自毁。
+            // 隐式生命周期不变量 (R46 P3-01): 此分支通过 load 而非 exchange 认领读取 inst 之所以绝对无 UAF，
+            // 是因为当前正处于 Flusher 线程栈帧内，而任何非 Flusher 销毁者在 destroy_instance 中执行
+            // delete inst 之前必须先完成 pal->thread_join(inst->flusher_thread)；只要本 Flusher 线程尚未退出，
+            // 即使其他线程并发抢走 cb->inst 认领权，inst 对象在本线程返回前也恒存活有效。
             Instance* inst = cb->inst.load(std::memory_order_acquire);
             if (inst) {
                 inst->flusher_exit.store(true, std::memory_order_release);
