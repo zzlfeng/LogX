@@ -1,10 +1,12 @@
 # LogX T5.8 生命周期堆控制块（Control Block）待决策项方案分析与裁决建议
 
-> **文档版本**: v1.4 (2026-10-24)  
+> **文档版本**: v1.5 (2026-10-24)  
 > **任务编号**: T5.8（生命周期堆控制块重构专项，根治 R41-05 尾读 UAF）  
-> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.4  
-> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)  
-> **当前状态**: ✅ 六项决策已正式拍板并完成全量代码与测试闭环（`431d5ee` 实施 + `0ef345f` R45 收口 + R46 4×P2/8×P3 全量闭环，详见计划文档 §七）
+> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.5  
+> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)、[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md)  
+> **当前状态**: 🔧 六项决策已拍板并完成代码落地（`431d5ee` 实施 + `0ef345f` R45 收口 + `677b70d` R46 余量收口）；**R47 复核判定 12 项中 10 项完全成立 / 2 项部分成立**（`P2-03` 内存门禁强度、`P3-08` TLS 清扫机制），余量 **2×P2 + 5×P3** 见计划文档 §7.4；发布门禁余 **ASan/TSAN + 真机四套件 + P50 重测**，发布状态维持「未发布 / 进行中」
+>
+> **v1.5 修订说明（依据 R47 复核）**：决策层结论不变（六项拍板均成立、无需重新裁决），仅校正状态口径——v1.4 的"已全量收口"在 R47 逐项复核与 5 组变异实验下修正为"10 成立 / 2 部分"：`P2-03` 的 5 类资源配对断言有效，但 8MB 内存阈值放过了 Instance 级泄漏（删 `delete inst` 后增量 6.02MB 仍绿）；`P3-08` 的 `nativeClose` 主动清扫在单实例递延关闭下对被关闭实例自身无效（水位未推进），现由 `logx_c.h` 契约如实声明残留窗口。`P2-02` 的历史基线勘误经 git 核对成立（`431d5ee~1` 即返回 `LOGX_ERR_STATE`）。
 >
 > **v1.4 修订说明（R46 4×P2 + 8×P3 全量闭环）**：v1.3 指出的全部实现细节余量（`append_block` 补走 `invoke_key_provider`、`cb->pal` 原子化、`logx_c.h` 空句柄契约与 `on_destroy` 文案修正、`nativeClose` 主动清扫宿主线程 TLS、`OpenCloseMemoryBounded` 真实资源/内存断言与测试静止态注入）已全部落地并通过 MSVC + Android NDK clean 构建与 CTest 4/4 验证。
 >

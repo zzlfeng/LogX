@@ -43,6 +43,7 @@
 | [code_review_R44_2026-10-18.md](code_review_R44_2026-10-18.md) | R44 方案评审(T5.8 生命周期堆控制块实施计划 v1.0：3×P0/4×P1/6×P2；指出裸句柄尾读 UAF 未根除、关停丢数据、引用协议/迁移缺口，待 6 项拍板) | 主文件 T5.8 批次（第 24 条） |
 | [code_review_R45_2026-10-24.md](code_review_R45_2026-10-24.md) | R45 审查(T5.8 生命周期堆控制块重构批次 `431d5ee` 独立审查：4×P0/3×P1/5×P2；捕获 `OpGuard` 早退漏认领泄漏、拆除 `seq_cst` 引发 4 组 Dekker 重排、递延 `close` 尾读 UAF 与过早停 Flusher 致关停未排空（R44-02 未闭合，mmap 模式可由下次启动恢复、堆降级模式丢失）、`set_error_handler`/`get_stats` 缺 `OpGuard`、`thread_detach` 空洞绿测试、`on_destroy` 跨线程触发致宿主 TLS 密钥残留等；R45-08 经复核由 P1 下调为 P2) | 主文件 T5.8 批次（第 24 条） |
 | [code_review_R46_2026-10-24.md](code_review_R46_2026-10-24.md) | R46 复核(T5.8 修复收口批次 `0ef345f` 独立复审：R45 十二项判定**7 成立 / 4 部分 / 1 未完成**，另捕获 4×P2 + 8×P3；无 P0/P1 阻断项可入库；实证 203/203 单测 + 4/4 压力测试 + 生命周期并发 20 轮无抖动；指出 `flusher.cpp:1155` 漏改 `key_provider` 门禁、`set_error_handler` 空句柄返回码静默变更、`OpenCloseMemoryBounded` 内存断言恒真、新增用例构成数据竞争) | 主文件 T5.8 批次（第 24 条） |
+| [code_review_R47_2026-10-24.md](code_review_R47_2026-10-24.md) | R47 复核(R46 十二项收口批次 `677b70d` 独立复审：**10 项完全成立 / 2 项部分成立**，无 P0/P1 可入库；另捕获 2×P2 + 5×P3。5 组变异实证：删 `delete inst->staging` 与回退 `append_block` 裸调均必红，但删 `delete inst` 实测增量 6.02MB < 8MB 阈值**仍绿** ⇒ P2-03 门禁仍有漏检形态；P2-02 历史基线勘误经 git 核对成立（`431d5ee~1` 即 STATE）；实证 MSVC clean 55 步 0 警告、NDK 61/61 步 0 警告、四套件 212 项全绿、并发用例 20 轮无抖动；指出计划文档状态口径超越自身 §7.3 发布门禁、`nativeClose` 水位清扫对递延关闭实例自身无效) | 主文件 T5.8 批次（第 24 条） |
 
 ## 说明
 

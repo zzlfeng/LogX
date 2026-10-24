@@ -1,10 +1,15 @@
 # LogX 1.x 生命周期堆控制块（Control Block）重构实施计划 (T5.8 / R41-05 根治)
 
-> **版本**: v1.4 (2026-10-24)  
+> **版本**: v1.5 (2026-10-24)  
 > **任务编号**: T5.8 (登记于 `docs/LogX后续实施计划表.md` §2 阶段三任务表)  
-> **当前状态**: ✅ **代码与双端编译已全量收口完成（`431d5ee` 重构 + `0ef345f` R45 收口 + R46 4×P2/8×P3 全量闭环）**——MSVC clean 0 警告 + CTest 4/4（203 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复）全绿 + Android NDK Clang clean 61/61 TU 0 警告通过；仅待真机复跑 P50 ≤ 4.2µs 确认后恢复正式发布状态  
-> **关联裁决**: [`lifecycle_control_block_decisions.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_decisions.md) v1.4 (6 大决策项正式拍板)  
-> **关联审查**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)  
+> **当前状态**: 🔧 **代码与双端编译已收口（`431d5ee` 重构 + `0ef345f` R45 收口 + `677b70d` R46 余量收口）**——MSVC clean 55 步 0 警告 + CTest 4/4（203 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复，合计 212 项）全绿 + Android NDK Clang clean 61/61 步 0 警告通过（均已独立复现）；**R47 复核判定 R46 十二项为 10 项完全成立 / 2 项部分成立，余量 2×P2 + 5×P3 见 §7.4**；发布门禁仍余 **ASan/TSAN 复跑 + 真机四套件 + P50 ≤ 4.2µs 重测**（见 §7.3），发布状态维持「未发布 / 进行中」  
+> **关联裁决**: [`lifecycle_control_block_decisions.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_decisions.md) v1.5 (6 大决策项正式拍板)  
+> **关联审查**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)、[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md)  
+>
+> **v1.5 修订摘要（相比 v1.4，依据 R47 复核）**：
+> 1. **状态口径纠正**：v1.4 声称"全量收口完成、仅待真机 P50"超越本文档 §7.3 自身的发布门禁——ASan/TSAN 复跑尚未执行，故状态回退为"代码与双端编译已收口"，并把剩余门禁完整列出。
+> 2. **R47 复核结果**：R46 十二项中 **10 项完全成立 / 2 项部分成立**（`P2-03` 进程内存门禁放过 Instance 级泄漏；`P3-08` 水位清扫对递延关闭实例自身无效），新增 **2×P2 + 5×P3** 余量，逐条登记于新增 **§7.4**。
+> 3. **§7.3 口径修订**：收口顺序标注为"已按此顺序执行"；发布前置条件细分为"已具备 / 未具备"两栏，避免把未执行门禁当作已达成。
 >
 > **v1.4 修订摘要（相比 v1.3，R46 4×P2 + 8×P3 全量代码闭环）**：
 > 1. **闭环 P2-01~04**：`flusher.cpp:1154` `append_block` 补走 `invoke_key_provider`；`logx_c.h` 补齐各接口空句柄/陈旧墓碑句柄返回码契约注释（纠偏 P2-02 历史基线定性）；`OpenCloseMemoryBounded` 升级为 `FastCountingPal` 五类底层资源 100% 配对净零 + 预热后 10k 轮进程真实内存增量 ≤ 8MB 双重刚性断言；新增 `test_inject_key_provider_quiesced` 先静止 Flusher 再挂载回调，消除测试数据竞争。
@@ -421,20 +426,20 @@ sequenceDiagram
 
 ---
 
-## 七、 R46 复核项闭环台账（4×P2 + 8×P3 已全部闭环）
+## 七、 R46 复核项落地台账（4×P2 + 8×P3；R47 复核 10 成立 / 2 部分）
 
-> 来源：[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md) §四/§六。下列 12 项（4×P2 + 8×P3）已全部完成代码与文档闭环：
+> 来源：[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md) §四/§六。下列 12 项（4×P2 + 8×P3）均已在 `677b70d` 落地，并经 [`R47 复核`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md) 逐项验证：**10 项完全成立、2 项部分成立**（`P2-03` / `P3-08`，余量与新增发现见 §7.4）。
 
-### 7.1 P2（4 项，已全部闭环）
+### 7.1 P2（4 项，已落地；`P2-03` 部分成立）
 
 | 编号 | 位置 | 问题 | 收口结果 |
 |---|---|---|---|
-| **P2-01** | `core/src/flusher.cpp:1154` | `append_block` 内仍裸调 `inst->key_provider`，未走 `invoke_key_provider` 门禁 | ✅ **已闭环**：已改为 `!invoke_key_provider(inst, inst->kid)`，并在单测中显式验证 `append_block` 触发 `in_callback > 0` |
-| **P2-02** | `core/include/logx_c.h`、`CHANGELOG.md` | `logx_set_error_handler(nullptr)` 恢复历史 `LOGX_ERR_STATE` 返回码，公开头缺统一空句柄契约说明 | ✅ **已闭环**：已在 `logx_c.h` 生命周期段显式列出各接口对空句柄及已关闭墓碑句柄的返回码契约，并在 R46 报告与 CHANGELOG 纠偏历史基线定性 |
-| **P2-03** | `tests/unit/test_r19_regression.cpp` | `OpenCloseMemoryBounded` 原断言为编译期恒真式 | ✅ **已闭环**：升级为 `FastCountingPal` 五类资源（fd/mmap/mutex/event/thread）100% 配对净零 + 预热后 10k 轮进程真实内存增量 ≤ 8MB 双重刚性断言 |
-| **P2-04** | `tests/test_accessor.h`、`test_r19_regression.cpp` | 在 `logx_open` 后直接改写运行中 Flusher 读取的非原子字段 | ✅ **已闭环**：新增 `test_inject_key_provider_quiesced` 先停止并 join Flusher，在单线程静止态下注入配置后再重启 Flusher |
+| **P2-01** | `core/src/flusher.cpp:1154` | `append_block` 内仍裸调 `inst->key_provider`，未走 `invoke_key_provider` 门禁 | ✅ **已闭环**（R47 变异实证）：回退为裸调用后用例必红（`max_in_callback_seen` 0 vs 1）；并在单测中显式验证 `append_block` 触发 `in_callback > 0` |
+| **P2-02** | `core/include/logx_c.h`、`CHANGELOG.md` | `logx_set_error_handler(nullptr)` 恢复历史 `LOGX_ERR_STATE` 返回码，公开头缺统一空句柄契约说明 | ✅ **已闭环**（R47 逐 API 核对）：`logx_c.h` 生命周期段已列出各接口对空句柄及已关闭墓碑句柄的返回码，8 个 API 与实现逐条相符；历史基线经 git 核对（`431d5ee~1` 即 `STATE`）成立 |
+| **P2-03** | `tests/unit/test_r19_regression.cpp` | `OpenCloseMemoryBounded` 原断言为编译期恒真式 | ⚠️ **部分闭环**：`FastCountingPal` 五类资源配对断言有效（删 `delete inst->staging` 必红，实测内存增量 252MB），但 8MB 内存阈值放过 Instance 级泄漏（正常 1.07MB / 泄漏 6.02MB 均 < 阈值）→ **见 §7.4 P2-N1** |
+| **P2-04** | `tests/test_accessor.h`、`test_r19_regression.cpp` | 在 `logx_open` 后直接改写运行中 Flusher 读取的非原子字段 | ✅ **已闭环**：新增 `test_inject_key_provider_quiesced` 先 `flusher_exit`+`thread_join` 再注入、后重启 Flusher；R47 复跑 20 轮无抖动 |
 
-### 7.2 P3（8 项，已全部闭环）
+### 7.2 P3（8 项，已落地；`P3-08` 部分成立）
 
 | 编号 | 位置 | 问题 | 收口结果 |
 |---|---|---|---|
@@ -445,12 +450,44 @@ sequenceDiagram
 | **P3-05** | `docs/reviews/code_review_R45_*.md`、`CHANGELOG.md` | R45 报告 8 个 ACT 复选框勾选与修复记录登记 | ✅ **已闭环**（ACT-1~8 全量勾选 `[x]`；CHANGELOG 第 24 条已完整登记） |
 | **P3-06** | `core/include/logx_internal.h` | 64B `static_assert` 文案写"single 64-byte cache line"但未设 64B 对齐 | ✅ **已闭环**：已将断言文案修正为如实描述尺寸上界 `size must stay <= 64 bytes for bounded tombstone footprint` |
 | **P3-07** | `core/src/logx_c.cpp` | `logx_close_ex` 同步快路径置 `*out_closed_immediately = true` 在 `if (target != nullptr)` 块外 | ✅ **已闭环**：已移入 `if (target != nullptr)` 块内，与兜底双检分支严格对称 |
-| **P3-08** | `android/cpp/jni_key_cache.h`、`logx_jni.cpp` | 递延销毁时调用方宿主线程 TLS 密钥仅在下次探测时惰性清零 | ✅ **已闭环**：`TlsKeyCache` 新增 `scrub_by_watermark`，在 `nativeClose` 返回前与 `nativeOpen` 失败分支主动清扫宿主线程 TLS，并在 `logx_c.h` 写明契约 |
+| **P3-08** | `android/cpp/jni_key_cache.h`、`logx_jni.cpp` | 递延销毁时调用方宿主线程 TLS 密钥仅在下次探测时惰性清零 | ⚠️ **部分闭环**：`TlsKeyCache` 新增 `scrub_by_watermark` 并在 `nativeClose`/`nativeOpen` 失败分支调用，但水位仅在**真正销毁**时推进，故递延关闭路径上**被关闭实例自身**的槽位不会被清（`jni_key_cache.h` 注释"待销毁槽位"不成立）；实际保障来自 `logx_c.h` 已如实写明的"惰性回收、空闲线程可能长期驻留"契约 → **见 §7.4 P3-N1** |
 
-### 7.3 收口顺序建议（沿用 R46 §六）
+### 7.3 收口顺序（已按此顺序执行完毕）
 
-`P2-01`（3 行，消除潜在 P1）→ `P2-04`（CI 稳定性）→ `P2-03`（重建门禁）→ `P2-02`（契约与登记）→ `P3-01/02/03/06`（注释与少量代码，零风险）→ `P3-07/08`（语义打磨）。
+`P2-01`（3 行，消除潜在 P1）→ `P2-04`（CI 稳定性）→ `P2-03`（重建门禁）→ `P2-02`（契约与登记）→ `P3-01/02/03/06`（注释与少量代码，零风险）→ `P3-07/08`（语义打磨）。上述 12 项均已在 `677b70d` 落地，`P2-03`/`P3-08` 的残余强度问题转入 §7.4。
 
-> **发布判定前置条件**：上述 4×P2 全部闭环 + NDK clean 构建 + ASan/TSAN 复跑 + 真机四套件与 P50 ≤ 4.2µs 门禁重测，方可把本专项与发布状态从「未发布 / 进行中」转为已收口。
+> **发布判定前置条件（R47 复核后按"已具备 / 未具备"重列）**：
 >
-> **基线更新（R46 实测）**：§五 登记的 **196 项**为立项时 clean 产物实数；`0ef345f` 后 host 实测已增至 **203 项**（含新增生命周期/并发用例），后续验收以 203 为起点，并按「重构新增用例在此基础上如实递增」累加。
+> | 门禁 | 状态 | 证据 |
+> |---|:--:|---|
+> | R46 4×P2 落地 | ✅ 已具备 | `677b70d`；其中 `P2-03` 门禁强度余量见 §7.4 P2-N1 |
+> | MSVC clean 构建 0 警告 | ✅ 已具备 | R47 复现：`ninja -t clean` 后 55 步全绿、warning = 0 |
+> | NDK clean 构建 0 警告 | ✅ 已具备 | R47 复现：arm64-v8a `ninja -t clean` 后 61/61 步全绿、warning = 0 |
+> | host 四套件全绿 | ✅ 已具备 | R47 复现：203 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复 = 212 项全通过（须在工作区外运行，规避已知 `CreateDirectoryW=5` 假红） |
+> | **ASan/TSAN 复跑** | ❌ **未具备** | R45/R46/R47 三轮均未执行；并发正确性目前仅靠静态推演 + 重复运行 + 压力/崩溃套件支撑 |
+> | **真机四套件** | ❌ **未具备** | 未上 Android 真机 |
+> | **P50 ≤ 4.2µs 重测** | ❌ **未具备** | `logx_set_error_handler`/`get_stats` 新增 `active_ops` 原子加减后的热路径未量化 |
+> | AAR 体积门禁 | ❌ 未复测 | 本轮无 Android 构建产物变更，风险低 |
+>
+> 结论：**上述"未具备"四项全部达成前，专项不得宣布收口，发布状态维持「未发布 / 进行中」**。
+>
+> **基线更新（R46/R47 实测）**：§五 登记的 **196 项**为立项时 clean 产物实数；`0ef345f` 后 host 实测增至 **203 项**，`677b70d` 后仍为 **203 项**（本批为改写既有用例，未新增用例）；后续验收以 203 为起点，并按「重构新增用例在此基础上如实递增」累加。
+
+### 7.4 R47 复核未闭合项（下一批次唯一输入）
+
+> 来源：[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md) §四。R47 裁定 `677b70d` **无 P0/P1、可入库**；下列 **2×P2 + 5×P3** 为收口前余量（均为门禁强度与文档口径类，无运行时缺陷）。
+
+| 编号 | 位置 | 问题 | 收口动作 |
+|---|---|---|---|
+| **P2-N1** | `tests/unit/test_r19_regression.cpp:3075` | 内存阈值 8MB 过宽：正常增量 1.07MB、删 `delete inst` 后增量 6.02MB（≈628B/轮），**变异后用例仍绿** | 阈值收紧至 ≤3MB，或增加 `Instance` 分配计数净零断言（与进程内存断言并用）；同步修正 `:3064` 注释口径 |
+| **P2-N2** | 本文档 header（已在本版修正） | 状态口径超越 §7.3 发布门禁（ASan/TSAN 未执行却称"仅待 P50"） | ✅ **本版（v1.5）已修正**，剩余动作见 §7.3 未具备项 |
+| **P3-N1** | `android/cpp/jni_key_cache.h:93`、`logx_jni.cpp:473-475` | 水位清扫对递延关闭实例自身无效，注释"待销毁槽位"不成立 | 修正注释为"仅清扫水位以内的旧代数槽位"；若要即时清除，需在 core 侧把 `gen` 暴露给 close 路径后按 `(owner, gen)` 精确 `invalidate_owner` |
+| **P3-N2** | `docs/reviews/code_review_R46_2026-10-24.md:7`/`:34-49` vs `:210-217` | 报告 header 与 §二 仍写"未闭环"，与 §六 全 ✅ 台账并存 | ✅ **本版已补锚注**（R46 报告 header 增"后续状态（R47 复核后补注）"行）；§二 逐项结论作历史快照保留，不再改写 |
+| **P3-N3** | 本文档 §7.3 | 标题仍为"收口顺序建议"，与 §7.1/§7.2 全量落地口径不一致 | ✅ **本版（v1.5）已修正**为"已按此顺序执行完毕" |
+| **P3-N4** | `core/src/logx_c.cpp:469` | `cb->pal` 以 `relaxed` 写入，而读侧（`:333`/`:537`/`internal.h:128`）为 `acquire`，无配对 `release` | 改为 `std::memory_order_release`（零成本，语义自洽） |
+| **P3-N5** | `core/src/flusher.cpp:1125` vs `:1154` | `append_block` 的 `kid` 入参被 `(void)kid` 忽略，门禁改用 `inst->kid` | 或改用入参 `kid`（与 `write_and_record` 语义一致），或在注释中明确"入参保留未用，语义以 `inst->kid` 为准" |
+
+**建议顺序**：`P2-N1`（门禁强度，唯一实质缺陷）→ `P3-N1`/`P3-N4`（注释与内存序，零风险）→ `P3-N5`（语义）→ 再攻 §7.3 的 ASan/TSAN + 真机 + P50。
+
+> **本版（v1.5）已就地闭环的文档项**：`P2-N2`（header 状态口径）、`P3-N2`（R46 报告锚注）、`P3-N3`（§7.3 标题口径）。
+> **仍需代码/测试改动的余量（4 项）**：`P2-N1`、`P3-N1`、`P3-N4`、`P3-N5`。
