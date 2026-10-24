@@ -40,12 +40,13 @@
 | [code_review_R41_2026-10-17.md](code_review_R41_2026-10-17.md) | R41 审查(R40 修复与 4 项拍板落地批次 a4b44e3..HEAD 独立复审：捕获 1 高危 2 中危 1 低危 1 提示，ctest 4/4 全绿) | 主文件近期批次章节第 22 条 |
 | [code_review_R42_2026-10-17.md](code_review_R42_2026-10-17.md) | R42 审查(R41 修复批次 9704832..HEAD 独立复审：捕获 2 中危 1 低危 1 提示，ACT-2/ACT-3 判定部分通过，ctest 4/4 全绿 + 新增 4 用例定向复跑通过) | 主文件近期批次章节第 22 条 |
 | [code_review_R43_2026-10-17.md](code_review_R43_2026-10-17.md) | R43 审查(R42 修复批次 2e75052..HEAD 独立复审：ACT-1~4 判定通过；新捕获 1 中危 R43-01 `close_pending` Flusher 盲区泄漏；当场修正密钥残留+测试回退 2 低危，登记 3 提示；ctest 4/4 全绿 + JniKeyCache 5/5 复跑通过) | 主文件近期批次章节第 22 条 |
-| [code_review_R44_2026-10-18.md](code_review_R44_2026-10-18.md) | R44 方案评审(T5.8 生命周期堆控制块实施计划 v1.0：3×P0/4×P1/6×P2；指出裸句柄尾读 UAF 未根除、关停丢数据、引用协议/迁移缺口，待 6 项拍板) | 待 T5.8 实施批次登记 |
-| [code_review_R45_2026-10-24.md](code_review_R45_2026-10-24.md) | R45 审查(T5.8 生命周期堆控制块重构批次 `431d5ee` 独立审查：4×P0/3×P1/5×P2；捕获 `OpGuard` 早退漏认领泄漏、拆除 `seq_cst` 引发 4 组 Dekker 重排、递延 `close` 尾读 UAF 与过早停 Flusher 致关停未排空（R44-02 未闭合，mmap 模式可由下次启动恢复、堆降级模式丢失）、`set_error_handler`/`get_stats` 缺 `OpGuard`、`thread_detach` 空洞绿测试、`on_destroy` 跨线程触发致宿主 TLS 密钥残留等；R45-08 经复核由 P1 下调为 P2) | 待 T5.8 修复收口批次登记 |
+| [code_review_R44_2026-10-18.md](code_review_R44_2026-10-18.md) | R44 方案评审(T5.8 生命周期堆控制块实施计划 v1.0：3×P0/4×P1/6×P2；指出裸句柄尾读 UAF 未根除、关停丢数据、引用协议/迁移缺口，待 6 项拍板) | 主文件 T5.8 批次（第 24 条） |
+| [code_review_R45_2026-10-24.md](code_review_R45_2026-10-24.md) | R45 审查(T5.8 生命周期堆控制块重构批次 `431d5ee` 独立审查：4×P0/3×P1/5×P2；捕获 `OpGuard` 早退漏认领泄漏、拆除 `seq_cst` 引发 4 组 Dekker 重排、递延 `close` 尾读 UAF 与过早停 Flusher 致关停未排空（R44-02 未闭合，mmap 模式可由下次启动恢复、堆降级模式丢失）、`set_error_handler`/`get_stats` 缺 `OpGuard`、`thread_detach` 空洞绿测试、`on_destroy` 跨线程触发致宿主 TLS 密钥残留等；R45-08 经复核由 P1 下调为 P2) | 主文件 T5.8 批次（第 24 条） |
+| [code_review_R46_2026-10-24.md](code_review_R46_2026-10-24.md) | R46 复核(T5.8 修复收口批次 `0ef345f` 独立复审：R45 十二项判定**7 成立 / 4 部分 / 1 未完成**，另捕获 4×P2 + 8×P3；无 P0/P1 阻断项可入库；实证 203/203 单测 + 4/4 压力测试 + 生命周期并发 20 轮无抖动；指出 `flusher.cpp:1155` 漏改 `key_provider` 门禁、`set_error_handler` 空句柄返回码静默变更、`OpenCloseMemoryBounded` 内存断言恒真、新增用例构成数据竞争) | 主文件 T5.8 批次（第 24 条） |
 
 ## 说明
 
-1. **位置沿革**:以上 21 份报告原落在 git 仓库外(工作区根目录),2026-10-06 迁入本目录入库;迁移系整体 `Move`,报告原文未改写。
+1. **位置沿革**:报告原落在 git 仓库外(工作区根目录),2026-10-06 迁入本目录入库(迁移当次共 21 份,此后各批次报告直接落盘本目录);迁移系整体 `Move`,报告原文未改写。
 2. **更早的 4 份综合报告**(`code_review_consolidated.md`、`code_review_report.md`、`code_review_report_2026-09-04.md`、`code_review_supplement.md`)仍在 [`../`](../) ——它们已入库且内部使用 `../core/...` 等相对链接,迁移动需重写链接,故保持原位。
 3. **行号锚点告警**:R24 报告引用的 `CHANGELOG.md#L2092-L2105`/`#L2105` 等行号系 **2026-10-06 CHANGELOG 拆分前坐标**;对应内容现位于主 CHANGELOG 的「R22 代码优化补丁」与「R25 批次」章节。各报告内 `file:///d:/...` 绝对链接指向的源码路径不受迁移影响。
 4. **命名纪律**:新报告命名 `code_review_R{n}_YYYY-MM-DD.md`,收口后在 CHANGELOG 对应批次章节与本表各登记一行。
