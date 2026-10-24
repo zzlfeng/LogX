@@ -131,9 +131,9 @@ typedef struct logx_config {
 #ifdef __cplusplus
 }  /* extern "C" */
 
-/* C++ 侧:不透明句柄即 logx::Instance(定义见 logx_internal.h),实现方可直接转换。 */
-namespace logx { struct Instance; }
-typedef logx::Instance logx_instance_t;
+/* C++ 侧: 严格不透明句柄类型声明，编译期阻断裸指针强转 (R44-06) */
+struct logx_instance;
+typedef struct logx_instance logx_instance_t;
 
 extern "C" {
 #else

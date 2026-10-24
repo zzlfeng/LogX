@@ -1,9 +1,19 @@
 # LogX 1.x 生命周期堆控制块（Control Block）重构实施计划 (T5.8 / R41-05 根治)
 
-> **版本**: v1.0 (2026-10-18)  
+> **版本**: v1.1 (2026-10-24)  
 > **任务编号**: T5.8 (登记于 `docs/LogX后续实施计划表.md` §2 阶段三任务表)  
-> **当前状态**: 📋 方案设计完成，待评审后实施 (未发布状态)  
-> **关联审查**: [`code_review_R41_2026-10-17.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R41_2026-10-17.md) (R41-05), [`code_review_R42_2026-10-17.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R42_2026-10-17.md), [`code_review_R43_2026-10-17.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R43_2026-10-17.md)
+> **当前状态**: 🚀 方案已拍板，正在分阶段实施  
+> **关联裁决**: [`lifecycle_control_block_decisions.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_decisions.md) v1.1 (6 大决策项正式拍板)  
+> **关联审查**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md) (R44 批次评审及阻断项分析)  
+>
+> **v1.1 关键修订摘要（相比 v1.0）**：
+> 1. **根治 R44-01（尾读 UAF）**：采纳 **CB 墓碑模型 (Tombstone)**，实例销毁仅物理释放 `Instance` 数据主体，控制块 CB 永久保留。彻底消除裸句柄在入口首行解引用已释放内存的 UAF 窗口；顺带消除 `weak_count` 及其配套复杂拓扑。
+> 2. **根治 R44-02（关停丢数据）**：采纳**强引用 + `active_ops` 静止判定（含回调在飞门禁）**，同步关停判定严格为 `active_ops == 0 && in_callback == 0`，一次判定非零即递延，绝不自旋等待。同步路径先 `flush_blocking` 排空再停转 Flusher；递延路径由收尾者协同 Flusher 完成最终落盘与认领，杜绝在途日志静默丢失。
+> 3. **闭合 R44-03 / R44-07（协议与启动引用）**：`cb->inst` 采用 `std::atomic<Instance*>` 并在读写侧建立 acquire-release 配对；销毁认领采用 `inst.exchange(nullptr)` 唯一胜出语义；open 初始引用清晰归属，启动失败路径完整回收。
+> 4. **解决 R44-04（关闭期事件）**：在墓碑模型下，只要 `inst != nullptr` 允许关闭期事件正常分发；关停协议感知 `in_callback > 0` 递延，规避 R43 死锁形态。
+> 5. **解决 R44-05（Flusher 自毁泄漏）**：扩展 PAL 接口增加 `thread_detach`，Flusher 回调内自销毁时 detach 自身，根治原生线程句柄泄漏。
+> 6. **解决 R44-06（句柄错转型与迁移漏项）**：C++ 内部声明不透明句柄类型，引入 `test_accessor.h` 穿透测试 seam，批量迁移 28 处强转与 7 处状态访问；`logx_set_error_handler` 与 `logx_get_stats` 补齐生命周期守卫。
+> 7. **对齐 R44-12（基线与门禁）**：单测基线勘误为实测 **196 项**；锁定真机热路径 P50 **门禁线 ≤ 4.2µs**（成功线 4.0µs，对齐 B2 回归基线 3.958µs）。
 
 ---
 
@@ -17,52 +27,51 @@
 4. `close_on_flusher`: 记录 Flusher 线程内部触发或转置自毁的标志。
 
 **存在的核心痛点**：
-- **极高的并发心智负担**：为协调这 4 个变量，退出逻辑分散在 5 个关键路径（`logx_close_ex` 外部主干、`logx_close_ex` 内部双检兜底、`OpGuard::~OpGuard` 退出段、`emit_event` 退出段、`flusher_main` 循环退出段）。在 R41~R43 期间连续修复了 Dekker store-load 重排、Flusher 回调盲区、递延漏认领等隐蔽并发缺陷。这套机制在数学推导上虽然已证明闭环，但维护极为脆弱；
-- **理论“尾读 UAF”隐患 (R41-05)**：所有状态标志均位于 `Instance` **内部**。当胜出线程判定条件满足并调用 `destroy_instance(inst)` 执行 `delete inst` 后，败方线程在此微秒级间隙仍在执行 `fetch_sub` 后的指令（如寄存器加载与栈清理）。虽然通过严格的 Dekker 屏障可以防止其触碰业务数据，但在严格的 C++ 内存模型下，对已释放 `inst` 指针的任何窥探都属于理论未定义行为（UB）。
+- **极高的并发心智负担**：为协调这 4 个变量，退出逻辑分散在 5 个关键路径（`logx_close_ex` 外部主干、`logx_close_ex` 内部双检兜底、`OpGuard::~OpGuard` 退出段、`emit_event` 退出段、`flusher_main` 循环退出段）。在 R41~R43 期间连续修复了 Dekker store-load 重排、Flusher 回调盲区、递延漏认领等隐蔽并发缺陷。这套机制维护极为脆弱；
+- **理论“尾读 UAF”隐患 (R41-05)**：所有状态标志均位于 `Instance` **内部**。当胜出线程判定条件满足并调用 `destroy_instance(inst)` 执行 `delete inst` 后，败方线程在此微秒级间隙仍在执行 `fetch_sub` 后的指令（如寄存器加载与栈清理）。虽然通过严格的 Dekker 屏障可以防止其触碰业务数据，但在严格的 C++ 内存模型下，对已释放 `inst` 指针的任何窥探都属于未定义行为（UB）。
+- **v1.0 初稿的局限**：初稿试图通过 weak 计数管辖 CB，但外部传入的裸句柄在入口首行解引用 CB 时尚未持有任何引用，UAF 只是从 `Instance` 搬到了 CB（R44-01）。
 
 ### 1.2 重构目标
-1. **解耦生命周期元数据与实例主体数据**：引入独立的堆控制块（`InstanceControlBlock`），其存活期超越 `Instance` 主体，彻底根治 R41-05 尾读 UAF；
-2. **状态机大幅收敛**：废弃 `active_ops`、`in_callback`、`close_pending`、`close_on_flusher` 四态纠缠与双检 Dekker 屏障，统一退化为标准的**强/弱引用计数模型**；
-3. **零破损 C ABI / JNI 契约**：`logx_instance_t*` 依然维持不透明指针形态，底层平滑切换；JNI 层与 Android Kotlin Facade 零改动；
-4. **性能无损**：热路径（`logx_write`）零多余堆分配，保持单次原子操作提升强引用，吞吐与纳秒级延迟无劣化。
+1. **解耦生命周期元数据与实例主体数据**：引入独立的堆控制块（`InstanceControlBlock`），其生命周期超越 `Instance` 主体，且采用**墓碑模型（Tombstone）**，彻底根治 R41-05 尾读 UAF；
+2. **状态机大幅收敛**：废弃 `close_pending`、`close_on_flusher` 两态纠缠与双检 Dekker 屏障，统一由 CB 的原子 `is_closing` 拦截、`active_ops` 与 `in_callback` 精确静止判定、以及 `inst.exchange(nullptr)` 唯一胜出认领收敛；
+3. **零破损 C ABI / JNI 契约**：`logx_instance_t*` 依然维持不透明指针形态；JNI 层与 Android Kotlin Facade 零改动；C++ 源码级改用严格不透明类型阻断危险强转；
+4. **性能极致保全**：热路径（`logx_write`）零多余堆分配，**仅维护单次原子在途计数加减**（绝不增加双重原子引用计数），确保真机 P50 满足 ≤ 4.2µs 严苛门禁。
 
 ---
 
 ## 二、 核心架构设计方案
 
-### 2.1 引用计数模型（强弱引用拓扑）
+### 2.1 控制块墓碑模型与内存拓扑
 
 ```mermaid
 graph TD
-    subgraph "Handle & References"
-        H["logx_instance_t* (Main Handle)"] -->|Strong Ref +1| CB
-        OG["OpGuard (Write/Flush/Export)"] -->|Strong Ref +1| CB
-        EG["EventGuard (emit_event Callback)"] -->|Strong Ref +1| CB
-        FT["Flusher Thread (Running Loop)"] -->|Strong Ref +1 + Weak Ref +1| CB
+    subgraph "External Handles & Operations"
+        H["logx_instance_t* (Caller Raw Pointer)"] -->|Opaque Ptr| CB
+        OG["OpGuard (Write/Flush/Export)"] -->|fetch_add active_ops| CB
+        EG["emit_event (Callback)"] -->|fetch_add in_callback| CB
     end
 
-    subgraph "Lifecycle Heap Control Block"
-        CB["InstanceControlBlock (Heap)"]
-        CB -->|owns raw ptr| INST["Instance Engine Data<br/>(staging, pal, mu, flusher)"]
+    subgraph "Control Block (Heap - Tombstone)"
+        CB["InstanceControlBlock (Permanent Tombstone)<br/>- is_closing: atomic<bool><br/>- active_ops: atomic<int><br/>- in_callback: atomic<int><br/>- flusher_tid: atomic<uint64_t><br/>- inst: atomic<Instance*>"]
     end
+
+    subgraph "Engine Data Subject (Disposable Heap)"
+        INST["Instance Engine Data<br/>(staging, pal, mu, flusher)"]
+    end
+
+    CB -->|owns atomic ptr| INST
 
     style CB fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
     style INST fill:#fff3e0,stroke:#f57c00,stroke-width:2px
 ```
 
-- **`strong_count`（强引用计数）**：管辖 `Instance` 数据主体的生命周期。
-  - 初始值为 1（由 `logx_open` 交付给调用方的主句柄持有）；
-  - Flusher 线程启动并运行循环期间持有 1 个强引用；
-  - 任何进入热路径的操作（`logx_write` / `logx_flush` / `logx_export`）通过 RAII `OpGuard` 尝试提升持有 1 个强引用；
-  - 触发错误回调（`emit_event`）时通过 `EventGuard` 持有 1 个强引用；
-  - **单一析构归属**：任何导致 `strong_count` 归零的最后一个线程（无论是外部 close、最后退出的写线程、还是 Flusher 线程），**天然且唯一**负责执行 `Instance` 资源的物理释放（`dispose_instance`），彻底消灭竞态！
-- **`weak_count`（弱引用计数）**：管辖 `InstanceControlBlock` 控制块自身的内存存活。
-  - 所有强引用整体共享 1 个弱引用；
-  - Flusher 线程内部持有 1 个弱引用；
-  - 当 `strong_count` 归零并释放 `Instance` 后，强引用持有的弱引用被释放；
-  - 当 `weak_count` 归零时，`delete cb` 释放控制块自身。
-
----
+- **墓碑模型（Tombstone）核心语义**：
+  - `InstanceControlBlock` 在 `logx_open` 成功时分配一次；
+  - 当实例被 `logx_close` 关闭并最终销毁时，**仅物理释放 `Instance` 数据主体**，并将 `cb->inst` 原子置空（`exchange(nullptr)`）；
+  - **CB 结构体自身永久保留在堆中**，永不 `delete cb`；
+  - 外部无论何时传入陈旧裸句柄，首行读取 `cb->is_closing` 或 `cb->inst` 永远是合法内存访问，绝对消灭 heap-use-after-free 崩溃窗口；
+  - 顺带彻底消除内存地址快速复用导致的 ABA 假句柄隐患；
+  - 单个 CB 结构体约 56B，计入分配器元数据约 80~100B，在移动端单实例/低频实例形态下开销可完全忽略。
 
 ### 2.2 数据结构定义
 
@@ -73,50 +82,23 @@ namespace logx {
 
 struct Instance;
 
-// 生命周期堆控制块
+// 生命周期堆控制块（墓碑模型）
 struct InstanceControlBlock {
-    std::atomic<uint32_t> strong_count{1};  // 初始 1 归主句柄
-    std::atomic<uint32_t> weak_count{2};    // 初始 2: 1 代表所有强引用, 1 代表 Flusher 线程存活
-    std::atomic<bool>     is_closing{false}; // 关闭中标志 (拒绝新写入/操作)
-    std::atomic<uint64_t> flusher_tid{0};    // Flusher 线程 TID (用于自死锁检测)
-
-    Instance*             inst{nullptr};     // 引擎实例数据主体
-    Pal*                  pal{nullptr};      // 平台抽象层指针
+    std::atomic<bool>      is_closing{false};    // 关闭中标志 (阻断新进入者)
+    std::atomic<int>       active_ops{0};        // 在途外部操作计数 (write/flush/export)
+    std::atomic<int>       in_callback{0};       // 在途回调计数 (emit_event / key_provider)
+    std::atomic<uint64_t>  flusher_tid{0};       // Flusher 线程 TID (用于自销毁检测)
+    
+    std::atomic<Instance*> inst{nullptr};        // 实例主体指针 (原子指针，负责认领销毁)
+    Pal*                   pal{nullptr};         // 平台抽象层指针
+    pal_thread_t           flusher_thread{nullptr}; // 保存 Flusher 线程句柄供自销毁 detach
 
     // 销毁回调与上下文 (J-1/F-2 契约)
     void (*on_destroy)(void* user, void* err_user){nullptr};
     void*                 on_destroy_key_user{nullptr};
     void*                 on_destroy_err_user{nullptr};
 
-    // 强引用获取 (仅在未关闭且强引用有效时成功)
-    bool acquire_strong() noexcept {
-        if (is_closing.load(std::memory_order_acquire)) return false;
-        uint32_t cur = strong_count.load(std::memory_order_relaxed);
-        while (true) {
-            if (cur == 0 || is_closing.load(std::memory_order_relaxed)) return false;
-            if (strong_count.compare_exchange_weak(
-                    cur, cur + 1,
-                    std::memory_order_acquire, std::memory_order_relaxed)) {
-                return true;
-            }
-        }
-    }
-
-    // 释放强引用：归零者执行 dispose_instance
-    void release_strong(bool is_flusher_thread = false) noexcept;
-
-    // 弱引用管理
-    void acquire_weak() noexcept {
-        weak_count.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    void release_weak() noexcept {
-        if (weak_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            delete this; // 控制块自身物理释放
-        }
-    }
-
-    // 释放 Instance 资源主体 (仅由归零胜出者调用一次)
+    // 统一释放 Instance 资源主体 (仅由 exchange(nullptr) 胜出者调用一次)
     void dispose_instance(bool is_flusher_thread) noexcept;
 };
 
@@ -124,27 +106,31 @@ struct InstanceControlBlock {
 ```
 
 同时，从 `Instance` 结构体中**彻底移除**以下废弃字段：
-- ~~`std::atomic<int> active_ops;`~~
-- ~~`std::atomic<int> in_callback;`~~
-- ~~`std::atomic<bool> closing;`~~
-- ~~`std::atomic<bool> close_pending;`~~
-- ~~`std::atomic<bool> close_on_flusher;`~~
+- ~~`std::atomic<int> active_ops;`~~（改由 `cb->active_ops` 承载）
+- ~~`std::atomic<int> in_callback;`~~（改由 `cb->in_callback` 承载）
+- ~~`std::atomic<bool> closing;`~~（改由 `cb->is_closing` 承载）
+- ~~`std::atomic<bool> close_pending;`~~（彻底删除）
+- ~~`std::atomic<bool> close_on_flusher;`~~（彻底删除）
 
-`Instance` 内部反向持有指向其所属控制块的指针：`InstanceControlBlock* cb = nullptr;`。
+`Instance` 内部保留反向引用：`InstanceControlBlock* cb{nullptr};`。
 
 ---
 
 ## 三、 关键路径重构逻辑
 
-### 3.1 实例创建 (`logx_open`)
-1. 分配 `InstanceControlBlock* cb = new InstanceControlBlock();`
-2. 分配 `Instance* inst = new Instance();`，并将 `inst->cb = cb; cb->inst = inst;`；
-3. 初始化 `on_destroy`、`pal` 等元数据到 `cb`；
-4. 启动 Flusher 线程（Flusher 线程启动即自然持有其分配的 1 个强引用与 1 个弱引用）；
-5. 成功后将 `*out_inst = reinterpret_cast<logx_instance_t*>(cb);` 返回给外部。
+### 3.1 实例创建 (`logx_open`) 失败路径与清理清单
+1. 分配 `InstanceControlBlock* cb = new (std::nothrow) InstanceControlBlock();`；
+2. 分配 `Instance* inst = new (std::nothrow) Instance();`，若失败则 `delete cb; return LOGX_ERR_NO_MEM;`；
+3. 将 `inst->cb = cb; cb->inst.store(inst, std::memory_order_relaxed);`；
+4. 初始化 `cb->pal = pal; cb->on_destroy = cfg->on_destroy;` 等元数据；
+5. 初始化 mutex、events、staging mmap 与 recovery；
+   - **失败清理清单**：若在 `thread_start` 之前的任一步骤失败（如 staging 创建失败、event 创建失败），必须按照依赖逆序释放 `staging`/`events`/`mutex`/`inst`，最后 `delete cb`（此时尚未向外部暴露句柄，无并发，可安全释放 CB），并返回对应错误码；
+6. 启动 Flusher 线程：`cb->flusher_thread = inst->flusher_thread;`；
+   - 若 `thread_start` 失败，执行完整资源清理，`delete inst; delete cb; return LOGX_ERR_OS;`；
+7. 成功后将 `*out_inst = reinterpret_cast<logx_instance_t*>(cb);` 返回给外部。
 
-### 3.2 写入/刷盘/导出热路径 (`logx_write` / `logx_flush` / `logx_export`)
-通过 RAII 守卫 `OpGuard` 简化为纯引用计数提升：
+### 3.2 写入/刷盘/导出热路径 (`OpGuard`)
+为保证真机 P50 写入延迟 ≤ 4.2µs 门禁，**热路径仅维护一次 `active_ops` 原子加减**：
 ```cpp
 struct OpGuard {
     InstanceControlBlock* cb{nullptr};
@@ -153,15 +139,35 @@ struct OpGuard {
     explicit OpGuard(logx_instance_t* h) {
         if (!h) return;
         auto* c = reinterpret_cast<InstanceControlBlock*>(h);
-        if (c->acquire_strong()) {
-            cb = c;
-            inst = c->inst;
+        // 入口检查：未关闭且实例主体有效
+        if (c->is_closing.load(std::memory_order_acquire)) return;
+        
+        c->active_ops.fetch_add(1, std::memory_order_acquire);
+        
+        // 二次双检：防止在 fetch_add 前后 close 刚完成置位
+        if (c->is_closing.load(std::memory_order_relaxed)) {
+            c->active_ops.fetch_sub(1, std::memory_order_release);
+            return;
         }
+
+        Instance* i = c->inst.load(std::memory_order_acquire);
+        if (!i) {
+            c->active_ops.fetch_sub(1, std::memory_order_release);
+            return;
+        }
+
+        cb = c;
+        inst = i;
     }
 
     ~OpGuard() {
         if (cb) {
-            cb->release_strong(/*is_flusher_thread=*/false);
+            // 退出并递减，若恰好归零且处于关闭态，协助递延排空认领
+            int rem = cb->active_ops.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (rem == 0 && cb->is_closing.load(std::memory_order_acquire)) {
+                // 静止达成，交由统一收尾判定
+                try_deferred_dispose(cb);
+            }
         }
     }
 
@@ -171,113 +177,161 @@ struct OpGuard {
 在 `logx_write` 中：
 ```cpp
 logx_status_e logx_write(logx_instance_t* h, int level, const char* tag,
-                         const uint8_t* payload, uint32_t payload_len) {
+                          const uint8_t* payload, uint32_t payload_len) {
     OpGuard guard{h};
-    if (!guard.is_valid()) return LOGX_ERR_STATE; // 已关闭或无效
+    if (!guard.is_valid()) return LOGX_ERR_STATE; // 已关闭或无效句柄
     Instance* inst = guard.inst;
-    // ... 后续格式化与入环逻辑完全不变 ...
+    // 后续格式化、ring 写入完全基于 inst 展开
 }
 ```
-> **优势**：不再需要先 `fetch_add` 再读 `closing` 的试探补偿逻辑，不再需要析构时的 Dekker 全序屏障！
 
 ### 3.3 错误事件发射 (`emit_event`)
-错误回调包装为 `EventGuard`：
+允许关闭期事件正常穿透分发，并维护 `in_callback`：
 ```cpp
 inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char* msg) {
     if (!inst || !inst->cb) return;
     InstanceControlBlock* cb = inst->cb;
-    
-    // 回调期间持有强引用，防止回调执行期间实例被销毁
-    if (!cb->acquire_strong()) return;
 
-    inst->err_mu.lock();
-    logx_error_fn fn = inst->err_fn;
-    void* user = inst->err_user;
-    inst->err_mu.unlock();
+    // 只要 inst 未被最终物理销毁，即使 is_closing 为 true 仍允许发事件
+    if (!cb->inst.load(std::memory_order_acquire)) return;
+
+    cb->in_callback.fetch_add(1, std::memory_order_acquire);
+
+    // 回调期间保护与分发
+    logx_error_fn fn = nullptr;
+    void* user = nullptr;
+    if (inst->pal && inst->mu) {
+        inst->err_mu.lock();
+        fn = inst->err_fn;
+        user = inst->err_user;
+        inst->err_mu.unlock();
+    }
 
     if (fn) {
         fn(user, k, code, msg ? msg : "");
     }
 
-    // 释放强引用；若当前是 Flusher 线程，如实标记线程身份
-    uint64_t current_tid = inst->pal->tid();
-    bool on_flusher = (cb->flusher_tid.load(std::memory_order_relaxed) == current_tid);
-    cb->release_strong(on_flusher);
+    int rem_cb = cb->in_callback.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (rem_cb == 0 && cb->is_closing.load(std::memory_order_acquire)) {
+        try_deferred_dispose(cb);
+    }
 }
 ```
-> **优势**：彻底删除了原 R41/R42/R43 的 `close_pending.exchange(false)`、`close_on_flusher` 转置移交、以及复杂的盲区规避代码！
 
 ### 3.4 实例关闭 (`logx_close_ex` / `logx_close`)
+严格遵循 **决策二方案 B（强引用 + `active_ops` 静止判定，含回调在飞门禁）**：
 ```cpp
 logx_status_e logx_close_ex(logx_instance_t* h, bool* out_closed_immediately) {
     if (out_closed_immediately) *out_closed_immediately = false;
     if (!h) return LOGX_ERR_INVALID_ARG;
     auto* cb = reinterpret_cast<InstanceControlBlock*>(h);
 
-    // 1. 原子标记 is_closing (仅首个调用者生效)
+    // 1. 原子置位 is_closing (仅首个调用者生效，后续并发 close 幂等返回 OK)
     if (cb->is_closing.exchange(true, std::memory_order_acq_rel)) {
-        return LOGX_OK; // 已在关闭中，幂等返回
+        return LOGX_OK;
     }
 
-    Instance* inst = cb->inst;
-    if (inst) {
-        if (inst->space_event) inst->pal->ev_signal(inst->space_event);
-        inst->flusher_exit.store(true, std::memory_order_release);
-        if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
+    // 唤醒可能阻塞在写满退避中的写线程，促使其快速退栈
+    Instance* inst = cb->inst.load(std::memory_order_acquire);
+    if (inst && inst->space_event) {
+        cb->pal->ev_signal(inst->space_event);
     }
 
-    uint64_t current_tid = cb->pal->tid();
+    uint64_t current_tid = cb->pal ? cb->pal->tid() : 0;
     bool on_flusher = (cb->flusher_tid.load(std::memory_order_acquire) == current_tid);
 
-    // 2. 检查当前是否可执行同步立即销毁:
-    //    仅当非 Flusher 线程且外部无并发活跃操作 (当前仅剩主句柄与 Flusher 线程持有的 2 个强引用)
-    if (!on_flusher && cb->strong_count.load(std::memory_order_acquire) == 2) {
-        // 同步关闭主流程：先 flush_blocking，再 join Flusher
+    // 2. 检查一次静止条件 (仅非 Flusher 线程且外部在途操作与回调均为 0)
+    if (!on_flusher &&
+        cb->active_ops.load(std::memory_order_acquire) == 0 &&
+        cb->in_callback.load(std::memory_order_acquire) == 0) {
+        
+        // ---- 同步快速路径 ----
         if (inst) {
+            // a. 排空 staging 环区在途日志落盘
             flush_blocking(inst);
+            
+            // b. 通知 Flusher 退出并安全 join
+            inst->flusher_exit.store(true, std::memory_order_release);
+            if (inst->flush_event) cb->pal->ev_signal(inst->flush_event);
+            if (inst->space_event) cb->pal->ev_signal(inst->space_event);
+            
             if (inst->flusher_thread) {
                 cb->pal->thread_join(inst->flusher_thread);
                 inst->flusher_thread = nullptr;
+                cb->flusher_thread = nullptr;
             }
         }
-        // 释放主句柄持有的强引用 (Flusher 退出时已释放其强引用，此时归零触发 dispose_instance)
-        cb->release_strong(/*is_flusher_thread=*/false);
+
+        // c. exchange(nullptr) 唯一胜出认领物理销毁
+        if (cb->inst.exchange(nullptr, std::memory_order_acq_rel) != nullptr) {
+            cb->dispose_instance(/*is_flusher_thread=*/false);
+        }
+        
         if (out_closed_immediately) *out_closed_immediately = true;
         return LOGX_OK;
     }
 
-    // 3. 递延关闭分支 (处于 Flusher 线程内部或有并发操作在持):
-    //    放弃主句柄持有的 1 个强引用，后续归零责任自然转交由最后一个退出者承担
-    cb->release_strong(on_flusher);
+    // ---- 递延关闭路径 (非零即递延，绝不自旋等待) ----
+    if (on_flusher) {
+        // Flusher 内部自触发：通知 Flusher 退出循环时自毁
+        if (inst) {
+            inst->flusher_exit.store(true, std::memory_order_release);
+            if (inst->flush_event) cb->pal->ev_signal(inst->flush_event);
+        }
+    } else {
+        // 外部并发活跃：通知 Flusher 准备退出
+        if (inst) {
+            inst->flusher_exit.store(true, std::memory_order_release);
+            if (inst->flush_event) cb->pal->ev_signal(inst->flush_event);
+        }
+    }
+
     return LOGX_OK;
 }
 ```
 
-### 3.5 统一物理清理 (`dispose_instance`)
-由 `strong_count` 归零胜出者无竞争执行：
+### 3.5 递延排空与销毁认领 (`try_deferred_dispose`)
+当在途操作或回调归零时协同认领：
+```cpp
+inline void try_deferred_dispose(InstanceControlBlock* cb) noexcept {
+    if (!cb) return;
+    if (!cb->is_closing.load(std::memory_order_acquire)) return;
+    
+    // 静止门禁：仅当活跃操作与回调全部归零时才允许认领
+    if (cb->active_ops.load(std::memory_order_acquire) == 0 &&
+        cb->in_callback.load(std::memory_order_acquire) == 0) {
+        
+        uint64_t current_tid = cb->pal ? cb->pal->tid() : 0;
+        bool is_flusher = (cb->flusher_tid.load(std::memory_order_acquire) == current_tid);
+
+        // 原子认领销毁权
+        Instance* target = cb->inst.exchange(nullptr, std::memory_order_acq_rel);
+        if (target != nullptr) {
+            cb->dispose_instance(is_flusher);
+        }
+    }
+}
+```
+
+### 3.6 统一物理清理 (`dispose_instance`)
+由 `inst.exchange(nullptr)` 唯一胜出者执行：
 ```cpp
 void InstanceControlBlock::dispose_instance(bool is_flusher_thread) noexcept {
-    if (!inst) return;
-    Instance* target = inst;
-    inst = nullptr; // 阻断后续任何可能的再次访问
-
-    // 若非 Flusher 线程且 Flusher 尚未 join，执行兜底 join
-    if (!is_flusher_thread && target->flusher_thread) {
-        target->flusher_exit.store(true, std::memory_order_release);
-        if (target->flush_event) target->pal->ev_signal(target->flush_event);
-        target->pal->thread_join(target->flusher_thread);
-        target->flusher_thread = nullptr;
+    // 此时 inst 已经为 nullptr，由调用方通过 target 传递或由内部私有上下文管理
+    // 若非 Flusher 线程执行销毁且 Flusher 线程仍在，执行 join
+    if (!is_flusher_thread && flusher_thread) {
+        pal->thread_join(flusher_thread);
+        flusher_thread = nullptr;
+    } else if (is_flusher_thread && flusher_thread) {
+        // Flusher 自毁形态：调用 PAL 新增的 thread_detach 释放原生句柄，杜绝泄漏
+        pal->thread_detach(flusher_thread);
+        flusher_thread = nullptr;
     }
 
-    delete target->staging;
-    target->staging = nullptr;
-    if (target->space_event) target->pal->ev_destroy(target->space_event);
-    if (target->flush_event) target->pal->ev_destroy(target->flush_event);
-    if (target->mu) target->pal->mutex_destroy(target->mu);
+    // 清理 Pal 指针，防止陈旧句柄解引用已失效 Pal
+    pal = nullptr;
 
-    delete target; // 释放 Instance 资源主体
-
-    // 触发 JNI / 外部销毁通知
+    // 触发外部 on_destroy 通知 (JNI / 用户上下文清理)
     if (on_destroy) {
         on_destroy(on_destroy_key_user, on_destroy_err_user);
     }
@@ -288,45 +342,65 @@ void InstanceControlBlock::dispose_instance(bool is_flusher_thread) noexcept {
 
 ## 四、 新旧状态机对比与收益确认
 
-| 维度 | 旧架构 (Dekker 多状态原子仲裁) | 新架构 (InstanceControlBlock 堆控制块) |
+| 维度 | 旧架构 (Dekker 多状态原子仲裁) | 新架构 (CB 墓碑模型 + 精确静止) |
 |---|---|---|
-| **状态量个数** | 4 个 (`active_ops`, `in_callback`, `close_pending`, `close_on_flusher`) | **1 个强引用 + 1 个弱引用 + 1 个布尔** |
-| **内存屏障复杂度** | 全链路强制要求 `seq_cst` Store-Load 屏障与双重校验 | 标准的 `acquire` / `release` 引用计数语义 |
-| **认领点位置** | 分散在 5 处退出段，逻辑各异容易漏补 | **单一归零事件触发**，代码归拢至 `dispose_instance` |
-| **尾读 UAF (R41-05)** | 理论存在（败方在胜方 `delete inst` 后访问其字段） | **彻底根除**（控制块内存独立且由弱引用保活） |
-| **Flusher 盲区泄漏** | 需针对 Flusher 回调增加移交转置分支 (R43-01) | 天然免疫（Flusher 线程持有强引用直至物理退出） |
-| **C ABI 与 JNI 侵入** | 依赖特定的 `on_destroy` 回调时机 | 外部完全透明，契约 100% 保持一致 |
+| **状态量个数** | 4 个 (`active_ops`, `in_callback`, `close_pending`, `close_on_flusher`) | **CB 永久留存 + `is_closing` + `active_ops` + `in_callback`** |
+| **内存屏障复杂度** | 全链路强制要求 `seq_cst` Store-Load 屏障与双重校验 | 标准的 `acquire` / `release` 内存序 |
+| **认领点位置** | 分散在 5 处退出段，逻辑各异容易漏补 | **收敛至 `try_deferred_dispose` 配合 `inst.exchange(nullptr)`** |
+| **尾读 UAF (R41-05)** | 理论存在（败方在胜方 `delete inst` 后访问其字段） | **彻底根除**（控制块墓碑永久存活，指针解引用合法） |
+| **Flusher 自毁泄漏** | 无法 join 导致 OS 原生线程句柄泄漏 | **彻底根除**（PAL `thread_detach` 原生解耦回收） |
+| **热路径性能** | 存在 check-then-increment 窗口，Dekker 屏障开销 | **单次原子操作提升**，零额外堆开销，延迟 ≤ 4.2µs |
 
 ---
 
 ## 五、 测试与回归验证计划
 
-本重构属于核心并发框架调整，必须执行严格的“两端四象限”全矩阵验证：
-
-1. **测试用例清理与适配**：
-   - 更新 `test_r19_regression.cpp` 中针对老 Dekker 竞态（如 R41/R42/R43）编写的探针用例，确保在新架构下全部通过且断言依然有效；
-   - 新增专用控制块生命周期单测：验证多线程并发 `logx_close` 与并发写、Flusher 回调内 `logx_close`、以及强/弱引用释放时序；
+1. **测试基线核准**：
+   - 实测单元测试基线确认为 **196 项**（clean 构建产物 `--gtest_list_tests` 实数）；
 2. **桌面端 MSVC x64 全量验证**：
-   - 必须遵循 **R21-2** 纪律（涉及结构体布局变动，必须 clean 全量重建）：`clean_build.bat` 全量编译，达到 **0 警告 0 错误**；
-   - CTest 四套件 **100% 通过**：
-     - `logx_unit_tests` (197 项)
+   - 必须遵循 **R21-2** 纪律：头文件变更强制 clean 全量编译，达到 **0 警告 0 错误**；
+   - CTest 四套件 **100% 通过 (4/4)**：
+     - `logx_unit_tests` (196 项)
      - `logx_hotpath_alloc_tests` (2 项零堆分配守护断言)
      - `logx_stress_tests` (4 项 50 线程极限并发压测)
      - `logx_crash_fork_tests` (3 项真实进程崩溃恢复对账)
 3. **Android NDK 交叉编译验证**：
    - 必须遵循 **B-11-1** 纪律：NDK 26.1 / 29.0 Clang clean 编译，达到 **61/61 TU 0 警告**；
 4. **Android 真机 (Redmi K30 Pro) 全量复跑**：
-   - 通过无线 adb 部署四套件至设备；
-   - 断言 **197/197 + 2/2 + 4/4 + 3/3 全部退出码为 0**；
-   - 检查 `MemAvailable` 波动与 ASan/TSan 内存安全。
+   - 通过无线 adb 部署四套件至设备，断言全绿；
+   - 热路径写入性能门禁：P50 **门禁线 ≤ 4.2µs**（成功线 4.0µs）；
+5. **专项测试补齐**：
+   - 陈旧句柄访问测试（返回 `LOGX_ERR_STATE` 且不崩溃）；
+   - 并发双 close 压力测试；
+   - 10k 轮 open/close 墓碑内存上界断言（验证内存平稳有界）；
+   - `thread_detach` 句柄配对断言。
 
 ---
 
-## 六、 实施步骤与节奏 (WBS)
+## 六、 分阶段实施计划 (WBS)
 
-- [ ] **Step 1: 控制块数据结构与核心头文件改造** (`core/include/logx_internal.h`, `core/include/logx_c.h`)
-- [ ] **Step 2: C ABI 实现层生命周期逻辑重构** (`core/src/logx_c.cpp`)
-- [ ] **Step 3: Flusher 线程循环引用持有与退出改造** (`core/src/flusher.cpp`)
-- [ ] **Step 4: 测试套件适配与 MSVC clean 全量构建回归 (CTest 4/4)**
-- [ ] **Step 5: Android NDK clean 构建与真机四套件部署复测**
-- [ ] **Step 6: 文档同步与正式发布状态复核** (`CHANGELOG.md`, `README.md`, `LogX后续实施计划表.md`)
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C1 as Phase 1 (机械迁移)
+    participant C2 as Phase 2 (协议替换)
+    participant V as Phase 3 (全量回归)
+
+    Note over C1: 编译期强类型阻断 + 测试 Accessor 迁移 + 守卫补齐
+    C1->>C1: 落地 InstanceControlBlock 基础定义与不透明句柄
+    C1->>C1: tests/ 引入 test_accessor.h, 机械替换 28 处强转与 7 处状态访问
+    C1->>C1: 补齐 logx_set_error_handler / logx_get_stats 生命周期守卫
+    C1->>C1: 保持旧并发状态机, 验证 MSVC clean 196/196 全绿
+
+    Note over C2: 协议替换 + 拆除 Dekker 屏障 + PAL detach
+    C2->>C2: PAL 扩展 thread_detach (Win32/POSIX/CountingPal)
+    C2->>C2: 引入 CB 墓碑与 inst.exchange(nullptr) 销毁认领
+    C2->>C2: 拆除 close_pending / close_on_flusher 与 Dekker 屏障
+    C2->>C2: 补齐并发 close、陈旧句柄、10k 轮墓碑内存上界单测
+
+    Note over V: 双端回归 + 性能门禁 + 收口
+    V->>V: MSVC clean 0 警告 + CTest 4/4
+    V->>V: NDK Clang clean 61/61 0 警告
+    V->>V: Android 真机四套件部署复跑全绿 + P50 ≤ 4.2µs
+    V->>V: 更新 CHANGELOG.md 与实施计划表
+```

@@ -20,6 +20,7 @@
 // 逐轮资源泄漏、锁 convoy、偶发堆分配 —— 而非卡住正常环境噪声。
 
 #include "logx_c.h"
+#include "test_accessor.h"
 #include "logx_internal.h"   // 传递包含 logx_pal.h / logx_staging.h / logx_format.h
 #include <gtest/gtest.h>
 
@@ -334,6 +335,11 @@ public:
         if (rc == 0) c.thread_destroy.fetch_add(1, std::memory_order_relaxed);
         return rc;
     }
+    int thread_detach(void* h) override {
+        const int rc = real_->thread_detach(h);
+        if (rc == 0) c.thread_destroy.fetch_add(1, std::memory_order_relaxed);
+        return rc;
+    }
 
     void* ev_create() override {
         void* h = real_->ev_create();
@@ -621,6 +627,71 @@ TEST(LeakRegression, CountingPal_NoResourceLeakAcrossOpenCloseCycles) {
            (long long)pal.c.mutex_create.load(),  (long long)pal.c.mutex_destroy.load(),
            (long long)pal.c.ev_create.load(),     (long long)pal.c.ev_destroy.load(),
            (long long)pal.c.thread_create.load(), (long long)pal.c.thread_destroy.load());
+}
+
+
+// T5.8 / R44-05: Flusher 回调内自销毁 thread_detach 句柄回收测试
+TEST(LeakRegression, FlusherSelfDestroyThreadDetachNoLeak) {
+    Pal& real_pal = default_pal();
+    CountingPal counting_pal(&real_pal);
+    std::string dir = make_dir(real_pal, "detach_leak");
+    counting_pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    std::atomic<bool> in_flusher_cb{false};
+    std::atomic<bool> destroyed{false};
+
+    struct Context {
+        logx_instance_t* inst = nullptr;
+        std::atomic<bool>* in_flusher_cb = nullptr;
+        std::atomic<bool>* destroyed = nullptr;
+    } ctx;
+
+    ctx.in_flusher_cb = &in_flusher_cb;
+    ctx.destroyed = &destroyed;
+
+    auto err_cb = [](void* user, logx_event_kind_e, int, const char*) {
+        auto* c = static_cast<Context*>(user);
+        c->in_flusher_cb->store(true, std::memory_order_release);
+        // 在回调内部调用 logx_close
+        logx_close(c->inst);
+    };
+
+    auto on_destroy = [](void* user, void*) {
+        auto* c = static_cast<Context*>(user);
+        c->destroyed->store(true, std::memory_order_release);
+    };
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.flush_threshold = 1024;
+    cfg.pal_override = &counting_pal;
+    cfg.err_fn = err_cb;
+    cfg.err_user = &ctx;
+    cfg.on_destroy = on_destroy;
+    cfg.user = &ctx;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    ctx.inst = inst;
+
+    // 手动在内部触发一个事件，模拟回调
+    emit_event(logx::test::test_get_instance(inst), LOGX_EV_DEGRADED, -1, "test callback self-close");
+
+    // 等待销毁完成
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!destroyed.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EXPECT_TRUE(destroyed.load());
+
+    // 核心断言 (R44-05): thread_create 与 thread_destroy 必须严格配对 (detach 回收了句柄)
+    EXPECT_EQ(counting_pal.c.thread_create.load(), counting_pal.c.thread_destroy.load())
+        << "Flusher 自销毁未泄漏线程句柄";
+
+    cleanup_dir(real_pal, dir);
 }
 
 }  // namespace

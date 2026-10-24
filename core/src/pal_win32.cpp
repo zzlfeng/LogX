@@ -400,6 +400,11 @@ public:
         CloseHandle(h);  // 线程句柄一次性;join 后释放
         return (rc == WAIT_OBJECT_0) ? 0 : -1;
     }
+    int thread_detach(void* handle) override {
+        if (!handle || handle == INVALID_HANDLE_VALUE) return -1;
+        HANDLE h = reinterpret_cast<HANDLE>(handle);
+        return CloseHandle(h) ? 0 : -1;
+    }
 
     void* ev_create() override {
         // P-6: CreateEventA 失败必须显式上报(nullptr)——否则 wait() 立即返回 /

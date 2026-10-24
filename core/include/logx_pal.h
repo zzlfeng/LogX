@@ -79,6 +79,7 @@ public:
     /* 启动一次性线程;失败 -1;routine 抛异常视为内部错误,本 PAL 仅负责线程创建。 */
     virtual int  thread_start(void* (*fn)(void*), void* arg, void** out_handle) = 0;
     virtual int  thread_join(void* handle) = 0;
+    virtual int  thread_detach(void* handle) = 0;
 
     /* 信号量 / 通知:用于 Flusher 唤醒;可能不依赖 OS 信号量,实现可自行选择
      * pthread_cond / eventfd / futex。本接口仅约定"唤醒正在 wait 的消费者"。 */

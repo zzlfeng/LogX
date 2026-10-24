@@ -23,9 +23,29 @@
 namespace logx {
 
 class Staging;
+struct Instance;
 
-// 单实例引擎;logx_instance_t 在 C ABI 里就是这个指针。
+// T5.8 生命周期堆控制块（CB 墓碑模型，根治 R41-05 尾读 UAF）
+struct InstanceControlBlock {
+    std::atomic<bool>      is_closing{false};    // 关闭中标志 (阻断新进入者)
+    std::atomic<bool>      close_requested{false}; // 外部已发起 close (递延销毁触发源)
+    std::atomic<int>       active_ops{0};        // 在途外部操作计数 (write/flush/export)
+    std::atomic<int>       in_callback{0};       // 在途回调计数 (emit_event / key_provider)
+    std::atomic<uint64_t>  flusher_tid{0};       // Flusher 线程 TID (用于自销毁检测)
+
+    std::atomic<Instance*> inst{nullptr};        // 实例主体指针 (原子指针，负责认领销毁)
+    Pal*                   pal{nullptr};         // 平台抽象层指针
+    void*                  flusher_thread{nullptr}; // 保存 Flusher 线程句柄供自销毁 detach
+
+    // 销毁回调与上下文 (J-1/F-2 契约)
+    void (*on_destroy)(void* user, void* err_user){nullptr};
+    void*                  on_destroy_key_user{nullptr};
+    void*                  on_destroy_err_user{nullptr};
+};
+
+// 单实例引擎主体数据
 struct Instance {
+    InstanceControlBlock* cb = nullptr;
     // ---- 配置 ----
     std::string log_dir;
     std::string staging_path;
@@ -80,14 +100,7 @@ struct Instance {
     // 场景真的走到了跳过分支。内部字段, 不进 logx_stats_t(零 ABI 影响)。
     std::atomic<uint64_t> seam_blocks_skipped{0};
 
-    // ---- 实例生命周期与错误回调重入防护 (R19 F-2) ----
-    std::atomic<int> active_ops{0};
-    std::atomic<int> in_callback{0};
-    std::atomic<bool> closing{false};
-    std::atomic<bool> close_pending{false};
-    std::atomic<bool> close_on_flusher{false};
-    std::atomic<uint64_t> flusher_tid{0};
-    void (*on_destroy)(void* user, void* err_user) = nullptr;
+    // 老 5 态生命周期字段已全部迁入 InstanceControlBlock (T5.8)
 };
 
 // B-13: retention_days atomic 须保持 lock-free——Instance 经不透明指针跨越 C ABI,
@@ -100,19 +113,38 @@ constexpr uint32_t kFlushBlockingTimeoutMs = 5000;
 // Spec §4.1 / T4.0-4 / F-10: Flusher 50~100ms Debounce 超时聚合窗口 (取中值 75ms)
 constexpr uint32_t kFlushDebounceMs = 75;
 
-// 实例销毁实现 (R19 F-2 / J-1): is_flusher_thread 为 true 时绝不 join 自身
-void destroy_instance(Instance* inst, bool is_flusher_thread);
+// 实例销毁实现 (T5.8 / R19 F-2 / J-1): 由 inst.exchange(nullptr) 唯一胜出者调用
+void destroy_instance(InstanceControlBlock* cb, Instance* inst, bool is_flusher_thread);
+
+// 递延销毁静止判定与认领辅助
+inline void check_deferred_dispose_on_exit(InstanceControlBlock* cb) {
+    if (!cb) return;
+    if (!cb->close_requested.load(std::memory_order_acquire)) return;
+    if (cb->active_ops.load(std::memory_order_acquire) == 0 &&
+        cb->in_callback.load(std::memory_order_acquire) == 0) {
+        uint64_t current_tid = cb->pal ? cb->pal->tid() : 0;
+        bool on_flusher = (cb->flusher_tid.load(std::memory_order_acquire) == current_tid);
+        // 若当前处于 Flusher 线程内部(如 emit_event 回调栈内)，严禁就地销毁，
+        // 移交给 flusher_main 退出段在循环完全退出后自毁
+        if (!on_flusher) {
+            if (cb->close_requested.exchange(false, std::memory_order_acq_rel)) {
+                Instance* target = cb->inst.exchange(nullptr, std::memory_order_acq_rel);
+                if (target != nullptr) {
+                    destroy_instance(cb, target, /*is_flusher_thread=*/false);
+                }
+            }
+        }
+    }
+}
 
 // 触发回调的便捷函数;忽略 null 回调。
-// E-01: 快照读取 err_fn/err_user 在 err_mu 保护下完成,消除与
-// logx_set_error_handler 并发注册的数据竞争;回调本身在锁外执行,
-// 避免回调内再注册 handler 或再打事件造成死锁。
-// R19 F-2: in_callback 跟踪回调调用深度, 供 logx_close 检测重入并实施递延销毁。
+// R44-04: 允许关闭期事件正常穿透，只要 inst 有效均可发射
 inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char* msg) {
     if (!inst) return;
-    // P-2: 递增侧 acq_rel 即为充分——递增属保守方向(只会让 close 更倾向递延),
-    // Dekker 配对建立在 seq_cst 递减侧与 close/flusher 侧的 seq_cst store+load 之间。
-    inst->in_callback.fetch_add(1, std::memory_order_acq_rel);
+    InstanceControlBlock* cb = inst->cb;
+    if (cb) {
+        cb->in_callback.fetch_add(1, std::memory_order_acq_rel);
+    }
     inst->err_mu.lock();
     logx_error_fn fn = inst->err_fn;
     void* user = inst->err_user;
@@ -120,26 +152,10 @@ inline void emit_event(Instance* inst, logx_event_kind_e k, int code, const char
     if (fn) {
         fn(user, k, code, msg ? msg : "");
     }
-    // R42-01 / ACT-1: seq_cst 全序屏障，杜绝 Dekker store-load 重排导致的漏认领与 UAF
-    // P-1: 独立 fence 为冗余防御性保留——两侧操作已全部 seq_cst, 屏障本体由 S 全序提供
-    int rem = inst->in_callback.fetch_sub(1, std::memory_order_seq_cst) - 1;
-    // F-2: 递延销毁死角收敛——当回调退出且为最后一个持有者时,消费 close_pending 触发销毁
-    if (rem == 0) {
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (inst->active_ops.load(std::memory_order_seq_cst) == 0 &&
-            inst->close_pending.load(std::memory_order_seq_cst)) {
-            uint64_t current_tid = inst->pal->tid();
-            bool on_flusher = (inst->flusher_tid.load(std::memory_order_seq_cst) == current_tid);
-            if (inst->close_pending.exchange(false, std::memory_order_seq_cst)) {
-                if (on_flusher) {
-                    // R43-01 / ACT-1: Flusher 正处于 emit_event 调用栈内,回调返回后调用方
-                    // 仍将持续引用 inst,严禁就地销毁(保留 R41-01 防尾读 UAF 纪律的本意);
-                    // 改转 close_on_flusher 移交,由 flusher_main 退出段在循环完全退出后自毁。
-                    inst->close_on_flusher.store(true, std::memory_order_seq_cst);
-                } else {
-                    destroy_instance(inst, /*is_flusher_thread=*/false);
-                }
-            }
+    if (cb) {
+        int rem = cb->in_callback.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (rem == 0 && cb->is_closing.load(std::memory_order_acquire)) {
+            check_deferred_dispose_on_exit(cb);
         }
     }
 }

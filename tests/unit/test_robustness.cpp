@@ -8,6 +8,7 @@
 //   - 持久化同步与断电检查点 (file_fsync, file_dir_fsync, mmap_sync, durability_sync) (F-04)
 
 #include "logx_c.h"
+#include "test_accessor.h"
 #include "logx_internal.h"
 #include "logx_format.h"
 #include <gtest/gtest.h>
@@ -159,6 +160,7 @@ public:
 
     int      thread_start(void* (*fn)(void*), void* a, void** out_t) override { return real_->thread_start(fn, a, out_t); }
     int      thread_join(void* t) override { return real_->thread_join(t); }
+    int thread_detach(void* t) override { return real_->thread_detach(t); }
 
     uint64_t atomic_add(uint64_t* p, int64_t delta) override { return real_->atomic_add(p, delta); }
     uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
@@ -211,8 +213,8 @@ TEST(Robustness, ClockJump_DayRolloverAtMidnight) {
     EXPECT_GT(mock_pal.file_size_path(expected_day2.c_str()), 32);
 
     // 校验 Block seqno 单调自增衔接
-    auto scan1 = scan_append_target(static_cast<Instance*>(inst), expected_day1);
-    auto scan2 = scan_append_target(static_cast<Instance*>(inst), expected_day2);
+    auto scan1 = scan_append_target(logx::test::test_get_instance(inst), expected_day1);
+    auto scan2 = scan_append_target(logx::test::test_get_instance(inst), expected_day2);
     EXPECT_TRUE(scan1.ok);
     EXPECT_TRUE(scan2.ok);
     EXPECT_EQ(scan1.seqno, 1u);
@@ -267,8 +269,8 @@ TEST(Robustness, ClockRollback_GracefullyHandledWithoutOverwrite) {
     // (T-07) 补齐两项核心保证断言:
     // 1. 回拨写入发生在回拨日期文件 (文件切换正确,而非误追加到未来文件)
     // 2. 回拨后新文件的块 seqno 严格大于未来文件块 seqno (全局单调,不回退)
-    auto scan_future = scan_append_target(static_cast<Instance*>(inst), f_future);
-    auto scan_rollback = scan_append_target(static_cast<Instance*>(inst), f_rollback);
+    auto scan_future = scan_append_target(logx::test::test_get_instance(inst), f_future);
+    auto scan_rollback = scan_append_target(logx::test::test_get_instance(inst), f_rollback);
     EXPECT_TRUE(scan_future.ok);
     EXPECT_TRUE(scan_rollback.ok);
     EXPECT_EQ(scan_future.seqno, 1u);       // 未来文件恰 1 块 (seqno=1)
@@ -375,6 +377,7 @@ public:
 
     int      thread_start(void* (*fn)(void*), void* a, void** out_t) override { return real_->thread_start(fn, a, out_t); }
     int      thread_join(void* t) override { return real_->thread_join(t); }
+    int thread_detach(void* t) override { return real_->thread_detach(t); }
 
     uint64_t atomic_add(uint64_t* p, int64_t delta) override { return real_->atomic_add(p, delta); }
     uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
@@ -421,7 +424,7 @@ TEST(Robustness, ShortWrite_RollsBackTornBytesAndEmitsEvent) {
     logx_instance_t* inst = nullptr;
     cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-auto* internal_inst = static_cast<Instance*>(inst);
+auto* internal_inst = logx::test::test_get_instance(inst);
 
 
     // 1. 正常写入一条基准日志并落盘，生成有效文件头与第一个数据块
@@ -494,7 +497,7 @@ TEST(Robustness, ShortWrite_TransientFailureAllowsSubsequentBlocksToResumeCleanl
     logx_instance_t* inst = nullptr;
     cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-auto* internal_inst = static_cast<Instance*>(inst);
+auto* internal_inst = logx::test::test_get_instance(inst);
 
 
     // 1. 写入一条基准日志并落盘
@@ -587,7 +590,7 @@ TEST(Robustness, ShortWrite_MidStreamEnospcTruncatesTornTail) {
     logx_instance_t* inst = nullptr;
     cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-auto* internal_inst = static_cast<Instance*>(inst);
+auto* internal_inst = logx::test::test_get_instance(inst);
 
 
     // 1. 基准写入一条日志并落盘
@@ -737,6 +740,7 @@ public:
 
     int      thread_start(void* (*fn)(void*), void* a, void** out_t) override { return real_->thread_start(fn, a, out_t); }
     int      thread_join(void* t) override { return real_->thread_join(t); }
+    int thread_detach(void* t) override { return real_->thread_detach(t); }
 
     uint64_t atomic_add(uint64_t* p, int64_t delta) override { return real_->atomic_add(p, delta); }
     uint64_t atomic_load(uint64_t* p) override { return real_->atomic_load(p); }
@@ -778,7 +782,7 @@ TEST(Robustness, Persistence_FlushTriggersFileAndStagingFsync) {
     logx_instance_t* inst = nullptr;
     cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-auto* internal_inst = static_cast<Instance*>(inst);
+auto* internal_inst = logx::test::test_get_instance(inst);
 
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
@@ -823,7 +827,7 @@ TEST(Robustness, Persistence_DurabilitySyncDirectAndGraceful) {
     logx_instance_t* inst = nullptr;
     cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-auto* internal_inst = static_cast<Instance*>(inst);
+auto* internal_inst = logx::test::test_get_instance(inst);
 
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
@@ -878,7 +882,7 @@ TEST(Robustness, Persistence_NewFileTriggersParentDirFsync) {
     logx_instance_t* inst = nullptr;
     cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-auto* internal_inst = static_cast<Instance*>(inst);
+auto* internal_inst = logx::test::test_get_instance(inst);
 
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
@@ -934,7 +938,7 @@ TEST(Robustness, Persistence_CloseTriggersFinalSync) {
     logx_instance_t* inst = nullptr;
     cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-auto* internal_inst = static_cast<Instance*>(inst);
+auto* internal_inst = logx::test::test_get_instance(inst);
 
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
@@ -984,7 +988,7 @@ TEST(Robustness, Persistence_FsyncFailureEmitsEventWithoutBlocking) {
     logx_instance_t* inst = nullptr;
     cfg.pal_override = &mock_pal;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-auto* internal_inst = static_cast<Instance*>(inst);
+auto* internal_inst = logx::test::test_get_instance(inst);
 
     if (internal_inst->staging) {
         internal_inst->staging->set_pal(&mock_pal);
@@ -1125,6 +1129,7 @@ public:
     int  threading_init() override { return real_->threading_init(); }
     int  thread_start(void* (*fn)(void*), void* arg, void** out) override { return real_->thread_start(fn, arg, out); }
     int  thread_join(void* h) override { return real_->thread_join(h); }
+    int thread_detach(void* h) override { return real_->thread_detach(h); }
 
     void* ev_create() override { return real_->ev_create(); }
     void  ev_destroy(void* h) override { real_->ev_destroy(h); }
@@ -1362,7 +1367,7 @@ TEST(Robustness, WriteInvalidLevel_ClassifiedAsInvalidArg) {
     cfg.max_log_length = 500;
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    auto* ii = static_cast<Instance*>(inst);
+    auto* ii = logx::test::test_get_instance(inst);
     uint64_t too_large_before = ii->drop_too_large.load();
     uint64_t truncated_before = ii->truncated_logs.load();
 
@@ -1456,6 +1461,7 @@ TEST(Robustness, ExportErrorPropagation_WriteFailAndCallbackFail) {
         int  threading_init() override { return real_->threading_init(); }
         int  thread_start(void* (*fn)(void*), void* arg, void** out_handle) override { return real_->thread_start(fn, arg, out_handle); }
         int  thread_join(void* handle) override { return real_->thread_join(handle); }
+    int thread_detach(void* handle) override { return real_->thread_detach(handle); }
         void* ev_create() override { return real_->ev_create(); }
         void  ev_destroy(void* h) override { return real_->ev_destroy(h); }
         void  ev_signal(void* h) override { return real_->ev_signal(h); }
@@ -1641,6 +1647,7 @@ TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
         int  threading_init() override { return real_->threading_init(); }
         int  thread_start(void* (*fn)(void*), void* arg, void** out_handle) override { return real_->thread_start(fn, arg, out_handle); }
         int  thread_join(void* handle) override { return real_->thread_join(handle); }
+    int thread_detach(void* handle) override { return real_->thread_detach(handle); }
         void* ev_create() override { return real_->ev_create(); }
         void  ev_destroy(void* h) override { return real_->ev_destroy(h); }
         void  ev_wait(void* h) override { return real_->ev_wait(h); }
@@ -1670,7 +1677,7 @@ TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
         logx_instance_t* inst = nullptr;
         cfg.pal_override = &mock;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
         ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-        auto* ii = static_cast<Instance*>(inst);
+        auto* ii = logx::test::test_get_instance(inst);
         (void)ii;
         EXPECT_EQ(ii->flush_threshold, 0u);
 
@@ -1705,7 +1712,7 @@ TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
         logx_instance_t* inst = nullptr;
         cfg.pal_override = &mock;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
         ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-        auto* ii = static_cast<Instance*>(inst);
+        auto* ii = logx::test::test_get_instance(inst);
         (void)ii;
         EXPECT_EQ(ii->flush_threshold, 8u * 1024);
 
@@ -1728,7 +1735,7 @@ TEST(Robustness, FlushThreshold_ZeroDisablesAutoWake_MaxMeansDefault) {
         logx_instance_t* inst = nullptr;
         cfg.pal_override = &mock;  // (T-04) Flusher 启动前定型 PAL,根除注入竞态
         ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-        auto* ii = static_cast<Instance*>(inst);
+        auto* ii = logx::test::test_get_instance(inst);
         (void)ii;
 
         int before = mock.ev_signal_count_.load();
@@ -2058,10 +2065,10 @@ TEST(Robustness, RetentionCleanup_ClockJumpForward20Years_DeletesExpiredProtects
     // retention_cleanup_impl 调用点现读一致), 再显式触发 retention 清理, 测试意图完整保留且
     // 无文件删除时序竞态。R38 F-1 指出的形式数据竞争已由 B-13 方案 1 atomic 化收口
     // (logx_internal.h retention_days 为 std::atomic<uint32_t>, 本写即为 atomic store)。
-    static_cast<Instance*>(inst)->retention_days = 7;
+    logx::test::test_set_retention_days(inst, 7);
 
     // 触发 retention 清理(与 Flusher 启动/跨天同一条路径)
-    retention_cleanup(static_cast<Instance*>(inst));
+    retention_cleanup(logx::test::test_get_instance(inst));
 
     for (const auto& cs : cases) {
         int64_t sz = mock_pal.file_size_path((dir + "/" + cs.fname).c_str());

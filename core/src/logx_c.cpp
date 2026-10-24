@@ -282,59 +282,88 @@ logx_status_e export_range(Instance* inst, const ExportRequest& req) {
 namespace {
 
 struct OpGuard {
-    Instance* inst;
+    InstanceControlBlock* cb{nullptr};
+    Instance*             inst{nullptr};
+
+    explicit OpGuard(logx_instance_t* h) {
+        if (!h) return;
+        auto* c = reinterpret_cast<InstanceControlBlock*>(h);
+        if (c->is_closing.load(std::memory_order_acquire)) return;
+
+        c->active_ops.fetch_add(1, std::memory_order_acquire);
+        if (c->is_closing.load(std::memory_order_relaxed)) {
+            c->active_ops.fetch_sub(1, std::memory_order_release);
+            return;
+        }
+
+        Instance* i = c->inst.load(std::memory_order_acquire);
+        if (!i) {
+            c->active_ops.fetch_sub(1, std::memory_order_release);
+            return;
+        }
+
+        cb = c;
+        inst = i;
+    }
+
     ~OpGuard() {
-        if (!inst) return;
-        // R42-01 / ACT-1: seq_cst 全序屏障，杜绝 Dekker store-load 重排导致的漏认领与 UAF
-        // P-1: 独立 fence 为冗余防御性保留——两侧操作已全部 seq_cst, 屏障本体由 S 全序提供
-        int rem = inst->active_ops.fetch_sub(1, std::memory_order_seq_cst) - 1;
-        if (rem == 0) {
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            if (inst->close_pending.load(std::memory_order_seq_cst)) {
-                if (inst->in_callback.load(std::memory_order_seq_cst) == 0) {
-                    if (inst->close_pending.exchange(false, std::memory_order_seq_cst)) {
-                        destroy_instance(inst, /*is_flusher_thread=*/false);
-                    }
-                }
+        if (cb) {
+            int rem = cb->active_ops.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (rem == 0 && cb->is_closing.load(std::memory_order_acquire)) {
+                check_deferred_dispose_on_exit(cb);
             }
         }
     }
+
+    bool is_valid() const noexcept { return inst != nullptr; }
 };
 
 }  // namespace
 
-void destroy_instance(Instance* inst, bool is_flusher_thread) {
+void destroy_instance(InstanceControlBlock* cb, Instance* inst, bool is_flusher_thread) {
     if (!inst) return;
+    Pal* pal = cb ? cb->pal : inst->pal;
     // 先做一次同步 flush,确保 staging 全部落块(仅非 Flusher 线程可调用, 杜绝自死锁)
     if (!is_flusher_thread) {
         flush_blocking(inst);
     }
     // 再让 Flusher 退出
     inst->flusher_exit.store(true, std::memory_order_release);
-    if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
-    if (inst->space_event) inst->pal->ev_signal(inst->space_event);
-    if (inst->flusher_thread && !is_flusher_thread) {
-        inst->pal->thread_join(inst->flusher_thread);
+    if (inst->flush_event && pal) pal->ev_signal(inst->flush_event);
+    if (inst->space_event && pal) pal->ev_signal(inst->space_event);
+    if (inst->flusher_thread) {
+        if (!is_flusher_thread) {
+            if (pal) pal->thread_join(inst->flusher_thread);
+        } else {
+            if (pal) pal->thread_detach(inst->flusher_thread);
+        }
         inst->flusher_thread = nullptr;
+        if (cb) cb->flusher_thread = nullptr;
     }
     delete inst->staging;
     inst->staging = nullptr;
-    if (inst->space_event) {
-        inst->pal->ev_destroy(inst->space_event);
+    if (inst->space_event && pal) {
+        pal->ev_destroy(inst->space_event);
         inst->space_event = nullptr;
     }
-    if (inst->flush_event) {
-        inst->pal->ev_destroy(inst->flush_event);
+    if (inst->flush_event && pal) {
+        pal->ev_destroy(inst->flush_event);
         inst->flush_event = nullptr;
     }
-    if (inst->mu) {
-        inst->pal->mutex_destroy(inst->mu);
+    if (inst->mu && pal) {
+        pal->mutex_destroy(inst->mu);
         inst->mu = nullptr;
     }
-    auto on_destroy = inst->on_destroy;
-    void* key_user = inst->key_user;
-    void* err_user = inst->err_user;
+    auto on_destroy = cb ? cb->on_destroy : nullptr;
+    void* key_user = cb ? cb->on_destroy_key_user : inst->key_user;
+    void* err_user = cb ? cb->on_destroy_err_user : inst->err_user;
+
     delete inst;
+
+    if (cb) {
+        cb->pal = nullptr; // R44-10: 清空 pal 避免陈旧句柄解引用已析构的 Pal
+    }
+
     if (on_destroy) {
         on_destroy(key_user, err_user);
     }
@@ -392,17 +421,24 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
             return LOGX_ERR_INVALID_ARG;
         }
     }
-    Instance* inst = new Instance();
+    // T5.8: 分配控制块与实例数据主体
+    InstanceControlBlock* cb = new (std::nothrow) InstanceControlBlock();
+    if (!cb) return LOGX_ERR_NOMEM;
+
+    Instance* inst = new (std::nothrow) Instance();
+    if (!inst) {
+        delete cb;
+        return LOGX_ERR_NOMEM;
+    }
+
+    inst->cb = cb;
+    cb->inst.store(inst, std::memory_order_relaxed);
+
     inst->log_dir = cfg->log_dir;
     inst->staging_path = cfg->staging_path;
     inst->max_log_length = cfg->max_log_length;
     inst->retention_days = cfg->retention_days ? cfg->retention_days : 7;
     inst->max_file_size  = cfg->max_file_size ? cfg->max_file_size : (10ULL * 1024 * 1024);
-    // E-06: flush_threshold 语义显式化——
-    //   0          = 禁用按阈值自动唤醒(完全由 logx_flush 手动控制落盘节奏);
-    //   UINT32_MAX = 取默认 8KB;
-    //   其它值     = 按配置字节阈值。
-    // 旧版把 0 静默替换为 8KB,吞掉了"彻底关闭自动刷盘"的业务意图。
     inst->flush_threshold = (cfg->flush_threshold == UINT32_MAX)
         ? (8 * 1024)
         : cfg->flush_threshold;
@@ -414,35 +450,39 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->key_user = cfg->user;
     inst->err_fn = cfg->err_fn;
     inst->err_user = cfg->err_user;
-    inst->on_destroy = cfg->on_destroy;
-    // (T-04) 测试专用 PAL 注入 seam:必须在 Flusher 线程启动(thread_start)之前
-    // 定型 inst->pal,否则 Flusher 读 inst->pal 与测试写 inst->pal 构成数据竞争。
+
+    cb->on_destroy = cfg->on_destroy;
+    cb->on_destroy_key_user = cfg->user;
+    cb->on_destroy_err_user = cfg->err_user;
+
     inst->pal = cfg->pal_override != nullptr
         ? static_cast<Pal*>(cfg->pal_override)
         : &default_pal();
+    cb->pal = inst->pal;
+
     inst->mu = inst->pal->mutex_create();
     inst->flush_event = inst->pal->ev_create();
     inst->space_event = inst->pal->ev_create();
-    // P-6: ev_create 失败(如 Win32 CreateEventA 返回 NULL)必须整体失败——
-    // 否则 wait()/wait_timeout() 退化, Flusher 等待循环沦为满 CPU 自旋且无错误
-    // 信号。mutex_create 理论不失败, 一并纳入守卫消除空指针解引用隐患。
-    if (!inst->mu || !inst->flush_event || !inst->space_event) {
+
+    // R44-07 open 失败路径清理清单
+    auto cleanup_open_failure = [&](logx_status_e err) -> logx_status_e {
+        if (inst->staging) delete inst->staging;
         if (inst->space_event) inst->pal->ev_destroy(inst->space_event);
         if (inst->flush_event) inst->pal->ev_destroy(inst->flush_event);
         if (inst->mu) inst->pal->mutex_destroy(inst->mu);
         delete inst;
-        return LOGX_ERR_STATE;
+        delete cb;
+        return err;
+    };
+
+    if (!inst->mu || !inst->flush_event || !inst->space_event) {
+        return cleanup_open_failure(LOGX_ERR_STATE);
     }
     if (inst->pal->threading_init() != 0) {
-        if (inst->space_event) inst->pal->ev_destroy(inst->space_event);
-        inst->pal->ev_destroy(inst->flush_event);
-        inst->pal->mutex_destroy(inst->mu);
-        delete inst;
-        return LOGX_ERR_STATE;
+        return cleanup_open_failure(LOGX_ERR_STATE);
     }
 
     // 创建 staging 文件目录
-    // E-05: 同 day 兼容 '/' 与 '\\' 分隔符,Windows 反斜杠路径不再误判为纯文件名
     {
         size_t pos = inst->staging_path.find_last_of("/\\");
         std::string dir = (pos == std::string::npos) ? std::string(".")
@@ -453,15 +493,9 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
 
     inst->staging = new Staging(inst->pal, inst->staging_path, kDataSizeDefault);
 
-    // 启动恢复(在创建 Flusher 之前,确保 Header 与 staging 已就绪)
+    // 启动恢复
     if (!run_recovery(inst)) {
-        delete inst->staging;
-        inst->staging = nullptr;
-        if (inst->space_event) inst->pal->ev_destroy(inst->space_event);
-        inst->pal->ev_destroy(inst->flush_event);
-        inst->pal->mutex_destroy(inst->mu);
-        delete inst;
-        return LOGX_ERR_IO;
+        return cleanup_open_failure(LOGX_ERR_IO);
     }
 
     if (inst->staging->is_degraded()) {
@@ -470,60 +504,69 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
 
     // 启动 Flusher 线程
     if (inst->pal->thread_start(&flusher_main, inst, &inst->flusher_thread) != 0) {
-        delete inst->staging;
-        inst->staging = nullptr;  // S-05: 防御性置空,杜绝潜在 double-free
-        if (inst->space_event) inst->pal->ev_destroy(inst->space_event);
-        inst->pal->ev_destroy(inst->flush_event);
-        inst->pal->mutex_destroy(inst->mu);
-        delete inst;
-        return LOGX_ERR_STATE;
+        return cleanup_open_failure(LOGX_ERR_STATE);
     }
+    cb->flusher_thread = inst->flusher_thread;
     inst->flusher_running.store(true, std::memory_order_release);
 
-    *out_inst = inst;
+    *out_inst = reinterpret_cast<logx_instance_t*>(cb);
     return LOGX_OK;
 }
 
 logx_status_e logx_close_ex(logx_instance_t* h, bool* out_closed_immediately) {
     if (out_closed_immediately) *out_closed_immediately = false;
-    Instance* inst = static_cast<Instance*>(h);
-    if (!inst) return LOGX_ERR_INVALID_ARG;
-    if (inst->closing.exchange(true, std::memory_order_acq_rel)) {
-        return LOGX_OK;
-    }
-    // R32 方案 2: 唤醒可能阻塞在退避重试中的写线程，促使其快速退出
-    if (inst->space_event) inst->pal->ev_signal(inst->space_event);
+    if (!h) return LOGX_ERR_INVALID_ARG;
+    auto* cb = reinterpret_cast<InstanceControlBlock*>(h);
 
-    uint64_t current_tid = inst->pal->tid();
-    bool on_flusher = (inst->flusher_tid.load(std::memory_order_acquire) == current_tid);
-    if (on_flusher) {
-        // R19 F-2: 处于 Flusher 线程内部，实施递延由 flusher_main 退出时销毁，杜绝 join 自身死锁
-        inst->close_on_flusher.store(true, std::memory_order_seq_cst);
-        inst->flusher_exit.store(true, std::memory_order_release);
-        if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
+    // 1. 原子置位 is_closing (仅首个调用者生效，后续并发 close 幂等返回 OK)
+    if (cb->is_closing.exchange(true, std::memory_order_acq_rel)) {
         return LOGX_OK;
     }
-    if (inst->in_callback.load(std::memory_order_seq_cst) > 0 ||
-        inst->active_ops.load(std::memory_order_seq_cst) > 0) {
-        // R19 F-2: 处于调用方线程的回调或活跃调用栈内部，实施递延销毁，由最外层 OpGuard 析构完成
-        inst->close_pending.store(true, std::memory_order_seq_cst);
+
+    Instance* inst = cb->inst.load(std::memory_order_acquire);
+    if (inst && inst->space_event && cb->pal) {
+        cb->pal->ev_signal(inst->space_event);
+    }
+
+    uint64_t current_tid = cb->pal ? cb->pal->tid() : 0;
+    bool on_flusher = (cb->flusher_tid.load(std::memory_order_acquire) == current_tid);
+
+    // 2. 检查一次静止条件 (仅非 Flusher 线程且外部在途操作与回调均为 0)
+    // 决策二方案 B: 必须严格满足 active_ops == 0 && in_callback == 0
+    if (!on_flusher &&
+        cb->active_ops.load(std::memory_order_acquire) == 0 &&
+        cb->in_callback.load(std::memory_order_acquire) == 0) {
+
+        // ---- 同步快速路径 ----
+        Instance* target = cb->inst.exchange(nullptr, std::memory_order_acq_rel);
+        if (target != nullptr) {
+            destroy_instance(cb, target, /*is_flusher_thread=*/false);
+        }
+        if (out_closed_immediately) *out_closed_immediately = true;
+        return LOGX_OK;
+    }
+
+    // ---- 递延关闭路径 (非零即递延，绝不自旋等待) ----
+    cb->close_requested.store(true, std::memory_order_release);
+
+    if (inst) {
         inst->flusher_exit.store(true, std::memory_order_release);
-        if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
-        // R43-02: 显式 seq_cst 屏障与双重校验——对齐 flusher_main 退出段
-        // 若活跃 op/callback 恰在 store(close_pending) 前全部退出并错失认领,
-        // 由本调用方兜底认领销毁, 消除 Dekker 漏认领导致的永久泄漏
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (inst->in_callback.load(std::memory_order_seq_cst) == 0 &&
-            inst->active_ops.load(std::memory_order_seq_cst) == 0) {
-            if (inst->close_pending.exchange(false, std::memory_order_seq_cst)) {
-                destroy_instance(inst, /*is_flusher_thread=*/false);
+        if (inst->flush_event && cb->pal) cb->pal->ev_signal(inst->flush_event);
+    }
+
+    // 兜底双检: 若活跃 op/callback 恰在 store(close_requested) 前退出完毕，且非 Flusher 线程，兜底认领
+    if (!on_flusher &&
+        cb->active_ops.load(std::memory_order_acquire) == 0 &&
+        cb->in_callback.load(std::memory_order_acquire) == 0) {
+        if (cb->close_requested.exchange(false, std::memory_order_acq_rel)) {
+            Instance* target = cb->inst.exchange(nullptr, std::memory_order_acq_rel);
+            if (target != nullptr) {
+                destroy_instance(cb, target, /*is_flusher_thread=*/false);
                 if (out_closed_immediately) *out_closed_immediately = true;
             }
         }
-        return LOGX_OK;
     }
-    destroy_instance(inst, false);
-    if (out_closed_immediately) *out_closed_immediately = true;
+
     return LOGX_OK;
 }
 
@@ -533,19 +576,14 @@ logx_status_e logx_close(logx_instance_t* h) {
 
 logx_status_e logx_write(logx_instance_t* h, int level,
                          const char* tag, const uint8_t* payload, uint32_t payload_len) {
-    Instance* inst = static_cast<Instance*>(h);
-    if (!inst) return LOGX_ERR_STATE;
-    if (!inst->staging) return LOGX_ERR_STATE;
+    if (!h) return LOGX_ERR_STATE;
     if (!tag) return LOGX_ERR_INVALID_ARG;
 
-    // F-1: 先增计数再查 closing——避免 close 恰在"查 closing 与 fetch_add 两步
-    // 之间完成(active_ops==0 走立即销毁)"导致写线程对已 delete 的 inst 增计数(UAF)。
-    // closing 置位后计数由 OpGuard 析构时递减并触发递延销毁, 语义与先前等价。
-    // P-2: 递增侧 acq_rel 即为充分——递增属保守方向(只会让 close 更倾向递延),
-    // Dekker 配对建立在 seq_cst 递减侧与 close/flusher 侧的 seq_cst store+load 之间。
-    inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
-    OpGuard guard{inst};
-    if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
+    OpGuard guard{h};
+    if (!guard.is_valid()) return LOGX_ERR_STATE;
+    Instance* inst = guard.inst;
+    InstanceControlBlock* cb = guard.cb;
+    if (!inst->staging) return LOGX_ERR_STATE;
 
     // 1) 锁外格式化(包含校验和计算)
     // E-02: 区分"输入非法"与"内容超长"两类失败——非法输入按 INVALID_ARG 上报,
@@ -563,12 +601,12 @@ logx_status_e logx_write(logx_instance_t* h, int level,
                            &truncated, &dropped_bytes);
     if (br == kBuildRecordsInvalidInput) {
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_INVALID_ARG, "invalid log input");
-        return inst->closing.load(std::memory_order_acquire) ? LOGX_OK : LOGX_ERR_INVALID_ARG;
+        return cb->is_closing.load(std::memory_order_acquire) ? LOGX_OK : LOGX_ERR_INVALID_ARG;
     }
     if (br == kBuildRecordsCannotFit) {
         inst->drop_too_large.fetch_add(1);
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, "log too large");
-        return inst->closing.load(std::memory_order_acquire) ? LOGX_OK : LOGX_ERR_TOO_LARGE;
+        return cb->is_closing.load(std::memory_order_acquire) ? LOGX_OK : LOGX_ERR_TOO_LARGE;
     }
     if (truncated) {
         inst->truncated_logs.fetch_add(1);
@@ -580,12 +618,12 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         std::snprintf(msg, sizeof(msg), "log truncated (dropped %llu bytes)",
                       static_cast<unsigned long long>(dropped_bytes));
         emit_event(inst, LOGX_EV_TRUNCATED, LOGX_OK, msg);
-        if (inst->closing.load(std::memory_order_acquire)) {
+        if (cb->is_closing.load(std::memory_order_acquire)) {
             return LOGX_OK;
         }
     }
 
-    if (inst->closing.load(std::memory_order_acquire)) {
+    if (cb->is_closing.load(std::memory_order_acquire)) {
         return LOGX_OK;
     }
 
@@ -641,7 +679,7 @@ logx_status_e logx_write(logx_instance_t* h, int level,
 
         // P3-2: 正在关闭时跳出循环交由统一 kFull 记账，避免静默丢弃无痕迹
         // (同时向下一个排队写线程级联传递 space_event 唤醒，确保所有写线程快速退出)
-        if (inst->closing.load(std::memory_order_acquire)) {
+        if (cb->is_closing.load(std::memory_order_acquire)) {
             if (inst->space_event) {
                 inst->pal->ev_signal(inst->space_event);
             }
@@ -665,7 +703,7 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         }
 
         // 唤醒后再次检查 closing
-        if (inst->closing.load(std::memory_order_acquire)) {
+        if (cb->is_closing.load(std::memory_order_acquire)) {
             if (inst->space_event) {
                 inst->pal->ev_signal(inst->space_event);
             }
@@ -685,7 +723,7 @@ logx_status_e logx_write(logx_instance_t* h, int level,
         emit_event(inst, LOGX_EV_DROP, LOGX_ERR_TOO_LARGE, "record too large for staging");
     }
 
-    if (inst->closing.load(std::memory_order_acquire)) {
+    if (cb->is_closing.load(std::memory_order_acquire)) {
         return LOGX_OK;
     }
 
@@ -695,51 +733,57 @@ logx_status_e logx_write(logx_instance_t* h, int level,
 }
 
 logx_status_e logx_flush(logx_instance_t* h) {
-    Instance* inst = static_cast<Instance*>(h);
-    if (!inst) return LOGX_ERR_STATE;
-    if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
-    // P-2: 递增侧 acq_rel 充分性理由见 logx_write 处注释
-    inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
-    OpGuard guard{inst};
-    return flush_blocking(inst) ? LOGX_OK : LOGX_ERR_TIMEOUT;
+    if (!h) return LOGX_ERR_STATE;
+    OpGuard guard{h};
+    if (!guard.is_valid()) return LOGX_ERR_STATE;
+    return flush_blocking(guard.inst) ? LOGX_OK : LOGX_ERR_TIMEOUT;
 }
 
 logx_status_e logx_export(logx_instance_t* h, const char* from, const char* to,
                           logx_export_cb cb, void* cb_user) {
-    Instance* inst = static_cast<Instance*>(h);
-    if (!inst) return LOGX_ERR_STATE;
-    if (inst->closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
+    if (!h) return LOGX_ERR_STATE;
     if (!from || !to) return LOGX_ERR_INVALID_ARG;
-    // P-2: 递增侧 acq_rel 充分性理由见 logx_write 处注释
-    inst->active_ops.fetch_add(1, std::memory_order_acq_rel);
-    OpGuard guard{inst};
+    OpGuard guard{h};
+    if (!guard.is_valid()) return LOGX_ERR_STATE;
     ExportRequest req;
     req.from = from; req.to = to; req.cb = cb; req.cb_user = cb_user;
-    return export_range(inst, req);
+    return export_range(guard.inst, req);
 }
 
 logx_status_e logx_set_error_handler(logx_instance_t* h, logx_error_fn fn, void* user) {
-    Instance* inst = static_cast<Instance*>(h);
+    if (!h) return LOGX_ERR_INVALID_ARG;
+    auto* cb = reinterpret_cast<InstanceControlBlock*>(h);
+    if (cb->is_closing.load(std::memory_order_acquire)) return LOGX_ERR_STATE;
+    Instance* inst = cb->inst.load(std::memory_order_acquire);
     if (!inst) return LOGX_ERR_STATE;
-    // E-01: 与 emit_event 的读取路径经 err_mu 串行化,消除数据竞争;
-    // 回调注册可被任意线程调用(见 logx_c.h 线程模型)。
-    inst->err_mu.lock();
+    std::lock_guard<std::mutex> lk(inst->err_mu);
     inst->err_fn = fn;
     inst->err_user = user;
-    inst->err_mu.unlock();
     return LOGX_OK;
 }
 
 void logx_get_stats(logx_instance_t* h, logx_stats_t* out) {
-    if (!h || !out) return;
-    Instance* inst = static_cast<Instance*>(h);
+    if (!out) return;
+    if (!h) {
+        std::memset(out, 0, sizeof(*out));
+        return;
+    }
+    auto* cb = reinterpret_cast<InstanceControlBlock*>(h);
+    if (cb->is_closing.load(std::memory_order_acquire)) {
+        std::memset(out, 0, sizeof(*out));
+        return;
+    }
+    Instance* inst = cb->inst.load(std::memory_order_acquire);
+    if (!inst) {
+        std::memset(out, 0, sizeof(*out));
+        return;
+    }
     out->drop_no_space    = inst->drop_no_space.load();
     out->drop_too_large   = inst->drop_too_large.load();
     out->truncated_blocks = inst->truncated_blocks.load();
     out->pad_records      = inst->pad_records.load();
     out->block_write_errors = inst->block_write_errors.load();
     out->truncated_logs   = inst->truncated_logs.load();
-    // E-07: 预留位保持零值契约(未来字段占用前必须为零初始化输出)
     for (size_t i = 0; i < sizeof(out->reserved) / sizeof(out->reserved[0]); ++i) {
         out->reserved[i] = 0;
     }

@@ -9,6 +9,7 @@
 //   - 50 轮多模式拆毁与重启恢复压力循环 → 零死锁、零状态错乱、数据 100% 一致
 
 #include "logx_c.h"
+#include "test_accessor.h"
 #include "logx_internal.h"
 #include "logx_format.h"
 #include <gtest/gtest.h>
@@ -59,21 +60,8 @@ TEST(CrashRecovery, GracefulTeardown_StagingDataRecovered) {
                              static_cast<uint32_t>(msg.size())), LOGX_OK);
     }
 
-    // 模拟进程突然崩溃或 kill -9:
-    // 直接强制销毁/关闭实例 (绕过 flush_blocking, 模拟被强杀时 mmap 仍停留在磁盘上)
-    Instance* raw_inst = static_cast<Instance*>(inst);
-    raw_inst->flusher_exit.store(true);
-    if (raw_inst->flusher_thread) {
-        raw_inst->pal->thread_join(raw_inst->flusher_thread);
-        raw_inst->flusher_thread = nullptr;
-    }
-    // 强制关闭 (不执行 exit flush)
-    delete raw_inst->staging;
-    raw_inst->staging = nullptr;
-    if (raw_inst->flush_event) raw_inst->pal->ev_destroy(raw_inst->flush_event);
-    if (raw_inst->mu) raw_inst->pal->mutex_destroy(raw_inst->mu);
-    delete raw_inst;
-    inst = nullptr;
+    // 模拟进程突然崩溃或 kill -9 (R44-06: 经 test_accessor 模拟强杀)
+    logx::test::test_simulate_crash_destroy(inst);
 
     // 重启引擎: 模拟崩溃后应用重新启动, 触发 run_recovery
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
@@ -246,18 +234,7 @@ TEST(CrashRecovery, FiftyCycles_RandomTeardownAndRecoveryLoop) {
             logx_close(inst);
         } else {
             // 模式 2: 模拟突然强杀崩溃 (绕过 close flush, 直接拆毁实例)
-            Instance* raw_inst = static_cast<Instance*>(inst);
-            raw_inst->flusher_exit.store(true);
-            if (raw_inst->flusher_thread) {
-                raw_inst->pal->thread_join(raw_inst->flusher_thread);
-                raw_inst->flusher_thread = nullptr;
-            }
-            delete raw_inst->staging;
-            raw_inst->staging = nullptr;
-            if (raw_inst->flush_event) raw_inst->pal->ev_destroy(raw_inst->flush_event);
-            if (raw_inst->mu) raw_inst->pal->mutex_destroy(raw_inst->mu);
-            delete raw_inst;
-            inst = nullptr;
+            logx::test::test_simulate_crash_destroy(inst);
         }
     }
 

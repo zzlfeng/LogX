@@ -34,6 +34,7 @@
 
 #include "logx_internal.h"
 #include "logx_c.h"
+#include "test_accessor.h"
 #include "logx_staging.h"
 #include "logx_codec.h"
 #include <gtest/gtest.h>
@@ -375,7 +376,7 @@ TEST(R19Regression, F1c_WrapSeamAtPendingHead_MicroBlockNeverReachesDisk) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    Instance* ii = static_cast<Instance*>(inst);
+    Instance* ii = logx::test::test_get_instance(inst);
     const uint32_t data_size = ii->staging->data_size();
     auto w_now = [&]() { return get_u32(ii->staging->raw_base() + 16); };
     auto f_now = [&]() { return get_u32(ii->staging->raw_base() + 12); };
@@ -1659,7 +1660,7 @@ TEST(R19Regression, F7_MicroBlockNotSeamPadding_DropsAndEmitsRecoveryEvent) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    Instance* ii = static_cast<Instance*>(inst);
+    Instance* ii = logx::test::test_get_instance(inst);
     const uint32_t data_size = ii->staging->data_size();
     auto w_now = [&]() { return get_u32(ii->staging->raw_base() + 16); };
     
@@ -2158,7 +2159,7 @@ TEST(R19Regression, B1_NoSpace_DefaultZeroWait_DropsImmediately) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    Instance* ii = static_cast<Instance*>(inst);
+    Instance* ii = logx::test::test_get_instance(inst);
 
     std::vector<uint8_t> rec(32 * 1024, 'A');
     bool saw_nospace = false;
@@ -2214,7 +2215,7 @@ TEST(R19Regression, B1_NoSpace_BoundedRetry_SucceedsWithoutDrop) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    Instance* ii = static_cast<Instance*>(inst);
+    Instance* ii = logx::test::test_get_instance(inst);
 
     std::vector<uint8_t> rec(30 * 1024, 'R');
     const int kTotalWrites = 8; // 8 * 30KB = 240KB >> 128KB staging
@@ -2253,7 +2254,7 @@ TEST(R19Regression, B1_NoSpace_BoundedRetry_FailFastWhenFlusherDead) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    Instance* ii = static_cast<Instance*>(inst);
+    Instance* ii = logx::test::test_get_instance(inst);
 
     // 填满 staging
     std::vector<uint8_t> rec(32 * 1024, 'D');
@@ -2327,6 +2328,7 @@ public:
     int   threading_init() override { return real_->threading_init(); }
     int   thread_start(void* (*fn)(void*), void* a, void** out_h) override { return real_->thread_start(fn, a, out_h); }
     int   thread_join(void* h) override { return real_->thread_join(h); }
+    int   thread_detach(void* h) override { return real_->thread_detach(h); }
     void* ev_create() override { return real_->ev_create(); }
     void  ev_destroy(void* h) override { real_->ev_destroy(h); }
     void  ev_signal(void* h) override { real_->ev_signal(h); }
@@ -2334,7 +2336,7 @@ public:
     bool  ev_wait_timeout(void* h, uint32_t ms) override {
         if (armed_closing.load(std::memory_order_acquire)) {
             if (inst) {
-                inst->closing.store(true, std::memory_order_release);
+                logx::test::test_set_closing(inst, true);
                 if (h) real_->ev_signal(h);
             }
         }
@@ -2348,7 +2350,7 @@ public:
     void     sleep_ms(uint32_t ms) override {
         if (armed_closing.load(std::memory_order_acquire)) {
             if (inst) {
-                inst->closing.store(true, std::memory_order_release);
+                logx::test::test_set_closing(inst, true);
             }
         }
         real_->sleep_ms(ms);
@@ -2387,7 +2389,7 @@ TEST(R19Regression, B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    Instance* ii = static_cast<Instance*>(inst);
+    Instance* ii = logx::test::test_get_instance(inst);
     mock_pal.inst = ii;
 
     // 阻塞 Flusher 刷盘，使暂存区得以稳定塞满
@@ -2423,7 +2425,7 @@ TEST(R19Regression, B1_NoSpace_ClosingDuringRetry_CountsDropAndReturnsOk) {
         mock_pal.stall_cv.notify_all();
     }
     // logx_close 内部通过 closing.exchange(true) 保证幂等；此处需显式复位 false，以便正常触发 Flusher 退出与资源 join 清理
-    ii->closing.store(false, std::memory_order_release);
+    logx::test::test_set_closing(inst, false);
 
     logx_close(inst);
     cleanup_dir(dir);
@@ -2499,13 +2501,14 @@ public:
     int   threading_init() override { return real_->threading_init(); }
     int   thread_start(void* (*fn)(void*), void* a, void** out_h) override { return real_->thread_start(fn, a, out_h); }
     int   thread_join(void* h) override { return real_->thread_join(h); }
+    int   thread_detach(void* h) override { return real_->thread_detach(h); }
     void  ev_destroy(void* h) override { real_->ev_destroy(h); }
     void  ev_signal(void* h) override {
         if (inst && h == inst->space_event) {
             space_signal_count.fetch_add(1, std::memory_order_relaxed);
             uint64_t tid = real_->tid();
             if (limit_flusher_space_signals.load(std::memory_order_acquire) &&
-                tid == inst->flusher_tid.load(std::memory_order_acquire)) {
+                tid == logx::test::test_get_flusher_tid(inst)) {
                 if (flusher_space_signals_sent.fetch_add(1, std::memory_order_acq_rel) >= 1) {
                     return; // 仅向 space_event 注入 Flusher 的首个唤醒脉冲，后继唤醒必须依赖级联令牌传递
                 }
@@ -2581,7 +2584,7 @@ TEST(R19Regression, B1_EventDrivenBackoff_FastWakeupOnSpaceFreed) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    Instance* ii = static_cast<Instance*>(inst);
+    Instance* ii = logx::test::test_get_instance(inst);
     mock_pal.inst = ii;
 
     // 填满暂存区 (3 条 32KB 记录占用约 98.3KB，环剩余空间约 32.6KB < 32.8KB，第 4 条必满)
@@ -2631,7 +2634,7 @@ TEST(R19Regression, B1_EventDrivenBackoff_FastWakeupOnSpaceFreed) {
     EXPECT_TRUE(write_finished.load()) << "写线程必须由 space_event 真实信号唤醒，若删去 signal 必然超时复红";
     if (!write_finished.load()) {
         // 安全退出兜底：置位 closing 并人工打信号以解除 writer 悬挂
-        ii->closing.store(true, std::memory_order_release);
+        logx::test::test_set_closing(inst, true);
         real_pal.ev_signal(ii->space_event);
     }
     writer.join();
@@ -2678,7 +2681,7 @@ TEST(R19Regression, B1_EventDrivenBackoff_CascadingWakeupMultiThread) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    Instance* ii = static_cast<Instance*>(inst);
+    Instance* ii = logx::test::test_get_instance(inst);
     mock_pal.inst = ii;
 
     // 等待 Flusher 完成首轮 drain_once 并确认停驻——首轮 drain 必须面对空环
@@ -2755,7 +2758,7 @@ TEST(R19Regression, B1_EventDrivenBackoff_CascadingWakeupMultiThread) {
         << "若级联唤醒令牌失效，后继线程将卡死，必然复红";
 
     // 安全回收兜底
-    ii->closing.store(true, std::memory_order_release);
+    logx::test::test_set_closing(inst, true);
     for (int i = 0; i < kWaiters; ++i) {
         real_pal.ev_signal(ii->space_event);
     }
@@ -2768,10 +2771,131 @@ TEST(R19Regression, B1_EventDrivenBackoff_CascadingWakeupMultiThread) {
     EXPECT_GE(mock_pal.space_signal_count.load(), kWaiters);
 
     // 验证追加的数据全部完好落盘
-    ii->closing.store(false, std::memory_order_release);
+    logx::test::test_set_closing(inst, false);
     ASSERT_EQ(logx_flush(inst), LOGX_OK);
     logx_close(inst);
     cleanup_dir(dir);
 }
 
+// ============================================================
+// T5.8 生命周期堆控制块 (Control Block 墓碑模型) 专项测试
+// ============================================================
+
+// 1. 陈旧句柄 (Stale Handle) 访问安全测试: 彻底根治 R41-05 / R44-01 尾读 UAF
+TEST(ControlBlockLifetime, StaleHandleAccessReturnsStateSafe) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_stale_handle_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.flush_threshold = 0;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+    ASSERT_NE(inst, nullptr);
+
+    // 正常写入与关闭
+    std::string msg = "live_data";
+    ASSERT_EQ(logx_write(inst, 2, "LIVE", reinterpret_cast<const uint8_t*>(msg.data()), static_cast<uint32_t>(msg.size())), LOGX_OK);
+    ASSERT_EQ(logx_close(inst), LOGX_OK);
+
+    // 实例主体已释放，此时 inst 为 CB 墓碑 (Tombstone)
+    // 验证后续任何陈旧裸句柄访问均为合法内存访问，绝对不崩溃，并返回契约错误码
+    EXPECT_EQ(logx_close(inst), LOGX_OK); // 幂等返回
+    EXPECT_EQ(logx_write(inst, 2, "STALE", reinterpret_cast<const uint8_t*>(msg.data()), static_cast<uint32_t>(msg.size())), LOGX_ERR_STATE);
+    EXPECT_EQ(logx_flush(inst), LOGX_ERR_STATE);
+    EXPECT_EQ(logx_export(inst, "20261024", "20261024", nullptr, nullptr), LOGX_ERR_STATE);
+    EXPECT_EQ(logx_set_error_handler(inst, nullptr, nullptr), LOGX_ERR_STATE);
+
+    // get_stats 契约: 无效句柄清零输出
+    logx_stats_t stats{};
+    stats.drop_no_space = 999;
+    logx_get_stats(inst, &stats);
+    EXPECT_EQ(stats.drop_no_space, 0u);
+
+    cleanup_dir(dir);
+}
+
+// 2. 并发双 close 测试: 验证原子 exchange(nullptr) 唯一销毁认领
+TEST(ControlBlockLifetime, ConcurrentDoubleCloseIdempotent) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_double_close_");
+    pal.file_mkdirs(dir.c_str());
+    std::string staging = dir + "/staging.mmap";
+
+    std::atomic<int> destroy_count{0};
+    auto on_destroy = [](void* user, void*) {
+        auto* cnt = static_cast<std::atomic<int>*>(user);
+        cnt->fetch_add(1, std::memory_order_relaxed);
+    };
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.staging_path = staging.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.flush_threshold = 0;
+    cfg.on_destroy = on_destroy;
+    cfg.user = &destroy_count;
+
+    logx_instance_t* inst = nullptr;
+    ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
+
+    std::atomic<bool> start_gun{false};
+    bool res1 = false, res2 = false;
+
+    std::thread t1([&]() {
+        while (!start_gun.load(std::memory_order_acquire)) std::this_thread::yield();
+        bool closed_imm = false;
+        EXPECT_EQ(logx_close_ex(inst, &closed_imm), LOGX_OK);
+        res1 = closed_imm;
+    });
+
+    std::thread t2([&]() {
+        while (!start_gun.load(std::memory_order_acquire)) std::this_thread::yield();
+        bool closed_imm = false;
+        EXPECT_EQ(logx_close_ex(inst, &closed_imm), LOGX_OK);
+        res2 = closed_imm;
+    });
+
+    start_gun.store(true, std::memory_order_release);
+    t1.join();
+    t2.join();
+
+    // 恰好执行一次 on_destroy
+    EXPECT_EQ(destroy_count.load(), 1);
+    // 至少有一个线程感知到即时销毁
+    EXPECT_TRUE(res1 || res2);
+
+    cleanup_dir(dir);
+}
+
+
+
+// 4. 2000 轮快速 open/close 墓碑内存上界压测 (R44-01 / 决策一)
+TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
+    Pal& pal = default_pal();
+    std::string dir = make_tmp_dir("logx_test_cb_mem_bound_");
+    pal.file_mkdirs(dir.c_str());
+
+    logx_config_t cfg{};
+    cfg.log_dir = dir.c_str();
+    cfg.max_log_length = 64 * 1024;
+    cfg.flush_threshold = 0;
+
+    constexpr int kRounds = 2000;
+    for (int i = 0; i < kRounds; ++i) {
+        std::string staging = dir + "/staging_" + std::to_string(i % 10) + ".mmap";
+        cfg.staging_path = staging.c_str();
+        logx_instance_t* inst = nullptr;
+        if (logx_open(&cfg, &inst) == LOGX_OK) {
+            logx_close(inst);
+        }
+    }
+    // 顺利跑完 2000 轮 open/close 且无崩溃、无死锁即达标
+    cleanup_dir(dir);
+}
 

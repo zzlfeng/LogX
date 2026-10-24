@@ -192,6 +192,7 @@ public:
     int threading_init() override { return real_->threading_init(); }
     int thread_start(void* (*fn)(void*), void* arg, void** out) override { return real_->thread_start(fn, arg, out); }
     int thread_join(void* h) override { return real_->thread_join(h); }
+    int thread_detach(void* h) override { return real_->thread_detach(h); }
     void* ev_create() override { return real_->ev_create(); }
     void ev_destroy(void* h) override { real_->ev_destroy(h); }
     void ev_signal(void* h) override { real_->ev_signal(h); }

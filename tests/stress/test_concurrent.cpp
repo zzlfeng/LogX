@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "logx_c.h"
+#include "test_accessor.h"
 #include "logx_codec.h"
 #include "logx_format.h"
 #include "logx_pal.h"
@@ -146,7 +147,7 @@ TEST(StressTest, FiftyThreads_HeavyConcurrentWritesWithFlushCompetition) {
     // 2.5 (T-11) 放行预热写,主线程等待 staging 积累真实数据后再激活竞争,
     // 消除"竞争线程起跑后前 15ms staging 尚无数据"的空跑窗口
     pre_gun.store(true, std::memory_order_release);
-    while (inst->staged_bytes_total.load(std::memory_order_acquire) < 16 * 1024) {
+    while (logx::test::test_get_instance(inst)->staged_bytes_total.load(std::memory_order_acquire) < 16 * 1024) {
         std::this_thread::yield();
     }
 

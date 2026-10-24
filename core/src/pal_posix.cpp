@@ -310,6 +310,13 @@ public:
         delete pt;
         return rc;
     }
+    int thread_detach(void* handle) override {
+        if (!handle) return -1;
+        pthread_t* pt = static_cast<pthread_t*>(handle);
+        int rc = ::pthread_detach(*pt);
+        delete pt;
+        return rc;
+    }
 
     void* ev_create() override { return new Event(); }
     void  ev_destroy(void* h) override { delete static_cast<Event*>(h); }

@@ -8,6 +8,7 @@
 //   - 跨回绕拷出与切块正确
 
 #include "logx_internal.h"
+#include "test_accessor.h"
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
@@ -1156,7 +1157,7 @@ TEST(Flush, HeapDegraded_WritesAndFlushesCorrectly) {
 
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
-    EXPECT_TRUE(inst->staging->is_degraded());
+    EXPECT_TRUE(logx::test::test_get_instance(inst)->staging->is_degraded());
 
     // 写入一条日志到堆环形区
     std::string msg = "degraded_heap_log_content";
@@ -1276,7 +1277,7 @@ TEST(ErrorMonitoring, CannotFitDropPath_PreservedForPathologicalLimit) {
     cfg.max_log_length = kMinLogLengthValid;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     ASSERT_NE(inst, nullptr);
-    inst->max_log_length = 33;
+    logx::test::test_get_instance(inst)->max_log_length = 33;
 
     struct DropTracker {
         int drop_count = 0;
@@ -1734,6 +1735,7 @@ public:
     int   threading_init() override { return real_->threading_init(); }
     int   thread_start(void* (*fn)(void*), void* a, void** out_h) override { return real_->thread_start(fn, a, out_h); }
     int   thread_join(void* h) override { return real_->thread_join(h); }
+    int thread_detach(void* h) override { return real_->thread_detach(h); }
     void* ev_create() override { return real_->ev_create(); }
     void  ev_destroy(void* h) override { real_->ev_destroy(h); }
     void  ev_signal(void* h) override { real_->ev_signal(h); }

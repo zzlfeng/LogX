@@ -20,6 +20,7 @@
 // 本测试即回归转红。
 
 #include "logx_c.h"
+#include "test_accessor.h"
 #include "logx_internal.h"
 #include <gtest/gtest.h>
 
@@ -181,7 +182,7 @@ TEST(J04Regression, TooLargeCannotFit_ErrHandlerSynchronousOnCallerThread) {
     logx_instance_t* inst = nullptr;
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     ASSERT_NE(inst, nullptr);
-    inst->max_log_length = 33;
+    logx::test::test_get_instance(inst)->max_log_length = 33;
 
     uint64_t caller_tid = pal.tid();
     std::vector<uint8_t> big(4096, 'A');
