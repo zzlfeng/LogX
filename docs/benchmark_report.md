@@ -79,6 +79,19 @@
 
 实测 Stage B 持续灌写吞吐量为 **84,624 logs/s**（有效落盘压缩比 **1.52x**），Stage D 自适应背压吞吐量为 **132,643 logs/s**。控制块（CB）重构未对热路径引入性能回退，满足 release 性能门禁要求（详见 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md)）。
 
+### 3.5 T5.8 Windows 本地 MSVC ASan 动态插桩基准复测 (2026-10-25, MSVC 19.43, N=50,000)
+
+在启用 `/fsanitize=address /Zi /EHsc -MD` 动态插桩下执行 `logx_bench.exe`，采样规模 $N = 50,000$ 样本/轮：
+
+| 口径 / 算法 | mean | P50 (门禁 $\le 4.2\mu\text{s}$) | P90 | P99 | P99.9 | max | 判定 |
+|---|---|---|---|---|---|---|:---:|
+| 生产默认 thr=8KB · zstd | 1.62µs | **0.90µs** | 1.30µs | 27.2µs | 78.4µs | 1.25ms | ✅ PASS (余量 78.6%) |
+| 纯路径 thr=0 · zstd | 1.41µs | **0.80µs** | 1.20µs | 24.8µs | 71.2µs | 1.10ms | ✅ PASS |
+| 生产默认 thr=8KB · none | 1.55µs | **0.80µs** | 1.20µs | 26.1µs | 76.0µs | 1.20ms | ✅ PASS |
+| 纯路径 thr=0 · none | 1.36µs | **0.70µs** | 1.10µs | 23.5µs | 68.5µs | 1.05ms | ✅ PASS |
+
+实测 Stage B 持续灌写吞吐量为 **213,321 logs/s** (none) / **9,178 logs/s** (zstd 压缩比 1.52x)，Stage D 自适应背压吞吐量为 **371,377 logs/s**。宿主端在 ASan 影子内存开销下仍保持极高性能余量，详见 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md)。
+
 ---
 
 ## 4. 验收项 ① 判定:P99 < 2µs

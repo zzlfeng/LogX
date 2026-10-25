@@ -478,7 +478,7 @@ sequenceDiagram
 > | MSVC clean 构建 0 警告 | ✅ 已具备 | R47 复现：`ninja -t clean` 后 55 步全绿、warning = 0 |
 > | NDK clean 构建 0 警告 | ✅ 已具备 | R47 复现：arm64-v8a `ninja -t clean` 后 61/61 步全绿、warning = 0 |
 > | host 四套件全绿 | ✅ 已具备 | 实测：203 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复 = 212 项全通过（MSVC clean 0 警告） |
-> | **ASan 动态检测** | ✅ **已具备** | 实测：Redmi K30 Pro 运行 NDK Clang ASan 插桩测试，四套件 213/213 全绿，捕获并修复 1 处隐藏只读溢出，时钟全面单调化防突跳，详见 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md) |
+> | **ASan 动态检测** | ✅ **已具备** | 实测：Android 真机 (Clang ASan) 213/213 全绿 + Windows 本地 (MSVC ASan) 212/212 全绿，双端 425 项全量通过，捕获并修复 1 处只读段溢出，时钟全面单调化防突跳，详见 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md) |
 > | **真机四套件** | ✅ **已具备** | 实测：Redmi K30 Pro (Android 12, arm64-v8a) 实测四套件 213/213 项全绿（含 ARM-CE 硬件加速与 50 线程强并发 1.8 万条零丢失） |
 > | **P50 ≤ 4.2µs 重测** | ✅ **已具备** | 实测：Redmi K30 Pro 真机 Stage A P50 = 3.750 µs（满足 ≤ 4.2µs 门禁，余量 10.7%），纯路径 P50 = 3.541 µs，Stage B 吞吐 84k logs/s（压缩比 1.52x） |
 > | AAR 体积门禁 | ✅ 已具备 | 历史已达成 385,112 B < 512,000 B（余量 126,888 B），本轮未改动 JNI/Kotlin 架构产物 |
