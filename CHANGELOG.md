@@ -157,7 +157,7 @@
 | `3c66f76` | fix(test,docs): 修正 test_recovery 历史 kid 实参笔误并在 CHANGELOG 补登 R48 提交记录 |
 | `c3e33e1` | test(android,core,docs): T5.8 真机四套件与 ASan 动态内存检测全绿、单调时钟加固与全量测试报告入库 |
 | `1d1f30d` | docs(test): 升级 T5.8 为 Android 真机与 Windows 本地双端 ASan 全量验证报告 |
-| `pending` | test(wsl,tsan,asan): T5.8 WSL Ubuntu 黄金方案 ASan+TSan 双插桩全量闭环与并发数据竞争根除 |
+| `1cb5c44` | test(wsl,tsan,asan): T5.8 WSL Ubuntu 黄金方案 ASan+TSan 双插桩全量闭环与并发数据竞争根除 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -735,7 +735,9 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **WSL Ubuntu 24.04 (Clang 18.1.3) ASan+LSan 实测**：配置 `-fsanitize=address -fno-omit-frame-pointer -g -O1`，引入 `__lsan_ignore_object(cb)` 声明控制块墓碑，四套件 212/212 全部通过 (100% 全绿)，实测 0 内存损坏、0 UAF、0 内存泄漏；性能基准 Stage A P50 = **0.469 µs**（优于 $\le 4.2\,\mu\text{s}$ 门禁线 88.8%），纯路径 P50 = **0.420 µs**，Stage B 持续落盘 13,661 logs/s；
    - **TSan 捕获并彻底根除核心并发数据竞争**：配置 `-fsanitize=thread -fno-omit-frame-pointer -g -O1`，TSan 敏锐捕获到 `flusher.cpp:ensure_append_target` 中 `read_target_cache` 跨线程未同步读取暂存区 Header（`write_pos` 偏移 16）与前台写入线程 `write_records` 的数据竞争；将 `read_target_cache(&tc)` 纳入 `inst->mu` 互斥锁保护，彻底根除竞争；同步将 `MockClockPal` 时间字段升级为 `std::atomic<uint32_t>`，将 `test_r19_regression.cpp` 的 `w_now()`/`f_now()` 改为持锁读取；TSan 全量复测四套件 **210/210 全部通过 (2 项合理跳过，0 竞态警告，0 死锁)**；
    - **跨平台兼容加固**：增加 `#ifndef __has_feature #define __has_feature(x) 0 #endif` 消除 MSVC 语法报错，core `ZSTD_DISABLE_ASM=1` 适配 Linux x86_64；Windows MSVC (build-full) 重编 0 警告，单测全绿；
-   - **三端动态检测总决算**：Android 真机 ASan (213) + Windows MSVC ASan (212) + WSL Ubuntu Clang ASan (212) + WSL Ubuntu Clang TSan (210)，累计 **847 项动态检测用例 100% 全绿**！权威报告升级为 [`docs/test_report_T5.8_android_real_device_and_asan.md`](./docs/test_report_T5.8_android_real_device_and_asan.md) v2.0。
+   - **三端动态检测总决算**：Android 真机 ASan (213) + Windows MSVC ASan (212) + WSL Ubuntu Clang ASan (212) + WSL Ubuntu Clang TSan (210)，累计 **847 项动态检测用例**；其中 WSL 422 项与 Windows Release 为本提交实测，Android/Windows ASan 425 项为前次构建产物（时效见报告 §十一）。权威报告升级为 [`docs/test_report_T5.8_android_real_device_and_asan.md`](./docs/test_report_T5.8_android_real_device_and_asan.md) v2.0。
+   - **R49 独立审查（2026-10-25，[`code_review_R49_2026-10-25.md`](./docs/reviews/code_review_R49_2026-10-25.md)）**：核心 `ensure_append_target` 竞争修复成立、无 P0/P1；捕获 **3×P2 + 7×P3**——P2 为证据时效/口径（WSL "Release 212/212" 无构建证据、`847` 聚合混入改动前 Android/Windows ASan 产物、plan §7.3 未同步 TSan/WSL 门禁）；P3 含 `LOGX_HAS_TSAN` 死宏、`__lsan_ignore_object` 早于失败路径 `delete cb`、CMake 注释与 `ZSTD_DISABLE_ASM` 矛盾、CHANGELOG `pending` 哈希等。复审实证：MSVC ASan 重建 **34 步 0 警告**、测试目标链接通过、`OpenCloseMemoryBounded` **PASS（43.5s）**；NDK 26.1/29 与 MSVC ASan 运行时均导出 `__lsan_ignore_object`；产物时间戳确认 WSL 双套件与 Windows Release 属改动后、Android ASan 属改动前。
+   - **R49 文档收口（本批 docs 提交）**：① 权威报告把 WSL "标准 Release 212/212" 行改标"未执行"并新增 §十一 证据时效与复跑说明（Android ASan 213 / Windows ASan 212 标注为前次产物，Windows 侧 R49 已复建并抽验）；② 修正"三端 847 项 100% 全绿"为分来源表述；③ plan 升 v1.8，§7.3 补 WSL ASan+LSan / TSan 门禁行并标注 Android ASan 产物时效；decisions 升 v1.8（决策结论不变）；计划表升 v1.74；④ 提交表 `pending` → `1cb5c44`；⑤ 代码类 P3（`LOGX_HAS_TSAN` 死宏、`__lsan_ignore_object` 位置、CMake 注释、150MB 阈值）留待后续修复批。
 
 ---
 

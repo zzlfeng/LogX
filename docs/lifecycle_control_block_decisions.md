@@ -1,10 +1,12 @@
 # LogX T5.8 生命周期堆控制块（Control Block）待决策项方案分析与裁决建议
 
-> **文档版本**: v1.7 (2026-10-25)  
+> **文档版本**: v1.8 (2026-10-25)  
 > **任务编号**: T5.8（生命周期堆控制块重构专项，根治 R41-05 尾读 UAF）  
-> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.7  
-> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)、[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md)、[`reviews/code_review_R48_2026-10-25.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R48_2026-10-25.md)  
-> **当前状态**: ✅ **六项决策已拍板，代码落地、测试余量收口与真机+ASan 门禁已全部达成，具备发布条件**（详见权威报告 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md)）  
+> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.8  
+> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)、[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md)、[`reviews/code_review_R48_2026-10-25.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R48_2026-10-25.md)、[`reviews/code_review_R49_2026-10-25.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R49_2026-10-25.md)  
+> **当前状态**: ✅ **六项决策已拍板，代码落地、测试余量收口与真机 + ASan + WSL ASan/TSan 门禁已全部达成，具备发布条件**（详见权威报告 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md)）  
+>
+> **v1.8 修订说明（R49 审查文档收口）**：决策结论不变。R49 复审（`1cb5c44`）判定核心 `ensure_append_target` 竞争修复成立、无 P0/P1；本版仅同步门禁证据口径——plan §7.3 补 WSL ASan+LSan 212/212 与 TSan 210/210 两行，并如实标注 Android/Windows ASan 数据来源时效（Android 213 为 `c3e33e1` 产物、Windows 212 为改动前产物，R49 已重建 MSVC ASan 并抽验关键用例）。  
 >
 > **v1.7 修订说明（双端全量套件 + ASan 动态内存检测 + P50 基准重测全部闭环）**：决策层结论全部在真机与双端 ASan 严苛测试下获得实证支撑。① Redmi K30 Pro 真机四套件 213/213 项全绿（含 ARM-CE 指令流水线与 50 线程强并发）；② Stage A 生产配置实测 P50 = 3.750 µs（满足 ≤ 4.2µs 门禁，余量 10.7%），Stage B 吞吐 84k logs/s（压缩比 1.52x）；③ Android Clang ASan 213/213 全绿 + Windows MSVC ASan 212/212 全绿（双端合计 425 项全绿），捕获并修复 FormatBounded 缓冲区溢出隐患，超时机制升级单调时钟彻底杜绝假超时，适配 MSVC ASan 栈影子特性；④ Windows MSVC 主机 203/203 全绿，核心质量门禁已全部达成。
 >

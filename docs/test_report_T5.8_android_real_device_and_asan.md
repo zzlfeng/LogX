@@ -9,7 +9,7 @@
 > 3. **WSL Ubuntu 24.04 Linux x86_64 黄金基准端 (Clang 18.1.3)**：
 >    - **完整 AddressSanitizer (ASan + LSan)**：四套件全量测试（HotPath 2/2、Stress 4/4、CrashFork 3/3、Unit 203/203 全绿），全量验证 0 内存损坏、0 UAF、0 内存泄漏。
 >    - **ThreadSanitizer (TSan)**：全量四套件与性能基准动态数据竞争检测；深度捕获并根除 `flusher.cpp:ensure_append_target` 跨线程未同步读 Header 竞争，重跑实现 0 竞态警告、0 死锁。
-> 4. **三端三编译器交叉核验与缺陷终审**：跨 Android NDK Clang、Windows MSVC 与 Linux Clang 三大平台，累计执行 **847 项** 动态内存与并发检测用例，100% 全绿通过！
+> 4. **三端三编译器交叉核验与缺陷终审**：跨 Android NDK Clang、Windows MSVC 与 Linux Clang 三大平台，累计执行 **847 项** 动态内存与并发检测用例；其中 WSL 422 项（ASan 212 + TSan 210）与 Windows Release 为本提交（`1cb5c44`）代码实测，Android ASan 213 与 Windows ASan 212 为前次构建产物（R49 复审已重建 MSVC ASan 并抽验关键用例，Android/Windows ASan 全量复跑待执行，见 §十一）。
 
 ---
 
@@ -25,7 +25,7 @@
 | 门禁项 | 门禁要求 | Android 真机实测 (arm64) | Windows 宿主实测 (x64) | WSL Ubuntu 实测 (x86_64) | 综合判定 |
 | :--- | :--- | :--- | :--- | :--- | :---: |
 | **Clean 构建 0 警告** | 全编译器干净编译 0 警告 0 错误 | NDK 26.1 Clang clean 0 警告 | MSVC 19.43 clean 0 警告 | Clang 18.1.3 clean 0 警告 | ✅ **PASS** |
-| **标准 Release 功能套件** | 四套件 100% 通过（无死锁/丢失） | **213 / 213 项 (100%)** | **203 / 203 项 (100%)** | **212 / 212 项 (100%)** | ✅ **PASS** |
+| **标准 Release 功能套件** | 四套件 100% 通过（无死锁/丢失） | **213 / 213 项 (100%)** | **203 / 203 项 (100%)** | **—**（未执行 Release；功能由 ASan 构建覆盖，见 §十一） | ✅ **PASS** |
 | **ASan 动态内存检测** | 零内存越界、零 UAF、零野指针 | **213 / 213 项 (100%)**<br>(Clang ASan runtime) | **212 / 212 项 (100%)**<br>(MSVC ASan runtime) | **212 / 212 项 (100%)**<br>(Clang ASan + LSan) | ✅ **PASS** |
 | **LSan 内存泄漏检测** | 堆控制块生命周期配对，0 内存泄漏 | 静态探针配对 0 泄漏 | 5 类底层资源净增量为 0 | **212 / 212 项 (100%)**<br>(LSan 严格断言 0 泄漏) | ✅ **PASS** |
 | **TSan 线程竞态检测** | 0 锁反转、0 数据竞争、0 未定义行为 | 并发 50 线程 18,577 条 0 丢失 | 并发 50 线程 24,080 条 0 丢失 | **210 / 210 项 (100%)**<br>(2 skipped; **0 Race 警告**) | ✅ **PASS** |
@@ -35,7 +35,7 @@
 | **硬件加密流水线加速** | 命中平台原生硬件向量指令 | 命中 ARMv8 Crypto Extensions | 支持 x64 AES-NI 流水线 | 支持 x64 AES-NI 流水线 | ✅ **PASS** |
 
 > **发布判定**：[lifecycle_control_block_plan.md](./lifecycle_control_block_plan.md) §7.3 所列之 **“真机测试”、“ASan 动态检测”、“TSan 线程竞态检测”、“P50 ≤ 4.2µs 性能复测” 全部门禁 100% 达成并闭环**。
-> 三端累计执行 **847 项动态检测用例全部通过**，底层 PAL（POSIX / Win32 / Linux）、环形暂存区与控制块生命周期不存在任何内存损坏、野指针、内存泄漏或多线程并发竞争隐患。
+> 三端累计执行 **847 项动态检测用例**；其中 WSL 422 项（ASan 212 + TSan 210）与 Windows Release 构建属本提交（`1cb5c44`）代码实测，Android ASan 213 项与 Windows ASan 212 项为前次构建产物（R49 复审已重建 MSVC ASan 并复跑关键用例，全量复跑与 Android ASan 复跑待执行；详见 §十一）。底层 PAL（POSIX / Win32 / Linux）、环形暂存区与控制块生命周期在上述已执行范围内不存在内存损坏、野指针、内存泄漏或多线程并发竞争隐患。
 
 ---
 
@@ -199,7 +199,7 @@ Linux + LLVM Clang 原生工具链是 Sanitizer 技术的发源地与黄金实�
 
 #### (2) 修复后 TSan 全量复验指标
 完成上述修复后，重新执行全量套件：
-- `logx_hotpath_alloc_tests`：**2/2 SKIPPED**（由于 TSan 运行时本身重写全局 `new`/`delete` 拦截线程事件，与测试中的探针钩子互斥，通过 `GTEST_SKIP()` 规范跳过，保持契约独立）
+- `logx_hotpath_alloc_tests`：**2/2 SKIPPED**（TSan 需接管全局 `new`/`delete` 以跟踪分配，自定义分配探针会破坏其拦截与竞态检测；故在 TSan 构建下禁用探针并以 `GTEST_SKIP()` 规范跳过，保持契约独立）
 - `logx_stress_tests`：**4/4 PASSED**（50 并发线程高压写入 24,080 条，耗时 14,062 ms，**TSan 报告 0 警告**，退出码 0）
 - `logx_crash_fork_tests`：**3/3 PASSED**（50 轮 fork/kill 循环测试耗时 42,805 ms，**TSan 报告 0 警告**，退出码 0）
 - `logx_unit_tests`：**203/203 PASSED**（全量 20 个套件 203 项单元测试耗时 82,191 ms，**TSan 报告 0 警告**，退出码 0）
@@ -221,7 +221,7 @@ Linux + LLVM Clang 原生工具链是 Sanitizer 技术的发源地与黄金实�
 | **线程与锁 PAL 抽象** | POSIX Threads (`pthread_mutex`) | Win32 API (`SRWLOCK`, `Event`) | POSIX Threads (`pthread_mutex`) | 三套不同 OS 原语并发竞争 0 死锁、0 竞态 |
 | **内存映射 PAL 抽象** | POSIX `mmap` / `msync` | Win32 `MapViewOfFile` | POSIX `mmap` / `msync` | 环形暂存区与底层 mmap 跨系统完全配对 |
 | **硬杀故障注入机制** | `fork()` + `kill(SIGKILL)` | `CreateProcessW` + `Terminate` | `fork()` + `kill(SIGKILL)` | 预写持久化协议在断电/强杀下 100% 挽回 |
-| **动态插桩测试通过总数** | **213 / 213 (100%)** | **212 / 212 (100%)** | **422 / 422 (100%)**<br>(ASan 212 + TSan 210) | **三端共计 847 项动态检测用例 100% 全绿** |
+| **动态插桩测试通过总数** | **213 / 213 (100%)**<br>（`c3e33e1` 产物） | **212 / 212 (100%)**<br>（改动前产物；R49 已重建并抽验） | **422 / 422 (100%)**<br>(ASan 212 + TSan 210，`1cb5c44` 实测) | **三端共计 847 项**（WSL 422 为本提交实测；Android/Windows ASan 425 为前次产物，见 §十一） |
 
 ---
 
@@ -255,7 +255,7 @@ Linux + LLVM Clang 原生工具链是 Sanitizer 技术的发源地与黄金实�
 5. [`third_party/mbedtls/src/aes.c`](file:///d:/Project/Android_Project/LogX/logx/third_party/mbedtls/src/aes.c#L19-L205)
    - 以 `#if defined(LOGX_AESCE_HOOK)` 守卫非 arm64 架构下的 `aesce_setkey_enc` 符号引用，修复 Linux x86_64 编译报错。
 6. [`tests/unit/test_hotpath_alloc.cpp`](file:///d:/Project/Android_Project/LogX/logx/tests/unit/test_hotpath_alloc.cpp#L45-L120)
-   - 在 TSan 下通过 `GTEST_SKIP()` 避免与 `libclang_rt.tsan_cxx` 发生符号冲突。
+   - 在 TSan 下禁用自定义 `new`/`delete` 探针并以 `GTEST_SKIP()` 跳过两用例——根因是 TSan 必须接管全局分配函数以跟踪线程事件，并非符号冲突。
 7. [`tests/unit/test_robustness.cpp`](file:///d:/Project/Android_Project/LogX/logx/tests/unit/test_robustness.cpp#L105-L175)
    - `MockClockPal` 时间字段升级为 `std::atomic<uint32_t>`，杜绝单测并发数据竞争。
 8. [`tests/unit/test_r19_regression.cpp`](file:///d:/Project/Android_Project/LogX/logx/tests/unit/test_r19_regression.cpp#L394-L3120)
@@ -268,9 +268,42 @@ Linux + LLVM Clang 原生工具链是 Sanitizer 技术的发源地与黄金实�
 经过本轮在 **Android 真实物理设备 (Redmi K30 Pro)**、**Windows 本地宿主端 (MSVC x64)** 以及 **WSL Ubuntu 24.04 (Linux Clang 18)** 的三端闭环测试：
 
 1. **三维立体门禁达成**：
-   - **功能正确性**：各端标准 Release 四套件 100% 全绿；
-   - **内存安全性**：Android Clang ASan (213/213)、Windows MSVC ASan (212/212)、WSL Ubuntu ASan + LSan (212/212) 全部通过，**零越界、零 UAF、零泄漏**；
+   - **功能正确性**：Android/Windows 标准 Release 四套件 100% 全绿；WSL 未单跑 Release，以 ASan 构建完成四套件功能核验；
+   - **内存安全性**：Android Clang ASan (213/213)、Windows MSVC ASan (212/212)、WSL Ubuntu ASan + LSan (212/212) 全部通过，**零越界、零 UAF、零泄漏**（Android/Windows 两项为前次产物，见 §十一）；
    - **线程安全性**：WSL Ubuntu TSan (210/210) 全量跑通，**零锁死、零竞态警告**，生产与测试竞态彻底清零；
    - **极限性能**：真机生产配置 P50 **$3.750\,\mu\text{s}$**（优于 $\le 4.2\,\mu\text{s}$ 门禁线），Windows/Linux 桌面环境稳态 P50 **$0.400\,\mu\text{s} \sim 0.469\,\mu\text{s}$**，压缩比达标 1.52x。
 2. **终审发布建议**：
    至此，LogX 日志库在经历了生命周期控制块重构、真机严苛测试、MSVC/Clang 双编译器 ASan 检验以及行业黄金标准 Linux ASan + LSan + TSan 的全面洗礼后，其**架构健壮性、内存安全性与多线程并发安全性已达到工业级顶尖水准**。建议正式将 LogX v1.0 推进至下一阶段打包发布流程！
+
+---
+
+## 十一、证据时效与复跑说明（R49 复审追加）
+
+> 本节由 [`code_review_R49_2026-10-25.md`](./reviews/code_review_R49_2026-10-25.md) 复审追加，用于区分"本提交代码实测"与"前次构建产物"，不改变任何测试用例的结论。
+
+### 1. 产物时间戳审计（相对提交 `1cb5c44`，2026-10-25 13:12:31）
+
+| 产物 | 时间 | 归属 |
+|---|---|---|
+| `build-wsl-asan/.ninja_log` | 13:04:28 | ✅ 本提交代码 |
+| `build-wsl-tsan/.ninja_log` | 13:01:14 | ✅ 本提交代码 |
+| `build-full` 相关 `.obj`（aes.c / logx_c.cpp / test_*） | 13:06:39–13:06:48 | ✅ 本提交代码 |
+| `build-host-asan/logx_c.cpp.obj`（Windows ASan） | 12:12:27 | ⚠️ 改动前产物 |
+| `build-android-asan/liblogx.so` | 11:42:20 | ❌ 改动前产物 |
+
+### 2. R49 复审补做验证
+
+| 项目 | 结果 |
+|---|---|
+| MSVC ASan 核心库重建 | `ninja -C build-host-asan logx_core` → **34/34 步，warning = 0** |
+| MSVC ASan 测试目标链接 | `logx_unit_tests` + `logx_hotpath_alloc_tests` → **13/13 步，链接通过** |
+| `__lsan_ignore_object` 链接实证 | MSVC `clang_rt.asan_dynamic-x86_64.dll` 导出（序号 322）；NDK 26.1 / 29 `libclang_rt.asan-aarch64-android.so` 均导出 `T __lsan_ignore_object` |
+| 关键用例复跑 | `ControlBlockLifetime.OpenCloseMemoryBounded` → **PASS（43,459 ms）**，走 MSVC ASan 4GB 分支 |
+| Windows Release | `build-full` 相关 5 个 TU 均于 13:06 编译（改动后），支撑"重编 0 警告"结论 |
+
+### 3. 尚未复跑项（如实登记）
+
+1. **Android ASan 全量 213 项**：仍为 `c3e33e1` 产物（11:42）。本批改动对 arm64 为编译期空操作（`__lsan_ignore_object` 在 NDK 运行时为桩、`ZSTD_DISABLE_ASM` 对非 x86 无效、`aes.c` 守卫仅影响非 arm64），但按证据纪律仍需随本提交复跑后方可继续引用 213。
+2. **Windows ASan 全量 212 项**：R49 仅重建并复跑关键内存用例，全量四套件待复跑。
+3. **WSL 标准 Release**：未构建、未执行；WSL 仅存在 `build-wsl-asan` 与 `build-wsl-tsan` 两套构建，矩阵对应行已标注"未执行"。
+4. **性能基准**：`logx_bench` 未在 R49 复审中重跑，P50 与吞吐数据沿用原报告记录。
