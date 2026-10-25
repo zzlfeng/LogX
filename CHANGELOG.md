@@ -156,8 +156,10 @@
 | `49dc973` | docs(review): R48 收口复核报告入库与 T5.8 台账同步——R48 报告入库（R47 2×P2+5×P3 全闭环）、CHANGELOG 第 24 条补充收口进展、plan/decisions 升 v1.6、计划表 v1.70 |
 | `3c66f76` | fix(test,docs): 修正 test_recovery 历史 kid 实参笔误并在 CHANGELOG 补登 R48 提交记录 |
 | `c3e33e1` | test(android,core,docs): T5.8 真机四套件与 ASan 动态内存检测全绿、单调时钟加固与全量测试报告入库 |
-| `1d1f30d` | docs(test): 升级 T5.8 为 Android 真机与 Windows 本地双端 ASan 全量验证报告 |
+| `2dbb3fa` | docs(test): 升级 T5.8 为 Android 真机与 Windows 本地双端 ASan 全量验证报告 |
 | `1cb5c44` | test(wsl,tsan,asan): T5.8 WSL Ubuntu 黄金方案 ASan+TSan 双插桩全量闭环与并发数据竞争根除 |
+| `f2e5ae2` | docs(review): R49 审查报告入库与 T5.8 三端动态检测证据时效口径收口 |
+| `aed97b9` | fix(core,test,docs): R49 审查 P2/P3 收口与三端六套复跑 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
