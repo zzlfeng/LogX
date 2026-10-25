@@ -1,10 +1,12 @@
 # LogX T5.8 生命周期堆控制块（Control Block）待决策项方案分析与裁决建议
 
-> **文档版本**: v1.5 (2026-10-24)  
+> **文档版本**: v1.6 (2026-10-25)  
 > **任务编号**: T5.8（生命周期堆控制块重构专项，根治 R41-05 尾读 UAF）  
-> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.5  
+> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.6  
 > **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)、[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md)  
-> **当前状态**: 🔧 六项决策已拍板并完成代码落地（`431d5ee` 实施 + `0ef345f` R45 收口 + `677b70d` R46 余量收口）；**R47 复核判定 12 项中 10 项完全成立 / 2 项部分成立**（`P2-03` 内存门禁强度、`P3-08` TLS 清扫机制），余量 **2×P2 + 5×P3** 见计划文档 §7.4；发布门禁余 **ASan/TSAN + 真机四套件 + P50 重测**，发布状态维持「未发布 / 进行中」
+> **当前状态**: 🔧 六项决策已拍板并完成代码落地与测试余量收口（`431d5ee` + `0ef345f` + `677b70d` + R47 收口批次）；**R47 的 2×P2 + 5×P3 已全部闭环**（文档 3 项于 `be22508`，代码 4 项——`P2-N1` Instance 净计数断言 + 阈值收紧、`P3-N1` 注释如实化、`P3-N4` `cb->pal` release 配对、`P3-N5` `append_block` 入参 `kid`）；发布门禁仍余 **ASan/TSAN + 真机四套件 + P50 重测**，发布状态维持「未发布 / 进行中」
+>
+> **v1.6 修订说明（R47 待收口 4 项代码闭环）**：决策层结论不变。`P2-N1` 以 `Instance` 存活净计数（构造+1/析构-1）+ 内存阈值收紧（host 3MB / Android 4MB）双闸落地，变异验证删 `delete inst` 双红；`P3-N1` 采用"注释如实化"路径（core 侧 `gen` 暴露属 API 设计变更，按 R47 建议不做，契约已声明残留窗口）；`P3-N4` `cb->pal` 写侧补 `release` 配对；`P3-N5` `append_block` 改用入参 `kid`（行为不变）。验证：MSVC/NDK 双端 0 警告、四套件 212 项全绿、内存有界用例 3 轮稳定。
 >
 > **v1.5 修订说明（依据 R47 复核）**：决策层结论不变（六项拍板均成立、无需重新裁决），仅校正状态口径——v1.4 的"已全量收口"在 R47 逐项复核与 5 组变异实验下修正为"10 成立 / 2 部分"：`P2-03` 的 5 类资源配对断言有效，但 8MB 内存阈值放过了 Instance 级泄漏（删 `delete inst` 后增量 6.02MB 仍绿）；`P3-08` 的 `nativeClose` 主动清扫在单实例递延关闭下对被关闭实例自身无效（水位未推进），现由 `logx_c.h` 契约如实声明残留窗口。`P2-02` 的历史基线勘误经 git 核对成立（`431d5ee~1` 即返回 `LOGX_ERR_STATE`）。
 >
