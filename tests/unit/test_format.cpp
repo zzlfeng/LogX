@@ -230,8 +230,9 @@ TEST(FormatBounded, UnderLimit_NoTruncation) {
     bool truncated = true;
     uint64_t dropped = 99;
     // tag "T"(1B): total = 27+1+66+6 = 100 == max_total → 恰好不截断
+    const std::string payload(66, 'h');
     logx::FormatBoundedStatus st = format_record_bounded(
-        2, "T", (const uint8_t*)"hello", 66, 0, 0, 0,
+        2, "T", reinterpret_cast<const uint8_t*>(payload.data()), 66, 0, 0, 0,
         buf, sizeof(buf), &total, 100, &truncated, &dropped);
     ASSERT_EQ(st, FormatBoundedStatus::kOk);
     EXPECT_FALSE(truncated);

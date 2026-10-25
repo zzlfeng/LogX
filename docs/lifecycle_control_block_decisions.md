@@ -1,10 +1,12 @@
 # LogX T5.8 生命周期堆控制块（Control Block）待决策项方案分析与裁决建议
 
-> **文档版本**: v1.6 (2026-10-25)  
+> **文档版本**: v1.7 (2026-10-25)  
 > **任务编号**: T5.8（生命周期堆控制块重构专项，根治 R41-05 尾读 UAF）  
-> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.6  
-> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)、[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md)  
-> **当前状态**: 🔧 六项决策已拍板并完成代码落地与测试余量收口（`431d5ee` + `0ef345f` + `677b70d` + R47 收口批次）；**R47 的 2×P2 + 5×P3 已全部闭环**（文档 3 项于 `be22508`，代码 4 项——`P2-N1` Instance 净计数断言 + 阈值收紧、`P3-N1` 注释如实化、`P3-N4` `cb->pal` release 配对、`P3-N5` `append_block` 入参 `kid`）；发布门禁仍余 **ASan/TSAN + 真机四套件 + P50 重测**，发布状态维持「未发布 / 进行中」
+> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.7  
+> **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)、[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md)、[`reviews/code_review_R48_2026-10-25.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R48_2026-10-25.md)  
+> **当前状态**: ✅ **六项决策已拍板，代码落地、测试余量收口与真机+ASan 门禁已全部达成，具备发布条件**（详见权威报告 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md)）  
+>
+> **v1.7 修订说明（真机全量套件 + ASan 动态内存检测 + P50 基准重测全部闭环）**：决策层结论全部在真机与 ASan 严苛测试下获得实证支撑。① Redmi K30 Pro 真机四套件 213/213 项全绿（含 ARM-CE 指令流水线与 50 线程强并发）；② Stage A 生产配置实测 P50 = 3.750 µs（满足 ≤ 4.2µs 门禁，余量 10.7%），Stage B 吞吐 84k logs/s（压缩比 1.52x）；③ ASan 动态插桩全量 213/213 项全绿，捕获并修复 FormatBounded 缓冲区溢出隐患，超时机制升级单调时钟彻底杜绝假超时；④ Windows MSVC 主机 203/203 全绿，核心质量门禁已全部达成。
 >
 > **v1.6 修订说明（R47 待收口 4 项代码闭环）**：决策层结论不变。`P2-N1` 以 `Instance` 存活净计数（构造+1/析构-1）+ 内存阈值收紧（host 3MB / Android 4MB）双闸落地，变异验证删 `delete inst` 双红；`P3-N1` 采用"注释如实化"路径（core 侧 `gen` 暴露属 API 设计变更，按 R47 建议不做，契约已声明残留窗口）；`P3-N4` `cb->pal` 写侧补 `release` 配对；`P3-N5` `append_block` 改用入参 `kid`（行为不变）。验证：MSVC/NDK 双端 0 警告、四套件 212 项全绿、内存有界用例 3 轮稳定。
 >

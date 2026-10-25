@@ -1028,12 +1028,12 @@ void flusher_loop(Instance* inst) {
     // F-8: 不再重复 store(true)——logx_open 在 thread_start 成功后已置位,
     // 此处再写既冗余又会在"线程瞬间退出"时覆写竞态;退出时统一 store(false)。
     retention_cleanup_impl(inst);
-    uint64_t last_sync_ms = inst->pal->wallclock_ms();
+    uint64_t last_sync_ms = inst->pal->monotonic_ns() / 1000000ULL;
     while (!inst->flusher_exit.load()) {
         drain_once(&c, inst);
 
         // 运行期 30s 定时持久化检查点 (spec §11 / T4.0-6)
-        uint64_t now_ms = inst->pal->wallclock_ms();
+        uint64_t now_ms = inst->pal->monotonic_ns() / 1000000ULL;
         if (now_ms >= last_sync_ms + 30000) {
             durability_sync(inst, nullptr);
             last_sync_ms = now_ms;
@@ -1294,7 +1294,7 @@ bool flush_blocking(Instance* inst) {
     uint64_t target = inst->staged_bytes_total.load(std::memory_order_relaxed);
     if (inst->mu) inst->pal->mutex_unlock(inst->mu);
 
-    uint64_t start_ms = inst->pal->wallclock_ms();
+    uint64_t start_ms = inst->pal->monotonic_ns() / 1000000ULL;
     if (inst->flush_event) inst->pal->ev_signal(inst->flush_event);
 
     while (inst->flushed_bytes_total.load(std::memory_order_relaxed) < target) {
@@ -1302,7 +1302,7 @@ bool flush_blocking(Instance* inst) {
             emit_event(inst, LOGX_EV_IO, -1, "flush skipped: flusher not running");
             return false;
         }
-        if (inst->pal->wallclock_ms() >= start_ms + kFlushBlockingTimeoutMs) {
+        if (inst->pal->monotonic_ns() / 1000000ULL >= start_ms + kFlushBlockingTimeoutMs) {
             emit_event(inst, LOGX_EV_IO, -1, "flush timeout: flusher stalled; data may be pending");
             return false;
         }
