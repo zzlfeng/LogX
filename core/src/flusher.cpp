@@ -1122,7 +1122,8 @@ bool append_block(Instance* inst,
     if (!inst || !inst->log_dir.size()) return false;
     // 单文件模式:按 hint 路径写;若文件不存在则创建并写 32B 文件头。
     // 仅单元测试用此接口绕过 Flusher 主循环(全仓调用点均传非空 file_salt)。
-    (void)kid;
+    // R47 P3-N5: 建文件探测与 32B 文件头统一使用**入参 kid**(与签名契约一致,
+    // 当前全仓调用点均与 inst->kid 相同, 行为不变; 未来多 kid 分卷时不再误用宿主实例 kid)。
     uint32_t yyyymmdd = 0, hhmmss = 0;
     inst->pal->wallclock_date(&yyyymmdd, &hhmmss);
     std::string path = make_log_path(inst->log_dir, yyyymmdd, 0);
@@ -1151,12 +1152,12 @@ bool append_block(Instance* inst,
         // R20 复核 (F-6 残留) + R46 P2-01 (ACT-6 补齐): 与 open_or_create_append_target 同款纪律,
         // 建文件时刻经 invoke_key_provider(纳入 in_callback 门禁)探测密钥, 文件头加密位与预期块形态一致。
         bool enc_capable = true;
-        if (inst->encrypt_enable != 0 && !invoke_key_provider(inst, inst->kid)) {
+        if (inst->encrypt_enable != 0 && !invoke_key_provider(inst, kid)) {
             enc_capable = false;
             emit_event(inst, LOGX_EV_DEGRADED, -1,
                        "key unavailable at file creation; file header written without encrypted bit");
         }
-        if (!write_file_header(inst, fd, yyyymmdd, inst->kid, salt, enc_capable)) {
+        if (!write_file_header(inst, fd, yyyymmdd, kid, salt, enc_capable)) {
             inst->pal->file_close(fd); return false;
         }
         if (inst->pal->file_fsync(fd) != 0) {

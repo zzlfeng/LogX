@@ -466,7 +466,10 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     inst->pal = cfg->pal_override != nullptr
         ? static_cast<Pal*>(cfg->pal_override)
         : &default_pal();
-    cb->pal.store(inst->pal, std::memory_order_relaxed);
+    // R47 P3-N4: 与读侧(check_deferred internal.h / close_ex :537 / destroy_instance :333 的
+    // acquire)显式配对用 release——句柄发布本身必经受同步通道, relaxed 实践中亦可见,
+    // 但配对语义自洽可免后续维护者对意图的猜测。
+    cb->pal.store(inst->pal, std::memory_order_release);
 
     inst->mu = inst->pal->mutex_create();
     inst->flush_event = inst->pal->ev_create();

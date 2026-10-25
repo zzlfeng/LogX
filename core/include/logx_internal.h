@@ -103,6 +103,16 @@ struct Instance {
     // 场景真的走到了跳过分支。内部字段, 不进 logx_stats_t(零 ABI 影响)。
     std::atomic<uint64_t> seam_blocks_skipped{0};
 
+    // ---- R47 P2-N1 (P2-03 门禁补强): 存活实例净计数 (构造+1 / 析构-1) ----
+    // OpenCloseMemoryBounded 以"轮次前后差值恒为 0"刚性拦截 Instance 级泄漏:
+    // 进程级内存阈值对小体积泄漏不敏感(实测正常增量 1.07MB、删 delete inst 后
+    // 6.02MB, 均低于 8MB 旧阈值), 本计数与其互补。构造/析构各一次 relaxed 原子
+    // 加减, open/close 非热路径, 运行期零感知; 不改变数据布局(仅静态成员)。
+    inline static std::atomic<int64_t> alive_instances_{0};
+    Instance()  { alive_instances_.fetch_add(1, std::memory_order_relaxed); }
+    ~Instance() { alive_instances_.fetch_sub(1, std::memory_order_relaxed); }
+    static int64_t alive_instances() { return alive_instances_.load(std::memory_order_relaxed); }
+
     // 老 5 态生命周期字段已全部迁入 InstanceControlBlock (T5.8)
 };
 

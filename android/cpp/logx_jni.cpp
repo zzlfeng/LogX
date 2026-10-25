@@ -470,8 +470,10 @@ Java_com_zzlfeng_logx_LogX_nativeClose(JNIEnv* /*env*/, jclass /*clazz*/, jlong 
     // Flusher 线程退出或 OpGuard 终结时刻安全触发, 此处绝不提前释放上下文(杜绝 UAF 与悬挂指针)。
     logx_close(inst);
 
-    // R46 P3-08: 无论同步销毁(可能已在异线程完成)还是递延销毁，顺手按当前已销毁代数水位
-    // 显式清扫调用 nativeClose 的宿主线程自身 TLS 密钥槽，收窄宿主线程空闲时的明文驻留窗口。
+    // R46 P3-08 / R47 P3-N1: 同步销毁路径上 jni_destroy_trampoline 已推进水位, 此处
+    // 顺手清零本线程中旧代数(<= 水位)的残留槽位; 递延销毁路径上被关闭实例自身 gen
+    // 尚未计入水位, 其槽位须待实际销毁推进水位后由下次探测/下次 nativeClose 清扫
+    // (完整取舍见 logx_c.h on_destroy 契约: 惰性回收, 空闲线程可能长期驻留)。
     g_tls_key_cache.scrub_by_watermark(g_jni_destroyed_gen_watermark.load(std::memory_order_acquire));
 }
 

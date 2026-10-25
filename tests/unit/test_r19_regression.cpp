@@ -3044,6 +3044,10 @@ TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
     }
     destroy_cnt.store(0, std::memory_order_relaxed);
     const uint64_t mem_before = sample_proc_mem_bytes();
+    // R47 P2-N1: 存活实例净计数基线——轮次前后差值必须恒为 0。
+    // 进程内存阈值对 Instance 级小体积泄漏不敏感(实测删 delete inst 后增量约 6MB),
+    // 本断言直接计数构造/析构配对, 是该失效形态的确定性拦截(变异验证: 删 delete inst 必红)。
+    const int64_t alive_before = Instance::alive_instances();
 
     constexpr int kRounds = 10000;
     int opened_cnt = 0;
@@ -3061,19 +3065,35 @@ TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
     EXPECT_EQ(opened_cnt, kRounds);
     EXPECT_EQ(destroy_cnt.load(), kRounds);
 
-    // R46 P2-03 刚性断言 1: 全部 5 类底层资源必须 100% 严格配对释放 (若注释掉 delete inst->staging 或 destroy_instance 即必红)
+    // R46 P2-03 刚性断言 1: 全部 5 类底层资源必须 100% 严格配对释放
+    // (注释掉 delete inst->staging 或整个 destroy_instance 调用即必红)
     EXPECT_EQ(fast_pal.fd_open_cnt.load(), fast_pal.fd_close_cnt.load());
     EXPECT_EQ(fast_pal.mmap_open_cnt.load(), fast_pal.mmap_close_cnt.load());
     EXPECT_EQ(fast_pal.mu_create_cnt.load(), fast_pal.mu_destroy_cnt.load());
     EXPECT_EQ(fast_pal.ev_create_cnt.load(), fast_pal.ev_destroy_cnt.load());
     EXPECT_EQ(fast_pal.th_start_cnt.load(), fast_pal.th_end_cnt.load());
 
-    // R46 P2-03 刚性断言 2: 实测进程内存增长上界 <= 8MB
-    // (10k 个 64B CB 墓碑含分配器元数据约 ~1MB; 若 Staging 128KB/轮或 Instance 泄漏则高达 >1.2GB 必红)
+    // R47 P2-N1 刚性断言 3: Instance 构造/析构净计数差值必须为 0
+    // (删掉 destroy_instance 内的 delete inst 时差值 = 10050, 必红;
+    //  亦覆盖 logx_open 失败回收路径与 test_simulate_crash_destroy 测试缝的 delete 配对)
+    EXPECT_EQ(Instance::alive_instances() - alive_before, 0)
+        << "10k open/close 后存活 Instance 净计数非零: 存在 Instance 泄漏";
+
+    // R46 P2-03 / R47 P2-N1 刚性断言 2: 实测进程内存增长上界
+    // (10k 个 64B CB 墓碑含分配器元数据实测 ~1.07MB; Staging 128KB/轮泄漏 >1.2GB 必红;
+    //  Instance 级小泄漏由上方净计数断言拦截, 本阈值收紧用于覆盖其余中等体积泄漏)
+    // R47 实测: 正常 1.07MB / 删 delete inst 约 6MB —— host 取 3MB(≈2.8x 余量),
+    // Android 走 /proc/self/statm RSS 采集抖动更大, 分支放宽至 4MB。
+#if defined(__ANDROID__)
+    constexpr uint64_t kMemGrowthLimitBytes = 4ull * 1024ull * 1024ull;
+#else
+    constexpr uint64_t kMemGrowthLimitBytes = 3ull * 1024ull * 1024ull;
+#endif
     if (mem_before > 0 && mem_after > mem_before) {
         const uint64_t growth_bytes = mem_after - mem_before;
-        EXPECT_LE(growth_bytes, 8ull * 1024ull * 1024ull)
-            << "10k open/close 内存增量越界 (before=" << mem_before << ", after=" << mem_after << ")";
+        EXPECT_LE(growth_bytes, kMemGrowthLimitBytes)
+            << "10k open/close 内存增量越界 (before=" << mem_before << ", after=" << mem_after
+            << ", limit=" << kMemGrowthLimitBytes << ")";
     }
     cleanup_dir(dir);
 }

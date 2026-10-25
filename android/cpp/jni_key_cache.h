@@ -89,9 +89,12 @@ public:
         }
     }
 
-    // R46 P3-08: 显式按全局已销毁代数水位清扫当前线程 TLS 槽位。
-    // 供 nativeClose 在递延关闭路径返回时主动清零调用方宿主线程(如 open 探活或 export 解密线程)的已销毁或待销毁槽位，
-    // 最大限度收窄空闲宿主线程的 TLS 明文密钥驻留窗口。
+    // R46 P3-08 / R47 P3-N1: 显式按全局已销毁代数水位清扫当前线程 TLS 槽位。
+    // 语义澄清: 仅清零 gen <= destroyed_watermark 的槽位, 即**已真正销毁**实例的残留
+    // (水位只在 jni_destroy_trampoline 实际销毁时推进)。递延关闭路径上, 被关闭实例
+    // 自身的 gen 尚未计入水位, 本函数对其槽位无效——须待其销毁推进水位后, 由该线程
+    // 下次 lookup/allocate_slot 惰性清扫或下次 nativeClose 顺手清扫。供 nativeClose
+    // 收窄空闲宿主线程对**旧代数**明文密钥的驻留窗口, 配合 logx_c.h 契约声明使用。
     void scrub_by_watermark(uint64_t destroyed_watermark) {
         if (destroyed_watermark == 0) return;
         scrub_stale_slots(nullptr, 0, destroyed_watermark);
