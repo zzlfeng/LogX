@@ -447,7 +447,7 @@ TEST_F(RecoveryTest, BothHeadersCorrupt_RebuiltAndTakesOverFileSeqno) {
     ASSERT_TRUE(append_block(inst, salt, 0, rec1.data(),
                              static_cast<uint32_t>(rec1.size()),
                              1, 0, &b1_start, &b1_end));
-    ASSERT_TRUE(append_block(inst, salt, b1_end, rec1.data(),
+    ASSERT_TRUE(append_block(inst, salt, 0, rec1.data(),
                              static_cast<uint32_t>(rec1.size()),
                              5, 0, nullptr, nullptr));
 
