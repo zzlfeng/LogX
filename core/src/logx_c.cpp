@@ -10,6 +10,17 @@
 #include "logx_c.h"
 #include "logx_internal.h"
 
+#ifndef __has_feature
+#  define __has_feature(x) 0
+#endif
+
+#if (defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)) && defined(__has_include)
+  #if __has_include(<sanitizer/lsan_interface.h>)
+    #include <sanitizer/lsan_interface.h>
+    #define LOGX_HAS_LSAN 1
+  #endif
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -432,6 +443,10 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     // T5.8: 分配控制块与实例数据主体
     InstanceControlBlock* cb = new (std::nothrow) InstanceControlBlock();
     if (!cb) return LOGX_ERR_NOMEM;
+#if defined(LOGX_HAS_LSAN)
+    // T5.8 CB 墓碑设计：控制块在实例关闭后永久保留以防 UAF，向 LSan 声明该指针为有意保留的墓碑
+    __lsan_ignore_object(cb);
+#endif
 
     Instance* inst = new (std::nothrow) Instance();
     if (!inst) {

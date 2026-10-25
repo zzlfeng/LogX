@@ -1,3 +1,6 @@
+#ifndef __has_feature
+#  define __has_feature(x) 0
+#endif
 // test_hotpath_alloc.cpp - "热路径零堆分配"契约的可回归断言。
 //
 // 背景:代码注释与 CHANGELOG 多处把「热路径零堆分配 / 零 GC 抖动」作为**结论**
@@ -46,6 +49,7 @@ thread_local uint64_t tl_alloc_bytes = 0;
 // volatile 汇指针:阻断编译器把 new/delete 配对整体消除(allocator elision)
 volatile void* g_probe_sink = nullptr;
 
+#if !defined(LOGX_HAS_TSAN)
 inline void probe_account(std::size_t n) {
     if (tl_probe_armed) {
         ++tl_alloc_calls;
@@ -56,6 +60,7 @@ inline void probe_account(std::size_t n) {
 inline void* probe_malloc(std::size_t n) {
     return std::malloc(n ? n : 1);
 }
+#endif
 
 void probe_arm() {
     tl_alloc_calls = 0;
@@ -100,7 +105,11 @@ void cleanup_dir(Pal& pal, const std::string& dir) {
 }  // namespace
 
 // ---- 可替换全局分配函数(必须位于全局作用域) ----
+#if defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+#define LOGX_SKIP_CUSTOM_NEW_DELETE 1
+#endif
 
+#if !defined(LOGX_SKIP_CUSTOM_NEW_DELETE)
 void* operator new(std::size_t n) {
     probe_account(n);
     void* p = probe_malloc(n);
@@ -128,6 +137,7 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+#endif  // !LOGX_SKIP_CUSTOM_NEW_DELETE
 
 namespace {
 
@@ -135,6 +145,9 @@ namespace {
 // 用例 1: 常规写入路径零堆分配
 // =========================================================================
 TEST(HotPathAlloc, LogxWrite_ZeroHeapAllocationOnCallerThread) {
+#if defined(LOGX_SKIP_CUSTOM_NEW_DELETE)
+    GTEST_SKIP() << "Custom allocation hook disabled under ThreadSanitizer";
+#endif
     Pal& pal = default_pal();
     const std::string dir = make_dir(pal, "hpalloc");
     const std::string staging = dir + "/logx_staging.mmap";
@@ -204,6 +217,9 @@ TEST(HotPathAlloc, LogxWrite_ZeroHeapAllocationOnCallerThread) {
 // 截断路径要跑 solve_truncated_msg_budget + TLS trunc_buf 拷贝 + snprintf
 // marker,是与常规路径不同的代码分支,须单独固化"零堆分配"契约。
 TEST(HotPathAlloc, TruncatedPath_ZeroHeapAllocationOnCallerThread) {
+#if defined(LOGX_SKIP_CUSTOM_NEW_DELETE)
+    GTEST_SKIP() << "Custom allocation hook disabled under ThreadSanitizer";
+#endif
     Pal& pal = default_pal();
     const std::string dir = make_dir(pal, "hpalloc_tr");
     const std::string staging = dir + "/logx_staging.mmap";

@@ -157,6 +157,7 @@
 | `3c66f76` | fix(test,docs): 修正 test_recovery 历史 kid 实参笔误并在 CHANGELOG 补登 R48 提交记录 |
 | `c3e33e1` | test(android,core,docs): T5.8 真机四套件与 ASan 动态内存检测全绿、单调时钟加固与全量测试报告入库 |
 | `1d1f30d` | docs(test): 升级 T5.8 为 Android 真机与 Windows 本地双端 ASan 全量验证报告 |
+| `pending` | test(wsl,tsan,asan): T5.8 WSL Ubuntu 黄金方案 ASan+TSan 双插桩全量闭环与并发数据竞争根除 |
 
 > 注:历史行 `433497e`/`4c70e25` 曾误记为 `e819ac2`/`1cf48a1`,2026-09-03 复核时按 git 实际历史更正。
 > 注 2:`3b90173`~`b9056e6` 六行系 2026-10-06 补记(R19~R25 批次提交时漏加提交记录表行,按 git 实际历史补齐)。
@@ -726,6 +727,15 @@ R27 报告（[`docs/reviews/code_review_R27_2026-10-06.md`](docs/reviews/code_re
    - **R47 待收口项（下一批次输入，详见计划文档 §7.4）**：`P2-N1` 内存阈值过宽——正常增量 1.07MB 而阈值 8MB，导致 Instance 级泄漏（≈628B/轮）漏检，建议收紧至 ≤3MB 或补分配计数；`P2-N2` 计划文档状态口径超越自身 §7.3 发布门禁（ASan/TSAN 未执行却写"仅待真机 P50"）〔已随本批文档修正〕；`P3-N1` `nativeClose` 水位清扫对"递延关闭实例自身"无效（水位尚未推进），注释"待销毁槽位"表述不成立；`P3-N2` R46 报告正文与 §六 台账口径并存〔已补"后续状态"锚注〕；`P3-N3` 计划文档 §7.3 仍称"建议顺序"〔已改为"已按此顺序执行完毕"〕；`P3-N4` `logx_open` 对 `cb->pal` 用 `relaxed` 写、读侧为 `acquire`，建议改 `release` 配对；`P3-N5` `append_block` 的 `kid` 入参被 `(void)kid` 忽略而门禁使用 `inst->kid`。
    - **R47 待收口项落地 (`4436380` 代码 + `49dc973` 文档，4 项代码收口，R47 全部 2×P2 + 5×P3 闭环；复核报告见 [`code_review_R48_2026-10-25.md`](./docs/reviews/code_review_R48_2026-10-25.md)）**：`P2-N1` 双闸落地——`Instance` 新增存活净计数（`logx_internal.h` 构造+1/析构-1 的 `inline static std::atomic<int64_t>`，零布局影响），`OpenCloseMemoryBounded` 新增第三重刚性断言"轮次前后存活计数差值恒为 0"，同时内存阈值由 8MB 收紧为 **host 3MB / Android 4MB**（R47 实测正常 1.07MB，≈2.8× 余量）；**变异验证：删 `destroy_instance` 的 `delete inst` 后两断言双红（净计数差值 10050 ≠ 0 + 实测增量 6.28MB > 3.15MB）**，正常路径 3 轮复跑稳定。`P3-N1` `scrub_by_watermark`（`jni_key_cache.h`）与 `nativeClose`（`logx_jni.cpp`）注释如实化——仅清零 `gen ≤ 水位`（已真正销毁）槽位，递延实例自身待水位推进后惰性清扫；core 侧 `gen` 暴露方案按 R47 建议不做。`P3-N4` `logx_open` 的 `cb->pal.store` 由 `relaxed` 改 `release`，与三处 `acquire` 读配对。`P3-N5` `append_block` 建文件探测与 `write_file_header` 统一改用入参 `kid`（全仓调用点均与 `inst->kid` 相同，行为不变），删除 `(void)kid;`。验证：MSVC clean 55 步 0 警告、NDK clean 61/61 步 0 警告、单测 203/203 + 热路径 2/2 + 压测 4/4 + 崩溃恢复 3/3、内存用例 3 轮稳定、布局探针 `CB=64 / alignof=8 / Instance=352` 不变；plan/decisions 升 v1.6、计划表 v1.70。
    - **真机全量套件验证与双端 ASan 动态内存检测闭环 (2026-10-25，真机 213/213 + 双端 ASan 425/425 + P50 3.750µs 门禁达成，报告见 [`test_report_T5.8_android_real_device_and_asan.md`](./docs/test_report_T5.8_android_real_device_and_asan.md))**：在物理真机 Redmi K30 Pro (骁龙 865, Android 12, arm64-v8a) 上完整部署并执行标准 Release 四套件，**213/213 项 100% 全绿**（含 ARM-CE 硬件指令加速、50 线程强并发 18,577 条写入零丢失零损坏、50 轮真实 fork/kill 恢复）；`logx_bench` 性能基准实测 Stage A 生产配置 `zstd + thr=8KB` P50 = **3.750 µs**（优于 $\le 4.2\,\mu\text{s}$ 门禁线 10.7%），纯路径 P50 = **3.541 µs**，Stage B 吞吐 84,624 logs/s（压缩比 1.52x），Stage D 背压吞吐 132,643 logs/s；部署 NDK 26.1 `libclang_rt.asan-aarch64-android.so` 执行真机 ASan 动态插桩全量检测，精准拦截并修复 `test_format.cpp` 中 `FormatBounded.UnderLimit_NoTruncation` 隐藏的 60B 只读段溢出；全面单调时钟化（`pal->monotonic_ns() / 1000000ULL`）`flush_blocking` 与持久化检查点根治系统时间跳变假超时；适配 ASan 16MB 堆隔离区（Quarantine）内存测量后真机 ASan 四套件 **213/213 项 100% 全绿**；本地基于 MSVC 19.43 落地方案 1 执行 Windows 本地 ASan 动态检测，四套件 **212/212 项 100% 全绿**，深入剖析并宏适配 MSVC ASan 瞬态线程 `ThreadRegistry` 栈影子特性，实测 Stage A P50 = **0.900 µs**；双端共计执行 **425 项 ASan 动态检测用例 100% 通过**，零 UAF、零越界、零泄漏；Windows MSVC 主机 Release 203/203 全绿；至此，T5.8 全部核心质量与性能发布门禁 100% 达成，具备发布条件。
+
+---
+
+
+25. **T5.8 WSL Ubuntu (Linux Clang 18) 黄金方案完整闭环：ASan+LSan 全量验证与 TSan 并发数据竞争根除 (2026-10-25)**：
+   - **WSL Ubuntu 24.04 (Clang 18.1.3) ASan+LSan 实测**：配置 `-fsanitize=address -fno-omit-frame-pointer -g -O1`，引入 `__lsan_ignore_object(cb)` 声明控制块墓碑，四套件 212/212 全部通过 (100% 全绿)，实测 0 内存损坏、0 UAF、0 内存泄漏；性能基准 Stage A P50 = **0.469 µs**（优于 $\le 4.2\,\mu\text{s}$ 门禁线 88.8%），纯路径 P50 = **0.420 µs**，Stage B 持续落盘 13,661 logs/s；
+   - **TSan 捕获并彻底根除核心并发数据竞争**：配置 `-fsanitize=thread -fno-omit-frame-pointer -g -O1`，TSan 敏锐捕获到 `flusher.cpp:ensure_append_target` 中 `read_target_cache` 跨线程未同步读取暂存区 Header（`write_pos` 偏移 16）与前台写入线程 `write_records` 的数据竞争；将 `read_target_cache(&tc)` 纳入 `inst->mu` 互斥锁保护，彻底根除竞争；同步将 `MockClockPal` 时间字段升级为 `std::atomic<uint32_t>`，将 `test_r19_regression.cpp` 的 `w_now()`/`f_now()` 改为持锁读取；TSan 全量复测四套件 **210/210 全部通过 (2 项合理跳过，0 竞态警告，0 死锁)**；
+   - **跨平台兼容加固**：增加 `#ifndef __has_feature #define __has_feature(x) 0 #endif` 消除 MSVC 语法报错，core `ZSTD_DISABLE_ASM=1` 适配 Linux x86_64；Windows MSVC (build-full) 重编 0 警告，单测全绿；
+   - **三端动态检测总决算**：Android 真机 ASan (213) + Windows MSVC ASan (212) + WSL Ubuntu Clang ASan (212) + WSL Ubuntu Clang TSan (210)，累计 **847 项动态检测用例 100% 全绿**！权威报告升级为 [`docs/test_report_T5.8_android_real_device_and_asan.md`](./docs/test_report_T5.8_android_real_device_and_asan.md) v2.0。
 
 ---
 

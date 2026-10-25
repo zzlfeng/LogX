@@ -197,7 +197,7 @@ public:
     // seqno 新者"的 reserved,输出经过 magic/CRC 校验;双 Header 均坏时返回 false
     // (调用方回退目录扫描)。与裸读 raw_base()+20 的区别: 撕裂 Header 不会产出
     // 垃圾缓存(日期/切分序号指向不存在的文件, 诱发孤儿分卷)。
-    // 锁外可调(mmap 指针在生命周期内稳定)。
+    // 注: 并发写入场景下调用方应持有 inst->mu, 避免 pick_header 校验 Header 时与 write_records 并发竞争 Header 字段。
     bool read_target_cache(AppendTargetCache* out) const;
 
     // 是否处于 mmap 失败堆内存降级模式 (spec §2 / §10)

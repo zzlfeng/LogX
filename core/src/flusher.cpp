@@ -740,7 +740,11 @@ int ensure_append_target(FlusherCtx* c, uint32_t today, Instance* inst, bool* ou
             // hint, 杜绝"date/split 指向不存在文件 → open_or_create 新建"的
             // 孤儿分卷路径。
             AppendTargetCache tc;
-            if (inst->staging->read_target_cache(&tc) && tc.date != 0) {
+            bool tc_ok = false;
+            inst->pal->mutex_lock(inst->mu);
+            tc_ok = inst->staging->read_target_cache(&tc);
+            inst->pal->mutex_unlock(inst->mu);
+            if (tc_ok && tc.date != 0) {
                 hint = make_log_path(inst->log_dir, tc.date, atc_split(tc));
             }
         }

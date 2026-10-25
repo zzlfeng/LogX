@@ -105,17 +105,20 @@ TEST(Robustness, UnalignedMemoryAccess_RecordFormatAndParse) {
 class MockClockPal : public Pal {
 public:
     explicit MockClockPal(Pal* real_pal) : real_(real_pal) {
-        real_->wallclock_date(&mock_date_, &mock_time_);
+        uint32_t d = 0, t = 0;
+        real_->wallclock_date(&d, &t);
+        mock_date_.store(d, std::memory_order_relaxed);
+        mock_time_.store(t, std::memory_order_relaxed);
     }
 
     void set_clock(uint32_t yyyymmdd, uint32_t hhmmss) {
-        mock_date_ = yyyymmdd;
-        mock_time_ = hhmmss;
+        mock_date_.store(yyyymmdd, std::memory_order_relaxed);
+        mock_time_.store(hhmmss, std::memory_order_relaxed);
     }
 
     void wallclock_date(uint32_t* yyyymmdd, uint32_t* hhmmss) override {
-        if (yyyymmdd) *yyyymmdd = mock_date_;
-        if (hhmmss)   *hhmmss   = mock_time_;
+        if (yyyymmdd) *yyyymmdd = mock_date_.load(std::memory_order_relaxed);
+        if (hhmmss)   *hhmmss   = mock_time_.load(std::memory_order_relaxed);
     }
 
     uint64_t wallclock_ms() override { return real_->wallclock_ms(); }
@@ -167,8 +170,8 @@ public:
 
 private:
     Pal* real_ = nullptr;
-    uint32_t mock_date_ = 20260903;
-    uint32_t mock_time_ = 120000;
+    std::atomic<uint32_t> mock_date_{20260903};
+    std::atomic<uint32_t> mock_time_{120000};
 };
 
 // =========================================================================

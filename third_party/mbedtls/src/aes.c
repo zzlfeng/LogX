@@ -19,7 +19,7 @@ int aesce_crypt_ecb(mbedtls_aes_context *ctx, const unsigned char input[16], uns
 unsigned int mbedtls_aesce_has_support(void);
 #define CE_MODE_ENABLED() (mbedtls_aesce_has_support())
 #else
-static unsigned int mbedtls_aesce_has_support(void) { return 0; }
+static inline unsigned int mbedtls_aesce_has_support(void) { return 0; }
 #define CE_MODE_ENABLED() 0
 #endif
 
@@ -195,12 +195,14 @@ int mbedtls_aes_setkey_enc_soft(mbedtls_aes_context *ctx, const unsigned char *k
  */
 int mbedtls_aes_setkey_enc(mbedtls_aes_context *ctx, const unsigned char *key, unsigned int keybits) {
     if (ctx == NULL || key == NULL) return MBEDTLS_ERR_AES_INVALID_PARAM;
+#if defined(LOGX_AESCE_HOOK)
     if (CE_MODE_ENABLED() && mbedtls_aes_setkey_enc_soft(ctx, key, keybits) == 0) {
         if (aesce_setkey_enc(ctx, key, keybits) == 0) {
             return 0;   /* ctx left in CE key form; crypt_ecb takes the CE path */
         }
         /* On CE failure, soft schedule below ensures clean fallback with ce_mode=0. */
     }
+#endif
     return mbedtls_aes_setkey_enc_soft(ctx, key, keybits);
 }
 

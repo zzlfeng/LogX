@@ -117,6 +117,7 @@ if(LOGX_WITH_ZSTD)
         ZSTD_EXCLUDE_BTULTRA_BLOCK_COMPRESSOR=1
         ZSTD_STRIP_ERROR_STRINGS=1
         ZSTD_NO_TRACE=1
+        ZSTD_DISABLE_ASM=1
     )
     # 单线程:pool.c/threading.c 无引用已移除;若未来定义 ZSTD_MULTITHREAD,
     # 必须恢复这两个文件并接入 zstdmt_compress.c。

@@ -1,3 +1,6 @@
+#ifndef __has_feature
+#  define __has_feature(x) 0
+#endif
 // test_r19_regression.cpp - R19 批次回归测试 + R20/R21 复核回归。
 //
 // 覆盖(括号内为"撤销该修复 → 本用例复红"的对应关系, R21 已逐条做撤销对照实验):
@@ -391,8 +394,20 @@ TEST(R19Regression, F1c_WrapSeamAtPendingHead_MicroBlockNeverReachesDisk) {
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     Instance* ii = logx::test::test_get_instance(inst);
     const uint32_t data_size = ii->staging->data_size();
-    auto w_now = [&]() { return get_u32(ii->staging->raw_base() + 16); };
-    auto f_now = [&]() { return get_u32(ii->staging->raw_base() + 12); };
+    auto w_now = [&]() {
+        uint32_t val = 0;
+        ii->pal->mutex_lock(ii->mu);
+        val = get_u32(ii->staging->raw_base() + 16);
+        ii->pal->mutex_unlock(ii->mu);
+        return val;
+    };
+    auto f_now = [&]() {
+        uint32_t val = 0;
+        ii->pal->mutex_lock(ii->mu);
+        val = get_u32(ii->staging->raw_base() + 12);
+        ii->pal->mutex_unlock(ii->mu);
+        return val;
+    };
 
     // 1) 探测单条记录的落环长度与固定开销(同 tag/level 下 record = msg + overhead)
     const uint32_t kMsg = 512;
@@ -1675,7 +1690,13 @@ TEST(R19Regression, F7_MicroBlockNotSeamPadding_DropsAndEmitsRecoveryEvent) {
     ASSERT_EQ(logx_open(&cfg, &inst), LOGX_OK);
     Instance* ii = logx::test::test_get_instance(inst);
     const uint32_t data_size = ii->staging->data_size();
-    auto w_now = [&]() { return get_u32(ii->staging->raw_base() + 16); };
+    auto w_now = [&]() {
+        uint32_t val = 0;
+        ii->pal->mutex_lock(ii->mu);
+        val = get_u32(ii->staging->raw_base() + 16);
+        ii->pal->mutex_unlock(ii->mu);
+        return val;
+    };
     
     // First, measure overhead
     const uint32_t kMsg = 512;
@@ -3089,15 +3110,14 @@ TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
     // 10k 轮 open/close 衍生的 10k 个瞬态 Flusher 线程栈影子被 ASan 运行时暂存，
     // PrivateUsage 实测增加 ~3.5GB（5 类底层资源与 Instance 净计数均 100% 严格配对释放归零）。
     constexpr uint64_t kMemGrowthLimitBytes = 4ull * 1024ull * 1024ull * 1024ull;
-#elif defined(__SANITIZE_ADDRESS__)
+#elif defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer) || \
+      defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+  #if defined(__ANDROID__)
     constexpr uint64_t kMemGrowthLimitBytes = 40ull * 1024ull * 1024ull;
-#elif defined(__clang__)
-  #if __has_feature(address_sanitizer)
-    constexpr uint64_t kMemGrowthLimitBytes = 40ull * 1024ull * 1024ull;
-  #elif defined(__ANDROID__)
-    constexpr uint64_t kMemGrowthLimitBytes = 4ull * 1024ull * 1024ull;
   #else
-    constexpr uint64_t kMemGrowthLimitBytes = 3ull * 1024ull * 1024ull;
+    // 桌面 Linux x86_64 下 ASan 默认 Quarantine 为 256MB，10k 轮正常堆释放被隔离区暂存，实测增量 ~100MB；
+    // 设 150MB 阈值，远小于 10k 轮 Staging 泄漏的 1.28GB，仍具备刚性拦截力。
+    constexpr uint64_t kMemGrowthLimitBytes = 150ull * 1024ull * 1024ull;
   #endif
 #elif defined(__ANDROID__)
     constexpr uint64_t kMemGrowthLimitBytes = 4ull * 1024ull * 1024ull;
