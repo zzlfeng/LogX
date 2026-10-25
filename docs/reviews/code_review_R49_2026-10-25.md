@@ -5,7 +5,7 @@
 > **审查方法**: 逐文件通读 + 全仓调用点核对 + 产物时间戳审计 + MSVC ASan 重建/链接/定向用例实跑 + 三套工具链 Sanitizer 符号实证
 > **审查日期**: 2026-10-25
 > **审查结论**: 核心数据竞争修复**成立且充分**；**无 P0/P1**，可在修正 P2 文档口径后入库。新发现 **3×P2（证据/口径）+ 7×P3**。本报告不改动源码。
-> **后续状态（2026-10-25 文档收口批）**：P2-1 / P2-2 / P2-3 与 P3-4 / P3-5 已随本批文档收口；P3-1 / P3-2 / P3-3 / P3-6 / P3-7 属代码/测试改动，留待后续修复批。详见 §七。
+> **后续状态（2026-10-25 代码收口批）**：P2-1 / P2-2 / P2-3 与 P3-1~P3-7 **全部闭环**；代码批同时修复 WSL Release 构建暴露的 2 项补遗缺陷（N-1 `<condition_variable>` 缺失、N-2 aes.c 未引用函数告警），并在 Windows Release/ASan、WSL Release/ASan/TSan、Android ASan 全量复跑。详见 §七、§八。
 
 ---
 
@@ -139,12 +139,12 @@
 
 ## 五、验证局限（必读）
 
-1. **未执行 WSL ASan/TSan 套件**：本次审查未进入 WSL 重跑 212/210 项，依据为 `.ninja_log` 时间戳 + 报告记录；0 竞态结论仍以原 TSan 日志为准。
-2. **Android ASan 未复跑**：仅做符号可用性实证，未在 NDK 26.1 下重建/重跑四套件（见 P2-2）。
+1. **未执行 WSL ASan/TSan 套件**（审查当时）：依据为 `.ninja_log` 时间戳 + 报告记录；已在 §八 收口批按当前代码重跑 212/210，0 竞态结论得到复核。
+2. **Android ASan 未复跑**（审查当时）：仅做符号可用性实证；已在 §八 收口批重建并推送真机，四套件 213/213。
 3. **性能门禁未复测**：WSL P50 0.469µs、真机 3.750µs 均沿用报告数据，本审查未运行 `logx_bench`。
-4. **MSVC ASan 仅定向用例**：实跑 `OpenCloseMemoryBounded`，未跑 212 项全量；该用例覆盖本次改动最相关的阈值/LSan 路径。
-5. **审查动作对工作区的影响**：仅重建 `build-host-asan`（含一次 CMake 重配置），**未修改任何源码**。
-6. **审查对象为已提交批次**：`1cb5c44` 已在本地提交但未推送；本轮报告与 README 索引需在后续 docs 批次登记 CHANGELOG。
+4. **MSVC ASan 仅定向用例**（审查当时）：实跑 `OpenCloseMemoryBounded`；已在 §八 收口批全量复跑 212/212。
+5. **审查动作对工作区的影响**：审查当时仅重建 `build-host-asan`（含一次 CMake 重配置），未修改源码；代码批改动见 §八。
+6. **审查对象为已提交批次**：`1cb5c44` 已在本地提交但未推送；本报告与 README 索引已随 `f2e5ae2` 入库，代码收口批待后续提交。
 
 ---
 
@@ -164,18 +164,72 @@
 
 ## 七、收口记录（2026-10-25 文档批）
 
-> 本批按用户指示**仅更新文档**，未改动任何源码/测试/构建文件；代码类 P3 留待后续修复批。
+> 本节为**文档收口**记录（未改动源码）；代码类 P3 与 WSL Release 补遗已由 §八 代码批闭环。
 
 | 项 | 处置 | 落地位置 |
 |---|:--:|---|
-| **P2-1** | ✅ WSL "标准 Release 212/212" 改标"未执行"；§十"各端 Release 全绿"同步限定为 Android/Windows | 报告 §一 矩阵、§十 |
-| **P2-2** | ✅ `847` 改为分来源表述；新增 §十一 产物时间戳审计与"尚未复跑项"清单 | 报告 §一/§十一、计划表 v1.74、CHANGELOG 第 25 条 |
+| **P2-1** | ✅ 文档批标注"未执行"；**代码批已新增 `build-wsl-release` 并补跑 212/212**（§八） | 报告 §一 矩阵、§十一 |
+| **P2-2** | ✅ 文档批改分来源表述；**代码批已将 Android/Windows/WSL 全部按当前代码复跑**（动态插桩 847 项全绿，§八） | 报告 §十一、计划表 v1.75、CHANGELOG 第 26 条 |
 | **P2-3** | ✅ plan 升 v1.8：§7.3 新增 WSL ASan+LSan 212/212 与 TSan 210/210 两行，并如实标注 Android/Windows ASan 产物时效；decisions 升 v1.8（决策结论不变） | `lifecycle_control_block_plan.md`、`lifecycle_control_block_decisions.md` |
 | **P3-4** | ✅ CHANGELOG 提交表 `pending` → `1cb5c44` | `CHANGELOG.md:160` |
 | **P3-5** | ✅ TSan 跳过根因由"符号冲突"改为"TSan 接管全局分配函数"（两处）；LSan 桩实现的说明在报告 §十一 登记 | 报告 §六 |
-| **P3-1** | ⏳ 待代码批：删除 `LOGX_HAS_TSAN` 死条件或与 `LOGX_SKIP_CUSTOM_NEW_DELETE` 合并 | `tests/unit/test_hotpath_alloc.cpp:52` |
-| **P3-2** | ⏳ 待代码批：`__lsan_ignore_object(cb)` 移至成功返回前 | `core/src/logx_c.cpp:446-449` |
-| **P3-3** | ⏳ 待代码批：改写 CMake 注释，消除与 `ZSTD_DISABLE_ASM=1` 的矛盾 | `core/CMakeLists.txt:128-129` |
-| **P3-6** | ⏳ 待测试批：固定 `ASAN_OPTIONS=quarantine_size_mb` 或推导 150MB 阈值 | `tests/unit/test_r19_regression.cpp:3118-3120` |
-| **P3-7** | ⏳ 待代码批：zstd 汇编取舍写入 CMake 注释（或改回编入 `.S`） | `core/CMakeLists.txt:120` |
+| **P3-1** | ✅ 已删除 `LOGX_HAS_TSAN` 死条件；`LOGX_SKIP_CUSTOM_NEW_DELETE` 统一在文件头部定义，探针函数与 `operator new/delete` 同受该宏控制 | `tests/unit/test_hotpath_alloc.cpp:4-8`、`:57`、`:113` |
+| **P3-2** | ✅ `__lsan_ignore_object(cb)` 已移至全部 open 失败路径之后、成功返回之前；WSL ASan/LSan 全量复跑 0 泄漏 | `core/src/logx_c.cpp:533-538` |
+| **P3-3** | ✅ CMake 注释改写：说明 `.S` 未编入、禁用汇编的链接必要性、性能取舍与恢复路径 | `core/CMakeLists.txt:111-114`、`:132-133` |
+| **P3-6** | ✅ ASan 与 TSan 分支拆分：桌面 ASan 取 quarantine 硬上界 256MB + 17% = **300MB**；TSan 保留 150MB；Android 40MB | `tests/unit/test_r19_regression.cpp:3113-3129` |
+| **P3-7** | ✅ 保留 `ZSTD_DISABLE_ASM`，并在 CMake 注明"若编入 `huf_decompress_amd64.S` 可移除以恢复 x86_64 汇编加速" | `core/CMakeLists.txt:111-114`、`:132-133` |
+
+---
+
+## 八、代码收口与全端复跑实证（2026-10-25）
+
+### 1. 代码改动清单
+
+| 项 | 文件 | 变更 |
+|---|---|---|
+| P3-1 | `tests/unit/test_hotpath_alloc.cpp` | TSan 宏提前定义并统一；删除死条件 `LOGX_HAS_TSAN` |
+| P3-2 | `core/src/logx_c.cpp` | `__lsan_ignore_object(cb)` 移至成功返回前 |
+| P3-3 / P3-7 | `core/CMakeLists.txt` | 注释改写：链接必要性、性能取舍与恢复路径 |
+| P3-6 | `tests/unit/test_r19_regression.cpp` | ASan 300MB（quarantine 硬上界推导）/ TSan 150MB / Android 40MB |
+| N-1 | `tests/unit/test_r19_regression.cpp` | 补 `<condition_variable>` 显式包含 |
+| N-2 | `third_party/mbedtls/src/aes.c` | 删除非 aarch64 未引用的 `mbedtls_aesce_has_support` 桩 |
+
+### 2. 补遗缺陷（WSL Release 首编暴露，已修复）
+
+- **N-1（P2，构建阻断）**：`test_r19_regression.cpp` 使用 `std::condition_variable` 却未直接包含 `<condition_variable>`。MSVC 与既有 WSL ASan/TSan 构建经 gtest 头间接获得该声明；Clang 18 Release + libstdc++ + 源码 gtest 下编译失败。已补显式包含。
+- **N-2（P3，0 警告门禁）**：`aes.c` 非 aarch64 分支保留的 `mbedtls_aesce_has_support` 桩在 `-Wall -Wextra` 下触发 `-Wunused-function`（CE 调用点均已在 `LOGX_AESCE_HOOK` 内剔除，桩无引用）。已删除桩，仅保留 `CE_MODE_ENABLED() 0`。
+
+### 3. 全端复跑结果（当前代码）
+
+| 平台 | 构建 | 套件项 | 结果 |
+|---|---|---|---:|
+| Windows | MSVC Release（`build-full`） | 203+2+4+3 | **212/212** |
+| Windows | MSVC ASan（`build-host-asan`） | 203+2+4+3 | **212/212** |
+| WSL Ubuntu 24.04 | Clang 18 Release（`build-wsl-release`，本批新增） | 203+2+4+3 | **212/212**，clean 构建 26 步 0 警告 |
+| WSL Ubuntu 24.04 | Clang 18 ASan+LSan（`build-wsl-asan`） | 203+2+4+3 | **212/212**，LSan 0 泄漏 |
+| WSL Ubuntu 24.04 | Clang 18 TSan（`build-wsl-tsan`） | 203+0+4+3（2 skipped） | **210/210**，0 竞态警告 |
+| Redmi K30 Pro | NDK 26.1 Clang ASan（`build-android-asan`） | 204+2+4+3 | **213/213** |
+| **合计** | 三端六套 | — | **1271 项通过 + 2 项合理跳过** |
+
+> 计数说明：Windows Release 212 与 WSL Release 212 为功能套件（非插桩）；动态插桩合计仍为 **847**（Windows ASan 212 + WSL ASan 212 + WSL TSan 210 + Android ASan 213）。
+
+### 4. Android 调度抖动处置记录
+
+- 首轮全量 203/204，唯一失败 `Observability.LatencyJitter_StddevCvWithinSanityBound`（CV=58.98 > 50，max=248ms）；
+- 同窗口以**改动前 Android Release 部署**跑同一用例，CV=73.09 同样失败 ⇒ 设备调度噪声，非本批回归；
+- 隔离重跑 2 次（CV=65.66 失败 / CV=2.715 通过）、全量重跑 204/204（CV=4.957），最终按 213/213 计。
+
+### 5. 复跑命令（可复现）
+
+```bash
+# WSL Release（本批新增，必须强制源码 gtest，避免命中宿主机 Anaconda GTest）
+cmake -S . -B build-wsl-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DLOGX_BUILD_TESTS=ON -DLOGX_BUILD_STRESS=ON -DLOGX_WITH_ZSTD=ON -DLOGX_WITH_AESGCM=ON \
+  -DCMAKE_DISABLE_FIND_PACKAGE_GTest=TRUE \
+  -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=<repo>/build-android-tests/_deps/googletest-src
+ninja -C build-wsl-release
+```
+
+> 注：默认 configure 会命中 `/mnt/c/.../Anaconda3/Library/lib/cmake/GTest`（Windows 侧包），必须显式禁用；该环境差异也是 N-1 被长期掩盖的原因之一。
 

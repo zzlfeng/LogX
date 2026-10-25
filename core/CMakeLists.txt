@@ -108,6 +108,10 @@ if(LOGX_WITH_ZSTD)
     # 源码级裁剪(0-diff):仅用上游 EXCLUDE 宏剔除 Level 5+ 匹配引擎。
     # 不得定义 ZSTD_EXCLUDE_DFAST_BLOCK_COMPRESSOR:LogX Level 3 依赖 dfast。
     # ZSTD_NO_TRACE 会改变 CCtx/DCtx 布局,所有 zstd TU 必须 clean 重建。
+    # ZSTD_DISABLE_ASM:本工程只编入 zstd 的 .c 源,未编入 x86_64 汇编实现
+    # (huf_decompress_amd64.S);不禁用会在链接期缺 HUF_decompress*_asm_loop。
+    # 代价是 x86_64 桌面 Release 的 huff0 解压改走 C 实现(轻微性能损失);
+    # Windows(MSVC)与 Android arm64 上游默认即禁用,定义与否行为一致。
     target_compile_definitions(logx_core PRIVATE
         ZSTD_EXCLUDE_GREEDY_BLOCK_COMPRESSOR=1
         ZSTD_EXCLUDE_LAZY_BLOCK_COMPRESSOR=1
@@ -125,8 +129,8 @@ if(LOGX_WITH_ZSTD)
     if(BUILD_SHARED_LIBS)
         set_target_properties(logx_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
     endif()
-    # Android 交叉编译下 zstd 的汇编文件(huf_decompress_amd64.S 仅 x86_64)
-    # 走 C 实现,ZSTD_DISABLE_ASM 与上游默认一致,无需额外定义。
+    # 注:若未来把 huf_decompress_amd64.S 加入源列表,可移除 ZSTD_DISABLE_ASM
+    # 以恢复 x86_64 汇编加速(需同时确认 NASM/汇编器接入)。
 endif()
 if(LOGX_WITH_AESGCM)
     target_compile_definitions(logx_core PUBLIC LOGX_WITH_AESGCM=1)

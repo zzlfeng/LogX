@@ -19,7 +19,8 @@ int aesce_crypt_ecb(mbedtls_aes_context *ctx, const unsigned char input[16], uns
 unsigned int mbedtls_aesce_has_support(void);
 #define CE_MODE_ENABLED() (mbedtls_aesce_has_support())
 #else
-static inline unsigned int mbedtls_aesce_has_support(void) { return 0; }
+/* 非 aarch64:CE 分支整体被 LOGX_AESCE_HOOK 守卫剔除,此处无需提供探针桩,
+ * 仅保留恒假宏以避免任何未引用符号/函数(Clang -Wunused-function)。 */
 #define CE_MODE_ENABLED() 0
 #endif
 

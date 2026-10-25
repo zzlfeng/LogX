@@ -443,10 +443,6 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
     // T5.8: 分配控制块与实例数据主体
     InstanceControlBlock* cb = new (std::nothrow) InstanceControlBlock();
     if (!cb) return LOGX_ERR_NOMEM;
-#if defined(LOGX_HAS_LSAN)
-    // T5.8 CB 墓碑设计：控制块在实例关闭后永久保留以防 UAF，向 LSan 声明该指针为有意保留的墓碑
-    __lsan_ignore_object(cb);
-#endif
 
     Instance* inst = new (std::nothrow) Instance();
     if (!inst) {
@@ -533,6 +529,13 @@ logx_status_e logx_open(const logx_config_t* cfg, logx_instance_t** out_inst) {
         return cleanup_open_failure(LOGX_ERR_STATE);
     }
     inst->flusher_running.store(true, std::memory_order_release);
+
+#if defined(LOGX_HAS_LSAN)
+    // T5.8 CB 墓碑设计：控制块在实例关闭后永久保留以防 UAF，向 LSan 声明该指针为有意保留的墓碑。
+    // 必须放在全部 open 失败路径之后登记：LSan 的 ignore 集合按地址记忆对象，若提前登记后
+    // 又经 cleanup_open_failure 删除 cb，地址被后续分配复用时可能掩盖其他对象的真实泄漏。
+    __lsan_ignore_object(cb);
+#endif
 
     *out_inst = reinterpret_cast<logx_instance_t*>(cb);
     return LOGX_OK;

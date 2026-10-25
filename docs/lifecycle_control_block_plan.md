@@ -1,11 +1,13 @@
 # LogX 1.x 生命周期堆控制块（Control Block）重构实施计划 (T5.8 / R41-05 根治)
 
-> **版本**: v1.8 (2026-10-25)  
+> **版本**: v1.9 (2026-10-25)  
 > **任务编号**: T5.8 (登记于 `docs/LogX后续实施计划表.md` §2 阶段三任务表)  
-> **当前状态**: ✅ **全量收口完成，核心发布门禁（真机 213/213 + Android ASan 213/213 + WSL ASan+LSan 212/212 + WSL TSan 210/210 + P50 3.75µs）100% 达成，具备发布条件**（详见权威报告 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md)）  
+> **当前状态**: ✅ **全量收口完成，核心发布门禁（真机 213/213 + Android ASan 213/213 + Windows ASan 212/212 + WSL Release/ASan 各 212/212 + WSL TSan 210/210 + P50 3.75µs）100% 达成，全部为当前代码复跑，具备发布条件**（详见权威报告 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md) v2.1）  
+>
+> **v1.9 修订摘要（R49 代码收口批：P3 全闭环 + 三端六套复跑）**：① 闭环 R49 全部代码类 P3（`LOGX_HAS_TSAN` 死宏、`__lsan_ignore_object` 位置、CMake 注释、ASan/TSan 阈值分支）；② 新增 WSL 标准 Release 构建与四套件 **212/212**（clean 26 步 0 警告），并修复其首编暴露的 **N-1** `<condition_variable>` 缺失（P2 构建阻断）与 **N-2** `aes.c` 未引用函数告警（P3）；③ Windows Release/ASan（212/212）、WSL Release/ASan/TSan（212/212/210+2 skipped）、Android ASan（213/213）全部按当前代码复跑，动态插桩 **847 项全绿**；④ Android 首轮 1 项调度抖动经改动前 Release 部署复现，确认环境噪声后全量重跑 204/204。  
 >
 > **v1.8 修订摘要（R49 审查文档收口：门禁补全与证据时效）**：R49 独立审查（`1cb5c44`，[`code_review_R49_2026-10-25.md`](./reviews/code_review_R49_2026-10-25.md)）判定核心 `ensure_append_target` 竞争修复成立、无 P0/P1，另捕获 3×P2 + 7×P3。本版据其收口文档口径：① §7.3 门禁表新增 **WSL ASan+LSan 212/212** 与 **TSan 210/210**（2 项合理跳过、0 竞态警告）两行证据；② 如实标注 Android ASan 213/213 为 `c3e33e1` 产物、Windows ASan 212/212 为改动前产物（R49 已重建 MSVC ASan 34 步 0 警告并复跑 `OpenCloseMemoryBounded` PASS 43.5s，全量复跑待执行）；③ 代码类 P3（`LOGX_HAS_TSAN` 死宏、`__lsan_ignore_object` 早于失败路径 `delete cb`、CMake 注释矛盾、150MB 阈值固定）留待后续修复批。决策结论不变。  
-> **关联裁决**: [`lifecycle_control_block_decisions.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_decisions.md) v1.8 (6 大决策项正式拍板)  
+> **关联裁决**: [`lifecycle_control_block_decisions.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_decisions.md) v1.9 (6 大决策项正式拍板)  
 > **关联审查**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)、[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md)、[`reviews/code_review_R48_2026-10-25.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R48_2026-10-25.md)、[`reviews/code_review_R49_2026-10-25.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R49_2026-10-25.md)  
 >
 > **v1.7 修订摘要（真机全量套件 + ASan 动态内存检测 + P50 基准重测全部闭环）**：
@@ -480,15 +482,16 @@ sequenceDiagram
 > | MSVC clean 构建 0 警告 | ✅ 已具备 | R47 复现：`ninja -t clean` 后 55 步全绿、warning = 0 |
 > | NDK clean 构建 0 警告 | ✅ 已具备 | R47 复现：arm64-v8a `ninja -t clean` 后 61/61 步全绿、warning = 0 |
 > | host 四套件全绿 | ✅ 已具备 | 实测：203 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复 = 212 项全通过（MSVC clean 0 警告） |
-> | **ASan 动态检测** | ✅ **已具备** | Android 真机 (Clang ASan) 213/213（`c3e33e1` 产物）+ Windows 本地 (MSVC ASan) 212/212（改动前产物；R49 已重建 34 步 0 警告并复跑关键用例）+ **WSL Ubuntu (Clang ASan+LSan) 212/212（`1cb5c44` 实测）**，捕获并修复 1 处只读段溢出，时钟全面单调化防突跳，详见 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md) |
-> | **TSan 线程竞态检测** | ✅ **已具备** | **WSL Ubuntu (Clang TSan) 210/210**（2 项合理跳过、0 竞态警告、0 死锁，`1cb5c44` 实测）；捕获并根除 `ensure_append_target` 与 `write_records` 的 Header 数据竞争 |
+> | **ASan 动态检测** | ✅ **已具备** | Android 真机 Clang ASan 213/213 + Windows MSVC ASan 212/212 + **WSL ASan+LSan 212/212**（R49 收口批全部按当前代码复跑，LSan 0 泄漏），捕获并修复 1 处只读段溢出，时钟全面单调化防突跳，详见 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md) v2.1 |
+> | **WSL 标准 Release 四套件** | ✅ **已具备** | 新增 `build-wsl-release`（Clang 18.1.3 `-O3`）：203+2+4+3 = **212/212**，clean 构建 26 步 0 警告 |
+> | **TSan 线程竞态检测** | ✅ **已具备** | **WSL Clang TSan 210/210**（2 项合理跳过、0 竞态警告、0 死锁，R49 收口批按当前代码复跑）；捕获并根除 `ensure_append_target` 与 `write_records` 的 Header 数据竞争 |
 > | **真机四套件** | ✅ **已具备** | 实测：Redmi K30 Pro (Android 12, arm64-v8a) 实测四套件 213/213 项全绿（含 ARM-CE 硬件加速与 50 线程强并发 1.8 万条零丢失） |
 > | **P50 ≤ 4.2µs 重测** | ✅ **已具备** | 实测：Redmi K30 Pro 真机 Stage A P50 = 3.750 µs（满足 ≤ 4.2µs 门禁，余量 10.7%），纯路径 P50 = 3.541 µs，Stage B 吞吐 84k logs/s（压缩比 1.52x） |
 > | AAR 体积门禁 | ✅ 已具备 | 历史已达成 385,112 B < 512,000 B（余量 126,888 B），本轮未改动 JNI/Kotlin 架构产物 |
 >
 > 结论：**全部核心发布门禁已 100% 达成，专项技术闭环完成，具备发布条件。**
 >
-> **基线更新（真机与 ASan 实测）**：真机四套件实测为 **213 项**（204 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复）；Host 端为 **203 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复 = 212 项**（真机专有 1 项为 `ArmCe_HardwarePathOnDevice`）；WSL Ubuntu 端 ASan+LSan 为 **212 项**、TSan 为 **210 项**（2 项热路径用例在 TSan 下合理跳过）。
+> **基线更新（真机与 ASan 实测）**：真机四套件实测为 **213 项**（204 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复）；Host 端为 **203 单测 + 2 热路径 + 4 压测 + 3 崩溃恢复 = 212 项**（真机专有 1 项为 `ArmCe_HardwarePathOnDevice`）；WSL Ubuntu 端 Release 为 **212 项**、ASan+LSan 为 **212 项**、TSan 为 **210 项**（2 项热路径用例在 TSan 下合理跳过）。
 
 ### 7.4 R47 复核未闭合项（已全部收口与验证闭环）
 
@@ -506,6 +509,6 @@ sequenceDiagram
 
 **后续执行结果**：全部代码项与文档项均已收口，外部真机四套件、性能基准 P50、ASan 动态检测门禁全部通过（详见 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md)）。
 
-> **闭环总账（v1.8）**：R47 的 2×P2 + 5×P3 **全部闭环**；所有发布前置门禁 **100% 达成**。
+> **闭环总账（v1.9）**：R47 的 2×P2 + 5×P3 与 R49 的 3×P2 + 7×P3（含 N-1/N-2）**全部闭环**；所有发布前置门禁 **100% 达成**（当前代码全量复跑）。
 >
-> **R49 复审（2026-10-25，`1cb5c44`）**：核心竞争修复成立、无 P0/P1；捕获 **3×P2（证据时效/文档口径）+ 7×P3**。本版已补全 §7.3 的 WSL ASan+LSan / TSan 门禁，并如实标注 Android/Windows ASan 产物时效（Android 213 为 `c3e33e1` 产物；Windows 212 为改动前产物，R49 已重建并抽验关键用例）。代码类 P3（`LOGX_HAS_TSAN` 死宏、`__lsan_ignore_object` 位置、CMake 注释、150MB 阈值）留待后续修复批，详见 [`code_review_R49_2026-10-25.md`](./reviews/code_review_R49_2026-10-25.md)。
+> **R49 复审（2026-10-25，`1cb5c44`）**：核心竞争修复成立、无 P0/P1；捕获 **3×P2（证据时效/文档口径）+ 7×P3**。**代码收口批已全部闭环**：文档口径随 v1.8 修正，代码类 P3（死宏、LSan ignore 位置、CMake 注释、阈值分支）全部落地；WSL Release 首编暴露的 N-1 `<condition_variable>` 缺失（P2）与 N-2 aes.c 未引用函数告警（P3）一并修复。全端复跑：Windows Release/ASan 212/212、WSL Release/ASan 212/212、WSL TSan 210/210（2 skipped）、Android ASan 213/213，动态插桩 847 项全绿，详见 [`code_review_R49_2026-10-25.md`](./reviews/code_review_R49_2026-10-25.md) §八。

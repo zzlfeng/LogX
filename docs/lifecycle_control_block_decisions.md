@@ -1,10 +1,12 @@
 # LogX T5.8 生命周期堆控制块（Control Block）待决策项方案分析与裁决建议
 
-> **文档版本**: v1.8 (2026-10-25)  
+> **文档版本**: v1.9 (2026-10-25)  
 > **任务编号**: T5.8（生命周期堆控制块重构专项，根治 R41-05 尾读 UAF）  
-> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.8  
+> **关联实施计划**: [`lifecycle_control_block_plan.md`](file:///d:/Project/Android_Project/LogX/logx/docs/lifecycle_control_block_plan.md) v1.9  
 > **关联审查报告**: [`reviews/code_review_R44_2026-10-18.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R44_2026-10-18.md)、[`reviews/code_review_R45_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R45_2026-10-24.md)、[`reviews/code_review_R46_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R46_2026-10-24.md)、[`reviews/code_review_R47_2026-10-24.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R47_2026-10-24.md)、[`reviews/code_review_R48_2026-10-25.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R48_2026-10-25.md)、[`reviews/code_review_R49_2026-10-25.md`](file:///d:/Project/Android_Project/LogX/logx/docs/reviews/code_review_R49_2026-10-25.md)  
-> **当前状态**: ✅ **六项决策已拍板，代码落地、测试余量收口与真机 + ASan + WSL ASan/TSan 门禁已全部达成，具备发布条件**（详见权威报告 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md)）  
+> **当前状态**: ✅ **六项决策已拍板，代码落地、测试余量收口与真机 + Windows/WSL Release + ASan/LSan + TSan 门禁已全部达成（当前代码全量复跑），具备发布条件**（详见权威报告 [`test_report_T5.8_android_real_device_and_asan.md`](./test_report_T5.8_android_real_device_and_asan.md) v2.1）  
+>
+> **v1.9 修订说明（R49 代码收口批）**：决策结论不变。R49 的代码类 P3 全部落地（死宏、LSan ignore 位置、CMake 注释、阈值分支）；WSL Release 首编暴露的 N-1 `<condition_variable>` 缺失与 N-2 aes.c 未引用函数告警一并修复。全端按当前代码复跑：Windows Release/ASan 212/212、WSL Release/ASan 212/212、WSL TSan 210/210（2 skipped）、Android ASan 213/213，动态插桩 847 项全绿。  
 >
 > **v1.8 修订说明（R49 审查文档收口）**：决策结论不变。R49 复审（`1cb5c44`）判定核心 `ensure_append_target` 竞争修复成立、无 P0/P1；本版仅同步门禁证据口径——plan §7.3 补 WSL ASan+LSan 212/212 与 TSan 210/210 两行，并如实标注 Android/Windows ASan 数据来源时效（Android 213 为 `c3e33e1` 产物、Windows 212 为改动前产物，R49 已重建 MSVC ASan 并抽验关键用例）。  
 >

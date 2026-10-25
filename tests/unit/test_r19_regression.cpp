@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -3110,13 +3111,21 @@ TEST(ControlBlockLifetime, OpenCloseMemoryBounded) {
     // 10k 轮 open/close 衍生的 10k 个瞬态 Flusher 线程栈影子被 ASan 运行时暂存，
     // PrivateUsage 实测增加 ~3.5GB（5 类底层资源与 Instance 净计数均 100% 严格配对释放归零）。
     constexpr uint64_t kMemGrowthLimitBytes = 4ull * 1024ull * 1024ull * 1024ull;
-#elif defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer) || \
-      defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+#elif defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
   #if defined(__ANDROID__)
     constexpr uint64_t kMemGrowthLimitBytes = 40ull * 1024ull * 1024ull;
   #else
-    // 桌面 Linux x86_64 下 ASan 默认 Quarantine 为 256MB，10k 轮正常堆释放被隔离区暂存，实测增量 ~100MB；
-    // 设 150MB 阈值，远小于 10k 轮 Staging 泄漏的 1.28GB，仍具备刚性拦截力。
+    // 桌面 ASan 默认 quarantine_size_mb=256 是 RSS 增量的硬上界（实测增量 ~100MB）；
+    // 取 256MB + 约 17% 余量 = 300MB，避免不同机器/分配器 size-class 抖动造成误报，
+    // 同时仍远低于 10k 轮 Staging mmap 泄漏的 1.28GB（拦截力保留）。
+    constexpr uint64_t kMemGrowthLimitBytes = 300ull * 1024ull * 1024ull;
+  #endif
+#elif defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+  #if defined(__ANDROID__)
+    constexpr uint64_t kMemGrowthLimitBytes = 40ull * 1024ull * 1024ull;
+  #else
+    // TSan 无 ASan 式 quarantine；150MB 覆盖 10k 轮瞬态线程与影子状态波动，
+    // 且远低于 10k 轮 Staging 泄漏的 1.28GB。
     constexpr uint64_t kMemGrowthLimitBytes = 150ull * 1024ull * 1024ull;
   #endif
 #elif defined(__ANDROID__)

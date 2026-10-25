@@ -1,6 +1,11 @@
 #ifndef __has_feature
 #  define __has_feature(x) 0
 #endif
+// TSan 必须接管全局 new/delete 以跟踪线程分配;本文件的自定义替换会破坏其拦截,
+// 故 TSan 构建下探针函数与 operator new/delete 一并不编译(两用例以 GTEST_SKIP 跳过)。
+#if defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+#define LOGX_SKIP_CUSTOM_NEW_DELETE 1
+#endif
 // test_hotpath_alloc.cpp - "热路径零堆分配"契约的可回归断言。
 //
 // 背景:代码注释与 CHANGELOG 多处把「热路径零堆分配 / 零 GC 抖动」作为**结论**
@@ -49,7 +54,7 @@ thread_local uint64_t tl_alloc_bytes = 0;
 // volatile 汇指针:阻断编译器把 new/delete 配对整体消除(allocator elision)
 volatile void* g_probe_sink = nullptr;
 
-#if !defined(LOGX_HAS_TSAN)
+#if !defined(LOGX_SKIP_CUSTOM_NEW_DELETE)
 inline void probe_account(std::size_t n) {
     if (tl_probe_armed) {
         ++tl_alloc_calls;
@@ -105,10 +110,6 @@ void cleanup_dir(Pal& pal, const std::string& dir) {
 }  // namespace
 
 // ---- 可替换全局分配函数(必须位于全局作用域) ----
-#if defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
-#define LOGX_SKIP_CUSTOM_NEW_DELETE 1
-#endif
-
 #if !defined(LOGX_SKIP_CUSTOM_NEW_DELETE)
 void* operator new(std::size_t n) {
     probe_account(n);
