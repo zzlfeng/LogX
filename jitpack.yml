@@ -1,0 +1,15 @@
+# JitPack 构建配置(https://jitpack.io)
+# 仓库根无 settings.gradle,Gradle 工程位于 android/logx-aar(单模块 :logx,AGP 8.5.1 + Kotlin 1.9.23)。
+# 发布产物:AAR(release 变体,arm64-v8a,MinSizeRel -Oz,含 Kotlin Facade 源码单源编译)。
+# 消费坐标以构建完成后 jitpack.io 页面展示的为准(com.github.zzlfeng:LogX:<tag> 或 com.github.zzlfeng.LogX:logx:<tag>)。
+
+jdk:
+  - openjdk17
+
+before_install:
+  # AGP 8.5.1 需要 compileSdk 34 / build-tools 34.0.0;native 构建需要 NDK 29.0.14206865(与 build.gradle.kts ndkVersion 一致)
+  - yes | sdkmanager --licenses > /dev/null || true
+  - sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;29.0.14206865" > /dev/null
+
+install:
+  - cd android/logx-aar && ./gradlew :logx:publishToMavenLocal --console=plain --stacktrace --no-daemon
